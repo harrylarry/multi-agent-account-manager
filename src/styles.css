@@ -985,6 +985,7 @@ body,
   padding: 16px 12px;
   display: flex;
   flex-direction: column;
+  overflow-y: auto;
   z-index: 30;
   animation: maam-fade-in 0.14s ease-out;
 }
@@ -1438,4 +1439,97 @@ body,
   min-width: 6px;
   border-radius: 999px;
   background: #f59e0b;
+}
+
+/* ---- iPhone / mobile adaptation (scoped to .mobile-shell) ----
+   Desktop sizes are too small for touch and iOS zooms into inputs
+   below 16px, so mobile gets larger tap targets, larger text and a
+   keyboard-safe modal. Desktop is untouched. */
+
+.mobile-shell .mobile-tab {
+  padding: 10px 6px;
+  font-size: 14px;
+}
+
+.mobile-shell .column-header {
+  height: 60px;
+  min-height: 60px;
+  padding: 0 12px 0 16px;
+}
+
+.mobile-shell .provider-title {
+  font-size: 16px;
+}
+
+.mobile-shell .ghost-icon-btn {
+  width: 36px;
+  height: 36px;
+  border-radius: 10px;
+}
+
+.mobile-shell .icon-btn {
+  height: 36px;
+  padding: 0 14px;
+  font-size: 13.5px;
+}
+
+.mobile-shell .account-alias {
+  font-size: 14px;
+}
+
+.mobile-shell .account-sub,
+.mobile-shell .quota-label-text,
+.mobile-shell .quota-plan-label,
+.mobile-shell .quota-val {
+  font-size: 12.5px;
+}
+
+.mobile-shell .action-icon-btn {
+  width: 36px;
+  height: 36px;
+  border-radius: 9px;
+}
+
+.mobile-shell .mini-btn {
+  padding: 7px 11px;
+  font-size: 12.5px;
+}
+
+.mobile-shell .notice-close {
+  padding: 4px 8px;
+  font-size: 16px;
+}
+
+.mobile-shell .inline-modal {
+  padding-bottom: max(16px, env(safe-area-inset-bottom, 0px));
+}
+
+.mobile-shell .modal-card {
+  padding: 18px;
+  gap: 13px;
+}
+
+.mobile-shell .modal-title {
+  font-size: 16px;
+}
+
+.mobile-shell .modal-desc {
+  font-size: 13px;
+}
+
+.mobile-shell .modal-input {
+  height: 44px;
+  font-size: 16px;
+  padding: 0 13px;
+}
+
+.mobile-shell .btn {
+  height: 40px;
+  padding: 0 18px;
+  font-size: 14px;
+  border-radius: 10px;
+}
+
+.mobile-shell .update-notes {
+  font-size: 12.5px;
 }
