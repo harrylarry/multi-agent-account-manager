@@ -158,7 +158,11 @@ class AccountSessionPlugin: Plugin {
         invoke.resolve()
         return
       }
-      let store = WKWebsiteDataStore(forIdentifier: args.uuid)
+      guard let identifier = UUID(uuidString: args.uuid) else {
+        invoke.reject("无效的会话标识")
+        return
+      }
+      let store = WKWebsiteDataStore(forIdentifier: identifier)
       store.removeData(
         ofTypes: WKWebsiteDataStore.allWebsiteDataTypes(),
         modifiedSince: Date.distantPast
