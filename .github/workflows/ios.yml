@@ -1,11 +1,11 @@
 name: Build unsigned iOS IPA
 
 # Builds an UNSIGNED .ipa (no Apple Developer account needed) for sideloading
-# via AltStore / Sideloadly / Xcode. Runs on the ios-port branch and on
-# manual dispatch; extend `branches` after the port lands on main.
+# via AltStore / Sideloadly / Xcode. Runs on pushes to main (and ios-port)
+# and on manual dispatch.
 on:
   push:
-    branches: ["ios-port"]
+    branches: ["main", "ios-port"]
   workflow_dispatch:
 
 permissions:
