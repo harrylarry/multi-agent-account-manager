@@ -14,7 +14,16 @@ pub fn current_platform_name() -> &'static str {
   {
     "android"
   }
-  #[cfg(all(not(target_os = "macos"), not(windows), not(target_os = "android")))]
+  #[cfg(target_os = "ios")]
+  {
+    "ios"
+  }
+  #[cfg(all(
+    not(target_os = "macos"),
+    not(windows),
+    not(target_os = "android"),
+    not(target_os = "ios")
+  ))]
   {
     "linux"
   }
@@ -217,3 +226,6 @@ pub async fn delete_desktop_profile(
 
 #[cfg(target_os = "android")]
 pub use tauri_plugin_account_session as android;
+
+#[cfg(target_os = "ios")]
+pub use tauri_plugin_account_session as ios;
