@@ -6,10 +6,24 @@ use tauri::AppHandle;
 use tauri::Emitter;
 use url::Url;
 
+// iOS 指向 fork 仓库（上游 ldjx7 没有 IPA）；其余平台保持上游地址。
+#[cfg(target_os = "ios")]
+const LATEST_MANIFEST_URL: &str =
+  "https://github.com/harrylarry/multi-agent-account-manager/releases/latest/download/latest.json";
+#[cfg(target_os = "ios")]
+const GITHUB_LATEST_API_URL: &str =
+  "https://api.github.com/repos/harrylarry/multi-agent-account-manager/releases/latest";
+#[cfg(target_os = "ios")]
+const RELEASES_PAGE_URL: &str =
+  "https://github.com/harrylarry/multi-agent-account-manager/releases";
+
+#[cfg(not(target_os = "ios"))]
 const LATEST_MANIFEST_URL: &str =
   "https://github.com/ldjx7/multi-agent-account-manager/releases/latest/download/latest.json";
+#[cfg(not(target_os = "ios"))]
 const GITHUB_LATEST_API_URL: &str =
   "https://api.github.com/repos/ldjx7/multi-agent-account-manager/releases/latest";
+#[cfg(not(target_os = "ios"))]
 const RELEASES_PAGE_URL: &str =
   "https://github.com/ldjx7/multi-agent-account-manager/releases";
 
@@ -219,6 +233,7 @@ fn default_filename_for_platform(version: &str, url: &str) -> String {
     "macos" => format!("account-manager-{ver}-macos.app.tar.gz"),
     "windows" => format!("account-manager-{ver}-windows-setup.exe"),
     "android" => format!("account-manager-{ver}-android.apk"),
+    "ios" => format!("account-manager-{ver}-ios.ipa"),
     _ => format!("account-manager-{ver}.bin"),
   }
 }
@@ -249,6 +264,9 @@ fn select_github_asset<'a>(assets: &'a [GithubAsset], platform: &str) -> Option<
           .iter()
           .find(|a| a.name.to_ascii_lowercase().ends_with(".apk"))
       }),
+    "ios" => assets
+      .iter()
+      .find(|a| a.name.to_ascii_lowercase().ends_with(".ipa")),
     _ => None,
   }
 }
@@ -313,6 +331,12 @@ async fn fetch_text_with_status(
   #[cfg(target_os = "android")]
   {
     let res = crate::platform::android::fetch_text(app, url, user_agent, accept).await?;
+    Ok((res.status, res.body))
+  }
+
+  #[cfg(target_os = "ios")]
+  {
+    let res = crate::platform::ios::fetch_text(app, url, user_agent, accept).await?;
     Ok((res.status, res.body))
   }
 }
@@ -844,6 +868,16 @@ pub async fn download_and_install_update(
     })
   }
 
+  // iOS 不做应用内安装：只提示用户去发布页下载新版 IPA 并重新侧载。
+  #[cfg(target_os = "ios")]
+  {
+    let _ = (user_agent, filename);
+    Ok(InstallUpdateOutcome {
+      status: "manual_install".to_string(),
+      message: "请从发布页下载新版 IPA 并重新侧载".to_string(),
+    })
+  }
+
   #[cfg(desktop)]
   {
     let (dest_path, downloaded) = match download_to_updates_cache(
@@ -912,5 +946,10 @@ pub async fn open_external_url(app: &AppHandle, raw_url: &str) -> Result<(), Str
   #[cfg(target_os = "android")]
   {
     crate::platform::android::open_external_url(app, parsed.as_str()).await
+  }
+
+  #[cfg(target_os = "ios")]
+  {
+    crate::platform::ios::open_external_url(app, parsed.as_str()).await
   }
 }
