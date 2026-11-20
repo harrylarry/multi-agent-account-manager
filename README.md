@@ -2,7 +2,9 @@
 
 [![LINUX DO](https://img.shields.io/badge/Community-LINUX%20DO-0064e0?style=flat-square)](https://linux.do/)
 
-基于 Tauri 2 构建的跨平台（macOS / Windows / Android）AI 助手多账号隔离与快速切换工具，安装后应用名称为 **叠号**。
+基于 Tauri 2 构建的跨平台（macOS / Windows / Android / iOS）AI 助手多账号隔离与快速切换工具，安装后应用名称为 **叠号**。
+
+> 本仓库在上游版本基础上新增 iOS 支持：未签名 IPA（iOS 17.0+），需自行签名后侧载安装。
 
 ## 支持服务与核心特性
 
@@ -11,9 +13,9 @@
 | **Muse · Meta** | 已启用 | 独立会话隔离、邮箱识别、额度明细同步 |
 | **Hark** | 已启用 | 独立会话隔离、额度与余额同步 |
 
-- **原生级多账号隔离**：macOS 使用独立 UUID `WKWebsiteDataStore`，Windows 使用独立 WebView2 `UserDataFolder`，Android 使用独立 WebView `MULTI_PROFILE`。
+- **原生级多账号隔离**：macOS 使用独立 UUID `WKWebsiteDataStore`，Windows 使用独立 WebView2 `UserDataFolder`，Android 使用独立 WebView `MULTI_PROFILE`，iOS 使用独立 UUID `WKWebsiteDataStore`。
 - **桌面端快捷切号**：支持 `⌘1~9` / `Ctrl+1~9` 以及 `⌘↑`/`⌘↓`/`⌘[`/`⌘]`（Windows 为 `Ctrl`）快速切换账号。
-- **应用内检查更新**：支持在客户端内检查 GitHub Releases 最新版本、带进度条下载、`SHA-256` 校验及覆盖更新。
+- **应用内检查更新**：支持在客户端内检查 GitHub Releases 最新版本、带进度条下载、`SHA-256` 校验及覆盖更新（iOS 因系统限制无法应用内覆盖更新，检查到新版后提示手动重新侧载）。
 
 ---
 
@@ -46,13 +48,14 @@
 
 ## 下载与安装
 
-前往 [GitHub Releases](https://github.com/ldjx7/multi-agent-account-manager/releases) 下载对应平台安装包：
+前往 [GitHub Releases](https://github.com/harrylarry/multi-agent-account-manager/releases) 下载对应平台安装包：
 
 | 平台 | 下载文件 | 架构 / 系统要求 |
 | --- | --- | --- |
 | macOS | `account-manager-macos-universal.dmg` | Apple Silicon & Intel（macOS 14.0+） |
 | Windows | `account-manager-windows-x64-setup.exe` | x64（Windows 10 / 11） |
 | Android | `account-manager-android-universal-release.apk` | 通用 ABI（Android 7.0+） |
+| iOS | `account-manager-ios-unsigned.ipa` | 未签名 IPA（iOS 17.0+，需自行签名侧载） |
 
 > `account-manager-macos-universal.app.tar.gz` 仅用于 macOS 应用内自动更新，首次安装请下载 `.dmg`。
 
@@ -100,11 +103,17 @@
 2. **WebView 内核要求**：多账号隔离依赖 Android System WebView 的 `MULTI_PROFILE` 能力；如提示不支持，请在应用商店或系统更新中升级 Android System WebView（或 Chrome）。
 3. **签名一致说明**：所有 Release APK 均使用固定发布密钥签名，可直接覆盖升级并完整保留多账号登录态。
 
+### iOS 安装注意事项
+
+1. **自行签名侧载**：发布的是未签名 IPA，无法直接安装，需用 AltStore / Sideloadly / SideStore 或 Xcode 以自己的 Apple ID 签名后安装。
+2. **免费签名有效期**：免费 Apple ID 签名有效期 7 天、每台设备最多 3 个自签应用，到期后需重新签名安装；付费开发者账号签名有效期 1 年。
+3. **应用内更新**：iOS 无法应用内覆盖更新，检查到新版后请从 Releases 下载新版 IPA 重新签名安装；同一 bundle id 覆盖安装可保留已登录账号。
+
 ---
 
 ## 应用内更新与发版
 
-- **客户端检查更新**：桌面端点击左侧栏底部「更新」按钮，Android 端点击右上角下载图标，可检查最新版本并一键下载校验安装；启动后也会静默检查一次并展示红点提醒。
+- **客户端检查更新**：桌面端点击左侧栏底部「更新」按钮，移动端（Android / iOS）点击右上角下载图标，可检查最新版本并一键下载校验安装；启动后也会静默检查一次并展示红点提醒（iOS 检查到新版后提示手动重新侧载）。
 - **维护者发布新版本**：
   1. 同步更新 [package.json](package.json)、[src-tauri/Cargo.toml](src-tauri/Cargo.toml) 与 [src-tauri/tauri.conf.json](src-tauri/tauri.conf.json) 中的版本号。
   2. 提交并推送 `v*` 标签（GitHub Actions 将自动编译三端安装包、生成 `latest.json` 并创建 Release）：
@@ -114,11 +123,13 @@
      git push origin v0.1.1
      ```
 
+  3. iOS 发版：手动创建 Release（标签形如 `ios-v0.1.5`），上传 CI 构建的未签名 IPA 与含 `ios` 条目的 `latest.json`；注意不要用 `v*` 标签，那会触发三端发版流程。
+
 ---
 
 ## 本地开发
 
-环境要求：Node.js 22+、Rust 1.85+，Android 构建需额外配置 Android SDK 与 NDK 26+。
+环境要求：Node.js 22+、Rust 1.85+，Android 构建需额外配置 Android SDK 与 NDK 26+，iOS 构建需 macOS + Xcode（见 [.github/workflows/ios.yml](.github/workflows/ios.yml)）。
 
 ```bash
 npm ci
