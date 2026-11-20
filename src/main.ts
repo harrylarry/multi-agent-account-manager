@@ -69,6 +69,10 @@ function effectiveSwitchingKey(state: ManagerSnapshot): AccountKey | null {
   return state.switchingAccount ?? optimisticSwitching;
 }
 
+function isMobilePlatform(platform: string): boolean {
+  return platform === "android" || platform === "ios";
+}
+
 function escapeHtml(value: string): string {
   return value
     .replace(/&/g, "&amp;")
@@ -535,14 +539,21 @@ function renderUpdateModal(): string {
     updateState.checking ||
     updateState.installing ||
     updateState.outcomeStatus === "restarting";
+  // iOS has no in-app install: the update flow ends at the release page,
+  // where the user downloads the new IPA and re-sideloads it. The Rust
+  // updater returns outcome status "manual_install" for the same reason.
+  const manualInstallFlow =
+    snapshot?.platform === "ios" || updateState.outcomeStatus === "manual_install";
   const primaryBtn = canInstall
-    ? `<button id="update-install-btn" class="btn primary" type="button" ${disablePrimary ? "disabled" : ""}>${
-        updateState.installing
-          ? "更新中..."
-          : updateState.outcomeStatus === "needs_permission"
-            ? "已授权，继续安装"
-            : "立即下载并更新"
-      }</button>`
+    ? manualInstallFlow
+      ? `<button id="update-manual-install-btn" class="btn primary" type="button" ${disablePrimary ? "disabled" : ""}>去下载 IPA</button>`
+      : `<button id="update-install-btn" class="btn primary" type="button" ${disablePrimary ? "disabled" : ""}>${
+          updateState.installing
+            ? "更新中..."
+            : updateState.outcomeStatus === "needs_permission"
+              ? "已授权，继续安装"
+              : "立即下载并更新"
+        }</button>`
     : `<button id="update-recheck-btn" class="btn primary" type="button" ${disablePrimary ? "disabled" : ""}>${
         updateState.checking ? "检查中..." : "重新检查"
       }</button>`;
@@ -619,7 +630,7 @@ function renderModal(provider: ProviderInfo): string {
 function renderMiddleContent(state: ManagerSnapshot, provider: ProviderInfo): string {
   const providerAccounts = state.accounts.filter((a) => a.providerId === provider.id);
   const switchingKey = effectiveSwitchingKey(state);
-  const isAndroid = state.platform === "android";
+  const isMobile = isMobilePlatform(state.platform);
 
   const noticeHtml = state.notice
     ? `
@@ -649,18 +660,18 @@ function renderMiddleContent(state: ManagerSnapshot, provider: ProviderInfo): st
     .join("");
 
   const hasUpdate = Boolean(updateState.result?.hasUpdate);
-  const androidUpdateBtn = isAndroid
+  const mobileUpdateBtn = isMobile
     ? `<button id="check-update-btn" class="ghost-icon-btn update-trigger-btn ${hasUpdate ? "has-update" : ""}" type="button" title="${hasUpdate ? `发现新版本 v${escapeHtml(updateState.result!.latestVersion)}` : "检查更新"}">${ICON_UPDATE}${hasUpdate ? `<span class="update-dot"></span>` : ""}</button>`
     : "";
 
   const headerBtnHtml = provider.enabled
     ? `
-      ${androidUpdateBtn}
-      ${!isAndroid ? `<button id="sync-all-btn" class="ghost-icon-btn" type="button" title="刷新已就绪账号额度">${ICON_REFRESH}</button>` : ""}
+      ${mobileUpdateBtn}
+      ${!isMobile ? `<button id="sync-all-btn" class="ghost-icon-btn" type="button" title="刷新已就绪账号额度">${ICON_REFRESH}</button>` : ""}
       <button id="open-site-btn" class="ghost-icon-btn" type="button" title="在浏览器中打开 ${escapeHtml(provider.shortName)} 官网">${ICON_EXTERNAL}</button>
       <button id="add-account-btn" class="icon-btn primary" type="button">+ 新增</button>
     `
-    : `${androidUpdateBtn}<button id="open-site-btn" class="icon-btn primary" type="button">打开官网 ${ICON_EXTERNAL}</button>`;
+    : `${mobileUpdateBtn}<button id="open-site-btn" class="icon-btn primary" type="button">打开官网 ${ICON_EXTERNAL}</button>`;
 
   let listBody = "";
   if (!provider.enabled) {
@@ -699,7 +710,7 @@ function renderMiddleContent(state: ManagerSnapshot, provider: ProviderInfo): st
 
         const isMac = navigator.userAgent.includes("Mac");
         const shortcutHint =
-          !isAndroid && idx < 9
+          !isMobile && idx < 9
             ? `<span class="shortcut-pill" title="快捷切号">${isMac ? "⌘" : "^"}${idx + 1}</span>`
             : "";
         const alertBadgeHtml = isLoggedOut
@@ -713,7 +724,7 @@ function renderMiddleContent(state: ManagerSnapshot, provider: ProviderInfo): st
           compactSubHtml = `<div class="account-sub loading-text"><span class="quota-label-text">正在加载…</span></div>`;
         } else if (isLoggedOut) {
           const loginHint = active
-            ? isAndroid
+            ? isMobile
               ? "登录已失效，点击进入重新登录"
               : "登录已失效，请在右侧重新登录"
             : acc.autoAlias
@@ -865,9 +876,9 @@ function render(): void {
   if (!root || !snapshot) return;
 
   const provider = currentProvider(snapshot);
-  const isAndroid = snapshot.platform === "android";
+  const isMobile = isMobilePlatform(snapshot.platform);
 
-  if (isAndroid) {
+  if (isMobile) {
     root.innerHTML = `
       <div class="mobile-shell">
         <div class="mobile-tabs">
@@ -984,7 +995,7 @@ function bindEvents(state: ManagerSnapshot, provider: ProviderInfo): void {
     await runDownloadAndInstall();
   });
 
-  document.querySelector("#update-open-page-btn")?.addEventListener("click", async () => {
+  const openReleasePage = async (): Promise<void> => {
     const pageUrl = updateState.result?.releasePageUrl;
     if (!pageUrl) return;
     try {
@@ -993,7 +1004,11 @@ function bindEvents(state: ManagerSnapshot, provider: ProviderInfo): void {
       updateState.error = String(err);
       rerenderPreservingScroll();
     }
-  });
+  };
+
+  document.querySelector("#update-manual-install-btn")?.addEventListener("click", openReleasePage);
+
+  document.querySelector("#update-open-page-btn")?.addEventListener("click", openReleasePage);
 
   document.querySelectorAll<HTMLElement>("[data-resolve-uuid]").forEach((btn) => {
     btn.addEventListener("click", async () => {
@@ -1039,7 +1054,7 @@ function bindEvents(state: ManagerSnapshot, provider: ProviderInfo): void {
       if (
         state.activeAccount?.providerId === provider.id &&
         state.activeAccount?.uuid === uuid &&
-        state.platform !== "android"
+        !isMobilePlatform(state.platform)
       ) {
         return;
       }
