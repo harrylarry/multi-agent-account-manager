@@ -158,7 +158,7 @@ final class AccountWebViewController: UIViewController, WKNavigationDelegate, WK
       topBar.topAnchor.constraint(equalTo: safe.topAnchor),
       topBar.leadingAnchor.constraint(equalTo: view.leadingAnchor),
       topBar.trailingAnchor.constraint(equalTo: view.trailingAnchor),
-      topBar.heightAnchor.constraint(greaterThanOrEqualToConstant: 52),
+      topBar.heightAnchor.constraint(equalToConstant: 52),
 
       backButton.leadingAnchor.constraint(equalTo: topBar.leadingAnchor, constant: 10),
       backButton.centerYAnchor.constraint(equalTo: topBar.centerYAnchor),
@@ -190,7 +190,7 @@ final class AccountWebViewController: UIViewController, WKNavigationDelegate, WK
       popupHeader.topAnchor.constraint(equalTo: safe.topAnchor),
       popupHeader.leadingAnchor.constraint(equalTo: popupOverlayRoot.leadingAnchor),
       popupHeader.trailingAnchor.constraint(equalTo: popupOverlayRoot.trailingAnchor),
-      popupHeader.heightAnchor.constraint(greaterThanOrEqualToConstant: 48),
+      popupHeader.heightAnchor.constraint(equalToConstant: 48),
 
       popupDomainLabel.leadingAnchor.constraint(equalTo: popupHeader.leadingAnchor, constant: 12),
       popupDomainLabel.centerYAnchor.constraint(equalTo: popupHeader.centerYAnchor),
