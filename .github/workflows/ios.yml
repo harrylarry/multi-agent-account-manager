@@ -1,0 +1,53 @@
+name: Build unsigned iOS IPA
+
+# Builds an UNSIGNED .ipa (no Apple Developer account needed) for sideloading
+# via AltStore / Sideloadly / Xcode. Runs on the ios-port branch and on
+# manual dispatch; extend `branches` after the port lands on main.
+on:
+  push:
+    branches: ["ios-port"]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  ios:
+    name: iOS (unsigned IPA)
+    runs-on: macos-15
+    timeout-minutes: 70
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@v6
+        with:
+          node-version: 22
+          cache: npm
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-apple-ios
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: ./src-tauri -> target
+      - run: npm ci
+      # init must go through `npm run tauri` (never raw xcodebuild / xcodegen);
+      # --skip-targets-install because the target is installed above.
+      - run: npm run tauri -- ios init --ci --skip-targets-install
+      # App icons are synced by tauri.ios.conf.json's beforeBuildCommand
+      # (scripts/sync-ios-resources.mjs) before the Xcode build runs.
+      - run: npm run tauri -- ios build --no-sign --ci
+      - name: Locate unsigned IPA
+        run: |
+          ipa=$(find src-tauri/gen/apple -name '*.ipa' -type f | head -n 1)
+          if [ -z "$ipa" ]; then
+            echo "No .ipa found under src-tauri/gen/apple" >&2
+            exit 1
+          fi
+          echo "Found IPA: $ipa"
+          cp "$ipa" "$RUNNER_TEMP/account-manager-ios-unsigned.ipa"
+      - uses: actions/upload-artifact@v7
+        with:
+          name: ios-unsigned-ipa
+          path: ${{ runner.temp }}/account-manager-ios-unsigned.ipa
+          if-no-files-found: error
