@@ -1,0 +1,11 @@
+{
+  "build": {
+    "beforeBuildCommand": "node scripts/sync-ios-resources.mjs && npm run build",
+    "beforeDevCommand": "node scripts/sync-ios-resources.mjs && npm run dev"
+  },
+  "bundle": {
+    "iOS": {
+      "minimumSystemVersion": "17.0"
+    }
+  }
+}
