@@ -1059,6 +1059,27 @@ impl SessionManager {
       let _ = crate::platform::android::subscribe_events(app, channel).await;
     }
 
+    #[cfg(target_os = "ios")]
+    {
+      let mgr = Arc::clone(self);
+      let app_clone = app.clone();
+      let channel = tauri::ipc::Channel::new(move |body| {
+        if let tauri::ipc::InvokeResponseBody::Json(raw_json) = body {
+          if let Ok(evt) =
+            serde_json::from_str::<crate::platform::ios::IosSessionEvent>(&raw_json)
+          {
+            let mgr_inner = Arc::clone(&mgr);
+            let app_inner = app_clone.clone();
+            tauri::async_runtime::spawn(async move {
+              mgr_inner.handle_ios_event(&app_inner, evt).await;
+            });
+          }
+        }
+        Ok(())
+      });
+      let _ = crate::platform::ios::subscribe_events(app, channel).await;
+    }
+
     self.retry_pending_cleanups(app).await;
 
     let mgr_periodic = Arc::clone(self);
@@ -1147,7 +1168,15 @@ impl SessionManager {
     {
       crate::platform::android::delete_profile(app, uuid_str).await
     }
-    #[cfg(all(not(desktop), not(target_os = "android")))]
+    #[cfg(target_os = "ios")]
+    {
+      crate::platform::ios::delete_profile(app, uuid_str).await
+    }
+    #[cfg(all(
+      not(desktop),
+      not(target_os = "android"),
+      not(target_os = "ios")
+    ))]
     {
       let _ = (app, uuid_str);
       Ok(())
@@ -1215,6 +1244,11 @@ impl SessionManager {
       {
         let _ = old_slot;
         let _ = crate::platform::android::close_active_session(app, next_seq).await;
+      }
+      #[cfg(target_os = "ios")]
+      {
+        let _ = old_slot;
+        let _ = crate::platform::ios::close_active_session(app, next_seq).await;
       }
     }
     #[cfg(desktop)]
@@ -1486,6 +1520,10 @@ impl SessionManager {
         {
           let _ = crate::platform::android::update_account_title(app, slot.switch_seq, &title).await;
         }
+        #[cfg(target_os = "ios")]
+        {
+          let _ = crate::platform::ios::update_account_title(app, slot.switch_seq, &title).await;
+        }
       }
     }
 
@@ -1599,6 +1637,10 @@ impl SessionManager {
     #[cfg(target_os = "android")]
     {
       crate::platform::android::open_external_url(app, homepage).await?;
+    }
+    #[cfg(target_os = "ios")]
+    {
+      crate::platform::ios::open_external_url(app, homepage).await?;
     }
 
     Ok(self.get_snapshot().await)
@@ -1977,6 +2019,44 @@ impl SessionManager {
 
       self
         .open_android_session(app, account_record, next_seq, view_instance_id, is_cold_start)
+        .await
+    }
+
+    #[cfg(target_os = "ios")]
+    {
+      let view_instance_id = self.view_counter.fetch_add(1, Ordering::SeqCst);
+      let account_record = {
+        let mut locked = self.inner.lock().await;
+        if !locked.conflicts.is_empty() {
+          return Err("存在 UUID 归属冲突，已停留在管理页".to_string());
+        }
+        if !get_provider(key.provider_id).info.enabled {
+          return Err(format!("{} 尚未开放应用内嵌", get_provider(key.provider_id).info.name));
+        }
+        if locked.store.pending_cleanup.contains(&key) {
+          self.hide_foreground_slot(app, next_seq, &mut locked).await;
+          locked.notice = Some("该账号正在清理本地资料，请稍后重试或重新创建".to_string());
+          return Ok(Self::snapshot_from_locked(&locked));
+        }
+        let Some(acc) = locked
+          .store
+          .accounts
+          .iter()
+          .find(|a| a.provider_id == key.provider_id && a.uuid == key.uuid)
+          .cloned()
+        else {
+          self.hide_foreground_slot(app, next_seq, &mut locked).await;
+          locked.notice = Some("账号归属核对失败，已回到管理页".to_string());
+          return Ok(Self::snapshot_from_locked(&locked));
+        };
+        locked.selected_provider_id = key.provider_id;
+        locked.notice = None;
+        self.hide_foreground_slot(app, next_seq, &mut locked).await;
+        acc
+      };
+
+      self
+        .open_ios_session(app, account_record, next_seq, view_instance_id, is_cold_start)
         .await
     }
   }
@@ -2836,6 +2916,83 @@ impl SessionManager {
     Ok(self.get_snapshot().await)
   }
 
+  #[cfg(target_os = "ios")]
+  async fn open_ios_session(
+    self: &Arc<Self>,
+    app: &AppHandle,
+    account: AccountRecord,
+    expected_seq: u64,
+    view_instance_id: u64,
+    is_cold_start: bool,
+  ) -> Result<ManagerSnapshot, String> {
+    let caps = match crate::platform::ios::check_capabilities(app).await {
+      Ok(c) => c,
+      Err(err) => {
+        let mut locked = self.inner.lock().await;
+        locked.notice = Some(format!("检测 iOS WebView 多资料能力失败: {err}"));
+        return Ok(Self::snapshot_from_locked(&locked));
+      }
+    };
+
+    if !caps.multi_profile_supported {
+      let mut locked = self.inner.lock().await;
+      locked.notice = Some(
+        "当前设备不支持多资料隔离（需要 iOS 17 或更高版本）"
+          .to_string(),
+      );
+      return Ok(Self::snapshot_from_locked(&locked));
+    }
+
+    if is_cold_start && !caps.profile_names.iter().any(|n| n == &account.uuid) {
+      let mut locked = self.inner.lock().await;
+      locked.notice = Some("上次已提交账号的系统数据店已丢失，已停留在管理页".to_string());
+      return Ok(Self::snapshot_from_locked(&locked));
+    }
+
+    let key = AccountKey {
+      provider_id: account.provider_id,
+      uuid: account.uuid.clone(),
+    };
+
+    {
+      let mut locked = self.inner.lock().await;
+      if self.current_seq.load(Ordering::SeqCst) != expected_seq {
+        return Ok(Self::snapshot_from_locked(&locked));
+      }
+      locked.active_slot = Some(ActiveSessionSlot {
+        account_key: key,
+        view_instance_id,
+        switch_seq: expected_seq,
+        committed: false,
+      });
+    }
+
+    let spec = get_provider(account.provider_id);
+    let payload = crate::platform::ios::OpenIosAccountPayload {
+      provider_id: account.provider_id.as_str().to_string(),
+      provider_name: spec.info.short_name.to_string(),
+      uuid: account.uuid.clone(),
+      alias: account.alias.clone(),
+      auto_alias: account.auto_alias,
+      entry_url: spec.info.entry_url.to_string(),
+      allowed_hosts: spec.allowed_hosts.iter().map(|s| (*s).to_string()).collect(),
+      switch_seq: expected_seq,
+      view_instance_id,
+      is_cold_start,
+    };
+
+    if let Err(err) = crate::platform::ios::open_account_session(app, payload).await {
+      let mut locked = self.inner.lock().await;
+      if self.current_seq.load(Ordering::SeqCst) == expected_seq {
+        locked.active_slot = None;
+        locked.notice = Some(format!("打开 iOS 独立会话页面失败: {err}"));
+      }
+      return Ok(Self::snapshot_from_locked(&locked));
+    }
+
+    Ok(self.get_snapshot().await)
+  }
+
   #[cfg(target_os = "android")]
   async fn handle_android_event(
     self: &Arc<Self>,
@@ -3035,6 +3192,205 @@ impl SessionManager {
     }
   }
 
+  #[cfg(target_os = "ios")]
+  async fn handle_ios_event(
+    self: &Arc<Self>,
+    app: &AppHandle,
+    event: crate::platform::ios::IosSessionEvent,
+  ) {
+    use crate::platform::ios::IosSessionEvent;
+    match event {
+      IosSessionEvent::PageCommitVisible {
+        provider_id,
+        uuid,
+        switch_seq,
+        view_instance_id,
+        url,
+      } => {
+        let Some(pid) = ProviderId::parse(&provider_id) else {
+          return;
+        };
+        let Some(norm_uuid) = normalize_uuid(&uuid) else {
+          return;
+        };
+        let Ok(parsed_url) = Url::parse(&url) else {
+          return;
+        };
+        self
+          .commit_ios_session(
+            app,
+            AccountKey {
+              provider_id: pid,
+              uuid: norm_uuid,
+            },
+            view_instance_id,
+            switch_seq,
+            parsed_url,
+          )
+          .await;
+      }
+      IosSessionEvent::IdentityDetected {
+        provider_id,
+        uuid,
+        switch_seq,
+        view_instance_id,
+        identity,
+        avatar_url,
+        quota_text,
+        quota_percent,
+        quota_detail_json,
+      } => {
+        let Some(pid) = ProviderId::parse(&provider_id) else {
+          return;
+        };
+        let Some(norm_uuid) = normalize_uuid(&uuid) else {
+          return;
+        };
+        let _ = switch_seq;
+        let parsed_detail = quota_detail_json
+          .as_deref()
+          .and_then(|s| serde_json::from_str::<QuotaDetail>(s).ok());
+        self
+          .apply_detected_metadata(
+            app,
+            AccountKey {
+              provider_id: pid,
+              uuid: norm_uuid,
+            },
+            view_instance_id,
+            if identity.is_empty() { None } else { Some(identity) },
+            avatar_url,
+            quota_text,
+            quota_percent,
+            parsed_detail,
+          )
+          .await;
+      }
+      IosSessionEvent::SessionFailed {
+        switch_seq,
+        view_instance_id,
+        reason,
+      } => {
+        let snap = {
+          let mut locked = self.inner.lock().await;
+          if self.current_seq.load(Ordering::SeqCst) != switch_seq {
+            return;
+          }
+          let matches = locked
+            .active_slot
+            .as_ref()
+            .map(|s| s.switch_seq == switch_seq && s.view_instance_id == view_instance_id)
+            .unwrap_or(false);
+          if !matches {
+            return;
+          }
+          locked.active_slot = None;
+          locked.notice = Some(reason);
+          Self::snapshot_from_locked(&locked)
+        };
+        self.emit_snapshot(app, &snap);
+      }
+      IosSessionEvent::ActivityClosed {
+        switch_seq,
+        view_instance_id,
+      } => {
+        let snap = {
+          let mut locked = self.inner.lock().await;
+          let matches = locked
+            .active_slot
+            .as_ref()
+            .map(|s| s.switch_seq == switch_seq && s.view_instance_id == view_instance_id)
+            .unwrap_or(false);
+          if !matches {
+            return;
+          }
+          locked.active_slot = None;
+          locked.pending_external_auth = None;
+          Self::snapshot_from_locked(&locked)
+        };
+        self.emit_snapshot(app, &snap);
+      }
+      IosSessionEvent::ExternalAuthUnavailable {
+        switch_seq,
+        view_instance_id,
+        reason,
+      } => {
+        let snap = {
+          let mut locked = self.inner.lock().await;
+          let matches = locked
+            .active_slot
+            .as_ref()
+            .map(|s| s.switch_seq == switch_seq && s.view_instance_id == view_instance_id)
+            .unwrap_or(false);
+          if !matches {
+            return;
+          }
+          locked.pending_external_auth = None;
+          locked.notice = Some(reason);
+          Self::snapshot_from_locked(&locked)
+        };
+        self.emit_snapshot(app, &snap);
+      }
+      IosSessionEvent::RecreateRequested { previous_switch_seq } => {
+        let fallback = {
+          let mut locked = self.inner.lock().await;
+          if self.current_seq.load(Ordering::SeqCst) == previous_switch_seq {
+            locked.active_slot = None;
+          }
+          locked.store.last_committed.clone()
+        };
+        if let Some(committed_key) = fallback {
+          let _ = self.switch_account_internal(app, committed_key, true).await;
+        } else {
+          let snap = self.get_snapshot().await;
+          self.emit_snapshot(app, &snap);
+        }
+      }
+      IosSessionEvent::UpdateProgress {
+        stage,
+        downloaded,
+        total,
+        percent,
+        message,
+      } => {
+        let _ = app.emit(
+          "update-progress",
+          crate::updater::UpdateProgressEvent {
+            stage,
+            downloaded,
+            total,
+            percent,
+            message,
+          },
+        );
+      }
+      IosSessionEvent::SessionLoggedOut {
+        provider_id,
+        uuid,
+        switch_seq,
+        view_instance_id,
+      } => {
+        let _ = switch_seq;
+        let Some(pid) = ProviderId::parse(&provider_id) else {
+          return;
+        };
+        let Some(norm_uuid) = normalize_uuid(&uuid) else {
+          return;
+        };
+        self
+          .apply_logged_out_state(
+            app,
+            AccountKey {
+              provider_id: pid,
+              uuid: norm_uuid,
+            },
+            view_instance_id,
+          )
+          .await;
+      }
+    }
+  }
+
   #[cfg(target_os = "android")]
   async fn commit_android_session(
     &self,
@@ -3101,6 +3457,81 @@ impl SessionManager {
           acc.alias
         );
         let _ = crate::platform::android::update_account_title(app, expected_seq, &title).await;
+        Some(Self::snapshot_from_locked(&locked))
+      }
+    };
+
+    if let Some(snap) = snap_opt {
+      self.emit_snapshot(app, &snap);
+    }
+  }
+
+  #[cfg(target_os = "ios")]
+  async fn commit_ios_session(
+    &self,
+    app: &AppHandle,
+    key: AccountKey,
+    view_instance_id: u64,
+    expected_seq: u64,
+    committed_url: Url,
+  ) {
+    if self.current_seq.load(Ordering::SeqCst) != expected_seq {
+      return;
+    }
+    if classify_top_level_url(key.provider_id, &committed_url, false) != NavigationDecision::AllowHttps {
+      return;
+    }
+
+    let snap_opt = {
+      let mut locked = self.inner.lock().await;
+      if self.current_seq.load(Ordering::SeqCst) != expected_seq {
+        return;
+      }
+      if !locked.conflicts.is_empty() || locked.store.pending_cleanup.contains(&key) {
+        self.hide_foreground_slot(app, expected_seq, &mut locked).await;
+        return;
+      }
+      let Some(acc) = locked
+        .store
+        .accounts
+        .iter()
+        .find(|a| a.provider_id == key.provider_id && a.uuid == key.uuid)
+        .cloned()
+      else {
+        self.hide_foreground_slot(app, expected_seq, &mut locked).await;
+        return;
+      };
+
+      let slot_matches = locked
+        .active_slot
+        .as_ref()
+        .map(|s| {
+          s.account_key == key
+            && s.view_instance_id == view_instance_id
+            && s.switch_seq == expected_seq
+        })
+        .unwrap_or(false);
+      if !slot_matches {
+        return;
+      }
+
+      let prev_last = locked.store.last_committed.clone();
+      locked.store.last_committed = Some(key.clone());
+      if let Err(err) = save_store_atomic(&locked.store_path, &locked.store) {
+        locked.store.last_committed = prev_last;
+        self.hide_foreground_slot(app, expected_seq, &mut locked).await;
+        locked.notice = Some(format!("提交账号记录写盘失败，已回退管理页: {err}"));
+        Some(Self::snapshot_from_locked(&locked))
+      } else {
+        if let Some(slot) = &mut locked.active_slot {
+          slot.committed = true;
+        }
+        let title = format!(
+          "{} · {}",
+          get_provider(key.provider_id).info.short_name,
+          acc.alias
+        );
+        let _ = crate::platform::ios::update_account_title(app, expected_seq, &title).await;
         Some(Self::snapshot_from_locked(&locked))
       }
     };
@@ -3536,6 +3967,10 @@ impl SessionManager {
           #[cfg(target_os = "android")]
           if let Some(slot) = &locked.active_slot {
             let _ = crate::platform::android::update_account_title(app, slot.switch_seq, &title).await;
+          }
+          #[cfg(target_os = "ios")]
+          if let Some(slot) = &locked.active_slot {
+            let _ = crate::platform::ios::update_account_title(app, slot.switch_seq, &title).await;
           }
         }
       }
