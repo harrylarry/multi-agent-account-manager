@@ -270,8 +270,15 @@ final class AccountWebViewController: UIViewController, WKNavigationDelegate, WK
     } else {
       let config = WKWebViewConfiguration()
       // Per-account isolated data store; identifier == account uuid.
-      // WKWebsiteDataStore(forIdentifier:) requires iOS 17+.
-      config.websiteDataStore = WKWebsiteDataStore(forIdentifier: spec.uuid)
+      // WKWebsiteDataStore(forIdentifier:) requires iOS 17+ and takes a UUID,
+      // so parse the (Rust-normalized) uuid string instead of passing it raw.
+      guard let identifier = UUID(uuidString: spec.uuid) else {
+        mainLoadFailed = true
+        headerTitleLabel.text = "会话标识无效"
+        loadingIndicator.stopAnimating()
+        return
+      }
+      config.websiteDataStore = WKWebsiteDataStore(forIdentifier: identifier)
       DataStoreRegistry.markCreated(spec.uuid)
       config.defaultWebpagePreferences.allowsContentJavaScript = true
       config.preferences.javaScriptCanOpenWindowsAutomatically = false
