@@ -36,3 +36,13 @@ objc2-web-kit = { version = "0.3.2", default-features = false, features = ["objc
 [target.'cfg(windows)'.dependencies]
 webview2-com = "0.39"
 windows = { version = "0.62", features = ["Win32_Foundation", "Win32_UI_WindowsAndMessaging", "Win32_UI_Input_KeyboardAndMouse", "Win32_System_Com"] }
+
+# iOS 27 launch-crash fix: wry 0.57.2's `platform_webview_version()` calls
+# `NSBundle::bundleWithIdentifier("com.apple.WebKit")`, which traps inside
+# CoreFoundation (CFRelease(NULL)) when the Tauri runtime calls it during
+# startup, before UIApplicationMain has run. Upstream (0.57.3 and dev) still
+# has the same call, so use a forked wry with that lookup replaced by
+# `NSBundle::bundleForClass(WKWebView::class())` on iOS. The macOS path is
+# unchanged. See harrylarry/wry branch ios-bundle-fix.
+[patch.crates-io]
+wry = { git = "https://github.com/harrylarry/wry", branch = "ios-bundle-fix" }
