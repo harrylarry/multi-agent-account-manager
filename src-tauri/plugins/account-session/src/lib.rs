@@ -276,3 +276,252 @@ pub async fn download_and_install_apk(
     .await
     .map_err(|e| e.to_string())
 }
+
+#[cfg(target_os = "ios")]
+use serde::{Deserialize, Serialize};
+#[cfg(target_os = "ios")]
+use tauri::{
+  ipc::Channel,
+  plugin::{Builder, PluginHandle, TauriPlugin},
+  AppHandle, Manager, Runtime,
+};
+
+#[cfg(target_os = "ios")]
+tauri::ios_plugin_binding!(init_plugin_account_session);
+
+#[cfg(target_os = "ios")]
+pub struct IosSessionBridge<R: Runtime>(pub PluginHandle<R>);
+
+#[cfg(target_os = "ios")]
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct OpenIosAccountPayload {
+  pub provider_id: String,
+  pub provider_name: String,
+  pub uuid: String,
+  pub alias: String,
+  pub auto_alias: bool,
+  pub entry_url: String,
+  pub allowed_hosts: Vec<String>,
+  pub switch_seq: u64,
+  pub view_instance_id: u64,
+  pub is_cold_start: bool,
+}
+
+#[cfg(target_os = "ios")]
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct IosCapabilitiesResponse {
+  pub multi_profile_supported: bool,
+  pub profile_names: Vec<String>,
+}
+
+#[cfg(target_os = "ios")]
+#[derive(Debug, Clone, Deserialize)]
+#[serde(tag = "kind", rename_all = "camelCase")]
+pub enum IosSessionEvent {
+  #[serde(rename_all = "camelCase")]
+  PageCommitVisible {
+    provider_id: String,
+    uuid: String,
+    switch_seq: u64,
+    view_instance_id: u64,
+    url: String,
+  },
+  #[serde(rename_all = "camelCase")]
+  IdentityDetected {
+    provider_id: String,
+    uuid: String,
+    switch_seq: u64,
+    view_instance_id: u64,
+    identity: String,
+    #[serde(default)]
+    avatar_url: Option<String>,
+    #[serde(default)]
+    quota_text: Option<String>,
+    #[serde(default)]
+    quota_percent: Option<u8>,
+    #[serde(default)]
+    quota_detail_json: Option<String>,
+  },
+  #[serde(rename_all = "camelCase")]
+  SessionFailed {
+    switch_seq: u64,
+    view_instance_id: u64,
+    reason: String,
+  },
+  #[serde(rename_all = "camelCase")]
+  ActivityClosed {
+    switch_seq: u64,
+    view_instance_id: u64,
+  },
+  #[serde(rename_all = "camelCase")]
+  ExternalAuthUnavailable {
+    switch_seq: u64,
+    view_instance_id: u64,
+    reason: String,
+  },
+  #[serde(rename_all = "camelCase")]
+  RecreateRequested {
+    previous_switch_seq: u64,
+  },
+  #[serde(rename_all = "camelCase")]
+  UpdateProgress {
+    stage: String,
+    downloaded: u64,
+    #[serde(default)]
+    total: Option<u64>,
+    #[serde(default)]
+    percent: Option<u8>,
+    message: String,
+  },
+  #[serde(rename_all = "camelCase")]
+  SessionLoggedOut {
+    provider_id: String,
+    uuid: String,
+    switch_seq: u64,
+    view_instance_id: u64,
+  },
+}
+
+#[cfg(target_os = "ios")]
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct IosFetchTextResponse {
+  pub status: u16,
+  pub body: String,
+}
+
+#[cfg(target_os = "ios")]
+pub fn init<R: Runtime>() -> TauriPlugin<R> {
+  Builder::new("account-session")
+    .setup(|app, api| {
+      let handle = api.register_ios_plugin(init_plugin_account_session)?;
+      app.manage(IosSessionBridge(handle));
+      Ok(())
+    })
+    .build()
+}
+
+#[cfg(target_os = "ios")]
+pub async fn subscribe_events(
+  app: &AppHandle,
+  channel: Channel<serde_json::Value>,
+) -> Result<(), String> {
+  let bridge = app.state::<IosSessionBridge<tauri::Wry>>();
+  bridge
+    .0
+    .run_mobile_plugin_async::<serde_json::Value>(
+      "subscribeEvents",
+      serde_json::json!({ "channel": channel }),
+    )
+    .await
+    .map(|_| ())
+    .map_err(|e| e.to_string())
+}
+
+#[cfg(target_os = "ios")]
+pub async fn check_capabilities(app: &AppHandle) -> Result<IosCapabilitiesResponse, String> {
+  let bridge = app.state::<IosSessionBridge<tauri::Wry>>();
+  bridge
+    .0
+    .run_mobile_plugin_async("checkCapabilities", serde_json::json!({}))
+    .await
+    .map_err(|e| e.to_string())
+}
+
+#[cfg(target_os = "ios")]
+pub async fn open_account_session(
+  app: &AppHandle,
+  payload: OpenIosAccountPayload,
+) -> Result<(), String> {
+  let bridge = app.state::<IosSessionBridge<tauri::Wry>>();
+  bridge
+    .0
+    .run_mobile_plugin_async::<serde_json::Value>("openAccountSession", payload)
+    .await
+    .map(|_| ())
+    .map_err(|e| e.to_string())
+}
+
+#[cfg(target_os = "ios")]
+pub async fn update_account_title(
+  app: &AppHandle,
+  switch_seq: u64,
+  title: &str,
+) -> Result<(), String> {
+  let bridge = app.state::<IosSessionBridge<tauri::Wry>>();
+  bridge
+    .0
+    .run_mobile_plugin_async::<serde_json::Value>(
+      "updateAccountTitle",
+      serde_json::json!({ "switchSeq": switch_seq, "title": title }),
+    )
+    .await
+    .map(|_| ())
+    .map_err(|e| e.to_string())
+}
+
+#[cfg(target_os = "ios")]
+pub async fn close_active_session(app: &AppHandle, switch_seq: u64) -> Result<(), String> {
+  let bridge = app.state::<IosSessionBridge<tauri::Wry>>();
+  bridge
+    .0
+    .run_mobile_plugin_async::<serde_json::Value>(
+      "closeActiveSession",
+      serde_json::json!({ "switchSeq": switch_seq }),
+    )
+    .await
+    .map(|_| ())
+    .map_err(|e| e.to_string())
+}
+
+#[cfg(target_os = "ios")]
+pub async fn delete_profile(app: &AppHandle, uuid: &str) -> Result<(), String> {
+  let bridge = app.state::<IosSessionBridge<tauri::Wry>>();
+  bridge
+    .0
+    .run_mobile_plugin_async::<serde_json::Value>(
+      "deleteProfile",
+      serde_json::json!({ "uuid": uuid }),
+    )
+    .await
+    .map(|_| ())
+    .map_err(|e| e.to_string())
+}
+
+#[cfg(target_os = "ios")]
+pub async fn open_external_url(app: &AppHandle, url: &str) -> Result<(), String> {
+  let bridge = app.state::<IosSessionBridge<tauri::Wry>>();
+  bridge
+    .0
+    .run_mobile_plugin_async::<serde_json::Value>(
+      "openExternalUrl",
+      serde_json::json!({ "url": url }),
+    )
+    .await
+    .map(|_| ())
+    .map_err(|e| e.to_string())
+}
+
+#[cfg(target_os = "ios")]
+pub async fn fetch_text(
+  app: &AppHandle,
+  url: &str,
+  user_agent: &str,
+  accept: Option<&str>,
+) -> Result<IosFetchTextResponse, String> {
+  let bridge = app.state::<IosSessionBridge<tauri::Wry>>();
+  bridge
+    .0
+    .run_mobile_plugin_async(
+      "fetchText",
+      serde_json::json!({
+        "url": url,
+        "userAgent": user_agent,
+        "accept": accept,
+      }),
+    )
+    .await
+    .map_err(|e| e.to_string())
+}
