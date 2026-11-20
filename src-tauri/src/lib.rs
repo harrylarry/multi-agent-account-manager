@@ -130,6 +130,9 @@ pub fn run() {
   #[cfg(target_os = "android")]
   let builder = builder.plugin(platform::android::init());
 
+  #[cfg(target_os = "ios")]
+  let builder = builder.plugin(platform::ios::init());
+
   builder
     .setup(|app| {
       let app_data_dir = app.path().app_data_dir()?;
