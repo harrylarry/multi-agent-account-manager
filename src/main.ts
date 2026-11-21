@@ -31,11 +31,22 @@ const ICON_EDIT = `<svg width="14" height="14" viewBox="0 0 24 24" fill="none" s
 const ICON_TRASH = `<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="3 6 5 6 21 6"/><path d="M19 6v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6m3 0V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2"/></svg>`;
 const ICON_USER_PLUS = `<svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M16 21v-2a4 4 0 0 0-4-4H6a4 4 0 0 0-4 4v2"/><circle cx="9" cy="7" r="4"/><line x1="19" y1="8" x2="19" y2="14"/><line x1="22" y1="11" x2="16" y2="11"/></svg>`;
 const ICON_UPDATE = `<svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><polyline points="7 10 12 15 17 10"/><line x1="12" y1="15" x2="12" y2="3"/></svg>`;
+const ICON_DRAG = `<svg width="16" height="16" viewBox="0 0 24 24" fill="currentColor"><circle cx="9" cy="6" r="1.6"/><circle cx="15" cy="6" r="1.6"/><circle cx="9" cy="12" r="1.6"/><circle cx="15" cy="12" r="1.6"/><circle cx="9" cy="18" r="1.6"/><circle cx="15" cy="18" r="1.6"/></svg>`;
 
 let snapshot: ManagerSnapshot | null = null;
 let modal: ModalMode = { kind: "none" };
 let optimisticSwitching: AccountKey | null = null;
 let busy = false;
+// Batch-1: a switch requested while another command is in flight is
+// queued (latest wins) instead of silently dropped.
+let pendingSwitch: {
+  cmd: string;
+  args: Record<string, unknown>;
+  optimisticTarget: AccountKey | null;
+} | null = null;
+// Batch-1 reorder mode: long-press a row to reorder accounts by drag.
+let reorderMode = false;
+let reorderProviderId: ProviderId | null = null;
 let lastRenderedUpdateStage: string | null = null;
 
 const updateState: {
@@ -430,7 +441,24 @@ async function callCommand(
   args: Record<string, unknown> = {},
   optimisticTarget: AccountKey | null = null
 ): Promise<void> {
-  if (busy) return;
+  if (busy) {
+    // Batch-1: don't silently drop taps. A switch requested while
+    // another command is in flight is queued (only the latest one
+    // matters) and runs as soon as the current command finishes;
+    // other commands keep the old drop behavior.
+    if (cmd === "switch_account") {
+      pendingSwitch = { cmd, args, optimisticTarget };
+      if (optimisticTarget) {
+        optimisticSwitching = optimisticTarget;
+        if (snapshot) {
+          snapshot = { ...snapshot, activeAccount: null };
+        }
+        render();
+        restoreScrollPosition();
+      }
+    }
+    return;
+  }
   busy = true;
   saveScrollPosition();
   if (optimisticTarget) {
@@ -452,7 +480,19 @@ async function callCommand(
     busy = false;
     render();
     restoreScrollPosition();
+    if (pendingSwitch) {
+      const next = pendingSwitch;
+      pendingSwitch = null;
+      await callCommand(next.cmd, next.args, next.optimisticTarget);
+    }
   }
+}
+
+// Batch-1: silent sync triggers (iOS). Fire-and-forget: the Rust side
+// throttles to one sync per 30s and skips the currently open account
+// (the foreground probe already covers it).
+function triggerAutoSync(): void {
+  void invoke("trigger_quota_sync", { force: false }).catch(() => {});
 }
 
 function currentProvider(state: ManagerSnapshot): ProviderInfo {
@@ -664,14 +704,18 @@ function renderMiddleContent(state: ManagerSnapshot, provider: ProviderInfo): st
     ? `<button id="check-update-btn" class="ghost-icon-btn update-trigger-btn ${hasUpdate ? "has-update" : ""}" type="button" title="${hasUpdate ? `发现新版本 v${escapeHtml(updateState.result!.latestVersion)}` : "检查更新"}">${ICON_UPDATE}${hasUpdate ? `<span class="update-dot"></span>` : ""}</button>`
     : "";
 
-  const headerBtnHtml = provider.enabled
-    ? `
+  // Batch-1 reorder mode: the header shows only a Done button.
+  const inReorder = reorderMode && reorderProviderId === provider.id;
+  const headerBtnHtml = inReorder
+    ? `<button id="reorder-done-btn" class="icon-btn" type="button">完成</button>`
+    : provider.enabled
+      ? `
       ${mobileUpdateBtn}
       ${!isMobile ? `<button id="sync-all-btn" class="ghost-icon-btn" type="button" title="刷新已就绪账号额度">${ICON_REFRESH}</button>` : ""}
       <button id="open-site-btn" class="ghost-icon-btn" type="button" title="在浏览器中打开 ${escapeHtml(provider.shortName)} 官网">${ICON_EXTERNAL}</button>
       <button id="add-account-btn" class="icon-btn primary" type="button">+ 新增</button>
     `
-    : `${mobileUpdateBtn}<button id="open-site-btn" class="icon-btn primary" type="button">打开官网 ${ICON_EXTERNAL}</button>`;
+      : `${mobileUpdateBtn}<button id="open-site-btn" class="icon-btn primary" type="button">打开官网 ${ICON_EXTERNAL}</button>`;
 
   let listBody = "";
   if (!provider.enabled) {
@@ -775,6 +819,7 @@ function renderMiddleContent(state: ManagerSnapshot, provider: ProviderInfo): st
         return `
           <div class="${rowClass}" data-switch-uuid="${escapeHtml(acc.uuid)}">
             <div class="account-header">
+              <span class="drag-handle" title="拖动排序">${ICON_DRAG}</span>
               <div class="avatar-wrap">
                 ${avatarNodeHtml}
                 ${switching ? `<span class="avatar-spinner"></span>` : ""}
@@ -816,7 +861,7 @@ function renderMiddleContent(state: ManagerSnapshot, provider: ProviderInfo): st
     </div>
     ${noticeHtml}
     ${conflictsHtml}
-    <div class="account-list">${listBody}</div>
+    <div class="account-list${inReorder ? " reorder-mode" : ""}">${listBody}</div>
     ${renderModal(provider)}
   `;
 }
@@ -949,7 +994,12 @@ function bindEvents(state: ManagerSnapshot, provider: ProviderInfo): void {
       if (modal.kind !== "none") {
         await setModal({ kind: "none" });
       }
+      // Batch-1: leaving reorder mode when switching provider.
+      reorderMode = false;
+      reorderProviderId = null;
       await callCommand("select_provider", { providerId: nextId });
+      // Batch-1: provider switch counts as activity — refresh quotas.
+      triggerAutoSync();
     });
   });
 
@@ -1048,7 +1098,8 @@ function bindEvents(state: ManagerSnapshot, provider: ProviderInfo): void {
 
   document.querySelectorAll<HTMLElement>("[data-switch-uuid]").forEach((row) => {
     row.addEventListener("click", async () => {
-      if (modal.kind !== "none" || state.conflicts.length > 0) return;
+      // Batch-1: taps do nothing in reorder mode.
+      if (reorderMode || modal.kind !== "none" || state.conflicts.length > 0) return;
       const uuid = row.dataset.switchUuid;
       if (!uuid) return;
       if (
@@ -1068,6 +1119,109 @@ function bindEvents(state: ManagerSnapshot, provider: ProviderInfo): void {
       );
     });
   });
+
+  // Batch-1 reorder: long-press a row to enter reorder mode, then drag
+  // by the handle. The DOM order is committed on release.
+  const listEl = document.querySelector<HTMLElement>(".account-list");
+  document.querySelector("#reorder-done-btn")?.addEventListener("click", () => {
+    reorderMode = false;
+    reorderProviderId = null;
+    render();
+    restoreScrollPosition();
+  });
+  if (listEl) {
+    let longPressTimer: ReturnType<typeof setTimeout> | null = null;
+    let longPressStart: { x: number; y: number } | null = null;
+    const cancelLongPress = () => {
+      if (longPressTimer) {
+        clearTimeout(longPressTimer);
+        longPressTimer = null;
+      }
+      longPressStart = null;
+    };
+    listEl.querySelectorAll<HTMLElement>("[data-switch-uuid]").forEach((row) => {
+      row.addEventListener("pointerdown", (ev) => {
+        if (reorderMode) return;
+        if ((ev.target as HTMLElement).closest("button")) return;
+        longPressStart = { x: ev.clientX, y: ev.clientY };
+        longPressTimer = setTimeout(() => {
+          longPressTimer = null;
+          longPressStart = null;
+          if (modal.kind !== "none") return;
+          reorderMode = true;
+          reorderProviderId = provider.id;
+          render();
+          restoreScrollPosition();
+        }, 500);
+      });
+      row.addEventListener("pointermove", (ev) => {
+        if (longPressTimer && longPressStart) {
+          const dx = ev.clientX - longPressStart.x;
+          const dy = ev.clientY - longPressStart.y;
+          if (dx * dx + dy * dy > 100) cancelLongPress();
+        }
+      });
+      row.addEventListener("pointerup", cancelLongPress);
+      row.addEventListener("pointercancel", cancelLongPress);
+    });
+    listEl.querySelectorAll<HTMLElement>(".drag-handle").forEach((handle) => {
+      handle.addEventListener("pointerdown", (ev) => {
+        if (!reorderMode) return;
+        ev.preventDefault();
+        ev.stopPropagation();
+        const row = handle.closest<HTMLElement>("[data-switch-uuid]");
+        if (!row) return;
+        try {
+          handle.setPointerCapture(ev.pointerId);
+        } catch (_) {
+          // setPointerCapture can throw if the pointer is already gone;
+          // the drag still works through window-level moves.
+        }
+        row.classList.add("dragging");
+        const onMove = (mv: PointerEvent) => {
+          const rows = Array.from(
+            listEl.querySelectorAll<HTMLElement>("[data-switch-uuid]")
+          );
+          const after = rows.find((r) => {
+            if (r === row) return false;
+            const rect = r.getBoundingClientRect();
+            return mv.clientY < rect.top + rect.height / 2;
+          });
+          if (after) listEl.insertBefore(row, after);
+          else listEl.appendChild(row);
+        };
+        const onUp = async () => {
+          handle.removeEventListener("pointermove", onMove);
+          handle.removeEventListener("pointerup", onUp);
+          handle.removeEventListener("pointercancel", onUp);
+          row.classList.remove("dragging");
+          const uuids = Array.from(
+            listEl.querySelectorAll<HTMLElement>("[data-switch-uuid]")
+          )
+            .map((r) => r.dataset.switchUuid)
+            .filter((u): u is string => Boolean(u));
+          const current = state.accounts
+            .filter((a) => a.providerId === provider.id)
+            .map((a) => a.uuid);
+          if (
+            uuids.length === current.length &&
+            uuids.some((u, i) => u !== current[i])
+          ) {
+            await callCommand("reorder_accounts", {
+              providerId: provider.id,
+              uuids,
+            });
+          } else {
+            render();
+            restoreScrollPosition();
+          }
+        };
+        handle.addEventListener("pointermove", onMove);
+        handle.addEventListener("pointerup", onUp);
+        handle.addEventListener("pointercancel", onUp);
+      });
+    });
+  }
 
   const aliasInput = document.querySelector<HTMLInputElement>("#modal-alias-input");
   aliasInput?.addEventListener("input", () => {
@@ -1237,6 +1391,13 @@ async function bootstrap(): Promise<void> {
 
   snapshot = await invoke<ManagerSnapshot>("get_manager_state");
   render();
+  // Batch-1: silent sync on app entry and whenever the app becomes
+  // active again (foreground / focus). No periodic background sync.
+  triggerAutoSync();
+  document.addEventListener("visibilitychange", () => {
+    if (!document.hidden) triggerAutoSync();
+  });
+  window.addEventListener("focus", () => triggerAutoSync());
   setTimeout(() => {
     void runCheckForUpdates(true);
   }, 3500);
