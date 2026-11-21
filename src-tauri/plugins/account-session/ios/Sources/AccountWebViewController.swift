@@ -49,6 +49,10 @@ final class AccountWebViewController: UIViewController, WKNavigationDelegate, WK
   // popup auto-closes (and the session reloads) once it lands back on
   // an allowlisted host — the OAuth callback.
   private var popupDidOAuth = false
+  // 0.1.12: set when the OAuth callback navigation has been reloaded
+  // programmatically once; keeps the cancel+reload intercept from
+  // looping on its own reload.
+  private var popupCallbackReloaded = false
   private var mainInputEnabled = false
   private var popupInputEnabled = false
   private var closingFromManager = false
@@ -431,6 +435,7 @@ final class AccountWebViewController: UIViewController, WKNavigationDelegate, WK
         // validates and the callback lands in the same jar). didFinish
         // closes the tab once the callback lands on an allowlisted host.
         popupDidOAuth = true
+        popupCallbackReloaded = false
         decisionHandler(.allow)
         return
       }
@@ -438,6 +443,22 @@ final class AccountWebViewController: UIViewController, WKNavigationDelegate, WK
         destroyPopupWebView()
         decisionHandler(.cancel)
         return
+      }
+      if popupDidOAuth, let url {
+        // 0.1.12: the OAuth callback is a universal link (muse.ai):
+        // left alone, iOS launches the Muse app instead of delivering
+        // the callback to the web page (0.1.11 user test — the password
+        // submit's user gesture carries through the redirect). Cancel
+        // it and reload programmatically: a programmatic load carries
+        // no user gesture, so it stays in the popup and the GET still
+        // reaches Muse's server. The flag keeps the intercept from
+        // looping on its own reload.
+        if !popupCallbackReloaded {
+          popupCallbackReloaded = true
+          decisionHandler(.cancel)
+          webView.load(URLRequest(url: url))
+          return
+        }
       }
       decisionHandler(.allow)
       return
@@ -745,6 +766,7 @@ final class AccountWebViewController: UIViewController, WKNavigationDelegate, WK
     popup.uiDelegate = self
 
     popupDidOAuth = false
+    popupCallbackReloaded = false
     popupWebView = popup
     popupDomainLabel.text = ""
     popupOverlayRoot.isHidden = true
@@ -764,6 +786,7 @@ final class AccountWebViewController: UIViewController, WKNavigationDelegate, WK
     let popup = popupWebView
     popupWebView = nil
     popupDidOAuth = false
+    popupCallbackReloaded = false
     popupInputEnabled = false
     popupOverlayRoot.isHidden = true
     popupDomainLabel.text = ""
