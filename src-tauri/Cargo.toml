@@ -1,6 +1,6 @@
 [package]
 name = "multi-agent-account-manager"
-version = "0.1.6"
+version = "0.1.7"
 edition = "2021"
 rust-version = "1.85"
 
@@ -46,3 +46,9 @@ windows = { version = "0.62", features = ["Win32_Foundation", "Win32_UI_WindowsA
 # unchanged. See harrylarry/wry branch ios-bundle-fix.
 [patch.crates-io]
 wry = { git = "https://github.com/harrylarry/wry", branch = "ios-bundle-fix" }
+
+# 0.1.7: link-time optimization. The app is small, so the win is modest
+# (cross-crate inlining + dead-code elimination, slightly smaller binary),
+# at the cost of a slower link step on CI.
+[profile.release]
+lto = true
