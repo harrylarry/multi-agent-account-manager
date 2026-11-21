@@ -47,6 +47,10 @@ let pendingSwitch: {
 // Batch-1 reorder mode: long-press a row to reorder accounts by drag.
 let reorderMode = false;
 let reorderProviderId: ProviderId | null = null;
+// True while a reorder drag is in progress. render() skips while set: a
+// snapshot arriving mid-drag must not rebuild the list under the finger
+// (the snapshot data is already stored; the next render picks it up).
+let dragActive = false;
 let lastRenderedUpdateStage: string | null = null;
 
 const updateState: {
@@ -919,6 +923,9 @@ function renderRightStage(state: ManagerSnapshot, provider: ProviderInfo): strin
 function render(): void {
   const root = document.querySelector<HTMLElement>("#app");
   if (!root || !snapshot) return;
+  // A snapshot arriving mid-drag must not rebuild the list under the
+  // finger; the drag-end handler re-renders with the latest snapshot.
+  if (dragActive) return;
 
   const provider = currentProvider(snapshot);
   const isMobile = isMobilePlatform(snapshot.platform);
@@ -1164,62 +1171,122 @@ function bindEvents(state: ManagerSnapshot, provider: ProviderInfo): void {
       row.addEventListener("pointerup", cancelLongPress);
       row.addEventListener("pointercancel", cancelLongPress);
     });
-    listEl.querySelectorAll<HTMLElement>(".drag-handle").forEach((handle) => {
-      handle.addEventListener("pointerdown", (ev) => {
-        if (!reorderMode) return;
-        ev.preventDefault();
-        ev.stopPropagation();
-        const row = handle.closest<HTMLElement>("[data-switch-uuid]");
-        if (!row) return;
-        try {
-          handle.setPointerCapture(ev.pointerId);
-        } catch (_) {
-          // setPointerCapture can throw if the pointer is already gone;
-          // the drag still works through window-level moves.
-        }
-        row.classList.add("dragging");
-        const onMove = (mv: PointerEvent) => {
-          const rows = Array.from(
-            listEl.querySelectorAll<HTMLElement>("[data-switch-uuid]")
-          );
-          const after = rows.find((r) => {
-            if (r === row) return false;
-            const rect = r.getBoundingClientRect();
-            return mv.clientY < rect.top + rect.height / 2;
-          });
-          if (after) listEl.insertBefore(row, after);
-          else listEl.appendChild(row);
-        };
-        const onUp = async () => {
-          handle.removeEventListener("pointermove", onMove);
-          handle.removeEventListener("pointerup", onUp);
-          handle.removeEventListener("pointercancel", onUp);
-          row.classList.remove("dragging");
-          const uuids = Array.from(
-            listEl.querySelectorAll<HTMLElement>("[data-switch-uuid]")
-          )
-            .map((r) => r.dataset.switchUuid)
-            .filter((u): u is string => Boolean(u));
-          const current = state.accounts
-            .filter((a) => a.providerId === provider.id)
-            .map((a) => a.uuid);
-          if (
-            uuids.length === current.length &&
-            uuids.some((u, i) => u !== current[i])
-          ) {
-            await callCommand("reorder_accounts", {
-              providerId: provider.id,
-              uuids,
-            });
-          } else {
-            render();
-            restoreScrollPosition();
-          }
-        };
-        handle.addEventListener("pointermove", onMove);
-        handle.addEventListener("pointerup", onUp);
-        handle.addEventListener("pointercancel", onUp);
+    // Reorder drag (rewritten 2026-11-21 after the first version failed
+    // on-device). The old code listened for pointermove on the 28px
+    // handle itself and relied on setPointerCapture to keep the moves
+    // coming; verified in a touch test that capture does not retarget
+    // moves here, so once the finger left the handle the drag went dead
+    // — and the midpoint-crossing moves that actually reorder always
+    // happen over other rows. The drag now starts on the whole row (row
+    // taps are no-ops in reorder mode anyway) and listens for moves on
+    // window, via both Pointer Events and Touch Events (touch is the
+    // reliable path on iOS WKWebView). One drag session guards against
+    // double-handling: a touch fires touchstart then pointerdown, and
+    // the second start is ignored while a drag is active.
+    let dragRow: HTMLElement | null = null;
+    let dragTouchId: number | null = null;
+    const moveDrag = (clientY: number) => {
+      if (!dragRow) return;
+      const rows = Array.from(
+        listEl.querySelectorAll<HTMLElement>("[data-switch-uuid]")
+      );
+      const after = rows.find((r) => {
+        if (r === dragRow) return false;
+        const rect = r.getBoundingClientRect();
+        return clientY < rect.top + rect.height / 2;
       });
+      if (after) listEl.insertBefore(dragRow, after);
+      else listEl.appendChild(dragRow);
+    };
+    const onPointerMove = (mv: PointerEvent) => moveDrag(mv.clientY);
+    const onPointerUp = () => {
+      void endDrag();
+    };
+    const onTouchMove = (ev: TouchEvent) => {
+      if (dragTouchId === null) return;
+      for (let i = 0; i < ev.changedTouches.length; i++) {
+        const t = ev.changedTouches[i];
+        if (t.identifier === dragTouchId) {
+          ev.preventDefault();
+          moveDrag(t.clientY);
+          return;
+        }
+      }
+    };
+    const onTouchEnd = (ev: TouchEvent) => {
+      if (dragTouchId === null) return;
+      for (let i = 0; i < ev.changedTouches.length; i++) {
+        if (ev.changedTouches[i].identifier === dragTouchId) {
+          void endDrag();
+          return;
+        }
+      }
+    };
+    const endDrag = async () => {
+      const row = dragRow;
+      if (!row) return;
+      dragRow = null;
+      dragTouchId = null;
+      dragActive = false;
+      window.removeEventListener("pointermove", onPointerMove);
+      window.removeEventListener("pointerup", onPointerUp);
+      window.removeEventListener("pointercancel", onPointerUp);
+      window.removeEventListener("touchmove", onTouchMove);
+      window.removeEventListener("touchend", onTouchEnd);
+      window.removeEventListener("touchcancel", onTouchEnd);
+      row.classList.remove("dragging");
+      const uuids = Array.from(
+        listEl.querySelectorAll<HTMLElement>("[data-switch-uuid]")
+      )
+        .map((r) => r.dataset.switchUuid)
+        .filter((u): u is string => Boolean(u));
+      const current = state.accounts
+        .filter((a) => a.providerId === provider.id)
+        .map((a) => a.uuid);
+      if (
+        uuids.length === current.length &&
+        uuids.some((u, i) => u !== current[i])
+      ) {
+        await callCommand("reorder_accounts", {
+          providerId: provider.id,
+          uuids,
+        });
+      } else {
+        render();
+        restoreScrollPosition();
+      }
+    };
+    const beginDrag = (row: HTMLElement) => {
+      if (dragRow) return;
+      dragRow = row;
+      dragActive = true;
+      row.classList.add("dragging");
+      window.addEventListener("pointermove", onPointerMove);
+      window.addEventListener("pointerup", onPointerUp);
+      window.addEventListener("pointercancel", onPointerUp);
+      window.addEventListener("touchmove", onTouchMove, { passive: false });
+      window.addEventListener("touchend", onTouchEnd);
+      window.addEventListener("touchcancel", onTouchEnd);
+    };
+    listEl.querySelectorAll<HTMLElement>("[data-switch-uuid]").forEach((row) => {
+      row.addEventListener("pointerdown", (ev) => {
+        if (!reorderMode || dragRow) return;
+        if ((ev.target as HTMLElement).closest("button")) return;
+        ev.preventDefault();
+        beginDrag(row);
+      });
+      row.addEventListener(
+        "touchstart",
+        (ev) => {
+          if (!reorderMode || dragRow) return;
+          if ((ev.target as HTMLElement).closest("button")) return;
+          if (ev.touches.length !== 1) return;
+          ev.preventDefault();
+          dragTouchId = ev.touches[0].identifier;
+          beginDrag(row);
+        },
+        { passive: false }
+      );
     });
   }
 
