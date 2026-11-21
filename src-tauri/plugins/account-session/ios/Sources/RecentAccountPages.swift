@@ -16,8 +16,12 @@ import UIKit
 import WebKit
 
 enum RecentAccountPages {
-  private static let maxAccountPages = 2
-  private static let idleTimeout: TimeInterval = 120
+  // Batch-1 optimization (2026-11-21): 2 pages / 120s was too small — a
+  // third account always reloaded and the cache expired after a short hop
+  // to another app. 4 pages / 300s, still guarded by the memory-warning
+  // trim below.
+  private static let maxAccountPages = 4
+  private static let idleTimeout: TimeInterval = 300
 
   /// Blocks main-frame navigations on a parked view and discards the view
   /// if its web content process dies — mirrors Kotlin's parkedClient.
@@ -116,6 +120,36 @@ enum RecentAccountPages {
       destroy(item.entry.view)
     }
     trim(maxAccountPages)
+  }
+
+  /// Drops every parked page. Used when memory is tight or the active web
+  /// content process was just terminated: inactive spaces are released
+  /// first, before the active page is reloaded (batch-1 eviction order).
+  static func clearAll() {
+    trim(0)
+  }
+
+  /// Runs JavaScript on a parked page without taking it out of the cache.
+  /// Used by background quota sync: a parked page already holds the
+  /// account's live session, so probing it is free (no reload).
+  /// The completion receives the raw evaluateJavaScript result, or nil when
+  /// the account has no parked page. Main-thread only.
+  static func probeParked(
+    providerId: String, uuid: String, javascript: String,
+    completion: @escaping (Any?) -> Void
+  ) {
+    trim(maxAccountPages)
+    guard
+      let entry = pages.first(where: {
+        $0.key.providerId == providerId && $0.key.uuid == uuid
+      })?.entry
+    else {
+      completion(nil)
+      return
+    }
+    entry.view.evaluateJavaScript(javascript) { result, _ in
+      completion(result)
+    }
   }
 
   private static func discardView(_ view: WKWebView) {
