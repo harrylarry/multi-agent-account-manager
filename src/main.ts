@@ -51,6 +51,21 @@ let reorderProviderId: ProviderId | null = null;
 // snapshot arriving mid-drag must not rebuild the list under the finger
 // (the snapshot data is already stored; the next render picks it up).
 let dragActive = false;
+// 0.1.9 incremental rendering: structural signature of the last full
+// render + per-row rendered state, so field-only snapshots (the 4.5s
+// quota probes) patch rows in place instead of rebuilding #app.
+let lastStructuralSig: string | null = null;
+let patchState: Map<
+  string,
+  { avatarSig: string; subVariant: RowSubVariant; detailHtml: string }
+> = new Map();
+// 0.1.9 event delegation: long-press / drag state used to live in the
+// per-render bindEvents closures; listeners are now bound once at
+// bootstrap, so the state lives here.
+let longPressTimer: ReturnType<typeof setTimeout> | null = null;
+let longPressStart: { x: number; y: number } | null = null;
+let dragRow: HTMLElement | null = null;
+let dragTouchId: number | null = null;
 let lastRenderedUpdateStage: string | null = null;
 
 const updateState: {
@@ -201,6 +216,152 @@ function resolveQuotaState(acc: AccountRecord): {
     return { status: "low", label: "偏低", extraDepleted: false };
   }
   return { status: "normal", label: "", extraDepleted: false };
+}
+
+// 0.1.9: per-row derived state, shared by the full renderer and the
+// incremental patcher so the two can never drift apart.
+type RowSubVariant = "loading" | "logged-out" | "quota" | "none";
+
+interface DerivedRowState {
+  switching: boolean;
+  active: boolean;
+  isLoggedOut: boolean;
+  hasDetail: boolean;
+  alertStatus: QuotaStatus;
+  alertLabel: string;
+  extraDepleted: boolean;
+  avatarText: string;
+  subVariant: RowSubVariant;
+  quotaLabel: string;
+  isEmpty: boolean;
+  isLow: boolean;
+}
+
+function deriveRowState(
+  acc: AccountRecord,
+  state: ManagerSnapshot,
+  switchingKey: AccountKey | null
+): DerivedRowState {
+  const switching = isSameKey(switchingKey, acc);
+  const active = !switching && isSameKey(state.activeAccount, acc);
+  const avatarText = computeAvatarText(acc);
+  const isLoggedOut = acc.authState === "logged_out";
+  const hasDetail = !isLoggedOut && Boolean(acc.quotaDetail);
+  const quotaState = isLoggedOut
+    ? { status: "normal" as QuotaStatus, label: "", extraDepleted: false }
+    : resolveQuotaState(acc);
+  const subVariant: RowSubVariant =
+    switching && !hasDetail
+      ? "loading"
+      : isLoggedOut
+        ? "logged-out"
+        : !hasDetail
+          ? "quota"
+          : "none";
+  const quotaLabel =
+    acc.quotaText ?? (acc.autoAlias ? "登录后自动同步额度" : "正在同步额度明细…");
+  const isEmpty =
+    acc.quotaPercent === 0 || Boolean(acc.quotaText?.includes("用尽"));
+  const isLow =
+    !isEmpty &&
+    ((typeof acc.quotaPercent === "number" && acc.quotaPercent <= 20) ||
+      Boolean(acc.quotaText?.includes("偏低")));
+  return {
+    switching,
+    active,
+    isLoggedOut,
+    hasDetail,
+    alertStatus: quotaState.status,
+    alertLabel: quotaState.label,
+    extraDepleted: quotaState.extraDepleted,
+    avatarText,
+    subVariant,
+    quotaLabel,
+    isEmpty,
+    isLow,
+  };
+}
+
+function rowClassFor(d: DerivedRowState): string {
+  return [
+    "account-row",
+    d.hasDetail ? "has-detail" : "",
+    d.active ? "active" : "",
+    d.switching ? "switching" : "",
+    d.isLoggedOut ? "logged-out" : "",
+    d.alertStatus !== "normal" ? `alert-${d.alertStatus}` : "",
+  ]
+    .filter(Boolean)
+    .join(" ");
+}
+
+function avatarWrapHtml(acc: AccountRecord, d: DerivedRowState): string {
+  const avatarClass = [
+    "avatar",
+    acc.autoAlias ? "pending-identity" : acc.providerId,
+  ].join(" ");
+  const avatarNodeHtml = acc.avatarUrl
+    ? `<div class="avatar has-photo"><img src="${escapeHtml(acc.avatarUrl)}" class="avatar-photo" alt="" draggable="false" /></div>`
+    : `<div class="${avatarClass}">${escapeHtml(d.avatarText)}</div>`;
+  return `${avatarNodeHtml}
+${d.switching ? `<span class="avatar-spinner"></span>` : ""}
+${d.active ? `<span class="status-dot ${d.isLoggedOut ? "offline" : ""}"></span>` : ""}`;
+}
+
+function avatarSigFor(acc: AccountRecord, d: DerivedRowState): string {
+  return [
+    acc.avatarUrl ?? "",
+    d.avatarText,
+    acc.autoAlias ? "1" : "0",
+    d.switching ? "1" : "0",
+    d.active ? "1" : "0",
+    d.isLoggedOut ? "1" : "0",
+  ].join("|");
+}
+
+function alertBadgeHtml(d: DerivedRowState): string {
+  if (d.isLoggedOut) return `<span class="auth-status-badge">未登录</span>`;
+  if (d.alertStatus !== "normal") {
+    return `<span class="quota-warning-badge ${d.alertStatus}">${d.alertLabel}</span>`;
+  }
+  return "";
+}
+
+function loginHintFor(
+  acc: AccountRecord,
+  d: DerivedRowState,
+  isMobile: boolean
+): string {
+  if (d.active) {
+    return isMobile ? "登录已失效，点击进入重新登录" : "登录已失效，请在右侧重新登录";
+  }
+  return acc.autoAlias ? "尚未登录，点击前往登录" : "登录已失效，点击重新登录";
+}
+
+function subHtmlFor(
+  acc: AccountRecord,
+  d: DerivedRowState,
+  isMobile: boolean
+): string {
+  if (d.subVariant === "loading") {
+    return `<div class="account-sub loading-text"><span class="quota-label-text">正在加载…</span></div>`;
+  }
+  if (d.subVariant === "logged-out") {
+    return `<div class="account-sub auth-logged-out"><span class="auth-dot-inline"></span><span class="quota-label-text">${loginHintFor(acc, d, isMobile)}</span></div>`;
+  }
+  if (d.subVariant === "quota") {
+    const subClass = d.isEmpty
+      ? "account-sub quota-empty"
+      : d.isLow
+        ? "account-sub quota-low"
+        : "account-sub";
+    const barHtml =
+      typeof acc.quotaPercent === "number"
+        ? `<span class="mini-quota-track"><span class="mini-quota-fill ${d.isEmpty ? "empty" : d.isLow ? "low" : ""}" style="width:${Math.max(0, Math.min(100, acc.quotaPercent))}%"></span></span>`
+        : "";
+    return `<div class="${subClass}">${barHtml}<span class="quota-label-text">${escapeHtml(d.quotaLabel)}</span></div>`;
+  }
+  return "";
 }
 
 function formatShortResetText(raw: string | null): string {
@@ -741,108 +902,33 @@ function renderMiddleContent(state: ManagerSnapshot, provider: ProviderInfo): st
   } else {
     listBody = providerAccounts
       .map((acc, idx) => {
-        const switching = isSameKey(switchingKey, acc);
-        const active = !switching && isSameKey(state.activeAccount, acc);
-        const avatarText = computeAvatarText(acc);
-        const isLoggedOut = acc.authState === "logged_out";
-        const hasDetail = !isLoggedOut && Boolean(acc.quotaDetail);
-
-        const quotaState = isLoggedOut
-          ? { status: "normal" as QuotaStatus, label: "", extraDepleted: false }
-          : resolveQuotaState(acc);
-        const {
-          status: alertStatus,
-          label: alertLabel,
-          extraDepleted,
-        } = quotaState;
-
+        const d = deriveRowState(acc, state, switchingKey);
         const isMac = navigator.userAgent.includes("Mac");
         const shortcutHint =
           !isMobile && idx < 9
             ? `<span class="shortcut-pill" title="快捷切号">${isMac ? "⌘" : "^"}${idx + 1}</span>`
             : "";
-        const alertBadgeHtml = isLoggedOut
-          ? `<span class="auth-status-badge">未登录</span>`
-          : alertStatus !== "normal"
-            ? `<span class="quota-warning-badge ${alertStatus}">${alertLabel}</span>`
-            : "";
-
-        let compactSubHtml = "";
-        if (switching && !hasDetail) {
-          compactSubHtml = `<div class="account-sub loading-text"><span class="quota-label-text">正在加载…</span></div>`;
-        } else if (isLoggedOut) {
-          const loginHint = active
-            ? isMobile
-              ? "登录已失效，点击进入重新登录"
-              : "登录已失效，请在右侧重新登录"
-            : acc.autoAlias
-              ? "尚未登录，点击前往登录"
-              : "登录已失效，点击重新登录";
-          compactSubHtml = `<div class="account-sub auth-logged-out"><span class="auth-dot-inline"></span><span class="quota-label-text">${loginHint}</span></div>`;
-        } else if (!hasDetail) {
-          const quotaLabel =
-            acc.quotaText ?? (acc.autoAlias ? "登录后自动同步额度" : "正在同步额度明细…");
-          const isEmpty =
-            acc.quotaPercent === 0 || Boolean(acc.quotaText?.includes("用尽"));
-          const isLow =
-            !isEmpty &&
-            ((typeof acc.quotaPercent === "number" && acc.quotaPercent <= 20) ||
-              Boolean(acc.quotaText?.includes("偏低")));
-          const subClass = isEmpty
-            ? "account-sub quota-empty"
-            : isLow
-              ? "account-sub quota-low"
-              : "account-sub";
-          const barHtml =
-            typeof acc.quotaPercent === "number"
-              ? `<span class="mini-quota-track"><span class="mini-quota-fill ${isEmpty ? "empty" : isLow ? "low" : ""}" style="width:${Math.max(0, Math.min(100, acc.quotaPercent))}%"></span></span>`
-              : "";
-          compactSubHtml = `<div class="${subClass}">${barHtml}<span class="quota-label-text">${escapeHtml(quotaLabel)}</span></div>`;
-        }
-
-        const rowClass = [
-          "account-row",
-          hasDetail ? "has-detail" : "",
-          active ? "active" : "",
-          switching ? "switching" : "",
-          isLoggedOut ? "logged-out" : "",
-          alertStatus !== "normal" ? `alert-${alertStatus}` : "",
-        ]
-          .filter(Boolean)
-          .join(" ");
-
-        const avatarClass = [
-          "avatar",
-          acc.autoAlias ? "pending-identity" : acc.providerId,
-        ].join(" ");
-
-        const avatarNodeHtml = acc.avatarUrl
-          ? `<div class="avatar has-photo"><img src="${escapeHtml(acc.avatarUrl)}" class="avatar-photo" alt="" draggable="false" /></div>`
-          : `<div class="${avatarClass}">${escapeHtml(avatarText)}</div>`;
-
         return `
-          <div class="${rowClass}" data-switch-uuid="${escapeHtml(acc.uuid)}">
+          <div class="${rowClassFor(d)}" data-switch-uuid="${escapeHtml(acc.uuid)}">
             <div class="account-header">
               <span class="drag-handle" title="拖动排序">${ICON_DRAG}</span>
               <div class="avatar-wrap">
-                ${avatarNodeHtml}
-                ${switching ? `<span class="avatar-spinner"></span>` : ""}
-                ${active ? `<span class="status-dot ${isLoggedOut ? "offline" : ""}"></span>` : ""}
+                ${avatarWrapHtml(acc, d)}
               </div>
               <div class="account-meta">
                 <div class="account-alias-row">
                   <span class="account-alias">${escapeHtml(acc.alias)}</span>
                   ${shortcutHint}
-                  ${alertBadgeHtml}
+                  ${alertBadgeHtml(d)}
                 </div>
-                ${compactSubHtml}
+                ${subHtmlFor(acc, d, isMobile)}
               </div>
               <div class="row-ops">
                 <button class="action-icon-btn" data-rename-uuid="${escapeHtml(acc.uuid)}" title="修改备注" type="button">${ICON_EDIT}</button>
                 <button class="action-icon-btn danger" data-remove-uuid="${escapeHtml(acc.uuid)}" title="从本机移除" type="button">${ICON_TRASH}</button>
               </div>
             </div>
-            ${!isLoggedOut && acc.quotaDetail ? renderQuotaDetailPanel(acc.quotaDetail, alertStatus, extraDepleted) : ""}
+            ${!d.isLoggedOut && acc.quotaDetail ? renderQuotaDetailPanel(acc.quotaDetail, d.alertStatus, d.extraDepleted) : ""}
           </div>
         `;
       })
@@ -920,14 +1006,239 @@ function renderRightStage(state: ManagerSnapshot, provider: ProviderInfo): strin
   `;
 }
 
+// 0.1.9 incremental rendering.
+//
+// Every snapshot used to rebuild #app from scratch (innerHTML +
+// re-binding every listener). The 4.5s quota probes only change field
+// values, so render() now compares a structural signature first:
+//   - signature unchanged -> patchRows(): update only the rows whose
+//     derived state changed, in place. Row nodes survive, so scroll,
+//     focus (typing in the rename modal), and an in-progress drag are
+//     never disturbed.
+//   - signature changed -> full render as before (add/remove account,
+//     provider switch, modal open/close, notice, conflicts, switching
+//     target, reorder mode, update state).
+// Anything that changes DOM structure must be in the signature; anything
+// patchable must NOT be (alias, quota text/percent, avatar, auth state,
+// active/switching flags — except the switching target itself, which
+// drives the desktop stage).
+function structuralSignature(state: ManagerSnapshot, provider: ProviderInfo): string {
+  const switchingKey = effectiveSwitchingKey(state);
+  const providerAccounts = state.accounts.filter(
+    (a) => a.providerId === provider.id
+  );
+  const switchingAcc = switchingKey
+    ? state.accounts.find((a) => isSameKey(switchingKey, a))
+    : undefined;
+  const parts = [
+    state.platform,
+    state.selectedProviderId,
+    state.providers
+      .map(
+        (p) =>
+          `${p.id}:${p.enabled ? 1 : 0}:${p.name}:${p.shortName}:${p.statusText}`
+      )
+      .join(","),
+    providerAccounts.map((a) => a.uuid).join(","),
+    providerAccounts
+      .map(
+        (a) =>
+          `${a.uuid}:${a.authState === "logged_out" ? 0 : a.quotaDetail ? 1 : 0}`
+      )
+      .join(","),
+    switchingKey
+      ? `${switchingKey.providerId}:${switchingKey.uuid}:${switchingAcc?.alias ?? ""}`
+      : "",
+    modal.kind,
+    modal.kind === "rename" || modal.kind === "remove"
+      ? modal.account.uuid
+      : "",
+    state.notice ?? "",
+    state.conflicts
+      .map((c) => `${c.uuid}:${c.providers.join("+")}`)
+      .join(","),
+    reorderMode ? `reorder:${reorderProviderId ?? ""}` : "",
+    // Update modal reads all of updateState except progress percent /
+    // message (the progress listener patches those in place). The
+    // result is stringified whole: a re-check can change notes/size
+    // without changing the version.
+    JSON.stringify(updateState.result ?? null),
+    updateState.checking ? "checking" : "",
+    updateState.installing ? "installing" : "",
+    updateState.outcomeStatus ?? "",
+    updateState.outcomeMessage ?? "",
+    updateState.error ?? "",
+    lastRenderedUpdateStage ?? "",
+  ];
+  return parts.join("\n");
+}
+
+function seedPatchState(state: ManagerSnapshot, provider: ProviderInfo): void {
+  patchState.clear();
+  const switchingKey = effectiveSwitchingKey(state);
+  for (const acc of state.accounts.filter(
+    (a) => a.providerId === provider.id
+  )) {
+    const d = deriveRowState(acc, state, switchingKey);
+    patchState.set(acc.uuid, {
+      avatarSig: avatarSigFor(acc, d),
+      subVariant: d.subVariant,
+      detailHtml:
+        !d.isLoggedOut && acc.quotaDetail
+          ? renderQuotaDetailPanel(acc.quotaDetail, d.alertStatus, d.extraDepleted)
+          : "",
+    });
+  }
+}
+
+function patchRows(state: ManagerSnapshot, provider: ProviderInfo): void {
+  const listEl = document.querySelector<HTMLElement>(".account-list");
+  if (!listEl) return;
+  const switchingKey = effectiveSwitchingKey(state);
+  for (const acc of state.accounts.filter(
+    (a) => a.providerId === provider.id
+  )) {
+    const row = listEl.querySelector<HTMLElement>(
+      `[data-switch-uuid="${CSS.escape(acc.uuid)}"]`
+    );
+    if (!row) continue;
+    // The row under the finger keeps its dragged position and .dragging
+    // class; the drag-end handler re-renders with the latest snapshot.
+    if (row === dragRow) continue;
+    patchRow(row, acc, state, switchingKey);
+  }
+}
+
+function patchRow(
+  row: HTMLElement,
+  acc: AccountRecord,
+  state: ManagerSnapshot,
+  switchingKey: AccountKey | null
+): void {
+  const d = deriveRowState(acc, state, switchingKey);
+  const isMobile = isMobilePlatform(state.platform);
+  const prev = patchState.get(acc.uuid);
+
+  // Row classes (active / switching / logged-out / alert / has-detail).
+  const cls = rowClassFor(d);
+  if (row.className !== cls) row.className = cls;
+
+  // Avatar block (photo, initial, spinner, status dot).
+  const avatarSig = avatarSigFor(acc, d);
+  if (!prev || prev.avatarSig !== avatarSig) {
+    const wrap = row.querySelector<HTMLElement>(".avatar-wrap");
+    if (wrap) wrap.innerHTML = avatarWrapHtml(acc, d);
+  }
+
+  // Alias text.
+  const aliasEl = row.querySelector<HTMLElement>(".account-alias");
+  if (aliasEl && aliasEl.textContent !== acc.alias) {
+    aliasEl.textContent = acc.alias;
+  }
+
+  // Alert badge (auth-status / quota-warning), last child of the alias row.
+  const aliasRow = row.querySelector<HTMLElement>(".account-alias-row");
+  const desiredBadge = alertBadgeHtml(d);
+  const currentBadge = aliasRow?.querySelector<HTMLElement>(
+    ".quota-warning-badge, .auth-status-badge"
+  );
+  if (desiredBadge === "") {
+    currentBadge?.remove();
+  } else if (!currentBadge || currentBadge.outerHTML !== desiredBadge) {
+    currentBadge?.remove();
+    aliasRow?.insertAdjacentHTML("beforeend", desiredBadge);
+  }
+
+  // Quota sub-line. Its existence depends only on hasDetail (in the
+  // signature), so within a patch it can only change variant or values.
+  const sub = row.querySelector<HTMLElement>(".account-sub");
+  if (d.hasDetail) {
+    sub?.remove();
+  } else if (!prev || prev.subVariant !== d.subVariant) {
+    const html = subHtmlFor(acc, d, isMobile);
+    if (sub) {
+      sub.outerHTML = html;
+    } else {
+      aliasRow?.insertAdjacentHTML("afterend", html);
+    }
+  } else if (sub) {
+    if (d.subVariant === "quota") {
+      const subCls = d.isEmpty
+        ? "account-sub quota-empty"
+        : d.isLow
+          ? "account-sub quota-low"
+          : "account-sub";
+      if (sub.className !== subCls) sub.className = subCls;
+      const fill = sub.querySelector<HTMLElement>(".mini-quota-fill");
+      const needsBar = typeof acc.quotaPercent === "number";
+      if (needsBar !== Boolean(fill)) {
+        // Bar appeared/disappeared: rebuild the sub line.
+        sub.outerHTML = subHtmlFor(acc, d, isMobile);
+      } else {
+        if (fill && needsBar) {
+          const w = `${Math.max(0, Math.min(100, acc.quotaPercent!))}%`;
+          if (fill.style.width !== w) fill.style.width = w;
+          fill.classList.toggle("empty", d.isEmpty);
+          fill.classList.toggle("low", d.isLow);
+        }
+        const labelEl = sub.querySelector<HTMLElement>(".quota-label-text");
+        if (labelEl && labelEl.textContent !== d.quotaLabel) {
+          labelEl.textContent = d.quotaLabel;
+        }
+      }
+    } else if (d.subVariant === "logged-out") {
+      const labelEl = sub.querySelector<HTMLElement>(".quota-label-text");
+      const hint = loginHintFor(acc, d, isMobile);
+      if (labelEl && labelEl.textContent !== hint) {
+        labelEl.textContent = hint;
+      }
+    }
+    // "loading" has static text; nothing to patch.
+  }
+
+  // Quota detail panel: no wrapper element (two sibling nodes after the
+  // header), so swap the subtree when its rendered HTML changes. No
+  // listeners or images live inside it.
+  const detailHtml =
+    !d.isLoggedOut && acc.quotaDetail
+      ? renderQuotaDetailPanel(acc.quotaDetail, d.alertStatus, d.extraDepleted)
+      : "";
+  if (!prev || prev.detailHtml !== detailHtml) {
+    row
+      .querySelectorAll(".quota-compact-main, .quota-compact-meta")
+      .forEach((el) => el.remove());
+    if (detailHtml) {
+      row
+        .querySelector<HTMLElement>(".account-header")
+        ?.insertAdjacentHTML("afterend", detailHtml);
+    }
+  }
+
+  patchState.set(acc.uuid, {
+    avatarSig,
+    subVariant: d.subVariant,
+    detailHtml,
+  });
+}
+
 function render(): void {
   const root = document.querySelector<HTMLElement>("#app");
   if (!root || !snapshot) return;
-  // A snapshot arriving mid-drag must not rebuild the list under the
-  // finger; the drag-end handler re-renders with the latest snapshot.
-  if (dragActive) return;
 
   const provider = currentProvider(snapshot);
+  const sig = structuralSignature(snapshot, provider);
+  if (sig === lastStructuralSig) {
+    // Field-only change: patch in place. Safe mid-drag (patchRow skips
+    // the dragging row), so quota updates keep flowing during a drag.
+    patchRows(snapshot, provider);
+    return;
+  }
+  // A structural change arriving mid-drag must not rebuild the list
+  // under the finger; the drag-end handler re-renders with the latest
+  // snapshot.
+  if (dragActive) return;
+  lastStructuralSig = sig;
+
   const isMobile = isMobilePlatform(snapshot.platform);
 
   if (isMobile) {
@@ -990,98 +1301,147 @@ function render(): void {
     `;
   }
 
-  bindEvents(snapshot, provider);
+  seedPatchState(snapshot, provider);
 }
 
-function bindEvents(state: ManagerSnapshot, provider: ProviderInfo): void {
-  document.querySelectorAll<HTMLElement>("[data-provider]").forEach((btn) => {
-    btn.addEventListener("click", async () => {
-      const nextId = btn.dataset.provider as ProviderId;
-      if (!nextId || nextId === state.selectedProviderId) return;
-      if (modal.kind !== "none") {
-        await setModal({ kind: "none" });
-      }
-      // Batch-1: leaving reorder mode when switching provider.
-      reorderMode = false;
-      reorderProviderId = null;
-      await callCommand("select_provider", { providerId: nextId });
-      // Batch-1: provider switch counts as activity — refresh quotas.
-      triggerAutoSync();
+// 0.1.9 event delegation: listeners are bound ONCE on #app at bootstrap
+// and dispatch by closest-match, instead of re-binding every listener
+// on every render. Row clicks, provider tabs, modal buttons, long-press
+// and drag-start all go through here; the drag's window-level move/up
+// listeners are still added per drag session (beginDrag/endDrag).
+
+function cancelLongPress(): void {
+  if (longPressTimer) {
+    clearTimeout(longPressTimer);
+    longPressTimer = null;
+  }
+  longPressStart = null;
+}
+
+function moveDrag(clientY: number): void {
+  if (!dragRow) return;
+  const listEl = document.querySelector<HTMLElement>(".account-list");
+  if (!listEl) return;
+  const rows = Array.from(
+    listEl.querySelectorAll<HTMLElement>("[data-switch-uuid]")
+  );
+  const after = rows.find((r) => {
+    if (r === dragRow) return false;
+    const rect = r.getBoundingClientRect();
+    return clientY < rect.top + rect.height / 2;
+  });
+  if (after) listEl.insertBefore(dragRow, after);
+  else listEl.appendChild(dragRow);
+}
+
+const onDragPointerMove = (mv: PointerEvent) => moveDrag(mv.clientY);
+const onDragPointerUp = () => {
+  void endDrag();
+};
+const onDragTouchMove = (ev: TouchEvent) => {
+  if (dragTouchId === null) return;
+  for (let i = 0; i < ev.changedTouches.length; i++) {
+    const t = ev.changedTouches[i];
+    if (t.identifier === dragTouchId) {
+      ev.preventDefault();
+      moveDrag(t.clientY);
+      return;
+    }
+  }
+};
+const onDragTouchEnd = (ev: TouchEvent) => {
+  if (dragTouchId === null) return;
+  for (let i = 0; i < ev.changedTouches.length; i++) {
+    if (ev.changedTouches[i].identifier === dragTouchId) {
+      void endDrag();
+      return;
+    }
+  }
+};
+
+async function endDrag(): Promise<void> {
+  const row = dragRow;
+  if (!row) return;
+  dragRow = null;
+  dragTouchId = null;
+  dragActive = false;
+  window.removeEventListener("pointermove", onDragPointerMove);
+  window.removeEventListener("pointerup", onDragPointerUp);
+  window.removeEventListener("pointercancel", onDragPointerUp);
+  window.removeEventListener("touchmove", onDragTouchMove);
+  window.removeEventListener("touchend", onDragTouchEnd);
+  window.removeEventListener("touchcancel", onDragTouchEnd);
+  row.classList.remove("dragging");
+  const listEl = document.querySelector<HTMLElement>(".account-list");
+  if (!listEl || !snapshot) {
+    render();
+    restoreScrollPosition();
+    return;
+  }
+  const uuids = Array.from(
+    listEl.querySelectorAll<HTMLElement>("[data-switch-uuid]")
+  )
+    .map((r) => r.dataset.switchUuid)
+    .filter((u): u is string => Boolean(u));
+  const provider = currentProvider(snapshot);
+  const current = snapshot.accounts
+    .filter((a) => a.providerId === provider.id)
+    .map((a) => a.uuid);
+  if (
+    uuids.length === current.length &&
+    uuids.some((u, i) => u !== current[i])
+  ) {
+    await callCommand("reorder_accounts", {
+      providerId: provider.id,
+      uuids,
     });
-  });
+  } else {
+    render();
+    restoreScrollPosition();
+  }
+}
 
-  const openOfficial = async () => {
-    await callCommand("open_official_site", { providerId: provider.id });
-  };
-  document.querySelector("#open-site-btn")?.addEventListener("click", openOfficial);
-  document.querySelector("#stage-open-site-btn")?.addEventListener("click", openOfficial);
+function beginDrag(row: HTMLElement): void {
+  if (dragRow) return;
+  dragRow = row;
+  dragActive = true;
+  row.classList.add("dragging");
+  window.addEventListener("pointermove", onDragPointerMove);
+  window.addEventListener("pointerup", onDragPointerUp);
+  window.addEventListener("pointercancel", onDragPointerUp);
+  window.addEventListener("touchmove", onDragTouchMove, { passive: false });
+  window.addEventListener("touchend", onDragTouchEnd);
+  window.addEventListener("touchcancel", onDragTouchEnd);
+}
 
-  document.querySelector("#sync-all-btn")?.addEventListener("click", async () => {
-    const btn = document.querySelector("#sync-all-btn");
-    btn?.classList.add("spinning");
-    try {
-      await callCommand("trigger_quota_sync");
-    } finally {
-      setTimeout(() => btn?.classList.remove("spinning"), 650);
-    }
-  });
+async function openReleasePage(): Promise<void> {
+  const pageUrl = updateState.result?.releasePageUrl;
+  if (!pageUrl) return;
+  try {
+    await invoke("open_external_url", { url: pageUrl });
+  } catch (err) {
+    updateState.error = String(err);
+    rerenderPreservingScroll();
+  }
+}
 
-  const openAddModal = async () => {
-    await setModal({ kind: "add", providerId: provider.id, draft: "" });
-  };
-  document.querySelector("#add-account-btn")?.addEventListener("click", openAddModal);
-  document.querySelector("#stage-add-btn")?.addEventListener("click", openAddModal);
+function bindDelegatedEvents(): void {
+  const root = document.querySelector<HTMLElement>("#app");
+  if (!root) return;
 
-  document.querySelector("#dismiss-notice-btn")?.addEventListener("click", async () => {
-    await callCommand("dismiss_notice");
-  });
+  root.addEventListener("click", async (ev) => {
+    if (!snapshot) return;
+    const target = ev.target as HTMLElement;
+    const provider = currentProvider(snapshot);
 
-  document.querySelector("#check-update-btn")?.addEventListener("click", async () => {
-    if (modal.kind !== "none") return;
-    await setModal({ kind: "update" });
-    if (!updateState.result && !updateState.checking && !updateState.installing) {
-      await runCheckForUpdates(false);
-    }
-  });
-
-  document.querySelector("#update-recheck-btn")?.addEventListener("click", async () => {
-    await runCheckForUpdates(false);
-  });
-
-  document.querySelector("#update-install-btn")?.addEventListener("click", async () => {
-    await runDownloadAndInstall();
-  });
-
-  const openReleasePage = async (): Promise<void> => {
-    const pageUrl = updateState.result?.releasePageUrl;
-    if (!pageUrl) return;
-    try {
-      await invoke("open_external_url", { url: pageUrl });
-    } catch (err) {
-      updateState.error = String(err);
-      rerenderPreservingScroll();
-    }
-  };
-
-  document.querySelector("#update-manual-install-btn")?.addEventListener("click", openReleasePage);
-
-  document.querySelector("#update-open-page-btn")?.addEventListener("click", openReleasePage);
-
-  document.querySelectorAll<HTMLElement>("[data-resolve-uuid]").forEach((btn) => {
-    btn.addEventListener("click", async () => {
-      const uuid = btn.dataset.resolveUuid;
-      const keepProviderId = btn.dataset.resolveProvider;
-      if (uuid && keepProviderId) {
-        await callCommand("resolve_uuid_conflict", { keepProviderId, uuid });
-      }
-    });
-  });
-
-  document.querySelectorAll<HTMLElement>("[data-rename-uuid]").forEach((btn) => {
-    btn.addEventListener("click", async (ev) => {
-      ev.stopPropagation();
-      const uuid = btn.dataset.renameUuid;
-      const acc = state.accounts.find((a) => a.providerId === provider.id && a.uuid === uuid);
+    // Most specific first; each branch returns after handling (this is
+    // what stopPropagation used to do for the row-op buttons).
+    const renameBtn = target.closest<HTMLElement>("[data-rename-uuid]");
+    if (renameBtn) {
+      const uuid = renameBtn.dataset.renameUuid;
+      const acc = snapshot.accounts.find(
+        (a) => a.providerId === provider.id && a.uuid === uuid
+      );
       if (acc) {
         await setModal({
           kind: "rename",
@@ -1089,34 +1449,58 @@ function bindEvents(state: ManagerSnapshot, provider: ProviderInfo): void {
           draft: acc.autoAlias ? "" : acc.alias,
         });
       }
-    });
-  });
-
-  document.querySelectorAll<HTMLElement>("[data-remove-uuid]").forEach((btn) => {
-    btn.addEventListener("click", async (ev) => {
-      ev.stopPropagation();
-      const uuid = btn.dataset.removeUuid;
-      const acc = state.accounts.find((a) => a.providerId === provider.id && a.uuid === uuid);
+      return;
+    }
+    const removeBtn = target.closest<HTMLElement>("[data-remove-uuid]");
+    if (removeBtn) {
+      const uuid = removeBtn.dataset.removeUuid;
+      const acc = snapshot.accounts.find(
+        (a) => a.providerId === provider.id && a.uuid === uuid
+      );
       if (acc) {
         await setModal({ kind: "remove", account: acc });
       }
-    });
-  });
-
-  document.querySelectorAll<HTMLElement>("[data-switch-uuid]").forEach((row) => {
-    row.addEventListener("click", async () => {
+      return;
+    }
+    const resolveBtn = target.closest<HTMLElement>("[data-resolve-uuid]");
+    if (resolveBtn) {
+      const uuid = resolveBtn.dataset.resolveUuid;
+      const keepProviderId = resolveBtn.dataset.resolveProvider;
+      if (uuid && keepProviderId) {
+        await callCommand("resolve_uuid_conflict", { keepProviderId, uuid });
+      }
+      return;
+    }
+    const providerBtn = target.closest<HTMLElement>("[data-provider]");
+    if (providerBtn) {
+      const nextId = providerBtn.dataset.provider as ProviderId;
+      if (!nextId || nextId === snapshot.selectedProviderId) return;
+      if (modal.kind !== "none") {
+        await setModal({ kind: "none" });
+      }
+      reorderMode = false;
+      reorderProviderId = null;
+      await callCommand("select_provider", { providerId: nextId });
+      // Batch-1: provider switch counts as activity — refresh quotas.
+      triggerAutoSync();
+      return;
+    }
+    const row = target.closest<HTMLElement>("[data-switch-uuid]");
+    if (row) {
       // Batch-1: taps do nothing in reorder mode.
-      if (reorderMode || modal.kind !== "none" || state.conflicts.length > 0) return;
+      if (reorderMode || modal.kind !== "none" || snapshot.conflicts.length > 0) {
+        return;
+      }
       const uuid = row.dataset.switchUuid;
       if (!uuid) return;
       if (
-        state.activeAccount?.providerId === provider.id &&
-        state.activeAccount?.uuid === uuid &&
-        !isMobilePlatform(state.platform)
+        snapshot.activeAccount?.providerId === provider.id &&
+        snapshot.activeAccount?.uuid === uuid &&
+        !isMobilePlatform(snapshot.platform)
       ) {
         return;
       }
-      const alreadyWarm = state.warmAccounts.some(
+      const alreadyWarm = snapshot.warmAccounts.some(
         (k) => k.providerId === provider.id && k.uuid === uuid
       );
       await callCommand(
@@ -1124,179 +1508,162 @@ function bindEvents(state: ManagerSnapshot, provider: ProviderInfo): void {
         { providerId: provider.id, uuid },
         alreadyWarm ? null : { providerId: provider.id, uuid }
       );
-    });
+      return;
+    }
+
+    const id = target.closest<HTMLElement>("[id]")?.id;
+    switch (id) {
+      case "open-site-btn":
+      case "stage-open-site-btn":
+        await callCommand("open_official_site", { providerId: provider.id });
+        break;
+      case "sync-all-btn": {
+        const btn = document.querySelector("#sync-all-btn");
+        btn?.classList.add("spinning");
+        try {
+          await callCommand("trigger_quota_sync");
+        } finally {
+          setTimeout(() => btn?.classList.remove("spinning"), 650);
+        }
+        break;
+      }
+      case "add-account-btn":
+      case "stage-add-btn":
+        await setModal({ kind: "add", providerId: provider.id, draft: "" });
+        break;
+      case "dismiss-notice-btn":
+        await callCommand("dismiss_notice");
+        break;
+      case "check-update-btn":
+        if (modal.kind !== "none") break;
+        await setModal({ kind: "update" });
+        if (!updateState.result && !updateState.checking && !updateState.installing) {
+          await runCheckForUpdates(false);
+        }
+        break;
+      case "update-recheck-btn":
+        await runCheckForUpdates(false);
+        break;
+      case "update-install-btn":
+        await runDownloadAndInstall();
+        break;
+      case "update-manual-install-btn":
+      case "update-open-page-btn":
+        await openReleasePage();
+        break;
+      case "reorder-done-btn":
+        reorderMode = false;
+        reorderProviderId = null;
+        render();
+        restoreScrollPosition();
+        break;
+      case "modal-cancel-btn":
+        if (modal.kind === "update" && updateState.installing) break;
+        await setModal({ kind: "none" });
+        break;
+      case "modal-confirm-btn": {
+        const currentModal = modal;
+        if (currentModal.kind === "add") {
+          const alias = currentModal.draft.trim();
+          await setModal({ kind: "none" });
+          await callCommand("add_account", {
+            providerId: currentModal.providerId,
+            alias,
+          });
+        } else if (currentModal.kind === "rename") {
+          const alias = currentModal.draft.trim();
+          if (!alias) break;
+          await setModal({ kind: "none" });
+          await callCommand("rename_account", {
+            providerId: currentModal.account.providerId,
+            uuid: currentModal.account.uuid,
+            alias,
+          });
+        } else if (currentModal.kind === "remove") {
+          await setModal({ kind: "none" });
+          await callCommand("remove_account", {
+            providerId: currentModal.account.providerId,
+            uuid: currentModal.account.uuid,
+          });
+        }
+        break;
+      }
+      default:
+        break;
+    }
   });
 
   // Batch-1 reorder: long-press a row to enter reorder mode, then drag
-  // by the handle. The DOM order is committed on release.
-  const listEl = document.querySelector<HTMLElement>(".account-list");
-  document.querySelector("#reorder-done-btn")?.addEventListener("click", () => {
-    reorderMode = false;
-    reorderProviderId = null;
-    render();
-    restoreScrollPosition();
-  });
-  if (listEl) {
-    let longPressTimer: ReturnType<typeof setTimeout> | null = null;
-    let longPressStart: { x: number; y: number } | null = null;
-    const cancelLongPress = () => {
-      if (longPressTimer) {
-        clearTimeout(longPressTimer);
-        longPressTimer = null;
-      }
-      longPressStart = null;
-    };
-    listEl.querySelectorAll<HTMLElement>("[data-switch-uuid]").forEach((row) => {
-      row.addEventListener("pointerdown", (ev) => {
-        if (reorderMode) return;
-        if ((ev.target as HTMLElement).closest("button")) return;
-        longPressStart = { x: ev.clientX, y: ev.clientY };
-        longPressTimer = setTimeout(() => {
-          longPressTimer = null;
-          longPressStart = null;
-          if (modal.kind !== "none") return;
-          reorderMode = true;
-          reorderProviderId = provider.id;
-          render();
-          restoreScrollPosition();
-        }, 500);
-      });
-      row.addEventListener("pointermove", (ev) => {
-        if (longPressTimer && longPressStart) {
-          const dx = ev.clientX - longPressStart.x;
-          const dy = ev.clientY - longPressStart.y;
-          if (dx * dx + dy * dy > 100) cancelLongPress();
-        }
-      });
-      row.addEventListener("pointerup", cancelLongPress);
-      row.addEventListener("pointercancel", cancelLongPress);
-    });
-    // Reorder drag (rewritten 2026-11-21 after the first version failed
-    // on-device). The old code listened for pointermove on the 28px
-    // handle itself and relied on setPointerCapture to keep the moves
-    // coming; verified in a touch test that capture does not retarget
-    // moves here, so once the finger left the handle the drag went dead
-    // — and the midpoint-crossing moves that actually reorder always
-    // happen over other rows. The drag now starts on the whole row (row
-    // taps are no-ops in reorder mode anyway) and listens for moves on
-    // window, via both Pointer Events and Touch Events (touch is the
-    // reliable path on iOS WKWebView). One drag session guards against
-    // double-handling: a touch fires touchstart then pointerdown, and
-    // the second start is ignored while a drag is active.
-    let dragRow: HTMLElement | null = null;
-    let dragTouchId: number | null = null;
-    const moveDrag = (clientY: number) => {
-      if (!dragRow) return;
-      const rows = Array.from(
-        listEl.querySelectorAll<HTMLElement>("[data-switch-uuid]")
-      );
-      const after = rows.find((r) => {
-        if (r === dragRow) return false;
-        const rect = r.getBoundingClientRect();
-        return clientY < rect.top + rect.height / 2;
-      });
-      if (after) listEl.insertBefore(dragRow, after);
-      else listEl.appendChild(dragRow);
-    };
-    const onPointerMove = (mv: PointerEvent) => moveDrag(mv.clientY);
-    const onPointerUp = () => {
-      void endDrag();
-    };
-    const onTouchMove = (ev: TouchEvent) => {
-      if (dragTouchId === null) return;
-      for (let i = 0; i < ev.changedTouches.length; i++) {
-        const t = ev.changedTouches[i];
-        if (t.identifier === dragTouchId) {
-          ev.preventDefault();
-          moveDrag(t.clientY);
-          return;
-        }
-      }
-    };
-    const onTouchEnd = (ev: TouchEvent) => {
-      if (dragTouchId === null) return;
-      for (let i = 0; i < ev.changedTouches.length; i++) {
-        if (ev.changedTouches[i].identifier === dragTouchId) {
-          void endDrag();
-          return;
-        }
-      }
-    };
-    const endDrag = async () => {
-      const row = dragRow;
-      if (!row) return;
-      dragRow = null;
-      dragTouchId = null;
-      dragActive = false;
-      window.removeEventListener("pointermove", onPointerMove);
-      window.removeEventListener("pointerup", onPointerUp);
-      window.removeEventListener("pointercancel", onPointerUp);
-      window.removeEventListener("touchmove", onTouchMove);
-      window.removeEventListener("touchend", onTouchEnd);
-      window.removeEventListener("touchcancel", onTouchEnd);
-      row.classList.remove("dragging");
-      const uuids = Array.from(
-        listEl.querySelectorAll<HTMLElement>("[data-switch-uuid]")
-      )
-        .map((r) => r.dataset.switchUuid)
-        .filter((u): u is string => Boolean(u));
-      const current = state.accounts
-        .filter((a) => a.providerId === provider.id)
-        .map((a) => a.uuid);
-      if (
-        uuids.length === current.length &&
-        uuids.some((u, i) => u !== current[i])
-      ) {
-        await callCommand("reorder_accounts", {
-          providerId: provider.id,
-          uuids,
-        });
-      } else {
-        render();
-        restoreScrollPosition();
-      }
-    };
-    const beginDrag = (row: HTMLElement) => {
+  // by the whole row. The DOM order is committed on release.
+  // (Drag rewritten 2026-11-21 after the first version failed on-device:
+  // the old code listened for pointermove on the 28px handle itself and
+  // relied on setPointerCapture to keep the moves coming; verified in a
+  // touch test that capture does not retarget moves here, so once the
+  // finger left the handle the drag went dead — and the midpoint-crossing
+  // moves that actually reorder always happen over other rows. The drag
+  // now starts on the whole row and listens for moves on window, via both
+  // Pointer Events and Touch Events. One drag session guards against
+  // double-handling: a touch fires touchstart then pointerdown, and the
+  // second start is ignored while a drag is active.)
+  root.addEventListener("pointerdown", (ev) => {
+    const row = (ev.target as HTMLElement).closest<HTMLElement>(
+      "[data-switch-uuid]"
+    );
+    if (!row) return;
+    if ((ev.target as HTMLElement).closest("button")) return;
+    if (reorderMode) {
       if (dragRow) return;
-      dragRow = row;
-      dragActive = true;
-      row.classList.add("dragging");
-      window.addEventListener("pointermove", onPointerMove);
-      window.addEventListener("pointerup", onPointerUp);
-      window.addEventListener("pointercancel", onPointerUp);
-      window.addEventListener("touchmove", onTouchMove, { passive: false });
-      window.addEventListener("touchend", onTouchEnd);
-      window.addEventListener("touchcancel", onTouchEnd);
-    };
-    listEl.querySelectorAll<HTMLElement>("[data-switch-uuid]").forEach((row) => {
-      row.addEventListener("pointerdown", (ev) => {
-        if (!reorderMode || dragRow) return;
-        if ((ev.target as HTMLElement).closest("button")) return;
-        ev.preventDefault();
-        beginDrag(row);
-      });
-      row.addEventListener(
-        "touchstart",
-        (ev) => {
-          if (!reorderMode || dragRow) return;
-          if ((ev.target as HTMLElement).closest("button")) return;
-          if (ev.touches.length !== 1) return;
-          ev.preventDefault();
-          dragTouchId = ev.touches[0].identifier;
-          beginDrag(row);
-        },
-        { passive: false }
-      );
-    });
-  }
-
-  const aliasInput = document.querySelector<HTMLInputElement>("#modal-alias-input");
-  aliasInput?.addEventListener("input", () => {
-    if (modal.kind === "add" || modal.kind === "rename") {
-      modal.draft = aliasInput.value;
+      ev.preventDefault();
+      beginDrag(row);
+      return;
+    }
+    longPressStart = { x: ev.clientX, y: ev.clientY };
+    longPressTimer = setTimeout(() => {
+      longPressTimer = null;
+      longPressStart = null;
+      if (modal.kind !== "none" || !snapshot) return;
+      reorderMode = true;
+      reorderProviderId = currentProvider(snapshot).id;
+      render();
+      restoreScrollPosition();
+    }, 500);
+  });
+  root.addEventListener("pointermove", (ev) => {
+    if (longPressTimer && longPressStart) {
+      const dx = ev.clientX - longPressStart.x;
+      const dy = ev.clientY - longPressStart.y;
+      if (dx * dx + dy * dy > 100) cancelLongPress();
     }
   });
-  aliasInput?.addEventListener("keydown", async (ev) => {
+  root.addEventListener("pointerup", cancelLongPress);
+  root.addEventListener("pointercancel", cancelLongPress);
+  root.addEventListener(
+    "touchstart",
+    (ev) => {
+      if (!reorderMode || dragRow) return;
+      const row = (ev.target as HTMLElement).closest<HTMLElement>(
+        "[data-switch-uuid]"
+      );
+      if (!row) return;
+      if ((ev.target as HTMLElement).closest("button")) return;
+      if (ev.touches.length !== 1) return;
+      ev.preventDefault();
+      dragTouchId = ev.touches[0].identifier;
+      beginDrag(row);
+    },
+    { passive: false }
+  );
+
+  root.addEventListener("input", (ev) => {
+    const input = ev.target as HTMLInputElement;
+    if (input.id !== "modal-alias-input") return;
+    if (modal.kind === "add" || modal.kind === "rename") {
+      modal.draft = input.value;
+    }
+  });
+  root.addEventListener("keydown", async (ev) => {
+    const input = ev.target as HTMLElement;
+    if (input.id !== "modal-alias-input") return;
     if (ev.key === "Enter") {
       ev.preventDefault();
       document.querySelector<HTMLButtonElement>("#modal-confirm-btn")?.click();
@@ -1305,41 +1672,12 @@ function bindEvents(state: ManagerSnapshot, provider: ProviderInfo): void {
       await setModal({ kind: "none" });
     }
   });
-
-  document.querySelector("#modal-cancel-btn")?.addEventListener("click", async () => {
-    if (modal.kind === "update" && updateState.installing) return;
-    await setModal({ kind: "none" });
-  });
-
-  document.querySelector("#modal-confirm-btn")?.addEventListener("click", async () => {
-    const currentModal = modal;
-    if (currentModal.kind === "add") {
-      const alias = currentModal.draft.trim();
-      await setModal({ kind: "none" });
-      await callCommand("add_account", {
-        providerId: currentModal.providerId,
-        alias,
-      });
-    } else if (currentModal.kind === "rename") {
-      const alias = currentModal.draft.trim();
-      if (!alias) return;
-      await setModal({ kind: "none" });
-      await callCommand("rename_account", {
-        providerId: currentModal.account.providerId,
-        uuid: currentModal.account.uuid,
-        alias,
-      });
-    } else if (currentModal.kind === "remove") {
-      await setModal({ kind: "none" });
-      await callCommand("remove_account", {
-        providerId: currentModal.account.providerId,
-        uuid: currentModal.account.uuid,
-      });
-    }
-  });
 }
 
 async function bootstrap(): Promise<void> {
+  // 0.1.9: event delegation is bound once here, before the first render.
+  bindDelegatedEvents();
+
   await listen<ManagerSnapshot>("manager-state-changed", (event) => {
     saveScrollPosition();
     snapshot = event.payload;
