@@ -100,9 +100,22 @@ async fn dismiss_notice(mgr: State<'_, Arc<SessionManager>>) -> Result<ManagerSn
 async fn trigger_quota_sync(
   app: AppHandle,
   mgr: State<'_, Arc<SessionManager>>,
+  force: Option<bool>,
 ) -> Result<ManagerSnapshot, String> {
-  mgr.trigger_silent_sync(&app, true).await;
+  // Batch-1: auto-triggers pass force=false (the 30s throttle applies);
+  // the desktop button omits it (force=true, as before).
+  mgr.trigger_silent_sync(&app, force.unwrap_or(true)).await;
   Ok(mgr.get_snapshot().await)
+}
+
+/// Batch-1: reorder one provider's accounts (long-press + drag in the list).
+#[tauri::command]
+async fn reorder_accounts(
+  mgr: State<'_, Arc<SessionManager>>,
+  provider_id: String,
+  uuids: Vec<String>,
+) -> Result<ManagerSnapshot, String> {
+  mgr.reorder_accounts(&provider_id, uuids).await
 }
 
 #[tauri::command]
@@ -213,6 +226,7 @@ pub fn run() {
       resolve_uuid_conflict,
       dismiss_notice,
       trigger_quota_sync,
+      reorder_accounts,
       check_for_updates,
       download_and_install_update,
       open_external_url,
