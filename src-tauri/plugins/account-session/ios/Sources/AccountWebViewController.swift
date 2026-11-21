@@ -53,6 +53,17 @@ final class AccountWebViewController: UIViewController, WKNavigationDelegate, WK
   // programmatically once; keeps the cancel+reload intercept from
   // looping on its own reload.
   private var popupCallbackReloaded = false
+  // 0.1.13: set once the OAuth callback page has loaded in the popup;
+  // the popup only closes after the flow moves on (a post-callback
+  // page, window.close, or the timeout below) — never on the callback
+  // load itself, which killed the completion in 0.1.12.
+  private var popupCallbackLoaded = false
+  // 0.1.13: closes a callback popup that never navigates on nor closes
+  // itself (8s after the callback page loads).
+  private var popupOAuthTimeout: Timer?
+  // 0.1.13: reloads the session a short while after an OAuth popup
+  // closes, so any in-flight completion on the main page can settle.
+  private var postOAuthReloadTimer: Timer?
   private var mainInputEnabled = false
   private var popupInputEnabled = false
   private var closingFromManager = false
@@ -433,7 +444,7 @@ final class AccountWebViewController: UIViewController, WKNavigationDelegate, WK
         // 0.1.11: same-store tab model — let Google load in the popup
         // (it shares the session's data store, so Muse's OAuth state
         // validates and the callback lands in the same jar). didFinish
-        // closes the tab once the callback lands on an allowlisted host.
+        // waits for the flow to complete before closing the tab (0.1.13).
         popupDidOAuth = true
         popupCallbackReloaded = false
         decisionHandler(.allow)
@@ -611,19 +622,43 @@ final class AccountWebViewController: UIViewController, WKNavigationDelegate, WK
   }
 
   func webView(_ webView: WKWebView, didFinish navigation: WKNavigation!) {
-    // 0.1.11: the OAuth callback has loaded inside the popup — the GET
-    // already reached Muse's server, so the code was exchanged. Close
-    // the tab and reload the session so the new connection state shows.
-    // (Checked here, not in decidePolicyFor: cancelling the callback
-    // navigation would stop the request from ever reaching the server.)
+    // 0.1.13: the OAuth callback page has loaded in the popup — but do
+    // NOT close it yet. 0.1.12 closed the popup and reloaded the session
+    // the moment the callback loaded, which killed the completion: the
+    // callback page (or the main page, via postMessage) may still be
+    // finishing async work, and the reload wiped the main page's state
+    // mid-flight (2026-11-22 user test: the flow reached the Muse page,
+    // but the connection never completed). Instead, mark the callback
+    // loaded and wait: the popup closes when it navigates on to a
+    // post-callback page, when the page closes itself (webViewDidClose),
+    // or after an 8s timeout; the session reloads 2s after the popup
+    // closes (see destroyPopupWebView).
     guard webView === popupWebView,
       popupDidOAuth,
       let spec = currentSpec,
       let url = webView.url,
       AccountSessionCoordinator.hostMatchesAllowed(url, allowedHosts: spec.allowedHosts)
     else { return }
+    if isOAuthCallbackURL(url) {
+      guard !popupCallbackLoaded else { return }
+      popupCallbackLoaded = true
+      popupOAuthTimeout?.invalidate()
+      popupOAuthTimeout = Timer.scheduledTimer(withTimeInterval: 8.0, repeats: false) {
+        [weak self] _ in
+        guard let self, self.popupWebView != nil else { return }
+        self.destroyPopupWebView()
+      }
+      return
+    }
+    // A post-callback page loaded (the flow redirected on): done.
+    guard popupCallbackLoaded else { return }
     destroyPopupWebView()
-    mainWebView?.reload()
+  }
+
+  /// The OAuth authorization-code callback carries a `code` query item.
+  private func isOAuthCallbackURL(_ url: URL) -> Bool {
+    URLComponents(url: url, resolvingAgainstBaseURL: false)?
+      .queryItems?.contains { $0.name == "code" } == true
   }
 
   func webView(
@@ -706,15 +741,15 @@ final class AccountWebViewController: UIViewController, WKNavigationDelegate, WK
     // the callback lands on muse.ai in the same jar. (0.1.10's Safari
     // sheet failed in practice: the sheet shares Safari's cookie jar, a
     // different Muse session, so the connection never reached the app's
-    // page.) Two risks this build tests: (a) the 0.1.6 crash happened
-    // creating a popup with a FRESH configuration in the SSO path
-    // (uncaught NSException in UIClient::createNewPage; 2026-11-21 .ips);
-    // 0.1.8 switched to the configuration WebKit prepared for the popup
-    // (opener's process pool + SSO state) — untested for Google OAuth
-    // until now; (b) Google policy blocks OAuth in embedded webviews
-    // (403 disallowed_useragent) — if the login page refuses to load,
-    // this path is dead and the fallback is running the whole flow
-    // inside the Safari sheet from the Muse connectors page.
+    // page.) 0.1.11's test cleared both risks it carried: no crash (the
+    // 0.1.6 crash was creating a popup with a FRESH configuration; 0.1.8
+    // switched to the configuration WebKit prepared for the popup) and
+    // no Google 403 — but the callback was then hijacked by iOS via
+    // Universal Link (fixed in 0.1.12 by cancelling the callback
+    // navigation and reloading it programmatically), and 0.1.12 closed
+    // the popup and reloaded the session the moment the callback loaded,
+    // which killed the completion (fixed in 0.1.13 by waiting for the
+    // flow to finish before closing).
     // About:blank popups (URL unknown yet) still go through and are
     // filtered by decidePolicyFor when they navigate.
     if let url = navigationAction.request.url,
@@ -767,6 +802,7 @@ final class AccountWebViewController: UIViewController, WKNavigationDelegate, WK
 
     popupDidOAuth = false
     popupCallbackReloaded = false
+    popupCallbackLoaded = false
     popupWebView = popup
     popupDomainLabel.text = ""
     popupOverlayRoot.isHidden = true
@@ -787,7 +823,19 @@ final class AccountWebViewController: UIViewController, WKNavigationDelegate, WK
     popupWebView = nil
     popupDidOAuth = false
     popupCallbackReloaded = false
+    popupOAuthTimeout?.invalidate()
+    popupOAuthTimeout = nil
     popupInputEnabled = false
+    // 0.1.13: the popup carried an OAuth callback to completion — reload
+    // the session after a short delay so any in-flight completion on
+    // the main page (e.g. a postMessage-triggered API call) can settle
+    // before the reload. No reload for popups that never reached a
+    // callback (cancelled flows, blocked navigations).
+    let didCallback = popupCallbackLoaded
+    popupCallbackLoaded = false
+    if didCallback, let spec = currentSpec {
+      schedulePostOAuthReload(spec: spec)
+    }
     popupOverlayRoot.isHidden = true
     popupDomainLabel.text = ""
     popupWebContainer.subviews.forEach { $0.removeFromSuperview() }
@@ -795,6 +843,24 @@ final class AccountWebViewController: UIViewController, WKNavigationDelegate, WK
     popup?.navigationDelegate = nil
     popup?.uiDelegate = nil
     popup?.removeFromSuperview()
+  }
+
+  /// 0.1.13: reloads the session 2s after an OAuth popup closes. The
+  /// delay lets any in-flight completion on the main page settle; the
+  /// guards skip the reload if the session moved on or another popup
+  /// opened in the meantime.
+  private func schedulePostOAuthReload(spec: IosAccountSessionSpec) {
+    postOAuthReloadTimer?.invalidate()
+    let seq = spec.switchSeq
+    let viewId = spec.viewInstanceId
+    postOAuthReloadTimer = Timer.scheduledTimer(withTimeInterval: 2.0, repeats: false) {
+      [weak self] _ in
+      guard let self,
+        self.popupWebView == nil,
+        AccountSessionCoordinator.shared.isCurrent(switchSeq: seq, viewInstanceId: viewId)
+      else { return }
+      self.mainWebView?.reload()
+    }
   }
 
   // MARK: - Identity probe loop
