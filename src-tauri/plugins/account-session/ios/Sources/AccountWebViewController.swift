@@ -36,6 +36,9 @@ final class AccountWebViewController: UIViewController, WKNavigationDelegate, WK
   private var popupOverlayRoot: UIView!
   private var popupDomainLabel: UILabel!
   private var popupWebContainer: UIView!
+  // Batch-1: thin load-progress bar under the top bar.
+  private var progressView: UIProgressView!
+  private var progressObservation: NSKeyValueObservation?
 
   // MARK: - Session state
 
@@ -52,6 +55,16 @@ final class AccountWebViewController: UIViewController, WKNavigationDelegate, WK
   private var probeGeneration = 0
   private var consecutiveLoggedOut = 0
   private var loggedOutReported = false
+  // Batch-1 probe backoff: while identity + quota are stable, the probe
+  // interval relaxes from 4.5s to 30s; any change snaps it back to 4.5s.
+  private var probeInterval: TimeInterval = 4.5
+  private var lastProbeSignature: String?
+  private var stableProbeCount = 0
+  // Batch-1 termination recovery: reload in place on the first kill, and
+  // only give up (back to the manager) if the process dies twice within
+  // 60 seconds.
+  private var contentProcessCrashCount = 0
+  private var lastContentProcessCrash: Date?
 
   private struct ProbeData {
     let auth: Bool
@@ -111,6 +124,14 @@ final class AccountWebViewController: UIViewController, WKNavigationDelegate, WK
     loadingIndicator = UIActivityIndicatorView(style: .large)
     loadingIndicator.translatesAutoresizingMaskIntoConstraints = false
 
+    // Batch-1: thin progress bar overlaying the top edge of the content
+    // area (Safari-style); hidden when no load is in progress.
+    progressView = UIProgressView(progressViewStyle: .bar)
+    progressView.translatesAutoresizingMaskIntoConstraints = false
+    progressView.progressTintColor = .systemBlue
+    progressView.trackTintColor = .clear
+    progressView.alpha = 0
+
     mainWebContainer = UIView()
     mainWebContainer.translatesAutoresizingMaskIntoConstraints = false
 
@@ -152,6 +173,7 @@ final class AccountWebViewController: UIViewController, WKNavigationDelegate, WK
     view.addSubview(topBar)
     view.addSubview(contentFrame)
     view.addSubview(popupOverlayRoot)
+    view.addSubview(progressView)
 
     let safe = view.safeAreaLayoutGuide
     NSLayoutConstraint.activate([
@@ -159,6 +181,11 @@ final class AccountWebViewController: UIViewController, WKNavigationDelegate, WK
       topBar.leadingAnchor.constraint(equalTo: view.leadingAnchor),
       topBar.trailingAnchor.constraint(equalTo: view.trailingAnchor),
       topBar.heightAnchor.constraint(equalToConstant: 52),
+
+      progressView.topAnchor.constraint(equalTo: topBar.bottomAnchor),
+      progressView.leadingAnchor.constraint(equalTo: view.leadingAnchor),
+      progressView.trailingAnchor.constraint(equalTo: view.trailingAnchor),
+      progressView.heightAnchor.constraint(equalToConstant: 2),
 
       backButton.leadingAnchor.constraint(equalTo: topBar.leadingAnchor, constant: 10),
       backButton.centerYAnchor.constraint(equalTo: topBar.centerYAnchor),
@@ -282,6 +309,10 @@ final class AccountWebViewController: UIViewController, WKNavigationDelegate, WK
       DataStoreRegistry.markCreated(spec.uuid)
       config.defaultWebpagePreferences.allowsContentJavaScript = true
       config.preferences.javaScriptCanOpenWindowsAutomatically = false
+      // Batch-1: on iPhone WKWebView plays every <video> fullscreen by
+      // default, which breaks avatar videos (muted autoplay) and leaves
+      // no working close control. Inline playback keeps video in-page.
+      config.allowsInlineMediaPlayback = true
       config.userContentController.addUserScript(
         WKUserScript(
           source: Scripts.quotaHookInitScript,
@@ -306,6 +337,26 @@ final class AccountWebViewController: UIViewController, WKNavigationDelegate, WK
       webView.trailingAnchor.constraint(equalTo: mainWebContainer.trailingAnchor),
       webView.bottomAnchor.constraint(equalTo: mainWebContainer.bottomAnchor),
     ])
+
+    // Batch-1: drive the progress bar from estimatedProgress.
+    progressObservation?.invalidate()
+    progressView.progress = 0
+    progressView.alpha = cached == nil ? 1 : 0
+    progressObservation = webView.observe(
+      \.estimatedProgress, options: [.new]
+    ) { [weak self] observed, _ in
+      guard let self else { return }
+      let update = {
+        let p = Float(observed.estimatedProgress)
+        self.progressView.setProgress(p, animated: true)
+        self.progressView.alpha = p >= 1.0 ? 0 : 1
+      }
+      if Thread.isMainThread {
+        update()
+      } else {
+        DispatchQueue.main.async(execute: update)
+      }
+    }
 
     if let restoredUrl = cached?.url {
       committedAuthority = authority(of: restoredUrl)
@@ -401,9 +452,41 @@ final class AccountWebViewController: UIViewController, WKNavigationDelegate, WK
       decisionHandler(.cancel)
       return
     }
-    decisionHandler(
-      AccountSessionCoordinator.hostMatchesAllowed(url, allowedHosts: spec.allowedHosts)
-        ? .allow : .cancel)
+    if AccountSessionCoordinator.hostMatchesAllowed(url, allowedHosts: spec.allowedHosts) {
+      decisionHandler(.allow)
+      return
+    }
+    // Batch-1: a tapped link outside the allowlist used to be cancelled
+    // silently. Offer Safari instead — but only for real link taps; other
+    // main-frame navigations (redirects, form posts) keep the silent
+    // cancel so auth flows are not interrupted by a prompt.
+    if navigationAction.navigationType == .linkActivated,
+      let url, url.scheme?.lowercased() == "https" || url.scheme?.lowercased() == "http"
+    {
+      decisionHandler(.cancel)
+      presentExternalLinkAlert(url: url)
+      return
+    }
+    decisionHandler(.cancel)
+  }
+
+  /// Batch-1: asks before opening an off-allowlist link in Safari (the
+  /// isolated session does not follow — Safari has its own cookies).
+  private func presentExternalLinkAlert(url: URL) {
+    guard presentedViewController == nil else { return }
+    let host = url.host ?? url.absoluteString
+    let alert = UIAlertController(
+      title: "在 Safari 中打开？",
+      message: "即将离开 \(host)，该页面将在系统浏览器中打开，不使用当前账号的独立会话。",
+      preferredStyle: .alert
+    )
+    alert.addAction(
+      UIAlertAction(title: "取消", style: .cancel, handler: nil))
+    alert.addAction(
+      UIAlertAction(title: "在 Safari 中打开", style: .default) { _ in
+        UIApplication.shared.open(url, options: [:], completionHandler: nil)
+      })
+    present(alert, animated: true, completion: nil)
   }
 
   func webView(
@@ -463,6 +546,9 @@ final class AccountWebViewController: UIViewController, WKNavigationDelegate, WK
       return
     }
     committedAuthority = mainLoadFailed ? nil : authority(of: url)
+    // Batch-1: a successful commit clears the termination-recovery count.
+    contentProcessCrashCount = 0
+    lastContentProcessCrash = nil
     AccountSessionCoordinator.shared.emitPageCommitVisible(spec: spec, url: url.absoluteString)
   }
 
@@ -494,12 +580,35 @@ final class AccountWebViewController: UIViewController, WKNavigationDelegate, WK
       return
     }
     guard webView === mainWebView, let spec = currentSpec else { return }
-    AccountSessionCoordinator.shared.emitSessionFailed(
-      switchSeq: spec.switchSeq,
-      viewInstanceId: spec.viewInstanceId,
-      reason: "账号页面已被系统回收，请重新打开"
-    )
-    closeAndFinishFromManager()
+    // Batch-1 recovery, in the user's eviction order: inactive spaces
+    // first (drop every parked page to free memory), then reload the
+    // active page in place — its cookies live in the data store, so a
+    // reload normally restores the session. Only if the process dies
+    // twice within 60 seconds do we give up and go back to the manager.
+    let now = Date()
+    if let last = lastContentProcessCrash,
+      now.timeIntervalSince(last) > 60
+    {
+      contentProcessCrashCount = 0
+    }
+    contentProcessCrashCount += 1
+    lastContentProcessCrash = now
+    guard contentProcessCrashCount < 2 else {
+      AccountSessionCoordinator.shared.emitSessionFailed(
+        switchSeq: spec.switchSeq,
+        viewInstanceId: spec.viewInstanceId,
+        reason: "账号页面已被系统回收，请重新打开"
+      )
+      closeAndFinishFromManager()
+      return
+    }
+    RecentAccountPages.clearAll()
+    destroyPopupWebView()
+    headerTitleLabel.text = "页面被系统回收，正在恢复…"
+    loadingIndicator.startAnimating()
+    progressView.progress = 0
+    progressView.alpha = 1
+    webView.reload()
   }
 
   // MARK: - WKUIDelegate (auth popup)
@@ -531,6 +640,8 @@ final class AccountWebViewController: UIViewController, WKNavigationDelegate, WK
     config.websiteDataStore = mainView.configuration.websiteDataStore
     config.defaultWebpagePreferences.allowsContentJavaScript = true
     config.preferences.javaScriptCanOpenWindowsAutomatically = false
+    // Batch-1: same inline-playback fix as the main view.
+    config.allowsInlineMediaPlayback = true
     let popup = WKWebView(frame: .zero, configuration: config)
 
     popupInputEnabled = false
@@ -573,6 +684,10 @@ final class AccountWebViewController: UIViewController, WKNavigationDelegate, WK
     stopIdentityProbeLoop()
     consecutiveLoggedOut = 0
     loggedOutReported = false
+    // Batch-1: backoff state resets with every new session.
+    probeInterval = 4.5
+    lastProbeSignature = nil
+    stableProbeCount = 0
     scheduleProbe(after: 1.4, spec: spec)
   }
 
@@ -620,6 +735,22 @@ final class AccountWebViewController: UIViewController, WKNavigationDelegate, WK
           switchSeq: spec.switchSeq, viewInstanceId: spec.viewInstanceId),
         let parsed = self.parseProbeOutput(result)
       else { return }
+      // Batch-1 backoff: when everything the probe reports stays identical
+      // for 4 consecutive probes, relax the interval to 30s; any change
+      // snaps it back to 4.5s on the next cycle.
+      let signature = [
+        parsed.auth ? "1" : "0",
+        parsed.loggedOut ? "1" : "0",
+        parsed.typed, parsed.email, parsed.avatar, parsed.quotaText,
+        String(parsed.quotaPct ?? -1), parsed.quotaDetailJson,
+      ].joined(separator: "|")
+      if signature == self.lastProbeSignature {
+        self.stableProbeCount += 1
+      } else {
+        self.stableProbeCount = 0
+        self.lastProbeSignature = signature
+      }
+      self.probeInterval = self.stableProbeCount >= 4 ? 30 : 4.5
       if !parsed.typed.isEmpty {
         self.capturedIdentityHint = parsed.typed
       }
@@ -649,7 +780,7 @@ final class AccountWebViewController: UIViewController, WKNavigationDelegate, WK
       }
     }
 
-    scheduleProbe(after: 4.5, spec: spec)
+    scheduleProbe(after: probeInterval, spec: spec)
   }
 
   private func parseProbeOutput(_ result: Any?) -> ProbeData? {
@@ -701,6 +832,9 @@ final class AccountWebViewController: UIViewController, WKNavigationDelegate, WK
     mainWebView = nil
     currentSpec = nil
     committedAuthority = nil
+    progressObservation?.invalidate()
+    progressObservation = nil
+    progressView.alpha = 0
     stopIdentityProbeLoop()
     capturedIdentityHint = nil
     mainInputEnabled = false
