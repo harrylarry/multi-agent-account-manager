@@ -1533,3 +1533,37 @@ body,
 .mobile-shell .update-notes {
   font-size: 12.5px;
 }
+
+/* Batch-1 account reorder (long-press a row, drag by the handle). */
+.drag-handle {
+  display: none;
+  align-items: center;
+  justify-content: center;
+  width: 28px;
+  height: 32px;
+  min-width: 28px;
+  color: var(--text-sub);
+  cursor: grab;
+  touch-action: none;
+  user-select: none;
+  -webkit-user-select: none;
+}
+
+.account-list.reorder-mode .drag-handle {
+  display: flex;
+}
+
+.account-list.reorder-mode .row-ops {
+  display: none;
+}
+
+.account-list.reorder-mode .account-row {
+  cursor: default;
+}
+
+.account-row.dragging {
+  opacity: 0.75;
+  box-shadow: 0 6px 18px rgba(0, 0, 0, 0.14);
+  background: #f5f9ff;
+  border-color: #bfd8ff;
+}
