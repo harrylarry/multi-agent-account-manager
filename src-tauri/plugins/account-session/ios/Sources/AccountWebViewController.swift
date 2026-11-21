@@ -580,6 +580,9 @@ final class AccountWebViewController: UIViewController, WKNavigationDelegate, WK
       return
     }
     guard webView === mainWebView, let spec = currentSpec else { return }
+    // 0.1.8: the shared WebContent process was jetsammed — lower the
+    // parked-page cap so the cache rebuilds more conservatively.
+    RecentAccountPages.noteProcessTermination()
     // Batch-1 recovery, in the user's eviction order: inactive spaces
     // first (drop every parked page to free memory), then reload the
     // active page in place — its cookies live in the data store, so a
@@ -623,7 +626,28 @@ final class AccountWebViewController: UIViewController, WKNavigationDelegate, WK
       popupWebView == nil,
       ownsMainView(webView, spec: spec)
     else { return nil }
-    return createBoundAuthPopup(spec: spec)
+    // 0.1.8 Gmail-crash fix: a popup opened for Google OAuth used to be
+    // created here and then immediately destroyed by decidePolicyFor —
+    // but on iOS 27, creating it at all crashes inside WebKit's
+    // SOAuthorizationCoordinator path (uncaught NSException in
+    // UIClient::createNewPage; 2026-11-21 .ips, 100% reproducible from
+    // Muse's Gmail connector). Never create a popup for a URL we are
+    // going to block anyway; about:blank popups (URL unknown yet) still
+    // go through and are filtered by decidePolicyFor when they navigate.
+    if let url = navigationAction.request.url,
+      url.absoluteString != "about:blank"
+    {
+      if AccountSessionCoordinator.isGoogleOAuthHost(url) {
+        AccountSessionCoordinator.shared.emitExternalAuthUnavailable(
+          switchSeq: spec.switchSeq, viewInstanceId: spec.viewInstanceId,
+          reason: Self.googleOAuthReason)
+        return nil
+      }
+      if !AccountSessionCoordinator.hostMatchesAllowed(url, allowedHosts: spec.allowedHosts) {
+        return nil
+      }
+    }
+    return createBoundAuthPopup(spec: spec, configuration: configuration)
   }
 
   func webViewDidClose(_ webView: WKWebView) {
@@ -632,11 +656,23 @@ final class AccountWebViewController: UIViewController, WKNavigationDelegate, WK
     }
   }
 
-  private func createBoundAuthPopup(spec: IosAccountSessionSpec) -> WKWebView? {
+  private func createBoundAuthPopup(
+    spec: IosAccountSessionSpec,
+    configuration: WKWebViewConfiguration
+  ) -> WKWebView? {
     guard let mainView = mainWebView else { return nil }
+    // 0.1.8: use the configuration WebKit prepared for this popup (it
+    // carries the opener's process pool and SSO state) instead of a
+    // fresh one. A fresh configuration drops the opener association,
+    // which is what the crashing SSO path chokes on. Copy before
+    // tweaking; the passed configuration is WebKit's.
+    guard let config = configuration.copy() as? WKWebViewConfiguration else {
+      return nil
+    }
     // Same data store as the main view: the popup shares the account's
     // isolated profile, exactly like Android's setProfile(popup, spec.uuid).
-    let config = WKWebViewConfiguration()
+    // (The passed configuration already inherits it from the opener;
+    // set explicitly so the invariant never depends on that.)
     config.websiteDataStore = mainView.configuration.websiteDataStore
     config.defaultWebpagePreferences.allowsContentJavaScript = true
     config.preferences.javaScriptCanOpenWindowsAutomatically = false
