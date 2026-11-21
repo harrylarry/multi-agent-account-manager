@@ -525,3 +525,61 @@ pub async fn fetch_text(
     .await
     .map_err(|e| e.to_string())
 }
+
+// Batch-1: background quota sync (iOS). Rust passes the accounts to sync
+// (already filtered: enabled, not the active one); Swift probes each
+// account's parked page or a hidden one-shot webview and returns the
+// per-account results for apply_synced_metadata.
+#[cfg(target_os = "ios")]
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SyncQuotaTarget {
+  pub provider_id: String,
+  pub uuid: String,
+  pub entry_url: String,
+}
+
+#[cfg(target_os = "ios")]
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SyncQuotaResult {
+  pub provider_id: String,
+  pub uuid: String,
+  #[serde(default)]
+  pub identity: String,
+  #[serde(default)]
+  pub avatar_url: Option<String>,
+  #[serde(default)]
+  pub quota_text: Option<String>,
+  #[serde(default)]
+  pub quota_percent: Option<u8>,
+  #[serde(default)]
+  pub quota_detail_json: Option<String>,
+  #[serde(default)]
+  pub logged_out: bool,
+}
+
+#[cfg(target_os = "ios")]
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SyncQuotasResponse {
+  #[serde(default)]
+  pub results: Vec<SyncQuotaResult>,
+}
+
+#[cfg(target_os = "ios")]
+pub async fn sync_account_quotas(
+  app: &AppHandle,
+  accounts: Vec<SyncQuotaTarget>,
+) -> Result<Vec<SyncQuotaResult>, String> {
+  let bridge = app.state::<IosSessionBridge<tauri::Wry>>();
+  let res: SyncQuotasResponse = bridge
+    .0
+    .run_mobile_plugin_async(
+      "syncAccountQuotas",
+      serde_json::json!({ "accounts": accounts }),
+    )
+    .await
+    .map_err(|e| e.to_string())?;
+  Ok(res.results)
+}
