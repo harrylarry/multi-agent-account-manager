@@ -20,13 +20,11 @@
 //   forMainFrameOnly at document start for all hosts.
 // - There is no Activity-recreate path on iOS (see Coordinator).
 
+import SafariServices
 import UIKit
 import WebKit
 
-final class AccountWebViewController: UIViewController, WKNavigationDelegate, WKUIDelegate {
-
-  private static let googleOAuthReason =
-    "Google OAuth 按政策需使用系统浏览器，当前回跳暂无法绑定至发起账号的独立 Profile，请使用邮箱或手机号登录"
+final class AccountWebViewController: UIViewController, WKNavigationDelegate, WKUIDelegate, SFSafariViewControllerDelegate {
 
   // MARK: - UI
 
@@ -423,11 +421,9 @@ final class AccountWebViewController: UIViewController, WKNavigationDelegate, WK
         decisionHandler(.cancel)
         return
       }
-      if AccountSessionCoordinator.isGoogleOAuthHost(url) {
+      if let url, AccountSessionCoordinator.isGoogleOAuthHost(url) {
         destroyPopupWebView()
-        AccountSessionCoordinator.shared.emitExternalAuthUnavailable(
-          switchSeq: spec.switchSeq, viewInstanceId: spec.viewInstanceId,
-          reason: Self.googleOAuthReason)
+        presentGoogleOAuth(url: url)
         decisionHandler(.cancel)
         return
       }
@@ -445,10 +441,8 @@ final class AccountWebViewController: UIViewController, WKNavigationDelegate, WK
       decisionHandler(.cancel)
       return
     }
-    if AccountSessionCoordinator.isGoogleOAuthHost(url) {
-      AccountSessionCoordinator.shared.emitExternalAuthUnavailable(
-        switchSeq: spec.switchSeq, viewInstanceId: spec.viewInstanceId,
-        reason: Self.googleOAuthReason)
+    if let url, AccountSessionCoordinator.isGoogleOAuthHost(url) {
+      presentGoogleOAuth(url: url)
       decisionHandler(.cancel)
       return
     }
@@ -487,6 +481,28 @@ final class AccountWebViewController: UIViewController, WKNavigationDelegate, WK
         UIApplication.shared.open(url, options: [:], completionHandler: nil)
       })
     present(alert, animated: true, completion: nil)
+  }
+
+  // 0.1.10: Google OAuth runs in an in-app Safari sheet. Google blocks
+  // OAuth in embedded webviews (403 disallowed_useragent), and creating
+  // a WKWebView popup for it crashes on iOS 27 (0.1.8). SFSafariViewController
+  // is a system browser surface Google explicitly allows. The flow is
+  // entirely web-based (muse.ai -> Google -> muse.ai): the callback loads
+  // as a page on muse.ai inside the sheet, Muse's server exchanges the
+  // code, and the connection is stored on the Muse account — the app never
+  // needs to catch the callback.
+  private func presentGoogleOAuth(url: URL) {
+    guard presentedViewController == nil else { return }
+    let safari = SFSafariViewController(url: url)
+    safari.delegate = self
+    present(safari, animated: true, completion: nil)
+  }
+
+  func safariViewControllerDidFinish(_ controller: SFSafariViewController) {
+    // The user closed the sheet (Done or swipe). If the OAuth completed,
+    // the Muse page now shows the connector as connected; reload so the
+    // session reflects it. Harmless if they cancelled mid-flow.
+    mainWebView?.reload()
   }
 
   func webView(
@@ -631,16 +647,15 @@ final class AccountWebViewController: UIViewController, WKNavigationDelegate, WK
     // but on iOS 27, creating it at all crashes inside WebKit's
     // SOAuthorizationCoordinator path (uncaught NSException in
     // UIClient::createNewPage; 2026-11-21 .ips, 100% reproducible from
-    // Muse's Gmail connector). Never create a popup for a URL we are
-    // going to block anyway; about:blank popups (URL unknown yet) still
+    // Muse's Gmail connector). Never create a popup for a Google OAuth
+    // URL; 0.1.10 opens it in an in-app Safari sheet instead (see
+    // presentGoogleOAuth). About:blank popups (URL unknown yet) still
     // go through and are filtered by decidePolicyFor when they navigate.
     if let url = navigationAction.request.url,
       url.absoluteString != "about:blank"
     {
       if AccountSessionCoordinator.isGoogleOAuthHost(url) {
-        AccountSessionCoordinator.shared.emitExternalAuthUnavailable(
-          switchSeq: spec.switchSeq, viewInstanceId: spec.viewInstanceId,
-          reason: Self.googleOAuthReason)
+        presentGoogleOAuth(url: url)
         return nil
       }
       if !AccountSessionCoordinator.hostMatchesAllowed(url, allowedHosts: spec.allowedHosts) {
