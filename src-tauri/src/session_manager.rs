@@ -1082,16 +1082,22 @@ impl SessionManager {
 
     self.retry_pending_cleanups(app).await;
 
-    let mgr_periodic = Arc::clone(self);
-    let app_periodic = app.clone();
-    tauri::async_runtime::spawn(async move {
-      let mut interval = tokio::time::interval(tokio::time::Duration::from_secs(5 * 60));
-      interval.tick().await;
-      loop {
+    // Batch-1: the 5-minute periodic sync is desktop-only now. On iOS
+    // there is no background sync at all — syncs happen on app entry and
+    // user activity (see trigger_silent_sync + the frontend triggers).
+    #[cfg(desktop)]
+    {
+      let mgr_periodic = Arc::clone(self);
+      let app_periodic = app.clone();
+      tauri::async_runtime::spawn(async move {
+        let mut interval = tokio::time::interval(tokio::time::Duration::from_secs(5 * 60));
         interval.tick().await;
-        mgr_periodic.trigger_silent_sync(&app_periodic, false).await;
-      }
-    });
+        loop {
+          interval.tick().await;
+          mgr_periodic.trigger_silent_sync(&app_periodic, false).await;
+        }
+      });
+    }
 
     let candidate = {
       let mut locked = self.inner.lock().await;
@@ -1680,6 +1686,55 @@ impl SessionManager {
     Self::snapshot_from_locked(&locked)
   }
 
+  /// Batch-1: reorders one provider's accounts to the given uuid order.
+  /// The uuid list must contain exactly that provider's accounts.
+  /// Other providers' accounts stay where they are; the reordered block
+  /// goes back at the first position this provider occupied.
+  pub async fn reorder_accounts(
+    &self,
+    provider_id: &str,
+    uuids: Vec<String>,
+  ) -> Result<ManagerSnapshot, String> {
+    let pid = ProviderId::parse(provider_id).ok_or_else(|| "未知服务".to_string())?;
+    if !get_provider(pid).info.enabled {
+      return Err("该服务尚未开放应用内嵌".to_string());
+    }
+    let mut locked = self.inner.lock().await;
+    let current: Vec<String> = locked
+      .store
+      .accounts
+      .iter()
+      .filter(|a| a.provider_id == pid)
+      .map(|a| a.uuid.clone())
+      .collect();
+    if uuids.len() != current.len() || !uuids.iter().all(|u| current.contains(u)) {
+      return Err("排序列表与账号列表不一致".to_string());
+    }
+    let first_pos = locked
+      .store
+      .accounts
+      .iter()
+      .position(|a| a.provider_id == pid);
+    let mut by_uuid: std::collections::HashMap<String, AccountRecord> = locked
+      .store
+      .accounts
+      .iter()
+      .filter(|a| a.provider_id == pid)
+      .map(|a| (a.uuid.clone(), a.clone()))
+      .collect();
+    locked.store.accounts.retain(|a| a.provider_id != pid);
+    let ordered: Vec<AccountRecord> = uuids
+      .into_iter()
+      .filter_map(|u| by_uuid.remove(&u))
+      .collect();
+    let at = first_pos.unwrap_or(locked.store.accounts.len());
+    for (i, acc) in ordered.into_iter().enumerate() {
+      locked.store.accounts.insert(at + i, acc);
+    }
+    save_store_atomic(&locked.store_path, &locked.store)?;
+    Ok(Self::snapshot_from_locked(&locked))
+  }
+
   pub async fn switch_account(
     self: &Arc<Self>,
     app: &AppHandle,
@@ -1729,7 +1784,50 @@ impl SessionManager {
     }
     self.last_sync_timestamp.store(now, Ordering::SeqCst);
 
-    #[cfg(not(desktop))]
+    #[cfg(target_os = "ios")]
+    {
+      // Batch-1: iOS silent sync. The desktop path evals JS in Tauri warm
+      // webviews, which iOS doesn't have; the Swift plugin probes parked
+      // pages or hidden one-shot webviews instead. The currently open
+      // account is skipped — the foreground probe already covers it.
+      // Runs in a spawned task: a sync can take a while (one hidden page
+      // load per cold account) and must never block the caller.
+      let targets = {
+        let locked = self.inner.lock().await;
+        let active = locked.active_slot.as_ref().map(|s| s.account_key.clone());
+        locked
+          .store
+          .accounts
+          .iter()
+          .filter(|a| get_provider(a.provider_id).info.enabled)
+          .filter(|a| {
+            let k = AccountKey {
+              provider_id: a.provider_id,
+              uuid: a.uuid.clone(),
+            };
+            Some(&k) != active.as_ref() && !locked.store.pending_cleanup.contains(&k)
+          })
+          .map(|a| crate::platform::ios::SyncQuotaTarget {
+            provider_id: a.provider_id.as_str().to_string(),
+            uuid: a.uuid.clone(),
+            entry_url: get_provider(a.provider_id).info.entry_url.to_string(),
+          })
+          .collect::<Vec<_>>()
+      };
+      if !targets.is_empty() {
+        let mgr = Arc::clone(self);
+        let app_handle = app.clone();
+        tauri::async_runtime::spawn(async move {
+          if let Ok(results) =
+            crate::platform::ios::sync_account_quotas(&app_handle, targets).await
+          {
+            mgr.apply_synced_metadata(&app_handle, results).await;
+          }
+        });
+      }
+    }
+
+    #[cfg(target_os = "android")]
     {
       let _ = app;
     }
@@ -3862,6 +3960,83 @@ impl SessionManager {
     }
   }
 
+  /// Shared store update for detected (foreground probe) and synced
+  /// (background sync) metadata. Returns (changed, alias_updated).
+  /// Does not save or emit — the caller does that.
+  /// Batch-1: extracted from apply_detected_metadata so the iOS
+  /// background sync can reuse the exact same update rules.
+  fn update_account_metadata_locked(
+    locked: &mut InnerState,
+    key: &AccountKey,
+    identity_opt: Option<String>,
+    avatar_opt: Option<String>,
+    quota_text_opt: Option<String>,
+    quota_pct_opt: Option<u8>,
+    quota_detail_opt: Option<QuotaDetail>,
+  ) -> (bool, Option<String>) {
+    let Some(target) = locked
+      .store
+      .accounts
+      .iter_mut()
+      .find(|a| a.provider_id == key.provider_id && a.uuid == key.uuid)
+    else {
+      return (false, None);
+    };
+
+    let mut changed = false;
+    let mut alias_updated = None;
+
+    if target.auth_state != AuthState::Authenticated {
+      target.auth_state = AuthState::Authenticated;
+      changed = true;
+    }
+
+    if target.auto_alias {
+      if let Some(raw_id) = identity_opt {
+        let cleaned = raw_id.trim();
+        if !cleaned.is_empty() && cleaned.len() <= 80 {
+          target.alias = cleaned.to_string();
+          target.auto_alias = false;
+          alias_updated = Some(cleaned.to_string());
+          changed = true;
+        }
+      }
+    }
+
+    if let Some(av) = avatar_opt {
+      if av.starts_with("data:image/") && av.len() < 80_000 && target.avatar_url.as_ref() != Some(&av) {
+        target.avatar_url = Some(av);
+        changed = true;
+      }
+    }
+
+    if let Some(detail) = quota_detail_opt {
+      if target.quota_detail.as_ref() != Some(&detail) {
+        target.quota_detail = Some(detail);
+        changed = true;
+      }
+    }
+
+    if let Some(qt) = quota_text_opt {
+      let cleaned_qt = qt.trim();
+      if !cleaned_qt.is_empty() && cleaned_qt.len() <= 60 {
+        let is_placeholder = cleaned_qt == "额度充足" || cleaned_qt == "正在同步额度…";
+        let should_overwrite = match (&target.quota_text, is_placeholder) {
+          (Some(existing), true) if existing != "额度充足" && existing != "正在同步额度…" => false,
+          (Some(existing), _) if existing == cleaned_qt && target.quota_percent == quota_pct_opt => false,
+          _ => true,
+        };
+        if should_overwrite {
+          target.quota_text = Some(cleaned_qt.to_string());
+          target.quota_percent = quota_pct_opt;
+          changed = true;
+        }
+      }
+    }
+
+    (changed, alias_updated)
+  }
+
   #[allow(clippy::too_many_arguments)]
   async fn apply_detected_metadata(
     &self,
@@ -3880,65 +4055,15 @@ impl SessionManager {
         return;
       }
 
-      let Some(target) = locked
-        .store
-        .accounts
-        .iter_mut()
-        .find(|a| a.provider_id == key.provider_id && a.uuid == key.uuid)
-      else {
-        return;
-      };
-
-      let mut changed = false;
-      let mut alias_updated = None;
-
-      if target.auth_state != AuthState::Authenticated {
-        target.auth_state = AuthState::Authenticated;
-        changed = true;
-      }
-
-      if target.auto_alias {
-        if let Some(raw_id) = identity_opt {
-          let cleaned = raw_id.trim();
-          if !cleaned.is_empty() && cleaned.len() <= 80 {
-            target.alias = cleaned.to_string();
-            target.auto_alias = false;
-            alias_updated = Some(cleaned.to_string());
-            changed = true;
-          }
-        }
-      }
-
-      if let Some(av) = avatar_opt {
-        if av.starts_with("data:image/") && av.len() < 80_000 && target.avatar_url.as_ref() != Some(&av) {
-          target.avatar_url = Some(av);
-          changed = true;
-        }
-      }
-
-      if let Some(detail) = quota_detail_opt {
-        if target.quota_detail.as_ref() != Some(&detail) {
-          target.quota_detail = Some(detail);
-          changed = true;
-        }
-      }
-
-      if let Some(qt) = quota_text_opt {
-        let cleaned_qt = qt.trim();
-        if !cleaned_qt.is_empty() && cleaned_qt.len() <= 60 {
-          let is_placeholder = cleaned_qt == "额度充足" || cleaned_qt == "正在同步额度…";
-          let should_overwrite = match (&target.quota_text, is_placeholder) {
-            (Some(existing), true) if existing != "额度充足" && existing != "正在同步额度…" => false,
-            (Some(existing), _) if existing == cleaned_qt && target.quota_percent == quota_pct_opt => false,
-            _ => true,
-          };
-          if should_overwrite {
-            target.quota_text = Some(cleaned_qt.to_string());
-            target.quota_percent = quota_pct_opt;
-            changed = true;
-          }
-        }
-      }
+      let (changed, alias_updated) = Self::update_account_metadata_locked(
+        &mut locked,
+        &key,
+        identity_opt,
+        avatar_opt,
+        quota_text_opt,
+        quota_pct_opt,
+        quota_detail_opt,
+      );
 
       if !changed {
         return;
@@ -3979,6 +4104,89 @@ impl SessionManager {
     };
 
     if let Some(snap) = snap_opt {
+      self.emit_snapshot(app, &snap);
+    }
+  }
+
+  /// Batch-1: applies background sync results (iOS). Unlike
+  /// apply_detected_metadata there is no live session to validate
+  /// against — the sync deliberately covers accounts that are NOT open —
+  /// so there is no view-instance check. Saves once and emits one
+  /// snapshot. A logged-out finding is applied directly: the probe ran
+  /// after a full page load, and opening the account re-verifies (a false
+  /// positive self-corrects on open via apply_detected_metadata).
+  #[cfg(target_os = "ios")]
+  async fn apply_synced_metadata(
+    &self,
+    app: &AppHandle,
+    results: Vec<crate::platform::ios::SyncQuotaResult>,
+  ) {
+    let changed_any = {
+      let mut locked = self.inner.lock().await;
+      let mut any = false;
+      for r in results {
+        let Some(pid) = ProviderId::parse(&r.provider_id) else {
+          continue;
+        };
+        let Some(norm_uuid) = normalize_uuid(&r.uuid) else {
+          continue;
+        };
+        let key = AccountKey {
+          provider_id: pid,
+          uuid: norm_uuid,
+        };
+        if r.logged_out {
+          let Some(target) = locked
+            .store
+            .accounts
+            .iter_mut()
+            .find(|a| a.provider_id == key.provider_id && a.uuid == key.uuid)
+          else {
+            continue;
+          };
+          if target.auth_state == AuthState::LoggedOut
+            && target.quota_detail.is_none()
+            && target.quota_text.is_none()
+            && target.quota_percent.is_none()
+          {
+            continue;
+          }
+          target.auth_state = AuthState::LoggedOut;
+          target.quota_detail = None;
+          target.quota_text = None;
+          target.quota_percent = None;
+          any = true;
+          continue;
+        }
+        let detail = r
+          .quota_detail_json
+          .as_deref()
+          .and_then(|s| serde_json::from_str::<QuotaDetail>(s).ok());
+        let (changed, _) = Self::update_account_metadata_locked(
+          &mut locked,
+          &key,
+          if r.identity.is_empty() {
+            None
+          } else {
+            Some(r.identity)
+          },
+          r.avatar_url,
+          r.quota_text,
+          r.quota_percent,
+          detail,
+        );
+        any = any || changed;
+      }
+      if !any {
+        return;
+      }
+      if save_store_atomic(&locked.store_path, &locked.store).is_err() {
+        return;
+      }
+      true
+    };
+    if changed_any {
+      let snap = self.get_snapshot().await;
       self.emit_snapshot(app, &snap);
     }
   }
