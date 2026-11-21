@@ -45,6 +45,10 @@ final class AccountWebViewController: UIViewController, WKNavigationDelegate, WK
   private var committedAuthority: String?
   private var mainLoadFailed = false
   private var popupWebView: WKWebView?
+  // 0.1.11: set when the popup navigates to a Google OAuth host; the
+  // popup auto-closes (and the session reloads) once it lands back on
+  // an allowlisted host — the OAuth callback.
+  private var popupDidOAuth = false
   private var mainInputEnabled = false
   private var popupInputEnabled = false
   private var closingFromManager = false
@@ -422,9 +426,12 @@ final class AccountWebViewController: UIViewController, WKNavigationDelegate, WK
         return
       }
       if let url, AccountSessionCoordinator.isGoogleOAuthHost(url) {
-        destroyPopupWebView()
-        presentGoogleOAuth(url: url)
-        decisionHandler(.cancel)
+        // 0.1.11: same-store tab model — let Google load in the popup
+        // (it shares the session's data store, so Muse's OAuth state
+        // validates and the callback lands in the same jar). didFinish
+        // closes the tab once the callback lands on an allowlisted host.
+        popupDidOAuth = true
+        decisionHandler(.allow)
         return
       }
       if !AccountSessionCoordinator.hostMatchesAllowed(url, allowedHosts: spec.allowedHosts) {
@@ -442,7 +449,18 @@ final class AccountWebViewController: UIViewController, WKNavigationDelegate, WK
       return
     }
     if let url, AccountSessionCoordinator.isGoogleOAuthHost(url) {
-      presentGoogleOAuth(url: url)
+      // 0.1.11: same-store tab model — open Google in a popup tab
+      // sharing the session's data store instead of navigating the
+      // session page away. (The usual path is window.open, which goes
+      // through createWebViewWith; this covers same-frame navigation.)
+      if popupWebView == nil,
+        let popup = createBoundAuthPopup(spec: spec, configuration: webView.configuration)
+      {
+        popup.load(URLRequest(url: url))
+      } else {
+        // A popup is already open; fall back to the Safari sheet.
+        presentGoogleOAuth(url: url)
+      }
       decisionHandler(.cancel)
       return
     }
@@ -483,14 +501,13 @@ final class AccountWebViewController: UIViewController, WKNavigationDelegate, WK
     present(alert, animated: true, completion: nil)
   }
 
-  // 0.1.10: Google OAuth runs in an in-app Safari sheet. Google blocks
-  // OAuth in embedded webviews (403 disallowed_useragent), and creating
-  // a WKWebView popup for it crashes on iOS 27 (0.1.8). SFSafariViewController
-  // is a system browser surface Google explicitly allows. The flow is
-  // entirely web-based (muse.ai -> Google -> muse.ai): the callback loads
-  // as a page on muse.ai inside the sheet, Muse's server exchanges the
-  // code, and the connection is stored on the Muse account — the app never
-  // needs to catch the callback.
+  // 0.1.10: Google OAuth ran in an in-app Safari sheet. It failed in
+  // practice (2026-11-21 user test): the sheet shares Safari's cookie
+  // jar, so the Muse page inside it is a different session — the user
+  // didn't log into Muse there, closed the sheet, and the app's page
+  // showed no connection. 0.1.11 opens Google OAuth in a same-store
+  // popup tab instead; the sheet remains only as a fallback (main-frame
+  // Google navigation while a popup is already open).
   private func presentGoogleOAuth(url: URL) {
     guard presentedViewController == nil else { return }
     let safari = SFSafariViewController(url: url)
@@ -537,7 +554,11 @@ final class AccountWebViewController: UIViewController, WKNavigationDelegate, WK
         switchSeq: spec.switchSeq, viewInstanceId: spec.viewInstanceId),
         let url = webView.url, url.absoluteString != "about:blank"
       else { return }
+      // 0.1.11: reveal the popup for Google OAuth hosts too — the login
+      // page loads in the same-store tab; the allowlist alone would
+      // destroy the popup the moment the Google page commits.
       guard AccountSessionCoordinator.hostMatchesAllowed(url, allowedHosts: spec.allowedHosts)
+        || AccountSessionCoordinator.isGoogleOAuthHost(url)
       else {
         destroyPopupWebView()
         return
@@ -566,6 +587,22 @@ final class AccountWebViewController: UIViewController, WKNavigationDelegate, WK
     contentProcessCrashCount = 0
     lastContentProcessCrash = nil
     AccountSessionCoordinator.shared.emitPageCommitVisible(spec: spec, url: url.absoluteString)
+  }
+
+  func webView(_ webView: WKWebView, didFinish navigation: WKNavigation!) {
+    // 0.1.11: the OAuth callback has loaded inside the popup — the GET
+    // already reached Muse's server, so the code was exchanged. Close
+    // the tab and reload the session so the new connection state shows.
+    // (Checked here, not in decidePolicyFor: cancelling the callback
+    // navigation would stop the request from ever reaching the server.)
+    guard webView === popupWebView,
+      popupDidOAuth,
+      let spec = currentSpec,
+      let url = webView.url,
+      AccountSessionCoordinator.hostMatchesAllowed(url, allowedHosts: spec.allowedHosts)
+    else { return }
+    destroyPopupWebView()
+    mainWebView?.reload()
   }
 
   func webView(
@@ -642,23 +679,29 @@ final class AccountWebViewController: UIViewController, WKNavigationDelegate, WK
       popupWebView == nil,
       ownsMainView(webView, spec: spec)
     else { return nil }
-    // 0.1.8 Gmail-crash fix: a popup opened for Google OAuth used to be
-    // created here and then immediately destroyed by decidePolicyFor —
-    // but on iOS 27, creating it at all crashes inside WebKit's
-    // SOAuthorizationCoordinator path (uncaught NSException in
-    // UIClient::createNewPage; 2026-11-21 .ips, 100% reproducible from
-    // Muse's Gmail connector). Never create a popup for a Google OAuth
-    // URL; 0.1.10 opens it in an in-app Safari sheet instead (see
-    // presentGoogleOAuth). About:blank popups (URL unknown yet) still
-    // go through and are filtered by decidePolicyFor when they navigate.
+    // 0.1.11: Google OAuth opens in a same-store popup tab — the app is
+    // the browser, the popup is a new tab sharing the session's data
+    // store, so Muse's OAuth state (even if cookie-based) validates and
+    // the callback lands on muse.ai in the same jar. (0.1.10's Safari
+    // sheet failed in practice: the sheet shares Safari's cookie jar, a
+    // different Muse session, so the connection never reached the app's
+    // page.) Two risks this build tests: (a) the 0.1.6 crash happened
+    // creating a popup with a FRESH configuration in the SSO path
+    // (uncaught NSException in UIClient::createNewPage; 2026-11-21 .ips);
+    // 0.1.8 switched to the configuration WebKit prepared for the popup
+    // (opener's process pool + SSO state) — untested for Google OAuth
+    // until now; (b) Google policy blocks OAuth in embedded webviews
+    // (403 disallowed_useragent) — if the login page refuses to load,
+    // this path is dead and the fallback is running the whole flow
+    // inside the Safari sheet from the Muse connectors page.
+    // About:blank popups (URL unknown yet) still go through and are
+    // filtered by decidePolicyFor when they navigate.
     if let url = navigationAction.request.url,
       url.absoluteString != "about:blank"
     {
-      if AccountSessionCoordinator.isGoogleOAuthHost(url) {
-        presentGoogleOAuth(url: url)
-        return nil
-      }
-      if !AccountSessionCoordinator.hostMatchesAllowed(url, allowedHosts: spec.allowedHosts) {
+      if !AccountSessionCoordinator.hostMatchesAllowed(url, allowedHosts: spec.allowedHosts)
+        && !AccountSessionCoordinator.isGoogleOAuthHost(url)
+      {
         return nil
       }
     }
@@ -701,6 +744,7 @@ final class AccountWebViewController: UIViewController, WKNavigationDelegate, WK
     popup.navigationDelegate = self
     popup.uiDelegate = self
 
+    popupDidOAuth = false
     popupWebView = popup
     popupDomainLabel.text = ""
     popupOverlayRoot.isHidden = true
@@ -719,6 +763,7 @@ final class AccountWebViewController: UIViewController, WKNavigationDelegate, WK
   private func destroyPopupWebView() {
     let popup = popupWebView
     popupWebView = nil
+    popupDidOAuth = false
     popupInputEnabled = false
     popupOverlayRoot.isHidden = true
     popupDomainLabel.text = ""
