@@ -12,6 +12,7 @@
     "allow-add-account",
     "allow-rename-account",
     "allow-remove-account",
+    "allow-reorder-accounts",
     "allow-switch-account",
     "allow-set-modal-active",
     "allow-open-official-site",
