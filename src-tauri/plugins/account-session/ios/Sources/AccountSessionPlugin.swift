@@ -2,7 +2,9 @@
 //
 // Exposes the same 8 commands as the Android plugin (subscribeEvents,
 // checkCapabilities, openAccountSession, updateAccountTitle,
-// closeActiveSession, deleteProfile, openExternalUrl, fetchText).
+// closeActiveSession, deleteProfile, openExternalUrl, fetchText), plus
+// syncAccountQuotas (batch-1 iOS background quota sync — no Android
+// equivalent, the Android sync runs through its own warm webviews).
 // downloadAndInstallApk is intentionally NOT ported: iOS updates are
 // manual re-sideloads (see Rust updater.rs, status "manual_install").
 //
@@ -58,6 +60,18 @@ private struct FetchTextArgs: Decodable {
   let url: String
   let userAgent: String
   let accept: String?
+}
+
+// Batch-1: background quota sync targets (Rust filters out the active
+// account — the foreground probe already covers it).
+private struct SyncAccountTarget: Decodable {
+  let providerId: String
+  let uuid: String
+  let entryUrl: String
+}
+
+private struct SyncAccountQuotasArgs: Decodable {
+  let accounts: [SyncAccountTarget]
 }
 
 class AccountSessionPlugin: Plugin {
@@ -186,6 +200,22 @@ class AccountSessionPlugin: Plugin {
         } else {
           invoke.reject("无法调用系统浏览器打开链接")
         }
+      }
+    }
+  }
+
+  /// Batch-1: background quota sync. Probes each listed account's quota
+  /// (parked page first, else a hidden one-shot webview) and resolves
+  /// with the per-account results for Rust to apply.
+  @objc public func syncAccountQuotas(_ invoke: Invoke) throws {
+    let args = try invoke.parseArgs(SyncAccountQuotasArgs.self)
+    DispatchQueue.main.async {
+      let targets = args.accounts.map {
+        QuotaSyncRunner.Target(
+          providerId: $0.providerId, uuid: $0.uuid, entryUrl: $0.entryUrl)
+      }
+      QuotaSyncRunner.run(targets: targets) { results in
+        invoke.resolve(["results": results.map { $0.json }])
       }
     }
   }
