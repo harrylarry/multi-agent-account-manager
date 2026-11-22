@@ -227,6 +227,9 @@ interface DerivedRowState {
   active: boolean;
   isLoggedOut: boolean;
   hasDetail: boolean;
+  // 0.1.15: task watcher saw a new reply while this account was not
+  // active (never shown on the active row — the user is looking at it).
+  hasUnreadReply: boolean;
   alertStatus: QuotaStatus;
   alertLabel: string;
   extraDepleted: boolean;
@@ -244,6 +247,7 @@ function deriveRowState(
 ): DerivedRowState {
   const switching = isSameKey(switchingKey, acc);
   const active = !switching && isSameKey(state.activeAccount, acc);
+  const hasUnreadReply = !active && Boolean(acc.hasUnreadReply);
   const avatarText = computeAvatarText(acc);
   const isLoggedOut = acc.authState === "logged_out";
   const hasDetail = !isLoggedOut && Boolean(acc.quotaDetail);
@@ -271,6 +275,7 @@ function deriveRowState(
     active,
     isLoggedOut,
     hasDetail,
+    hasUnreadReply,
     alertStatus: quotaState.status,
     alertLabel: quotaState.label,
     extraDepleted: quotaState.extraDepleted,
@@ -305,7 +310,8 @@ function avatarWrapHtml(acc: AccountRecord, d: DerivedRowState): string {
     : `<div class="${avatarClass}">${escapeHtml(d.avatarText)}</div>`;
   return `${avatarNodeHtml}
 ${d.switching ? `<span class="avatar-spinner"></span>` : ""}
-${d.active ? `<span class="status-dot ${d.isLoggedOut ? "offline" : ""}"></span>` : ""}`;
+${d.active ? `<span class="status-dot ${d.isLoggedOut ? "offline" : ""}"></span>` : ""}
+${d.hasUnreadReply ? `<span class="unread-dot"></span>` : ""}`;
 }
 
 function avatarSigFor(acc: AccountRecord, d: DerivedRowState): string {
@@ -316,6 +322,7 @@ function avatarSigFor(acc: AccountRecord, d: DerivedRowState): string {
     d.switching ? "1" : "0",
     d.active ? "1" : "0",
     d.isLoggedOut ? "1" : "0",
+    d.hasUnreadReply ? "1" : "0",
   ].join("|");
 }
 
@@ -1043,7 +1050,7 @@ function structuralSignature(state: ManagerSnapshot, provider: ProviderInfo): st
     providerAccounts
       .map(
         (a) =>
-          `${a.uuid}:${a.authState === "logged_out" ? 0 : a.quotaDetail ? 1 : 0}`
+          `${a.uuid}:${a.authState === "logged_out" ? 0 : a.quotaDetail ? 1 : 0}:${a.hasUnreadReply ? 1 : 0}`
       )
       .join(","),
     switchingKey
