@@ -66,6 +66,10 @@ pub struct AccountRecord {
   pub quota_detail: Option<QuotaDetail>,
   #[serde(default)]
   pub auth_state: AuthState,
+  /// 0.1.15: the iOS task watcher saw a new reply for this account
+  /// while it was not active. Cleared when the account is opened.
+  #[serde(default)]
+  pub has_unread_reply: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -254,6 +258,7 @@ fn migrate_from_value(root: Value) -> Result<(AccountsStoreFile, bool), String> 
         quota_percent,
         quota_detail,
         auth_state,
+        has_unread_reply: false,
       });
     }
   }
