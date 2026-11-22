@@ -102,6 +102,10 @@ enum RecentAccountPages {
     let view: WKWebView
     /// Retained because WKWebView.navigationDelegate is weak.
     let delegate: ParkedDelegate
+    /// Alias as of park time, for task-completion notifications
+    /// (0.1.15). May lag the live alias by one park cycle; refreshed
+    /// whenever the account is re-parked.
+    let alias: String
   }
 
   // Park-ordered (oldest first = least recently active); eviction takes
@@ -162,8 +166,19 @@ enum RecentAccountPages {
     if let idx = pages.firstIndex(where: { $0.key == key }) {
       destroy(pages.remove(at: idx).entry.view)
     }
-    pages.append((key: key, entry: Entry(view: view, delegate: delegate)))
+    pages.append((key: key, entry: Entry(view: view, delegate: delegate, alias: spec.alias)))
     trim(maxAccountPages)
+  }
+
+  /// Snapshot of parked accounts (provider, uuid, alias) for the task
+  /// watcher sweep (0.1.15). A key listed here may be evicted before
+  /// the sweep probes it; probeParked then returns nil, which the
+  /// watcher treats as no sample.
+  static func parkedKeys() -> [(providerId: String, uuid: String, alias: String)] {
+    trim(maxAccountPages)
+    return pages.map {
+      (providerId: $0.key.providerId, uuid: $0.key.uuid, alias: $0.entry.alias)
+    }
   }
 
   static func discardProfile(_ uuid: String) {
