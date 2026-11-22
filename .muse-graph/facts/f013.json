@@ -1,0 +1,12 @@
+{
+  "created_at": "2026-11-22T19:57:02Z",
+  "creator": "codex",
+  "description": "Spike 版 Muse 页顶栏标题旁新增「Spike」pill（src/main.ts + src/styles.css），随 PR #15 分支 spike/native-client 提交；tsc 与 vite build 产物校验通过，日常版代码未改。",
+  "doc": "改动：renderMiddleContent() 在 provider.id === \"muse\" 时渲染 <span class=\"spike-badge\">Spike</span>，位于 .provider-title 之后、count-badge 之前；样式 .spike-badge 沿用 --primary / --primary-soft，10px pill，移动端 11px。只改前端两个文件：未动 Rust、未升版本、未改 CI。验证：tsc（strict + noUnusedLocals）通过；vite build 在本机沙箱用 esbuild-wasm + fs 补丁跑通（沙箱禁止 exec 原生二进制与 npm .bin，直接的 npm run build 包装命令跑不起来，真实构建由 CI 复核），产物 dist/assets 内含 .spike-badge 样式与该 span。注意：与诊断区同样处理——本分支即 Spike 分支，合入 main 后日常版也会显示该 pill，届时按 bundle id 门控。",
+  "id": "f013",
+  "refs": {
+    "pr": 15
+  },
+  "source_intent": "i007",
+  "title": "Spike 顶栏标识完成"
+}

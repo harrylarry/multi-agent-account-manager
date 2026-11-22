@@ -1,0 +1,16 @@
+{
+  "concluded_at": "2026-11-22T19:59:25Z",
+  "confirmed_at": null,
+  "created_at": "2026-11-22T19:04:36Z",
+  "creator": "wally",
+  "description": "【工作流测试任务：Wally 计划 + Codex 开发 + Wally 审核】在 Spike App（分支 spike/native-client）的账号列表页顶栏加一个「Spike」标识，让用户肉眼能区分 Spike App 与日常版 App。前端-only：src/main.ts（在 Muse 页顶栏或标题旁加一个小 pill/tag，文字「Spike」）+ src/styles.css（样式，小巧不突兀，沿用现有变量）。不改 Rust、不升版本、不动其他功能。验收：npm run build 通过；Spike App 里 Muse 页顶栏可见「Spike」标识；日常版不受影响（本分支即 Spike 分支）。分支：spike/native-client（提交进 PR #15）。执行：Codex（用户驱动）。完成后 PR 里带图谱更新：新 fact（Spike 标识完成，source_intent i007）+ i007 结论（done → 该 fact）+ 重渲染 GRAPH.md。",
+  "from": [
+    "f011"
+  ],
+  "id": "i007",
+  "requires_confirmation": false,
+  "status": "done",
+  "title": "Spike 顶栏标识",
+  "to": "f013",
+  "worker": "codex"
+}
