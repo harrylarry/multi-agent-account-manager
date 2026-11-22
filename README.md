@@ -4,6 +4,8 @@
 
 基于 Tauri 2 构建的跨平台（macOS / Windows / Android / iOS）AI 助手多账号隔离与快速切换工具，安装后应用名称为 **叠号**。
 
+---
+
 ## iOS 移植说明
 
 本仓库是 [ldjx7/multi-agent-account-manager](https://github.com/ldjx7/multi-agent-account-manager) 的 iOS 移植 fork：基于 Tauri 2 + WKWebView，在上游 v0.1.5 基础上新增 iOS 支持。
