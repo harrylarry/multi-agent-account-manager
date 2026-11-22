@@ -4,16 +4,16 @@
 
 基于 Tauri 2 构建的跨平台（macOS / Windows / Android / iOS）AI 助手多账号隔离与快速切换工具，安装后应用名称为 **叠号**。
 
-> 本仓库在上游版本基础上新增 iOS 支持：未签名 IPA（iOS 17.0+），需自行签名后侧载安装。
-
 ## iOS 移植说明
 
-本仓库是 [ldjx7/multi-agent-account-manager](https://github.com/ldjx7/multi-agent-account-manager) 的 iOS 移植 fork：基于 Tauri 2 + WKWebView，在上游基础上新增 iOS 支持。
+本仓库是 [ldjx7/multi-agent-account-manager](https://github.com/ldjx7/multi-agent-account-manager) 的 iOS 移植 fork：基于 Tauri 2 + WKWebView，在上游 v0.1.5 基础上新增 iOS 支持。
 
 - **当前版本**：0.1.21。
 - **IPA 构建**：由 GitHub Actions（`.github/workflows/ios.yml`）在 `macos-15-intel` runner 上构建，产物为未签名 IPA（`account-manager-ios-unsigned.ipa`），无需 Apple 开发者账号。
-- **安装方式**：侧载安装。iOS 17.0+，需用 AltStore / Sideloadly / SideStore 或 Xcode 以自己的 Apple ID 签名后安装；免费 Apple ID 签名有效期 7 天，付费开发者账号 1 年。
+- **安装方式**：未签名 IPA（iOS 17.0+），需自行签名后侧载安装，详见「iOS 安装注意事项」。
 - **上游更新**：上游更新不再合入本 fork。
+
+---
 
 ## 支持服务与核心特性
 
@@ -57,14 +57,16 @@
 
 ## 下载与安装
 
-前往 [GitHub Releases](https://github.com/harrylarry/multi-agent-account-manager/releases) 下载对应平台安装包：
+**本 fork 只发布 iOS 安装包。**macOS / Windows / Android 安装包请前往[上游 Releases](https://github.com/ldjx7/multi-agent-account-manager/releases)下载。
 
-| 平台 | 下载文件 | 架构 / 系统要求 |
-| --- | --- | --- |
-| macOS | `account-manager-macos-universal.dmg` | Apple Silicon & Intel（macOS 14.0+） |
-| Windows | `account-manager-windows-x64-setup.exe` | x64（Windows 10 / 11） |
-| Android | `account-manager-android-universal-release.apk` | 通用 ABI（Android 7.0+） |
-| iOS | `account-manager-ios-unsigned.ipa` | 未签名 IPA（iOS 17.0+，需自行签名侧载） |
+| 平台 | 下载文件 | 架构 / 系统要求 | 发布方 |
+| --- | --- | --- | --- |
+| macOS | `account-manager-macos-universal.dmg` | Apple Silicon & Intel（macOS 14.0+） | 上游 |
+| Windows | `account-manager-windows-x64-setup.exe` | x64（Windows 10 / 11） | 上游 |
+| Android | `account-manager-android-universal-release.apk` | 通用 ABI（Android 7.0+） | 上游 |
+| iOS | `account-manager-ios-unsigned.ipa` | 未签名 IPA（iOS 17.0+，需自行签名侧载） | 本 fork |
+
+本 fork 的 iOS 安装包见 [GitHub Releases](https://github.com/harrylarry/multi-agent-account-manager/releases)。
 
 > `account-manager-macos-universal.app.tar.gz` 仅用于 macOS 应用内自动更新，首次安装请下载 `.dmg`。
 
@@ -123,16 +125,10 @@
 ## 应用内更新与发版
 
 - **客户端检查更新**：桌面端点击左侧栏底部「更新」按钮，移动端（Android / iOS）点击右上角下载图标，可检查最新版本并一键下载校验安装；启动后也会静默检查一次并展示红点提醒（iOS 检查到新版后提示手动重新侧载）。
-- **维护者发布新版本**：
+- **维护者发布新版本**：本 fork 只做 `ios-v*` 发版，不做 `v*` 三端发版（`v*` 标签会触发三端发版流程，不要用）。
   1. 同步更新 [package.json](package.json)、[src-tauri/Cargo.toml](src-tauri/Cargo.toml) 与 [src-tauri/tauri.conf.json](src-tauri/tauri.conf.json) 中的版本号。
-  2. 提交并推送 `v*` 标签（GitHub Actions 将自动编译三端安装包、生成 `latest.json` 并创建 Release）：
-
-     ```bash
-     git tag v0.1.1
-     git push origin v0.1.1
-     ```
-
-  3. iOS 发版：手动创建 Release（标签形如 `ios-v0.1.5`），上传 CI 构建的未签名 IPA 与含 `ios` 条目的 `latest.json`；注意不要用 `v*` 标签，那会触发三端发版流程。
+  2. 合入 `main` 后由 GitHub Actions（`.github/workflows/ios.yml`）构建未签名 IPA。
+  3. 手动创建 Release（标签形如 `ios-v0.1.5`），上传 CI 构建的未签名 IPA 与含 `ios` 条目的 `latest.json`。
 
 ---
 
