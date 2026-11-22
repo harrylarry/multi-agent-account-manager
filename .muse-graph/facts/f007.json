@@ -1,0 +1,13 @@
+{
+  "created_at": "2026-11-22T10:52:32Z",
+  "creator": "nova",
+  "description": "0.1.21 UI 与性能优化完成（Issue #8）：顶部栏 backButton 13→15pt、弹窗头关闭按钮 12→13pt、CSS 14 档字号收敛为 6 档；hasUnreadReply 与 modal.kind 移出 structuralSignature，弹窗独立渲染进 #modal-root，红点与弹窗开/关不再重建列表；版本升到 0.1.21，本地 npm run build 通过。",
+  "doc": "改动 7 个文件：AccountWebViewController.swift（backButton 13→15pt 与 headerTitleLabel 一致，closePopupButton 12→13pt 与 popupDomainLabel 一致；红点仍锚在 titleLabel 上，随字号自动跟随，须用户在分支包上视觉确认）；src/styles.css（24 处字号按 Issue 映射收敛，14 档→6 档 10/11/12/13/14/16px，grep 验证，:root 13.5→14px，无 rem/em 字号依赖）；src/main.ts（hasUnreadReply 移出 structuralSignature，已在 avatarSigFor 里，patchRows 就地更新红点；modal 移出 #app 的 innerHTML，独立渲染进 #modal-root，modal.kind 与 updateState 同步移出 signature，check-update 按钮改为就地同步，弹窗开/关不再重建列表）；4 个版本文件升 0.1.21。本地检查：npm run build 通过（tsc + vite）；Playwright harness 不可用（~/workspace/maam-ios-port 不存在）；Swift 由 CI 校验。",
+  "id": "f007",
+  "refs": {
+    "issue": 8,
+    "pr": 9
+  },
+  "source_intent": "i002",
+  "title": "UI与性能优化完成"
+}

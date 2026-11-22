@@ -67,6 +67,20 @@ let longPressStart: { x: number; y: number } | null = null;
 let dragRow: HTMLElement | null = null;
 let dragTouchId: number | null = null;
 let lastRenderedUpdateStage: string | null = null;
+// 0.1.21: identity key of the last modal HTML written into #modal-root,
+// and the mount element it was written into — renderModalRoot() skips
+// the write when neither changed, so a re-render never disturbs modal
+// input focus. The key is the modal's identity (kind / account), NOT
+// the full HTML: typing in the rename/add input only changes
+// modal.draft, which must not trigger a rewrite — the live input node
+// already holds the typed value, and rewriting it would replace the
+// node and drop focus. The update modal is the exception: its content
+// is dynamic (check / install progress), so it falls back to comparing
+// the full HTML. The mount changes identity on every full #app
+// rebuild, which is how the cache knows the new (empty) container
+// still needs filling.
+let lastModalKey: string | null = null;
+let lastModalMount: HTMLElement | null = null;
 
 const updateState: {
   checking: boolean;
@@ -959,7 +973,10 @@ function renderMiddleContent(state: ManagerSnapshot, provider: ProviderInfo): st
     ${noticeHtml}
     ${conflictsHtml}
     <div class="account-list${inReorder ? " reorder-mode" : ""}">${listBody}</div>
-    ${renderModal(provider)}
+    <!-- 0.1.21: the modal lives in its own overlay container and is
+         filled by renderModalRoot(), not by this template — opening or
+         closing it no longer rebuilds #app (see structuralSignature). -->
+    <div id="modal-root"></div>
   `;
 }
 
@@ -1023,8 +1040,12 @@ function renderRightStage(state: ManagerSnapshot, provider: ProviderInfo): strin
 //     focus (typing in the rename modal), and an in-progress drag are
 //     never disturbed.
 //   - signature changed -> full render as before (add/remove account,
-//     provider switch, modal open/close, notice, conflicts, switching
-//     target, reorder mode, update state).
+//     provider switch, notice, conflicts, switching target,
+//     reorder mode).
+// 0.1.21: modal open/close and update-check state are no longer in the
+// signature — the modal renders into #modal-root on its own and the
+// update button is synced in place (syncUpdateButton), so neither
+// rebuilds the list or disturbs scroll / drag / modal input focus.
 // Anything that changes DOM structure must be in the signature; anything
 // patchable must NOT be (alias, quota text/percent, avatar, auth state,
 // active/switching flags — except the switching target itself, which
@@ -1047,37 +1068,96 @@ function structuralSignature(state: ManagerSnapshot, provider: ProviderInfo): st
       )
       .join(","),
     providerAccounts.map((a) => a.uuid).join(","),
+    // 0.1.21: hasUnreadReply is NOT here — it already lives in
+    // avatarSigFor, so patchRows updates the unread dot in place
+    // instead of rebuilding the whole list when a reply arrives.
     providerAccounts
       .map(
         (a) =>
-          `${a.uuid}:${a.authState === "logged_out" ? 0 : a.quotaDetail ? 1 : 0}:${a.hasUnreadReply ? 1 : 0}`
+          `${a.uuid}:${a.authState === "logged_out" ? 0 : a.quotaDetail ? 1 : 0}`
       )
       .join(","),
     switchingKey
       ? `${switchingKey.providerId}:${switchingKey.uuid}:${switchingAcc?.alias ?? ""}`
       : "",
-    modal.kind,
-    modal.kind === "rename" || modal.kind === "remove"
-      ? modal.account.uuid
-      : "",
+    // 0.1.21: modal.kind / modal.account are NOT here — the modal is
+    // rendered separately into #modal-root (renderModalRoot), so
+    // opening or closing it leaves the list untouched.
     state.notice ?? "",
     state.conflicts
       .map((c) => `${c.uuid}:${c.providers.join("+")}`)
       .join(","),
     reorderMode ? `reorder:${reorderProviderId ?? ""}` : "",
-    // Update modal reads all of updateState except progress percent /
-    // message (the progress listener patches those in place). The
-    // result is stringified whole: a re-check can change notes/size
-    // without changing the version.
-    JSON.stringify(updateState.result ?? null),
-    updateState.checking ? "checking" : "",
-    updateState.installing ? "installing" : "",
-    updateState.outcomeStatus ?? "",
-    updateState.outcomeMessage ?? "",
-    updateState.error ?? "",
-    lastRenderedUpdateStage ?? "",
+    // 0.1.21: updateState is NOT here either — its only #app consumer
+    // besides the (now separate) update modal is the check-update
+    // button, which syncUpdateButton() patches in place. A silent
+    // update check therefore no longer rebuilds the list either.
   ];
   return parts.join("\n");
+}
+
+// 0.1.21: render the modal into its own overlay container (#modal-root,
+// inside the middle column, so the existing absolute positioning and
+// .mobile-shell overrides apply unchanged), independently of #app's
+// innerHTML. The HTML is only written when the modal's identity changes,
+// so typing in the rename/add input (draft lives in `modal`, and the
+// live input node already shows it) and the update-progress in-place
+// patching are never disturbed by a rewrite. Called from render() on
+// both the patch and the full paths.
+function modalIdentityKey(provider: ProviderInfo): string | null {
+  // Deliberately excludes modal.draft: a draft change is a keystroke,
+  // not a new modal — the input's value is already up to date in the
+  // DOM, and rewriting #modal-root here would replace the focused
+  // input node (regression vs 0.1.20, where the patch path never
+  // touched the modal). The opening draft is still rendered: opening
+  // the modal changes kind from "none", so the key changes and the
+  // HTML is written then.
+  switch (modal.kind) {
+    case "none":
+      return "none";
+    case "add":
+      return `add:${modal.providerId}:${provider.shortName}`;
+    case "rename":
+      return `rename:${modal.account.uuid}`;
+    case "remove":
+      return `remove:${modal.account.uuid}:${modal.account.alias}`;
+    case "update":
+      // Dynamic content (update check / install progress): no stable
+      // identity — the caller falls back to the full HTML.
+      return null;
+  }
+}
+
+function renderModalRoot(provider: ProviderInfo): void {
+  const mount = document.querySelector<HTMLElement>("#modal-root");
+  if (!mount) return;
+  const html = renderModal(provider);
+  const key = modalIdentityKey(provider) ?? html;
+  if (mount === lastModalMount && key === lastModalKey) return;
+  lastModalMount = mount;
+  lastModalKey = key;
+  mount.innerHTML = html;
+}
+
+// 0.1.21: updateState left the structural signature with the modal, so
+// a silent update check must not rebuild the list either. The
+// check-update button is the one #app element that reads updateState —
+// sync it in place here, on the patch path. (The full path rebuilds it
+// from the template as before.)
+function syncUpdateButton(): void {
+  const btn = document.querySelector<HTMLElement>("#check-update-btn");
+  if (!btn) return;
+  const hasUpdate = Boolean(updateState.result?.hasUpdate);
+  btn.classList.toggle("has-update", hasUpdate);
+  btn.title = hasUpdate
+    ? `发现新版本 v${updateState.result!.latestVersion}`
+    : "检查更新";
+  const dot = btn.querySelector<HTMLElement>(".update-dot");
+  if (hasUpdate && !dot) {
+    btn.insertAdjacentHTML("beforeend", `<span class="update-dot"></span>`);
+  } else if (!hasUpdate && dot) {
+    dot.remove();
+  }
 }
 
 function seedPatchState(state: ManagerSnapshot, provider: ProviderInfo): void {
@@ -1237,7 +1317,12 @@ function render(): void {
   if (sig === lastStructuralSig) {
     // Field-only change: patch in place. Safe mid-drag (patchRow skips
     // the dragging row), so quota updates keep flowing during a drag.
+    // 0.1.21: the modal and the update button are synced here too —
+    // modal open/close and update checks take this path, so the list
+    // is never rebuilt for them.
     patchRows(snapshot, provider);
+    renderModalRoot(provider);
+    syncUpdateButton();
     return;
   }
   // A structural change arriving mid-drag must not rebuild the list
@@ -1308,6 +1393,10 @@ function render(): void {
     `;
   }
 
+  // 0.1.21: refill the modal container after the full rebuild — the
+  // container itself is recreated with #app, renderModalRoot() notices
+  // the new mount and writes the modal HTML into it.
+  renderModalRoot(provider);
   seedPatchState(snapshot, provider);
 }
 
