@@ -67,12 +67,19 @@ let longPressStart: { x: number; y: number } | null = null;
 let dragRow: HTMLElement | null = null;
 let dragTouchId: number | null = null;
 let lastRenderedUpdateStage: string | null = null;
-// 0.1.21: last modal HTML written into #modal-root, and the mount
-// element it was written into — renderModalRoot() skips the write when
-// neither changed, so a re-render never disturbs modal input focus.
-// The mount changes identity on every full #app rebuild, which is how
-// the cache knows the new (empty) container still needs filling.
-let lastModalHtml: string | null = null;
+// 0.1.21: identity key of the last modal HTML written into #modal-root,
+// and the mount element it was written into — renderModalRoot() skips
+// the write when neither changed, so a re-render never disturbs modal
+// input focus. The key is the modal's identity (kind / account), NOT
+// the full HTML: typing in the rename/add input only changes
+// modal.draft, which must not trigger a rewrite — the live input node
+// already holds the typed value, and rewriting it would replace the
+// node and drop focus. The update modal is the exception: its content
+// is dynamic (check / install progress), so it falls back to comparing
+// the full HTML. The mount changes identity on every full #app
+// rebuild, which is how the cache knows the new (empty) container
+// still needs filling.
+let lastModalKey: string | null = null;
 let lastModalMount: HTMLElement | null = null;
 
 const updateState: {
@@ -1092,17 +1099,43 @@ function structuralSignature(state: ManagerSnapshot, provider: ProviderInfo): st
 // 0.1.21: render the modal into its own overlay container (#modal-root,
 // inside the middle column, so the existing absolute positioning and
 // .mobile-shell overrides apply unchanged), independently of #app's
-// innerHTML. The HTML is only written when it actually changes, so
-// typing in the rename/add input (draft lives in `modal`) and the
-// update-progress in-place patching are never disturbed by a rewrite.
-// Called from render() on both the patch and the full paths.
+// innerHTML. The HTML is only written when the modal's identity changes,
+// so typing in the rename/add input (draft lives in `modal`, and the
+// live input node already shows it) and the update-progress in-place
+// patching are never disturbed by a rewrite. Called from render() on
+// both the patch and the full paths.
+function modalIdentityKey(provider: ProviderInfo): string | null {
+  // Deliberately excludes modal.draft: a draft change is a keystroke,
+  // not a new modal — the input's value is already up to date in the
+  // DOM, and rewriting #modal-root here would replace the focused
+  // input node (regression vs 0.1.20, where the patch path never
+  // touched the modal). The opening draft is still rendered: opening
+  // the modal changes kind from "none", so the key changes and the
+  // HTML is written then.
+  switch (modal.kind) {
+    case "none":
+      return "none";
+    case "add":
+      return `add:${modal.providerId}:${provider.shortName}`;
+    case "rename":
+      return `rename:${modal.account.uuid}`;
+    case "remove":
+      return `remove:${modal.account.uuid}:${modal.account.alias}`;
+    case "update":
+      // Dynamic content (update check / install progress): no stable
+      // identity — the caller falls back to the full HTML.
+      return null;
+  }
+}
+
 function renderModalRoot(provider: ProviderInfo): void {
   const mount = document.querySelector<HTMLElement>("#modal-root");
   if (!mount) return;
   const html = renderModal(provider);
-  if (mount === lastModalMount && html === lastModalHtml) return;
+  const key = modalIdentityKey(provider) ?? html;
+  if (mount === lastModalMount && key === lastModalKey) return;
   lastModalMount = mount;
-  lastModalHtml = html;
+  lastModalKey = key;
   mount.innerHTML = html;
 }
 
