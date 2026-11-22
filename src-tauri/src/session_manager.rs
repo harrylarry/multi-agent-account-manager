@@ -1481,6 +1481,7 @@ impl SessionManager {
         quota_percent: None,
         quota_detail: None,
         auth_state: AuthState::LoggedOut,
+        has_unread_reply: false,
       });
       save_store_atomic(&locked.store_path, &locked.store)?;
       locked.selected_provider_id = provider_id;
@@ -3063,6 +3064,19 @@ impl SessionManager {
         switch_seq: expected_seq,
         committed: false,
       });
+      // 0.1.15: opening the account clears its unread-reply flag — the
+      // user is looking at the reply now.
+      if let Some(acc) = locked
+        .store
+        .accounts
+        .iter_mut()
+        .find(|a| a.provider_id == key.provider_id && a.uuid == key.uuid)
+      {
+        if acc.has_unread_reply {
+          acc.has_unread_reply = false;
+          let _ = save_store_atomic(&locked.store_path, &locked.store);
+        }
+      }
     }
 
     let spec = get_provider(account.provider_id);
@@ -3483,6 +3497,66 @@ impl SessionManager {
               uuid: norm_uuid,
             },
             view_instance_id,
+          )
+          .await;
+      }
+      // 0.1.15: task watcher saw a new reply for an account (active or
+      // parked). Mark it unread in the manager list; the flag clears
+      // when the account is opened (open_ios_session).
+      IosSessionEvent::TaskReplyDetected {
+        provider_id,
+        uuid,
+      } => {
+        let Some(pid) = ProviderId::parse(&provider_id) else {
+          return;
+        };
+        let Some(norm_uuid) = normalize_uuid(&uuid) else {
+          return;
+        };
+        let snap_opt = {
+          let mut locked = self.inner.lock().await;
+          let Some(acc) = locked
+            .store
+            .accounts
+            .iter_mut()
+            .find(|a| a.provider_id == pid && a.uuid == norm_uuid)
+          else {
+            return;
+          };
+          if acc.has_unread_reply {
+            return;
+          }
+          acc.has_unread_reply = true;
+          if save_store_atomic(&locked.store_path, &locked.store).is_err() {
+            return;
+          }
+          Some(Self::snapshot_from_locked(&locked))
+        };
+        if let Some(snap) = snap_opt {
+          self.emit_snapshot(app, &snap);
+        }
+      }
+      // 0.1.15: the user tapped a task-completion notification. Switch
+      // to that account (not a cold start, so a parked page is reused).
+      // Mirrors the RecreateRequested recovery path.
+      IosSessionEvent::NotificationTapped {
+        provider_id,
+        uuid,
+      } => {
+        let Some(pid) = ProviderId::parse(&provider_id) else {
+          return;
+        };
+        let Some(norm_uuid) = normalize_uuid(&uuid) else {
+          return;
+        };
+        let _ = self
+          .switch_account_internal(
+            app,
+            AccountKey {
+              provider_id: pid,
+              uuid: norm_uuid,
+            },
+            false,
           )
           .await;
       }
