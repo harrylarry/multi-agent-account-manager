@@ -383,15 +383,10 @@ pub enum IosSessionEvent {
     view_instance_id: u64,
   },
   /// 0.1.15: the iOS task watcher detected a new assistant reply
-  /// (working → idle) for an account, active or parked.
+  /// (working → idle) for a parked account (0.1.16: the active
+  /// account's completions are Muse web's job and never reach here).
   #[serde(rename_all = "camelCase")]
   TaskReplyDetected {
-    provider_id: String,
-    uuid: String,
-  },
-  /// 0.1.15: the user tapped a task-completion notification.
-  #[serde(rename_all = "camelCase")]
-  NotificationTapped {
     provider_id: String,
     uuid: String,
   },
@@ -497,6 +492,23 @@ pub async fn delete_profile(app: &AppHandle, uuid: &str) -> Result<(), String> {
     .run_mobile_plugin_async::<serde_json::Value>(
       "deleteProfile",
       serde_json::json!({ "uuid": uuid }),
+    )
+    .await
+    .map(|_| ())
+    .map_err(|e| e.to_string())
+}
+
+/// 0.1.16: pushes the aggregate unread state (any account with an
+/// unread reply) to the native session view, which shows/hides the
+/// dot on the "← 账号" button.
+#[cfg(target_os = "ios")]
+pub async fn set_unread_badge(app: &AppHandle, has_unread: bool) -> Result<(), String> {
+  let bridge = app.state::<IosSessionBridge<tauri::Wry>>();
+  bridge
+    .0
+    .run_mobile_plugin_async::<serde_json::Value>(
+      "setUnreadBadge",
+      serde_json::json!({ "hasUnread": has_unread }),
     )
     .await
     .map(|_| ())
