@@ -498,6 +498,35 @@ pub async fn delete_profile(app: &AppHandle, uuid: &str) -> Result<(), String> {
     .map_err(|e| e.to_string())
 }
 
+/// Spike 0.1.22 (#2 Cookie 桥)：从指定账号的 WKWebsiteDataStore 取
+/// muse.ai 会话 cookie（Swift 侧已按域过滤；值只在内存里传递，Rust 侧
+/// 用后 zeroize，永不落盘、永不进日志）。
+#[cfg(target_os = "ios")]
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct IosSessionCookie {
+  pub name: String,
+  pub value: String,
+}
+
+#[cfg(target_os = "ios")]
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SessionCookiesResponse {
+  #[serde(default)]
+  pub cookies: Vec<IosSessionCookie>,
+}
+
+#[cfg(target_os = "ios")]
+pub async fn get_session_cookies(app: &AppHandle, uuid: &str) -> Result<Vec<IosSessionCookie>, String> {
+  let bridge = app.state::<IosSessionBridge<tauri::Wry>>();
+  let res: SessionCookiesResponse = bridge
+    .0
+    .run_mobile_plugin_async("getSessionCookies", serde_json::json!({ "uuid": uuid }))
+    .await
+    .map_err(|e| e.to_string())?;
+  Ok(res.cookies)
+}
+
 /// 0.1.16: pushes the aggregate unread state (any account with an
 /// unread reply) to the native session view, which shows/hides the
 /// dot on the "← 账号" button.

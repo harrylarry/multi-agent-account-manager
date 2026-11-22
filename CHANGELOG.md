@@ -1,10 +1,17 @@
-# 叠号 iOS 完整更新日志（0.1.5 → 0.1.21）
+# 叠号 iOS 完整更新日志（0.1.5 → 0.1.22）
 
-本 fork 基于上游 v0.1.5 + iOS 移植与优化。版本号 0.1.6–0.1.21 是 fork 自有版本，不包含上游 v0.1.6 的功能（每账号无认证 HTTP CONNECT 代理、一键复制 Cookie，仅 macOS/Windows/Android）。
+本 fork 基于上游 v0.1.5 + iOS 移植与优化。版本号 0.1.6–0.1.22 是 fork 自有版本，不包含上游 v0.1.6 的功能（每账号无认证 HTTP CONNECT 代理、一键复制 Cookie，仅 macOS/Windows/Android）。
 
 未签名 IPA（iOS 17.0+），需自行签名后侧载安装（LC sign / AltStore / Sideloadly 等）。
 
 ---
+
+## 0.1.22（2026-11-23）
+
+- **Phase 0 Spike：原生客户端骨架 + 握手 + 认证（Issue #12）**：新增 `src-tauri/muse-native/` Rust 库，移植 BotArk v0.12.0 的 Muse 原生协议——Noise_XX_25519_AESGCM_SHA256 握手（`noise.rs`）、HTTP-over-Noise 帧编解码（`transport.rs` + `protobuf.rs`）、HTTPS 控制面 wake / lease / token / notary（`control_plane.rs`）、WSS 握手 + `connection.ping` 探针（`gateway.rs`）；`cargo test` 22 项通过，含与 BotArk 参考实现逐字节一致的握手向量与帧向量。
+- **Cookie 桥（Spike #2）**：iOS 插件新增 `getSessionCookies`，从各账号 WKWebsiteDataStore 取 muse.ai 会话 cookie 传给 Rust，内存传递、用后 zeroize，永不落盘、永不进日志。
+- **Spike 诊断**：新增 `muse_native_diagnose` 命令与 Spike 版启动自检（只在换了 bundle id 的 Spike 包里跑，日常版不跑），跑一次“取凭证 → WSS → Noise 握手 → ping”，结果只含阶段与状态。握手成功与否待用户在 Spike App 里登录非主力测试账号后实测。
+- **Spike 版为独立 App**：bundle id 与显示名改动单独一个提交（验包通过后 rebase 去掉再合入 main），日常版 bundle id 不变。
 
 ## 0.1.21（2026-11-22）
 

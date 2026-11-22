@@ -21,6 +21,7 @@
     "allow-trigger-quota-sync",
     "allow-check-for-updates",
     "allow-download-and-install-update",
-    "allow-open-external-url"
+    "allow-open-external-url",
+    "allow-muse-native-diagnose"
   ]
 }

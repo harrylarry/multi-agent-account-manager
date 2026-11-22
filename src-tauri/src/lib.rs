@@ -1,3 +1,4 @@
+mod muse_native;
 mod platform;
 mod providers;
 mod session_manager;
@@ -136,6 +137,17 @@ async fn open_external_url(app: AppHandle, url: String) -> Result<(), String> {
   updater::open_external_url(&app, &url).await
 }
 
+/// Spike 0.1.22：原生握手诊断（取凭证 → WSS → Noise 握手 → ping）。
+/// 只做诊断，不发聊天；结果不含任何密钥。由 Spike 版启动自检或手动调用。
+#[tauri::command]
+async fn muse_native_diagnose(
+  app: AppHandle,
+  provider_id: String,
+  uuid: String,
+) -> Result<muse_native::SpikeDiagnose, String> {
+  muse_native::diagnose(&app, &provider_id, &uuid).await
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
   let builder = tauri::Builder::default();
@@ -212,6 +224,14 @@ pub fn run() {
         mgr_for_boot.run_startup_tasks(&app_for_boot).await;
       });
 
+      // Spike 0.1.22：Spike 版启动后对首个已登录 Muse 账号跑一次握手诊断
+      // （日常版不跑；见 muse_native::maybe_auto_diagnose）。
+      let app_for_diag = app.handle().clone();
+      let mgr_for_diag = Arc::clone(&session_mgr);
+      tauri::async_runtime::spawn(async move {
+        muse_native::maybe_auto_diagnose(&app_for_diag, &mgr_for_diag).await;
+      });
+
       Ok(())
     })
     .invoke_handler(tauri::generate_handler![
@@ -230,6 +250,7 @@ pub fn run() {
       check_for_updates,
       download_and_install_update,
       open_external_url,
+      muse_native_diagnose,
     ])
     .run(tauri::generate_context!())
     .expect("error while running tauri application");

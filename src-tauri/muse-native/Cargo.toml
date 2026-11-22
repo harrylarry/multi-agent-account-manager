@@ -1,0 +1,22 @@
+[package]
+name = "muse-native"
+version = "0.1.22"
+edition = "2021"
+rust-version = "1.85"
+description = "Muse.ai native Noise client for 叠号 (Spike 0.1.22): Noise_XX handshake, HTTP-over-Noise transport, HTTPS control plane. Ported from BotArk (MIT, qybaihe/botark v0.12.0)."
+license = "MIT"
+
+[dependencies]
+aes-gcm = { version = "0.10", features = ["aes"] }
+futures-util = "0.3"
+getrandom = "0.3"
+hmac = "0.12"
+http = "1"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+sha2 = "0.10"
+tokio = { version = "1", features = ["io-util", "macros", "net", "rt", "sync", "time"] }
+tokio-tungstenite = { version = "0.28", features = ["rustls-tls-webpki-roots"] }
+uuid = { version = "1", features = ["v4"] }
+x25519-dalek = { version = "2", features = ["static_secrets"] }
+zeroize = { version = "1", features = ["derive"] }

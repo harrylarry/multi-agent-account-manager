@@ -54,6 +54,10 @@ private struct DeleteProfileArgs: Decodable {
   let uuid: String
 }
 
+private struct GetSessionCookiesArgs: Decodable {
+  let uuid: String
+}
+
 private struct SetUnreadBadgeArgs: Decodable {
   let hasUnread: Bool
 }
@@ -190,6 +194,24 @@ class AccountSessionPlugin: Plugin {
       ) {
         DataStoreRegistry.remove(args.uuid)
         invoke.resolve()
+      }
+    }
+  }
+
+  /// Spike 0.1.22 (#2 Cookie 桥)：从指定账号的 WKWebsiteDataStore 取
+  /// muse.ai 会话 cookie 传给 Rust（内存传递）。
+  /// 只回传 muse.ai 域的 cookie；值不记日志、不落盘，Rust 侧用后 zeroize。
+  @objc public func getSessionCookies(_ invoke: Invoke) throws {
+    let args = try invoke.parseArgs(GetSessionCookiesArgs.self)
+    DispatchQueue.main.async {
+      guard let identifier = UUID(uuidString: args.uuid) else {
+        invoke.reject("无效的会话标识")
+        return
+      }
+      let store = WKWebsiteDataStore(forIdentifier: identifier)
+      store.httpCookieStore.getAllCookies { cookies in
+        let mine = cookies.filter { $0.domain == "muse.ai" || $0.domain.hasSuffix(".muse.ai") }
+        invoke.resolve(["cookies": mine.map { ["name": $0.name, "value": $0.value] }])
       }
     }
   }
