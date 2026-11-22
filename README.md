@@ -146,6 +146,14 @@ npm run tauri -- build
 
 ---
 
+## 开发约定与计划
+
+- [AGENTS.md](AGENTS.md)：开发 Agent 的协作约定（单 Agent 连续开发、以 GitHub 作为项目事实来源、测试与安全门禁）。
+- [开发计划 v2.1](docs/叠号开发计划-严谨执行版-v2.1-2026-11-23.md)：Phase 0–5 的可执行任务、验收矩阵、风险登记与 Go/No-Go 门禁。
+- 任务进度、验收证据与阻断以 GitHub Issue / PR / Actions 为准；`.muse-graph/` 仅作辅助索引，不与 GitHub 记录冲突。
+
+---
+
 ## 社区与开源协议
 
 本项目已加入并致谢 [LINUX DO](https://linux.do/) 开源社区。

@@ -85,27 +85,26 @@ ID 格式：事实 `fNNN`、意图 `iNNN`、提示 `hNNN`，三位补零，按 p
 
 维护类仓库没有“完成”那一天，goal 只是维护目标描述；完成以任务（intent）为单位，不设 terminal fact。
 
-## 5. 角色
+## 5. 角色与责任
 
-- **Wally（commander，唯一）**：拆任务、写 intent、审核（代码 + 图）、裁决冲突、维护 project.json 与 GRAPH.md。图更新直接提交 main（用户 2026-11-22 确认）。
-- **Nova（executor）**：认领 intent、开发、写 fact（随 PR）、同步 GRAPH.md。
-- **未来 executor**：取一个 worker 名，同样规则。frontier（可干的 intent 列表）就是共享工作队列。
-- **用户**：提需求、confirm 门禁拍板人、验包人。
+- **不设固定开发角色**（2026-11-23 起）：不再把「Wally 拆任务 / Nova 开发 / Wally 审核」当作流程。当前执行 Agent 对任务闭环负责：核查、实现、测试、更新 Issue/PR、按权限收尾。
+- **图是辅助索引**：图谱用于 recall 与历史索引，不替代 GitHub Issue/PR/CI 的事实地位；两者冲突时以 GitHub 为准。图更新不再是每个任务的必需交接环节。
+- **用户**：提需求、决定产品范围与风险接受、confirm 门禁拍板人、验包人。
+- 允许复合角色（同一 Agent 既实现又自检）；高风险任务可另请复核，但复核不是某个固定身份的职责。
 
 ## 6. 循环（对齐先验后合流程）
 
-1. 用户提需求 → Wally 拆任务、确认方案（老规则不变）。
-2. Wally：先 recall（查 GRAPH.md 有无相似旧事实，有则引用）；写 intent 进图（直接提交 main，附 Issue 号）；开 Issue 任务单（写 intent id）；发派活邮件（写 intent id）。
-3. Nova 接任务：读 GRAPH.md + intent 的 from 事实的 doc；开发；本地检查。
-4. Nova 完成：写 fact（新事实 JSON，source_intent 指向 intent）+ 更新 intent（to=fact，status=done，concluded_at）+ 更新 project.json counters + 跑 `graph.py render` 同步 GRAPH.md + 跑 `graph.py validate` 自查；全部随任务 PR 提交，PR 描述里写清图更新内容。
-5. Wally 审代码：diff 对照任务单 + 审图更新（跑 `graph.py validate` + `graph.py check`，再看 fact 是否有证据、intent 指向是否对）。图更新不合格 → 评审意见打回，与代码问题同等处理。
-6. 审过 → 手动触发分支构建 → 用户验包 → 有问题回第 3 步（Nova 修，图更新随之改）。
-7. 用户确认 → 合入 main：fact 正式生效。Wally 关 Issue、删分支、报告用户。
-8. 任务外的小事实（如流程决定、根因结论）：Wally 直接记 fact 提交 main，不走任务流程。
+1. 用户提需求 → 当前执行 Agent 确认范围；已有 Issue 就沿用，不重复开单。
+2. 需要图索引时先 recall，再写 intent（附 Issue 号）；邮件/交接文档不是必需环节。
+3. 开发：读 Issue 验收项与 `from` 事实的 doc；实现、测试、自检。
+4. 完成：fact 与 intent 结论随任务 PR 提交（`graph.py render` + `validate`），PR 描述写清图更新；本次若无图更新，在 Issue/PR 说明即可。
+5. 自检：CI 通过；如改图再跑 `graph.py check`。
+6. 用户验收 → 合入 main：fact 正式生效，关闭 Issue，可删分支。
+7. 任务外的小结论（根因、流程决定）：直接记 fact 提交 main，或写进 Issue 评论，二者取一，不重复维护。
 
 ## 7. Recall（经验复用）
 
-Wally 拆任务前、Nova 接任务后，各查一次：读 GRAPH.md，相关节点读 doc。发现重复工作时，在 intent 描述里引用旧 fact id，不重复造。
+当前执行 Agent 接任务后查一次：读 GRAPH.md，相关节点读 doc。发现重复工作时，在 intent 描述或 Issue 里引用旧 fact id，不重复造。
 
 ## 8. Confirm 门禁
 
