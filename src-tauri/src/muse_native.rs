@@ -18,7 +18,8 @@ use tauri::AppHandle;
 use zeroize::Zeroize;
 
 use crate::providers::ProviderId;
-use crate::session_manager::{AuthState, SessionManager};
+use crate::session_manager::SessionManager;
+use crate::storage::AuthState;
 
 /// 日常版 bundle id：自检只在 Spike 版（换了 bundle id 的包）里跑。
 const DAILY_IDENTIFIER: &str = "com.ldjx.accountmanager";
