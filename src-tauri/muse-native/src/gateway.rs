@@ -20,6 +20,7 @@ use futures_util::{SinkExt, StreamExt};
 use std::fmt;
 use std::time::Duration;
 use tokio::net::TcpStream;
+use tokio_tungstenite::tungstenite::handshake::client::generate_key;
 use tokio_tungstenite::tungstenite::protocol::Message;
 use tokio_tungstenite::{connect_async, MaybeTlsStream, WebSocketStream};
 use zeroize::Zeroize;
@@ -164,8 +165,18 @@ impl<F: ControlPlaneFetch> MuseGateway<F> {
     creds.zeroize();
     drop(creds);
 
+    // tungstenite 的 connect_async 接到预建 Request 时不会自动补 WebSocket
+    // 握手头（只在传 URL 字符串时 generate_request 才会补），缺了就报
+    // "Missing, duplicated or incorrect header sec-websocket-key"。
+    // 须手动带齐 5 个强制头（Host / Connection / Upgrade /
+    // Sec-WebSocket-Version / Sec-WebSocket-Key）。
     let request = http::Request::builder()
       .uri(url)
+      .header("Host", "hatch.metaaivm.com")
+      .header("Connection", "Upgrade")
+      .header("Upgrade", "websocket")
+      .header("Sec-WebSocket-Version", "13")
+      .header("Sec-WebSocket-Key", generate_key())
       .header("Origin", "https://muse.ai")
       .header("User-Agent", GATEWAY_UA)
       .body(())
