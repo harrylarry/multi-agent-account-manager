@@ -21,6 +21,7 @@
 // - gateway: WSS + Noise 握手 + 单次 unary RPC（BotArk gateway.ts 的 Spike 子集，
 //   无心跳、无自动重连——那是 Phase 1 的事）。
 // - cookie: 会话 cookie 的内存持有者（Swift WKWebsiteDataStore 桥接）。
+// - watch: chat.subscribe 事件归一化与去重（B1，Issue #13 #5）。
 
 pub mod control_plane;
 pub mod cookie;
@@ -30,3 +31,4 @@ pub mod methods;
 pub mod noise;
 pub mod protobuf;
 pub mod transport;
+pub mod watch;

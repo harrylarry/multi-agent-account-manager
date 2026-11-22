@@ -140,3 +140,6 @@ jobs:
       # muse-native 是 src-tauri 的 path 依赖、不是 workspace 成员，不能用 -p；
       # 对整个包 check 才能复用 src-tauri/Cargo.lock 与 target 目录。
       - run: cargo check --manifest-path src-tauri/Cargo.toml --target aarch64-apple-ios
+      # 纯逻辑测试（watch/transport/noise）跑宿主 target，不需要 Xcode。
+      - name: cargo test (muse-native)
+        run: cargo test --manifest-path src-tauri/muse-native/Cargo.toml

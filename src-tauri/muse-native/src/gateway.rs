@@ -245,6 +245,98 @@ pub struct ConnectedGateway {
 }
 
 impl ConnectedGateway {
+  /// 发起长连接订阅（一次连接一个订阅），把连接移交给 `Subscription` 按行读取。
+  pub async fn subscribe(mut self, req: HttpRequest) -> Result<Subscription, GatewayError> {
+    let (stream_id, frames) = self.transport.encrypt_request(&req)?;
+    for frame in frames {
+      self.ws.send(Message::Binary(frame.into())).await?;
+    }
+    Ok(Subscription {
+      ws: self.ws,
+      transport: self.transport,
+      stream_id,
+      status: None,
+      buf: String::new(),
+      ended: false,
+    })
+  }
+}
+
+/// 一条进行中的订阅流。事件是 NDJSON，可能被拆到多个正文块，所以按缓冲区
+/// 拼行；`end_body` 之后把剩余内容作为最后一行返回，再返回 `None`。
+pub struct Subscription {
+  ws: WebSocketStream<MaybeTlsStream<TcpStream>>,
+  transport: NoiseTransport,
+  stream_id: u64,
+  status: Option<u16>,
+  buf: String,
+  ended: bool,
+}
+
+impl Subscription {
+  pub fn stream_id(&self) -> u64 {
+    self.stream_id
+  }
+
+  pub fn status(&self) -> Option<u16> {
+    self.status
+  }
+
+  pub async fn next_line(&mut self, timeout: Duration) -> Result<Option<String>, GatewayError> {
+    let deadline = tokio::time::Instant::now() + timeout;
+    loop {
+      if let Some(pos) = self.buf.find('\n') {
+        let mut line: String = self.buf.drain(..=pos).collect();
+        while line.ends_with('\n') || line.ends_with('\r') {
+          line.pop();
+        }
+        if line.is_empty() {
+          continue;
+        }
+        return Ok(Some(line));
+      }
+      if self.ended {
+        let rest = std::mem::take(&mut self.buf);
+        let rest = rest.trim();
+        return Ok(if rest.is_empty() {
+          None
+        } else {
+          Some(rest.to_string())
+        });
+      }
+      let msg = match tokio::time::timeout_at(deadline, self.ws.next()).await {
+        Err(_) => return Err(GatewayError::Timeout("subscription read")),
+        Ok(None) => return Ok(None),
+        Ok(Some(Err(e))) => return Err(e.into()),
+        Ok(Some(Ok(m))) => m,
+      };
+      match msg {
+        Message::Binary(data) => {
+          if let Some(frame) = self.transport.decrypt(&data)? {
+            match frame {
+              InboundFrame::Response { status, .. } => self.status = Some(status),
+              InboundFrame::BodyChunk {
+                data, end_body, ..
+              } => {
+                self.buf.push_str(&String::from_utf8_lossy(&data));
+                if end_body {
+                  self.ended = true;
+                }
+              }
+              InboundFrame::Reset { code, reason, .. } => {
+                return Err(GatewayError::Reset(code, reason));
+              }
+            }
+          }
+        }
+        Message::Close(_) => return Ok(None),
+        _ => {}
+      }
+    }
+  }
+}
+
+impl ConnectedGateway {
   /// 握手探针：connection.ping（POST /api/ping），返回 HTTP 状态码。
   pub async fn ping(&mut self) -> Result<u16, GatewayError> {
     let spec = methods::connection_ping();
