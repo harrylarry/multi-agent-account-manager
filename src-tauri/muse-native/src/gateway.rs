@@ -264,6 +264,12 @@ impl ConnectedGateway {
     for frame in frames {
       self.ws.send(Message::Binary(frame.into())).await?;
     }
+    // 一次 unary 响应的结束方式有两种（对齐 BotArk finishStream）：
+    // 响应头帧自带 end_body，或响应头帧 end_body=false、随后由正文块 end_body=true 收尾。
+    // 记下先到的状态码，任何一个结束帧都算流结束；只有「一个响应头帧都没收到、
+    // 却以正文块结束」才算异常（否则会把正常响应误判成 failed）。
+    let mut status: Option<u16> = None;
+    let mut body_chunks = 0usize;
     let deadline = tokio::time::timeout(PING_TIMEOUT, async {
       loop {
         let msg = self
@@ -280,22 +286,29 @@ impl ConnectedGateway {
         match frame {
           InboundFrame::Response {
             stream_id: sid,
-            status,
+            status: st,
             end_body,
             ..
           } if sid == stream_id => {
+            status = Some(st);
             if end_body {
-              return Ok(status);
+              return Ok(st);
             }
           }
           InboundFrame::BodyChunk {
             stream_id: sid,
             end_body,
             ..
-          } if sid == stream_id && end_body => {
-            return Err(GatewayError::Closed(
-              "ping ended without response".to_string(),
-            ));
+          } if sid == stream_id => {
+            body_chunks += 1;
+            if end_body {
+              return match status {
+                Some(st) => Ok(st),
+                None => Err(GatewayError::Closed(format!(
+                  "ping ended without response frame (body chunks: {body_chunks})"
+                ))),
+              };
+            }
           }
           InboundFrame::Reset {
             stream_id: sid,
