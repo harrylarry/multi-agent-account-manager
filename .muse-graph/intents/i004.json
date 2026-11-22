@@ -1,5 +1,5 @@
 {
-  "concluded_at": null,
+  "concluded_at": "2026-11-22T17:28:38Z",
   "confirmed_at": null,
   "created_at": "2026-11-22T16:42:48Z",
   "creator": "wally",
@@ -11,8 +11,8 @@
   "id": "i004",
   "issue": 12,
   "requires_confirmation": false,
-  "status": "open",
+  "status": "done",
   "title": "原生客户端骨架",
-  "to": null,
-  "worker": null
+  "to": "f012",
+  "worker": "nova"
 }
