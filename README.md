@@ -6,6 +6,15 @@
 
 > 本仓库在上游版本基础上新增 iOS 支持：未签名 IPA（iOS 17.0+），需自行签名后侧载安装。
 
+## iOS 移植说明
+
+本仓库是 [ldjx7/multi-agent-account-manager](https://github.com/ldjx7/multi-agent-account-manager) 的 iOS 移植 fork：基于 Tauri 2 + WKWebView，在上游基础上新增 iOS 支持。
+
+- **当前版本**：0.1.19。
+- **IPA 构建**：由 GitHub Actions（`.github/workflows/ios.yml`）在 `macos-15-intel` runner 上构建，产物为未签名 IPA（`account-manager-ios-unsigned.ipa`），无需 Apple 开发者账号。
+- **安装方式**：侧载安装。iOS 17.0+，需用 AltStore / Sideloadly / SideStore 或 Xcode 以自己的 Apple ID 签名后安装；免费 Apple ID 签名有效期 7 天，付费开发者账号 1 年。
+- **上游更新**：上游更新不再合入本 fork。
+
 ## 支持服务与核心特性
 
 | 服务 | 状态 | 说明 |
