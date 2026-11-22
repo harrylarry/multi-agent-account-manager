@@ -134,6 +134,11 @@ class AccountSessionPlugin: Plugin {
         }
         presenter.present(vc, animated: true)
       }
+      // 0.1.15: first Muse session open is the contextual moment to ask
+      // for notification permission (task-completion alerts).
+      if args.providerId == "muse" {
+        TaskWatcher.shared.ensureAuthorization()
+      }
       invoke.resolve()
     }
   }
@@ -168,6 +173,7 @@ class AccountSessionPlugin: Plugin {
         return
       }
       RecentAccountPages.discardProfile(args.uuid)
+      TaskWatcher.shared.forget(uuid: args.uuid)
       guard DataStoreRegistry.contains(args.uuid) else {
         invoke.resolve()
         return
@@ -316,5 +322,8 @@ class AccountSessionPlugin: Plugin {
 
 @_cdecl("init_plugin_account_session")
 public func initPlugin() -> Plugin {
+  // 0.1.15: start the task watcher at plugin init so the notification
+  // delegate is set before a cold-launch tap can be delivered.
+  TaskWatcher.shared.start()
   return AccountSessionPlugin()
 }
