@@ -1,4 +1,4 @@
-# 事实意图图谱协议（v1）
+# 事实意图图谱协议（v1.1）
 
 双 Muse（以后多 Muse）共享工作记忆的协议。理念借鉴 nvwabase（N1nEmAn，MIT）的事实意图图设计；本协议与一切实现均为自写，未用其代码。
 
@@ -16,7 +16,7 @@
 - main 上的图只含已确认事实；PR 分支里的图更新是待确认的，合入才生效。
 - Git 是唯一的同步通道，不新开通道。邮件和 Issue 是通知，不是图本身。
 - 图是记录，不是聊天：只记确认的事实和工作单元，不记讨论过程。
-- 谁改图，谁同步 GRAPH.md。
+- GRAPH.md 由工具生成，禁止手改；改图后跑 `graph.py render` 同步（见第 13 节）。
 - 不记密钥、凭证、私人通信原文、身份/财务/健康信息。只记确认的事实，不记猜测（猜测写进 intent 描述或 hint）。
 
 ## 3. 布局
@@ -97,8 +97,8 @@ ID 格式：事实 `fNNN`、意图 `iNNN`、提示 `hNNN`，三位补零，按 p
 1. 用户提需求 → Wally 拆任务、确认方案（老规则不变）。
 2. Wally：先 recall（查 GRAPH.md 有无相似旧事实，有则引用）；写 intent 进图（直接提交 main，附 Issue 号）；开 Issue 任务单（写 intent id）；发派活邮件（写 intent id）。
 3. Nova 接任务：读 GRAPH.md + intent 的 from 事实的 doc；开发；本地检查。
-4. Nova 完成：写 fact（新事实 JSON，source_intent 指向 intent）+ 更新 intent（to=fact，status=done，concluded_at）+ 更新 project.json counters + 同步 GRAPH.md；全部随任务 PR 提交，PR 描述里写清图更新内容。
-5. Wally 审代码：diff 对照任务单 + 审图更新（fact 是否有证据、intent 指向是否对、GRAPH.md 是否同步、id 有无冲突）。图更新不合格 → 评审意见打回，与代码问题同等处理。
+4. Nova 完成：写 fact（新事实 JSON，source_intent 指向 intent）+ 更新 intent（to=fact，status=done，concluded_at）+ 更新 project.json counters + 跑 `graph.py render` 同步 GRAPH.md + 跑 `graph.py validate` 自查；全部随任务 PR 提交，PR 描述里写清图更新内容。
+5. Wally 审代码：diff 对照任务单 + 审图更新（跑 `graph.py validate` + `graph.py check`，再看 fact 是否有证据、intent 指向是否对）。图更新不合格 → 评审意见打回，与代码问题同等处理。
 6. 审过 → 手动触发分支构建 → 用户验包 → 有问题回第 3 步（Nova 修，图更新随之改）。
 7. 用户确认 → 合入 main：fact 正式生效。Wally 关 Issue、删分支、报告用户。
 8. 任务外的小事实（如流程决定、根因结论）：Wally 直接记 fact 提交 main，不走任务流程。
@@ -129,19 +129,19 @@ Wally 拆任务前、Nova 接任务后，各查一次：读 GRAPH.md，相关节
 协议：见 PROTOCOL.md
 
 ## 前沿（可干）
-- iNNN：标题（一句话）
+- iNNN：标题（Issue #N）
 
 ## 最近事实（最新 8 条）
-- fNNN：标题（一句话）
+- fNNN：标题（Issue #N、PR #N）
 
 ## 最近完成（最新 4 条）
-- iNNN → fNNN：标题
+- iNNN → fNNN：标题（Issue #N）
 
 ## 提示
 - hNNN：内容
 ```
 
-无内容的部分写“（无）”，不要省略标题。
+括号里只放 refs/Issue 引用，没有则省略；标题即摘要，详情在 JSON 的 doc 里。无内容的部分写“（无）”，不要省略标题。GRAPH.md 由 `graph.py render` 生成，禁止手改。
 
 ## 11. 协议维护
 
@@ -151,6 +151,17 @@ Wally 拆任务前、Nova 接任务后，各查一次：读 GRAPH.md，相关节
 
 先在叠号 iOS 试点；跑 3–5 个任务后评估：有用 → 做小工具（校验、自动渲染 GRAPH.md、recall 搜索）；没用 → 停，图文件留作可读记录。评估由用户定。
 
+## 13. 工具（graph.py）
+
+- 位置：各仓库 `.muse-graph/tools/graph.py`，单文件、只用 Python 标准库，Wally 和 Nova 跑同一个文件。
+- `validate`：校验 JSON、字段、引用、计数器、密钥扫描；过 exit 0，不过列出每条错。
+- `render`：从 JSON 重新生成 GRAPH.md，确定性输出（同一份图永远生成同一份文件）。
+- `check`：重渲染并与 GRAPH.md 对 diff；不同则退出 1 并显示差异。
+- `recall`：词面搜索（中文二元字串 + 标题权重），列前 5 条；不是语义搜索，查不到同义词。
+- `new`：按计数器取号新建节点（fact/intent/hint），省手写 JSON 出错。
+- 用法：Nova 开 PR 前跑 `validate` + `render` 自查；Wally 审 PR 时跑 `validate` + `check`；改图后跑 `render`，禁止手改 GRAPH.md。
+
 ## 变更记录
 
 - v1（2026-11-22）：初版。试点：harrylarry/multi-agent-account-manager。
+- v1.1（2026-11-22）：增加工具 graph.py（validate/render/check/recall/new）；GRAPH.md 改为工具生成，禁止手改；§10 模板对齐渲染格式。
