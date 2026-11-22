@@ -96,20 +96,30 @@ impl ControlPlaneFetch for ReqwestFetch {
 /// 跑一次原生握手诊断：取凭证 → WSS → Noise 握手 → connection.ping。
 /// 只做诊断，不发聊天、不做 watcher、不做通知、不改 UI。
 /// cookie 只在内存里用，控制面跑完立即 zeroize。
-/// 整体包一层 60 秒超时：任何一步卡住都返回明确的失败结果，不让前端一直转圈。
+///
+/// 超时实现说明（2026-11-23 实测教训）：不能用 tokio::time::timeout 包
+/// diagnose_inner——如果内层在某处同步阻塞（如插件调用卡住工作线程），
+/// 同一任务里的 timer 永远得不到轮询，超时不会触发（spike4/spike5 实测：
+/// 前端 70 秒超时先触发，Rust 60 秒超时没反应）。
+/// 改成把 diagnose_inner 派到独立任务，再用 select! 对 sleep 竞速：
+/// 计时器在另一个任务里，即使内层任务卡死也能按时返回。
 pub async fn diagnose(
   app: &AppHandle,
   provider_id: &str,
   uuid: &str,
 ) -> Result<SpikeDiagnose, String> {
-  match tokio::time::timeout(
-    DIAGNOSE_TIMEOUT,
-    diagnose_inner(app, provider_id, uuid),
-  )
-  .await
-  {
-    Ok(r) => r,
-    Err(_) => Ok(SpikeDiagnose::fail(
+  let app_owned = app.clone();
+  let provider_owned = provider_id.to_string();
+  let uuid_owned = uuid.to_string();
+  let handle = tokio::spawn(async move {
+    diagnose_inner(&app_owned, &provider_owned, &uuid_owned).await
+  });
+  tokio::select! {
+    res = handle => match res {
+      Ok(r) => r,
+      Err(e) => Err(format!("诊断任务异常结束: {e}")),
+    },
+    _ = tokio::time::sleep(DIAGNOSE_TIMEOUT) => Ok(SpikeDiagnose::fail(
       "timeout",
       "诊断整体超时（60 秒）：某一步卡住了，请重启 App 再试；如反复出现请反馈。",
     )),
@@ -133,11 +143,23 @@ async fn diagnose_inner(
   }
   #[cfg(not(target_os = "android"))]
   {
-    let mut cookies = tokio::time::timeout(COOKIE_TIMEOUT, fetch_session_cookies(app, uuid))
-      .await
-      .map_err(|_| {
-        "取 muse.ai 会话 cookie 超时（15 秒）：Cookie 桥没响应，请重启 App 再试。".to_string()
-      })??;
+    // Cookie 取用也走独立任务 + select! 竞速（同上：timeout 包不住同步阻塞）。
+    let app_owned = app.clone();
+    let uuid_owned = uuid.to_string();
+    let cookie_handle =
+      tokio::spawn(async move { fetch_session_cookies(&app_owned, &uuid_owned).await });
+    let mut cookies = tokio::select! {
+      res = cookie_handle => match res {
+        Ok(r) => r?,
+        Err(e) => return Err(format!("取 cookie 任务异常结束: {e}")),
+      },
+      _ = tokio::time::sleep(COOKIE_TIMEOUT) => {
+        return Ok(SpikeDiagnose::fail(
+          "timeout",
+          "取 muse.ai 会话 cookie 超时（15 秒）：Cookie 桥没响应，请重启 App 再试。",
+        ));
+      }
+    };
     if cookies.is_empty() {
       return Ok(SpikeDiagnose::fail(
         "no_cookies",
