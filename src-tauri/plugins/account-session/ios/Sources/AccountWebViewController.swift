@@ -1066,6 +1066,14 @@ final class AccountWebViewController: UIViewController, WKNavigationDelegate, WK
     dismiss(animated: true)
   }
 
+  /// 0.1.17: foreground return after a long absence — same as tapping
+  /// "← 账号". Skipped while an OAuth popup is open, so a login flow
+  /// in progress is never interrupted.
+  func returnToListAfterLongAbsence() {
+    guard popupWebView == nil else { return }
+    returnToAccountList()
+  }
+
   private func returnToAccountList() {
     let spec = currentSpec
     closingFromManager = true
