@@ -36,6 +36,20 @@ const ICON_DRAG = `<svg width="16" height="16" viewBox="0 0 24 24" fill="current
 let snapshot: ManagerSnapshot | null = null;
 let modal: ModalMode = { kind: "none" };
 let optimisticSwitching: AccountKey | null = null;
+// Spike 原生诊断（0.1.22）：只在 Spike 版（bundle id 非日常版）显示。
+// 诊断结果不进 structuralSignature，改动后只同步诊断区 DOM，不重建列表。
+interface SpikeDiagnoseResult {
+  ok: boolean;
+  phase: string;
+  handshakeCompleted: boolean;
+  pingStatus: number | null;
+  cvmDetected: boolean;
+  error: string | null;
+}
+let isSpikeBuild = false;
+let spikeDiagnose: SpikeDiagnoseResult | null = null;
+let spikeDiagnoseRunning = false;
+let spikeDiagnoseError: string | null = null;
 let busy = false;
 // Batch-1: a switch requested while another command is in flight is
 // queued (latest wins) instead of silently dropped.
@@ -681,6 +695,65 @@ function triggerAutoSync(): void {
   void invoke("trigger_quota_sync", { force: false }).catch(() => {});
 }
 
+// Spike 原生诊断（0.1.22）：诊断区只在 Spike 版的 Muse 页显示。
+// 结果只同步诊断区 DOM（syncSpikeDiag），不走 render()，不重建列表。
+function spikeDiagInnerHtml(): string {
+  const btnLabel = spikeDiagnoseRunning ? "诊断中…" : "运行诊断";
+  let resultHtml = "";
+  if (spikeDiagnose) {
+    const r = spikeDiagnose;
+    resultHtml = `
+      <div class="spike-diag-result ${r.ok ? "ok" : "fail"}">
+        <div>${r.ok ? "✓ 诊断通过" : "✗ 诊断失败"}（阶段：${escapeHtml(r.phase)}）</div>
+        <div>握手：${r.handshakeCompleted ? "✓ 完成" : "✗ 未完成"}</div>
+        <div>ping：${r.pingStatus !== null ? `HTTP ${r.pingStatus}` : "—"}</div>
+        <div>CVM：${r.cvmDetected ? "已检测到" : "未检测到"}</div>
+        ${r.error ? `<div>错误：${escapeHtml(r.error)}</div>` : ""}
+      </div>`;
+  } else if (spikeDiagnoseError) {
+    resultHtml = `<div class="spike-diag-result fail">错误：${escapeHtml(spikeDiagnoseError)}</div>`;
+  }
+  return `
+    <div class="spike-diag-header">
+      <span class="spike-diag-title">原生诊断（Spike）</span>
+      <button id="spike-diagnose-btn" class="mini-btn" type="button" ${spikeDiagnoseRunning ? "disabled" : ""}>${btnLabel}</button>
+    </div>
+    ${resultHtml}`;
+}
+
+function syncSpikeDiag(): void {
+  const el = document.querySelector<HTMLElement>(".spike-diag");
+  if (!el) return;
+  el.innerHTML = spikeDiagInnerHtml();
+}
+
+async function runSpikeDiagnose(): Promise<void> {
+  if (!snapshot || spikeDiagnoseRunning) return;
+  const acc = snapshot.accounts.find(
+    (a) => a.providerId === "muse" && a.authState === "authenticated"
+  );
+  if (!acc) {
+    spikeDiagnose = null;
+    spikeDiagnoseError = "没有已登录的 Muse 账号，请先登录一个测试账号。";
+    syncSpikeDiag();
+    return;
+  }
+  spikeDiagnoseRunning = true;
+  spikeDiagnoseError = null;
+  syncSpikeDiag();
+  try {
+    spikeDiagnose = await invoke<SpikeDiagnoseResult>("muse_native_diagnose", {
+      providerId: "muse",
+      uuid: acc.uuid,
+    });
+  } catch (e) {
+    spikeDiagnose = null;
+    spikeDiagnoseError = String(e);
+  }
+  spikeDiagnoseRunning = false;
+  syncSpikeDiag();
+}
+
 function currentProvider(state: ManagerSnapshot): ProviderInfo {
   return (
     state.providers.find((p) => p.id === state.selectedProviderId) ??
@@ -956,6 +1029,12 @@ function renderMiddleContent(state: ManagerSnapshot, provider: ProviderInfo): st
       .join("");
   }
 
+  // Spike 原生诊断区：只在 Spike 版的 Muse 页显示，日常版 / 其他服务页不渲染。
+  const spikeDiagHtml =
+    isSpikeBuild && provider.id === "muse"
+      ? `<div class="spike-diag">${spikeDiagInnerHtml()}</div>`
+      : "";
+
   return `
     <div class="column-header">
       <div class="provider-title-wrap">
@@ -973,6 +1052,7 @@ function renderMiddleContent(state: ManagerSnapshot, provider: ProviderInfo): st
     ${noticeHtml}
     ${conflictsHtml}
     <div class="account-list${inReorder ? " reorder-mode" : ""}">${listBody}</div>
+    ${spikeDiagHtml}
     <!-- 0.1.21: the modal lives in its own overlay container and is
          filled by renderModalRoot(), not by this template — opening or
          closing it no longer rebuilds #app (see structuralSignature). -->
@@ -1567,6 +1647,12 @@ function bindDelegatedEvents(): void {
       }
       return;
     }
+    // Spike 原生诊断按钮（只在 Spike 版的 Muse 页存在）。
+    const diagBtn = target.closest<HTMLElement>("#spike-diagnose-btn");
+    if (diagBtn) {
+      await runSpikeDiagnose();
+      return;
+    }
     const providerBtn = target.closest<HTMLElement>("[data-provider]");
     if (providerBtn) {
       const nextId = providerBtn.dataset.provider as ProviderId;
@@ -1891,6 +1977,12 @@ async function bootstrap(): Promise<void> {
   });
 
   snapshot = await invoke<ManagerSnapshot>("get_manager_state");
+  // Spike 版判定：决定是否显示原生诊断区（失败时默认不显示）。
+  try {
+    isSpikeBuild = await invoke<boolean>("is_spike_build");
+  } catch {
+    isSpikeBuild = false;
+  }
   render();
   // Batch-1: silent sync on app entry and whenever the app becomes
   // active again (foreground / focus). No periodic background sync.

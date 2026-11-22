@@ -24,6 +24,12 @@ use crate::storage::AuthState;
 /// 日常版 bundle id：自检只在 Spike 版（换了 bundle id 的包）里跑。
 const DAILY_IDENTIFIER: &str = "com.ldjx.accountmanager";
 
+/// Spike 版判定：bundle id 不是日常版时为 true。前端据此决定是否显示原生诊断区。
+#[tauri::command]
+pub fn is_spike_build(app: AppHandle) -> bool {
+  app.config().identifier != DAILY_IDENTIFIER
+}
+
 /// 诊断结果——只含阶段与状态，不含 cookie / token / 凭证值。
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]

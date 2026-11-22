@@ -1587,3 +1587,33 @@ body,
   background: #f5f9ff;
   border-color: #bfd8ff;
 }
+
+/* Spike 原生诊断区（0.1.22）：只在 Spike 版的 Muse 页渲染。 */
+.spike-diag {
+  margin: 12px;
+  padding: 12px;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  background: var(--stage-bg);
+}
+.spike-diag-header {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+}
+.spike-diag-title {
+  font-size: 13px;
+  font-weight: 600;
+}
+.spike-diag-result {
+  margin-top: 8px;
+  font-size: 12px;
+  line-height: 1.7;
+  word-break: break-word;
+}
+.spike-diag-result.ok {
+  color: var(--online);
+}
+.spike-diag-result.fail {
+  color: var(--danger);
+}

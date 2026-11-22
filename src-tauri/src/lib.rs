@@ -251,6 +251,7 @@ pub fn run() {
       download_and_install_update,
       open_external_url,
       muse_native_diagnose,
+      muse_native::is_spike_build,
     ])
     .run(tauri::generate_context!())
     .expect("error while running tauri application");
