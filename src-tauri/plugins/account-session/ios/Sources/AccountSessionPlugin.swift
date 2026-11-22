@@ -4,7 +4,9 @@
 // checkCapabilities, openAccountSession, updateAccountTitle,
 // closeActiveSession, deleteProfile, openExternalUrl, fetchText), plus
 // syncAccountQuotas (batch-1 iOS background quota sync — no Android
-// equivalent, the Android sync runs through its own warm webviews).
+// equivalent, the Android sync runs through its own warm webviews) and
+// setUnreadBadge (0.1.16 aggregate unread dot on the session "← 账号"
+// button — no Android equivalent).
 // downloadAndInstallApk is intentionally NOT ported: iOS updates are
 // manual re-sideloads (see Rust updater.rs, status "manual_install").
 //
@@ -50,6 +52,10 @@ private struct CloseSessionArgs: Decodable {
 
 private struct DeleteProfileArgs: Decodable {
   let uuid: String
+}
+
+private struct SetUnreadBadgeArgs: Decodable {
+  let hasUnread: Bool
 }
 
 private struct OpenExternalUrlArgs: Decodable {
@@ -134,11 +140,6 @@ class AccountSessionPlugin: Plugin {
         }
         presenter.present(vc, animated: true)
       }
-      // 0.1.15: first Muse session open is the contextual moment to ask
-      // for notification permission (task-completion alerts).
-      if args.providerId == "muse" {
-        TaskWatcher.shared.ensureAuthorization()
-      }
       invoke.resolve()
     }
   }
@@ -190,6 +191,18 @@ class AccountSessionPlugin: Plugin {
         DataStoreRegistry.remove(args.uuid)
         invoke.resolve()
       }
+    }
+  }
+
+  /// 0.1.16: aggregate unread dot on the session "← 账号" button.
+  /// Rust pushes the aggregate (any account with an unread reply)
+  /// whenever a flag flips; the coordinator stores it and applies it
+  /// to the current session view (or the next one opened).
+  @objc public func setUnreadBadge(_ invoke: Invoke) throws {
+    let args = try invoke.parseArgs(SetUnreadBadgeArgs.self)
+    DispatchQueue.main.async {
+      AccountSessionCoordinator.shared.setUnreadBadge(args.hasUnread)
+      invoke.resolve()
     }
   }
 
@@ -322,8 +335,8 @@ class AccountSessionPlugin: Plugin {
 
 @_cdecl("init_plugin_account_session")
 public func initPlugin() -> Plugin {
-  // 0.1.15: start the task watcher at plugin init so the notification
-  // delegate is set before a cold-launch tap can be delivered.
+  // 0.1.15: start the task watcher at plugin init so the parked-page
+  // sweep is running from the first session on.
   TaskWatcher.shared.start()
   return AccountSessionPlugin()
 }
