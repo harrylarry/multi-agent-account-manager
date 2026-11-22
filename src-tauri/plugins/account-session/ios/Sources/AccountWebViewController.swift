@@ -34,6 +34,10 @@ final class AccountWebViewController: UIViewController, WKNavigationDelegate, WK
   private var popupOverlayRoot: UIView!
   private var popupDomainLabel: UILabel!
   private var popupWebContainer: UIView!
+  // 0.1.18: the popup is a card floating over the dimmed session page
+  // (not a full-screen replacement), so the session stays visibly the
+  // main content underneath.
+  private var popupCardView: UIView!
   // Batch-1: thin load-progress bar under the top bar.
   private var progressView: UIProgressView!
   // 0.1.16: aggregate unread dot on the "← 账号" button.
@@ -47,10 +51,11 @@ final class AccountWebViewController: UIViewController, WKNavigationDelegate, WK
   private var committedAuthority: String?
   private var mainLoadFailed = false
   private var popupWebView: WKWebView?
-  // 0.1.11: set when the popup navigates to a Google OAuth host; the
-  // popup auto-closes (and the session reloads) once it lands back on
-  // an allowlisted host — the OAuth callback.
-  private var popupDidOAuth = false
+  // 0.1.11 (generalized in 0.1.18): set when the popup navigates to a
+  // non-allowlisted host — the popup is doing external auth. The popup
+  // auto-closes (and the session reloads) once it lands back on an
+  // allowlisted host — the OAuth callback.
+  private var popupDidExternalAuth = false
   // 0.1.12: set when the OAuth callback navigation has been reloaded
   // programmatically once; keeps the cancel+reload intercept from
   // looping on its own reload.
@@ -174,10 +179,20 @@ final class AccountWebViewController: UIViewController, WKNavigationDelegate, WK
     contentFrame.addSubview(loadingIndicator)
     contentFrame.addSubview(mainWebContainer)
 
+    // 0.1.18: the overlay root is now just the dim layer; the popup
+    // itself lives in a rounded card on top of it. No tap-to-dismiss
+    // on the dim — a stray tap must not kill an auth flow mid-flight;
+    // the header's close button is the manual close.
     popupOverlayRoot = UIView()
-    popupOverlayRoot.backgroundColor = .white
+    popupOverlayRoot.backgroundColor = UIColor.black.withAlphaComponent(0.45)
     popupOverlayRoot.isHidden = true
     popupOverlayRoot.translatesAutoresizingMaskIntoConstraints = false
+
+    popupCardView = UIView()
+    popupCardView.backgroundColor = .white
+    popupCardView.layer.cornerRadius = 16
+    popupCardView.clipsToBounds = true
+    popupCardView.translatesAutoresizingMaskIntoConstraints = false
 
     let popupHeader = UIView()
     popupHeader.backgroundColor = UIColor(hex: 0xF2F5FA)
@@ -203,8 +218,9 @@ final class AccountWebViewController: UIViewController, WKNavigationDelegate, WK
     popupWebContainer = UIView()
     popupWebContainer.translatesAutoresizingMaskIntoConstraints = false
 
-    popupOverlayRoot.addSubview(popupHeader)
-    popupOverlayRoot.addSubview(popupWebContainer)
+    popupCardView.addSubview(popupHeader)
+    popupCardView.addSubview(popupWebContainer)
+    popupOverlayRoot.addSubview(popupCardView)
 
     view.addSubview(topBar)
     view.addSubview(contentFrame)
@@ -250,9 +266,14 @@ final class AccountWebViewController: UIViewController, WKNavigationDelegate, WK
       popupOverlayRoot.trailingAnchor.constraint(equalTo: view.trailingAnchor),
       popupOverlayRoot.bottomAnchor.constraint(equalTo: view.bottomAnchor),
 
-      popupHeader.topAnchor.constraint(equalTo: safe.topAnchor),
-      popupHeader.leadingAnchor.constraint(equalTo: popupOverlayRoot.leadingAnchor),
-      popupHeader.trailingAnchor.constraint(equalTo: popupOverlayRoot.trailingAnchor),
+      popupCardView.topAnchor.constraint(equalTo: safe.topAnchor, constant: 12),
+      popupCardView.leadingAnchor.constraint(equalTo: view.leadingAnchor, constant: 12),
+      popupCardView.trailingAnchor.constraint(equalTo: view.trailingAnchor, constant: -12),
+      popupCardView.bottomAnchor.constraint(equalTo: safe.bottomAnchor, constant: -12),
+
+      popupHeader.topAnchor.constraint(equalTo: popupCardView.topAnchor),
+      popupHeader.leadingAnchor.constraint(equalTo: popupCardView.leadingAnchor),
+      popupHeader.trailingAnchor.constraint(equalTo: popupCardView.trailingAnchor),
       popupHeader.heightAnchor.constraint(equalToConstant: 48),
 
       popupDomainLabel.leadingAnchor.constraint(equalTo: popupHeader.leadingAnchor, constant: 12),
@@ -265,9 +286,9 @@ final class AccountWebViewController: UIViewController, WKNavigationDelegate, WK
       closePopupButton.centerYAnchor.constraint(equalTo: popupHeader.centerYAnchor),
 
       popupWebContainer.topAnchor.constraint(equalTo: popupHeader.bottomAnchor),
-      popupWebContainer.leadingAnchor.constraint(equalTo: popupOverlayRoot.leadingAnchor),
-      popupWebContainer.trailingAnchor.constraint(equalTo: popupOverlayRoot.trailingAnchor),
-      popupWebContainer.bottomAnchor.constraint(equalTo: popupOverlayRoot.bottomAnchor),
+      popupWebContainer.leadingAnchor.constraint(equalTo: popupCardView.leadingAnchor),
+      popupWebContainer.trailingAnchor.constraint(equalTo: popupCardView.trailingAnchor),
+      popupWebContainer.bottomAnchor.constraint(equalTo: popupCardView.bottomAnchor),
     ])
   }
 
@@ -466,30 +487,37 @@ final class AccountWebViewController: UIViewController, WKNavigationDelegate, WK
         decisionHandler(.cancel)
         return
       }
-      if let url, AccountSessionCoordinator.isGoogleOAuthHost(url) {
-        // 0.1.11: same-store tab model — let Google load in the popup
-        // (it shares the session's data store, so Muse's OAuth state
-        // validates and the callback lands in the same jar). didFinish
-        // waits for the flow to complete before closing the tab (0.1.13).
-        popupDidOAuth = true
-        popupCallbackReloaded = false
-        decisionHandler(.allow)
-        return
-      }
-      if !AccountSessionCoordinator.hostMatchesAllowed(url, allowedHosts: spec.allowedHosts) {
+      if let url,
+        !AccountSessionCoordinator.hostMatchesAllowed(url, allowedHosts: spec.allowedHosts)
+      {
+        // 0.1.18: the popup is a general external-auth tab, not a
+        // Google-only one — any https host may load here. It shares
+        // the session's data store, so the provider's OAuth state
+        // validates and the callback lands in the same jar. (Before
+        // 0.1.18 this destroyed the popup, which is why every
+        // non-Gmail connector silently did nothing.) Non-https stays
+        // blocked.
+        if url.scheme?.lowercased() == "https" {
+          popupDidExternalAuth = true
+          popupCallbackReloaded = false
+          decisionHandler(.allow)
+          return
+        }
         destroyPopupWebView()
         decisionHandler(.cancel)
         return
       }
-      if popupDidOAuth, let url {
-        // 0.1.12: the OAuth callback is a universal link (muse.ai):
-        // left alone, iOS launches the Muse app instead of delivering
-        // the callback to the web page (0.1.11 user test — the password
-        // submit's user gesture carries through the redirect). Cancel
-        // it and reload programmatically: a programmatic load carries
-        // no user gesture, so it stays in the popup and the GET still
-        // reaches Muse's server. The flag keeps the intercept from
-        // looping on its own reload.
+      if let url, popupDidExternalAuth || isOAuthCallbackURL(url) {
+        // 0.1.12 (generalized in 0.1.18): the OAuth callback is a
+        // universal link (muse.ai): left alone, iOS launches the Muse
+        // app instead of delivering the callback to the web page
+        // (0.1.11 user test — the password submit's user gesture
+        // carries through the redirect). Cancel it and reload
+        // programmatically: a programmatic load carries no user
+        // gesture, so it stays in the popup and the GET still reaches
+        // Muse's server. The flag keeps the intercept from looping on
+        // its own reload. The `code` check also covers auth flows
+        // that never left allowlisted hosts (e.g. Meta domains).
         if !popupCallbackReloaded {
           popupCallbackReloaded = true
           decisionHandler(.cancel)
@@ -535,6 +563,22 @@ final class AccountWebViewController: UIViewController, WKNavigationDelegate, WK
     {
       decisionHandler(.cancel)
       presentExternalLinkAlert(url: url)
+      return
+    }
+    // 0.1.18: a programmatic navigation (redirect, form post, script)
+    // to an external host is almost always an auth flow the page is
+    // driving — open it in the same-store popup tab instead of
+    // silently cancelling, so the flow can complete and the callback
+    // lands back in the session. (Before 0.1.18 this was a silent
+    // cancel: the button did nothing.) If a popup is already open,
+    // keep the silent cancel — popups don't stack.
+    if let url,
+      url.scheme?.lowercased() == "https" || url.scheme?.lowercased() == "http",
+      popupWebView == nil,
+      let popup = createBoundAuthPopup(spec: spec, configuration: webView.configuration)
+    {
+      popup.load(URLRequest(url: url))
+      decisionHandler(.cancel)
       return
     }
     decisionHandler(.cancel)
@@ -612,11 +656,11 @@ final class AccountWebViewController: UIViewController, WKNavigationDelegate, WK
         switchSeq: spec.switchSeq, viewInstanceId: spec.viewInstanceId),
         let url = webView.url, url.absoluteString != "about:blank"
       else { return }
-      // 0.1.11: reveal the popup for Google OAuth hosts too — the login
-      // page loads in the same-store tab; the allowlist alone would
-      // destroy the popup the moment the Google page commits.
-      guard AccountSessionCoordinator.hostMatchesAllowed(url, allowedHosts: spec.allowedHosts)
-        || AccountSessionCoordinator.isGoogleOAuthHost(url)
+      // 0.1.18: reveal the popup for any https page — the popup is a
+      // general external-auth tab now, not a Google-only one. (Before
+      // 0.1.18 the allowlist/Google check here destroyed the popup the
+      // moment a non-Google provider page committed.)
+      guard url.scheme?.lowercased() == "https"
       else {
         destroyPopupWebView()
         return
@@ -660,12 +704,15 @@ final class AccountWebViewController: UIViewController, WKNavigationDelegate, WK
     // or after an 8s timeout; the session reloads 2s after the popup
     // closes (see destroyPopupWebView).
     guard webView === popupWebView,
-      popupDidOAuth,
       let spec = currentSpec,
       let url = webView.url,
       AccountSessionCoordinator.hostMatchesAllowed(url, allowedHosts: spec.allowedHosts)
     else { return }
-    if isOAuthCallbackURL(url) {
+    // 0.1.18: a callback is either a URL carrying an authorization
+    // code, or any allowlisted page reached after the popup visited an
+    // external host (the provider redirected back). The `code` check
+    // also covers auth flows that never left allowlisted hosts.
+    if isOAuthCallbackURL(url) || popupDidExternalAuth {
       guard !popupCallbackLoaded else { return }
       popupCallbackLoaded = true
       popupOAuthTimeout?.invalidate()
@@ -801,17 +848,14 @@ final class AccountWebViewController: UIViewController, WKNavigationDelegate, WK
     // the popup and reloaded the session the moment the callback loaded,
     // which killed the completion (fixed in 0.1.13 by waiting for the
     // flow to finish before closing).
-    // About:blank popups (URL unknown yet) still go through and are
-    // filtered by decidePolicyFor when they navigate.
-    if let url = navigationAction.request.url,
-      url.absoluteString != "about:blank"
-    {
-      if !AccountSessionCoordinator.hostMatchesAllowed(url, allowedHosts: spec.allowedHosts)
-        && !AccountSessionCoordinator.isGoogleOAuthHost(url)
-      {
-        return nil
-      }
-    }
+    // 0.1.18: no host gate at creation — the popup is a general
+    // external-auth tab now, and decidePolicyFor filters what it may
+    // load (https only; the main view keeps the allowlist). Before
+    // 0.1.18 this returned nil for non-allowlisted hosts, so
+    // window.open to any non-Google provider returned null and the
+    // page did nothing. (The 0.1.8 crash this gate was part of fixing
+    // was about creating the popup with a fresh configuration, not
+    // about the host — the prepared configuration is still used.)
     return createBoundAuthPopup(spec: spec, configuration: configuration)
   }
 
@@ -851,7 +895,7 @@ final class AccountWebViewController: UIViewController, WKNavigationDelegate, WK
     popup.navigationDelegate = self
     popup.uiDelegate = self
 
-    popupDidOAuth = false
+    popupDidExternalAuth = false
     popupCallbackReloaded = false
     popupCallbackLoaded = false
     popupWebView = popup
@@ -872,7 +916,7 @@ final class AccountWebViewController: UIViewController, WKNavigationDelegate, WK
   private func destroyPopupWebView() {
     let popup = popupWebView
     popupWebView = nil
-    popupDidOAuth = false
+    popupDidExternalAuth = false
     popupCallbackReloaded = false
     popupOAuthTimeout?.invalidate()
     popupOAuthTimeout = nil
