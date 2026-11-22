@@ -38,9 +38,8 @@ let modal: ModalMode = { kind: "none" };
 let optimisticSwitching: AccountKey | null = null;
 // Spike 原生诊断（0.1.22）：Muse 页底部显示诊断区。
 // 诊断结果不进 structuralSignature，改动后只同步诊断区 DOM，不重建列表。
-// 注：原先用 Rust is_spike_build 命令判定 Spike 版，但 CI 的 Rust 缓存导致
-// 主 crate 没重新编译、命令没进包，面板被误隐藏。改成无条件显示（本分支
-// 即 Spike 分支；合入 main 后日常版也会有这个区，届时再按 bundle id 门控）。
+// 注：诊断区无条件显示（日常版也有，方便后续配合调试——用户 2026-11-23 定）。
+// Spike 徽章则按 bundle id 门控（is_spike_build 命令），只在 Spike 版显示。
 interface SpikeDiagnoseResult {
   ok: boolean;
   phase: string;
@@ -52,6 +51,8 @@ interface SpikeDiagnoseResult {
 let spikeDiagnose: SpikeDiagnoseResult | null = null;
 let spikeDiagnoseRunning = false;
 let spikeDiagnoseError: string | null = null;
+// 是否 Spike 版（bundle id 门控）：只决定顶栏徽章显不显示；诊断区不门控。
+let isSpikeBuild = false;
 let busy = false;
 // Batch-1: a switch requested while another command is in flight is
 // queued (latest wins) instead of silently dropped.
@@ -1053,10 +1054,9 @@ function renderMiddleContent(state: ManagerSnapshot, provider: ProviderInfo): st
       ? `<div class="spike-diag">${spikeDiagInnerHtml()}</div>`
       : "";
 
-  // Spike 顶栏标识（0.1.22）：本分支即 Spike 分支，Muse 页标题旁常显；
-  // 合入 main 后日常版也会显示，届时按 bundle id 门控（同诊断区）。
+  // Spike 顶栏标识（0.1.22）：只在 Spike 版显示（bundle id 门控）。
   const spikeBadgeHtml =
-    provider.id === "muse"
+    isSpikeBuild && provider.id === "muse"
       ? `<span class="spike-badge" title="Spike 版">Spike</span>`
       : "";
 
@@ -2001,6 +2001,14 @@ async function bootstrap(): Promise<void> {
       }
     }
   });
+
+  // Spike 版判定：决定顶栏徽章显不显示。命令不存在（旧包）时 invoke
+  // 失败，isSpikeBuild 保持 false，徽章不显示（fail-closed）。
+  try {
+    isSpikeBuild = await invoke<boolean>("is_spike_build");
+  } catch {
+    isSpikeBuild = false;
+  }
 
   snapshot = await invoke<ManagerSnapshot>("get_manager_state");
   render();

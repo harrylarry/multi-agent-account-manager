@@ -93,6 +93,14 @@ impl ControlPlaneFetch for ReqwestFetch {
   }
 }
 
+/// 是否 Spike 版：bundle id 不是日常版即为 Spike 版。
+/// 前端据此决定是否显示 Spike 专属 UI（顶栏徽章）。
+/// 诊断区不走这个门控（日常版也显示，方便后续调试——用户 2026-11-23 定）。
+#[tauri::command]
+pub fn is_spike_build(app: AppHandle) -> bool {
+  app.config().identifier != DAILY_IDENTIFIER
+}
+
 /// 跑一次原生握手诊断：取凭证 → WSS → Noise 握手 → connection.ping。
 /// 只做诊断，不发聊天、不做 watcher、不做通知、不改 UI。
 /// cookie 只在内存里用，控制面跑完立即 zeroize。

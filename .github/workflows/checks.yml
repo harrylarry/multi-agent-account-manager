@@ -1,16 +1,16 @@
 name: Quick checks
 
-# 轻量校验，不产出 IPA。只在 spike/native-client 的 push 上运行。
+# 轻量校验，不产出 IPA。在 main 与 spike/native-client 的 push 上运行。
 #
 # 为什么没有 paths 过滤：工作流一旦被设为必需检查，路径过滤会让不相关改动
 # 长期 Pending。这里改为总是运行 changes job（约 15s）做分类，再按需跑后续 job。
-# 为什么没有 pull_request：当前 PR #15 的 head 就是本分支，push 的检查已挂在
+# 为什么没有 pull_request：PR 的 head 就是对应分支，push 的检查已挂在
 # 同一个 commit 上，再监听 pull_request 会对同一 commit 重复跑两遍。
 # 为什么没有 workflow_dispatch：GitHub 要求可手动触发的工作流存在于默认分支，
 # 本文件目前只在 spike 分支；合并进 main 后再按需加回。
 on:
   push:
-    branches: ["spike/native-client"]
+    branches: ["main", "spike/native-client"]
 
 concurrency:
   group: quick-checks-${{ github.ref }}

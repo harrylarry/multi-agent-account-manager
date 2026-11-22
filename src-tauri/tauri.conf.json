@@ -1,8 +1,8 @@
 {
   "$schema": "https://schema.tauri.app/config/2",
-  "productName": "叠号 Spike",
+  "productName": "叠号",
   "version": "0.1.22",
-  "identifier": "com.ldjx.accountmanager.spike",
+  "identifier": "com.ldjx.accountmanager",
   "build": {
     "beforeDevCommand": "npm run dev",
     "devUrl": "http://localhost:1420",
