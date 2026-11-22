@@ -36,8 +36,11 @@ const ICON_DRAG = `<svg width="16" height="16" viewBox="0 0 24 24" fill="current
 let snapshot: ManagerSnapshot | null = null;
 let modal: ModalMode = { kind: "none" };
 let optimisticSwitching: AccountKey | null = null;
-// Spike 原生诊断（0.1.22）：只在 Spike 版（bundle id 非日常版）显示。
+// Spike 原生诊断（0.1.22）：Muse 页底部显示诊断区。
 // 诊断结果不进 structuralSignature，改动后只同步诊断区 DOM，不重建列表。
+// 注：原先用 Rust is_spike_build 命令判定 Spike 版，但 CI 的 Rust 缓存导致
+// 主 crate 没重新编译、命令没进包，面板被误隐藏。改成无条件显示（本分支
+// 即 Spike 分支；合入 main 后日常版也会有这个区，届时再按 bundle id 门控）。
 interface SpikeDiagnoseResult {
   ok: boolean;
   phase: string;
@@ -46,7 +49,6 @@ interface SpikeDiagnoseResult {
   cvmDetected: boolean;
   error: string | null;
 }
-let isSpikeBuild = false;
 let spikeDiagnose: SpikeDiagnoseResult | null = null;
 let spikeDiagnoseRunning = false;
 let spikeDiagnoseError: string | null = null;
@@ -1029,9 +1031,9 @@ function renderMiddleContent(state: ManagerSnapshot, provider: ProviderInfo): st
       .join("");
   }
 
-  // Spike 原生诊断区：只在 Spike 版的 Muse 页显示，日常版 / 其他服务页不渲染。
+  // Spike 原生诊断区：Muse 页显示（本分支即 Spike 分支）。
   const spikeDiagHtml =
-    isSpikeBuild && provider.id === "muse"
+    provider.id === "muse"
       ? `<div class="spike-diag">${spikeDiagInnerHtml()}</div>`
       : "";
 
@@ -1977,12 +1979,6 @@ async function bootstrap(): Promise<void> {
   });
 
   snapshot = await invoke<ManagerSnapshot>("get_manager_state");
-  // Spike 版判定：决定是否显示原生诊断区（失败时默认不显示）。
-  try {
-    isSpikeBuild = await invoke<boolean>("is_spike_build");
-  } catch {
-    isSpikeBuild = false;
-  }
   render();
   // Batch-1: silent sync on app entry and whenever the app becomes
   // active again (foreground / focus). No periodic background sync.
