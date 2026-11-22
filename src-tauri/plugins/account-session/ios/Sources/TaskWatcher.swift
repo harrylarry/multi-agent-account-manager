@@ -1,25 +1,27 @@
-// TaskWatcher.swift — 0.1.15: Muse task-completion notifications.
+// TaskWatcher.swift — 0.1.15 (detection), 0.1.16 (no system notifications).
 //
 // Watches every live Muse session — the active one via the identity
 // probe cycle, parked ones via a 20s sweep — for a new assistant reply.
 // The user's rule: a task is done when a new reply appears. On a
-// working→idle transition the watcher posts a local notification
-// (tap = switch to that account) and marks the account unread in the
-// manager list. Each account is watched independently, so several
-// accounts can notify at once, including non-active spaces.
+// working→idle transition for a PARKED account the watcher marks the
+// account unread in the manager list (avatar dot); Rust also lights
+// the aggregate dot on the session "← 账号" button. The ACTIVE
+// account's completions are Muse web's own job (hamburger dot etc.) —
+// the app never duplicates them, and while the app is in use there
+// are no system notifications at all (user decision, 0.1.16). The
+// 0.1.15 notification plumbing (posting, authorization, tap routing)
+// was removed in 0.1.16 rather than kept as dead code; background
+// notifications are a separate, paused phase.
 //
 // Detection is heuristic: Muse's DOM has no stable message API, so the
 // script reports a message-count estimate (best of several common
 // selectors), a hash of the conversation tail, the text length, and
 // whether a Stop button is visible. The state machine arms only after
 // sustained activity — a Stop button seen, or content growing on 2+
-// separate checks — so a lone user message never notifies; it fires
+// separate checks — so a lone user message never fires; it fires
 // after the content is stable for 2 consecutive checks.
 //
 // Limits (platform design, not choice):
-// - Local notifications only. The app is signed with a free personal
-//   certificate, which Apple does not grant the push entitlement, so
-//   there is no APNs and no server — detection runs on-device.
 // - Detection only runs while the app is in the foreground. iOS
 //   suspends the app in the background, so parked pages stop updating
 //   and the sweep timer stops firing. On foreground return the watcher
@@ -30,7 +32,6 @@
 
 import Foundation
 import UIKit
-import UserNotifications
 
 final class TaskWatcher: NSObject {
   static let shared = TaskWatcher()
@@ -126,7 +127,6 @@ final class TaskWatcher: NSObject {
 
   private static let sweepInterval: TimeInterval = 20
   private static let stableChecksToFire = 2
-  private static let authRequestedKey = "maam.notificationAuthRequested"
 
   private var started = false
   private var sweepTimer: Timer?
@@ -137,11 +137,8 @@ final class TaskWatcher: NSObject {
     super.init()
   }
 
-  /// Idempotent. Sets the notification delegate (so banners show while
-  /// the app is in the foreground and taps route to the account) and
-  /// starts the parked-page sweep. Called from plugin init — the
-  /// earliest point in this codebase — so a notification tap that
-  /// cold-launches the app still reaches the delegate.
+  /// Idempotent. Starts the parked-page sweep (and the foreground-
+  /// return catch-up sweep). Called from plugin init.
   func start() {
     if Thread.isMainThread {
       startOnMain()
@@ -153,7 +150,6 @@ final class TaskWatcher: NSObject {
   private func startOnMain() {
     guard !started else { return }
     started = true
-    UNUserNotificationCenter.current().delegate = self
     let timer = Timer(
       timeInterval: Self.sweepInterval, repeats: true
     ) { [weak self] _ in self?.sweepParkedPages() }
@@ -169,19 +165,6 @@ final class TaskWatcher: NSObject {
     ) { [weak self] _ in self?.sweepParkedPages() }
   }
 
-  /// Requests notification authorization once, the first time a Muse
-  /// session opens (called from openAccountSession). The system prompt
-  /// appears exactly once; a denial is final until the user changes it
-  /// in Settings, and the watcher keeps working (the manager-list
-  /// unread dot still marks the account).
-  func ensureAuthorization() {
-    guard !UserDefaults.standard.bool(forKey: Self.authRequestedKey) else { return }
-    UserDefaults.standard.set(true, forKey: Self.authRequestedKey)
-    UNUserNotificationCenter.current().requestAuthorization(
-      options: [.alert, .sound, .badge]
-    ) { _, _ in }
-  }
-
   /// Drops all state for an account (profile deleted).
   func forget(uuid: String) {
     states = states.filter { !$0.key.hasSuffix("|\(uuid)") }
@@ -192,7 +175,7 @@ final class TaskWatcher: NSObject {
   /// interval while a task is streaming). Main-thread only.
   @discardableResult
   func noteSample(
-    providerId: String, uuid: String, alias: String, result: Any?
+    providerId: String, uuid: String, result: Any?
   ) -> Bool {
     guard providerId == "muse" else { return false }
     guard let sample = parseSample(result) else { return false }
@@ -221,7 +204,7 @@ final class TaskWatcher: NSObject {
         state.growthEvents = 0
         state.stableCount = 0
         states[key] = state
-        fireCompletion(providerId: providerId, uuid: uuid, alias: alias)
+        fireCompletion(providerId: providerId, uuid: uuid)
       }
       return false
     }
@@ -269,31 +252,19 @@ final class TaskWatcher: NSObject {
         // listing and probing; parseSample(nil) is nil, so this is
         // a harmless no-op.
         self?.noteSample(
-          providerId: entry.providerId, uuid: entry.uuid,
-          alias: entry.alias, result: result)
+          providerId: entry.providerId, uuid: entry.uuid, result: result)
       }
     }
   }
 
   // MARK: - Completion
 
-  private func fireCompletion(providerId: String, uuid: String, alias: String) {
-    postNotification(providerId: providerId, uuid: uuid, alias: alias)
+  private func fireCompletion(providerId: String, uuid: String) {
+    // 0.1.16: no system notification — the emit marks the account
+    // unread (avatar dot + aggregate "← 账号" dot). The coordinator
+    // skips the active account (Muse web handles its completions).
     AccountSessionCoordinator.shared.emitTaskReplyDetected(
       providerId: providerId, uuid: uuid)
-  }
-
-  private func postNotification(providerId: String, uuid: String, alias: String) {
-    let content = UNMutableNotificationContent()
-    content.title = alias.isEmpty ? "Muse" : alias
-    content.body = "任务完成了，有新回复"
-    content.sound = .default
-    content.userInfo = ["providerId": providerId, "uuid": uuid]
-    // One notification per account: a new one replaces the old, so a
-    // busy account never stacks banners.
-    let request = UNNotificationRequest(
-      identifier: "maam.task.\(uuid)", content: content, trigger: nil)
-    UNUserNotificationCenter.current().add(request) { _ in }
   }
 
   private func parseSample(_ result: Any?) -> TaskSample? {
@@ -308,37 +279,5 @@ final class TaskWatcher: NSObject {
       tailLen: obj["tailLen"] as? Int ?? 0,
       working: obj["working"] as? Bool ?? false
     )
-  }
-}
-
-// MARK: - UNUserNotificationCenterDelegate
-
-extension TaskWatcher: UNUserNotificationCenterDelegate {
-  /// Show the banner even while the app is in the foreground — the user
-  /// asked for foreground-space completions to notify too.
-  func userNotificationCenter(
-    _ center: UNUserNotificationCenter,
-    willPresent notification: UNNotification
-  ) async -> UNNotificationPresentationOptions {
-    [.banner, .sound]
-  }
-
-  /// Tap on a task notification: switch to that account. The tap is
-  /// stored first so a cold launch (channel not yet subscribed) still
-  /// delivers it when the channel is set; emitNotificationTapped clears
-  /// the stored tap once the event is sent.
-  func userNotificationCenter(
-    _ center: UNUserNotificationCenter,
-    didReceive response: UNNotificationResponse
-  ) async {
-    guard response.actionIdentifier == UNNotificationDefaultActionIdentifier
-    else { return }
-    let info = response.notification.request.content.userInfo
-    guard let providerId = info["providerId"] as? String,
-      let uuid = info["uuid"] as? String
-    else { return }
-    let coordinator = AccountSessionCoordinator.shared
-    coordinator.storePendingNotificationTap(providerId: providerId, uuid: uuid)
-    coordinator.emitNotificationTapped(providerId: providerId, uuid: uuid)
   }
 }
