@@ -645,8 +645,7 @@ final class AccountWebViewController: UIViewController, WKNavigationDelegate, WK
       popupOAuthTimeout?.invalidate()
       popupOAuthTimeout = Timer.scheduledTimer(withTimeInterval: 8.0, repeats: false) {
         [weak self] _ in
-        guard let self, self.popupWebView != nil else { return }
-        self.destroyPopupWebView()
+        self?.handlePopupOAuthTimeout()
       }
       return
     }
@@ -659,6 +658,32 @@ final class AccountWebViewController: UIViewController, WKNavigationDelegate, WK
   private func isOAuthCallbackURL(_ url: URL) -> Bool {
     URLComponents(url: url, resolvingAgainstBaseURL: false)?
       .queryItems?.contains { $0.name == "code" } == true
+  }
+
+  /// 0.1.14: the 8s OAuth popup timeout. Before auto-closing, check
+  /// whether the callback page is showing an error — if it is, leave
+  /// the popup open so the user can read it and close it manually
+  /// (0.1.13 closed it blindly and any error text was lost). The manual
+  /// close still triggers the delayed session reload via
+  /// destroyPopupWebView.
+  private func handlePopupOAuthTimeout() {
+    guard let popup = popupWebView, popupCallbackLoaded else { return }
+    popup.evaluateJavaScript(
+      "(document.title + ' ' + (document.body ? document.body.innerText.slice(0, 800) : '')).toLowerCase()"
+    ) { [weak self] result, _ in
+      guard let self, self.popupWebView === popup, self.popupCallbackLoaded else { return }
+      let text = (result as? String) ?? ""
+      let errorHints = [
+        "error", "错误", "失败", "denied", "invalid", "unauthorized",
+        "forbidden", "something went wrong", "出错", "拒绝访问",
+        "无法完成", "expired",
+      ]
+      if errorHints.contains(where: { text.contains($0) }) {
+        // Looks like an error page: leave it open for the user.
+        return
+      }
+      self.destroyPopupWebView()
+    }
   }
 
   func webView(
@@ -962,6 +987,25 @@ final class AccountWebViewController: UIViewController, WKNavigationDelegate, WK
         }
       } else {
         self.consecutiveLoggedOut = 0
+      }
+    }
+
+    // 0.1.15: task-completion check for the active Muse session. Runs
+    // alongside the identity probe; when the conversation content
+    // changed, the probe stays at the 4.5s interval (instead of
+    // backing off to 30s) while the task is streaming.
+    if spec.providerId == "muse" {
+      mainWebView?.evaluateJavaScript(TaskWatcher.taskStateScript) { [weak self] result, _ in
+        guard let self, generation == self.probeGeneration,
+          AccountSessionCoordinator.shared.isCurrent(
+            switchSeq: spec.switchSeq, viewInstanceId: spec.viewInstanceId)
+        else { return }
+        let alias = AccountSessionCoordinator.shared.currentActiveSpec()?.alias ?? spec.alias
+        if TaskWatcher.shared.noteSample(
+          providerId: spec.providerId, uuid: spec.uuid, alias: alias, result: result)
+        {
+          self.stableProbeCount = 0
+        }
       }
     }
 
