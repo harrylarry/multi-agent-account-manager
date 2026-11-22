@@ -382,6 +382,19 @@ pub enum IosSessionEvent {
     switch_seq: u64,
     view_instance_id: u64,
   },
+  /// 0.1.15: the iOS task watcher detected a new assistant reply
+  /// (working → idle) for an account, active or parked.
+  #[serde(rename_all = "camelCase")]
+  TaskReplyDetected {
+    provider_id: String,
+    uuid: String,
+  },
+  /// 0.1.15: the user tapped a task-completion notification.
+  #[serde(rename_all = "camelCase")]
+  NotificationTapped {
+    provider_id: String,
+    uuid: String,
+  },
 }
 
 #[cfg(target_os = "ios")]
