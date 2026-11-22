@@ -699,10 +699,18 @@ final class AccountWebViewController: UIViewController, WKNavigationDelegate, WK
     // finishing async work, and the reload wiped the main page's state
     // mid-flight (2026-11-22 user test: the flow reached the Muse page,
     // but the connection never completed). Instead, mark the callback
-    // loaded and wait: the popup closes when it navigates on to a
-    // post-callback page, when the page closes itself (webViewDidClose),
-    // or after an 8s timeout; the session reloads 2s after the popup
-    // closes (see destroyPopupWebView).
+    // loaded and wait: the popup closes when the user closes it, when
+    // the page closes itself (webViewDidClose), or after an 8s timeout;
+    // the session reloads 2s after the popup closes (see
+    // destroyPopupWebView).
+    // 0.1.19: the post-callback auto-close is gone — 0.1.13 closed the
+    // popup the moment the flow navigated on past the callback page,
+    // which killed multi-step flows whose work is not done at the first
+    // return to muse.ai (Muse Mail setup: the popup flashed and died
+    // while the flow still had steps left, 2026-11-22 user test). The
+    // 8s timeout still auto-closes plain OAuth popups (at most a few
+    // seconds later than before), and the user can always close it
+    // manually — the delayed session reload runs either way.
     guard webView === popupWebView,
       let spec = currentSpec,
       let url = webView.url,
@@ -722,9 +730,10 @@ final class AccountWebViewController: UIViewController, WKNavigationDelegate, WK
       }
       return
     }
-    // A post-callback page loaded (the flow redirected on): done.
-    guard popupCallbackLoaded else { return }
-    destroyPopupWebView()
+    // 0.1.19: a post-callback page loaded (the flow redirected on) —
+    // that is NOT completion. Multi-step flows keep going here; the
+    // popup stays open until the user closes it, the page closes
+    // itself, or the 8s timeout fires.
   }
 
   /// The OAuth authorization-code callback carries a `code` query item.
