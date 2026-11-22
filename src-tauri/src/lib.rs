@@ -224,13 +224,17 @@ pub fn run() {
         mgr_for_boot.run_startup_tasks(&app_for_boot).await;
       });
 
-      // Spike 0.1.22：Spike 版启动后对首个已登录 Muse 账号跑一次握手诊断
+      // Spike 0.1.22：启动自检已暂停（2026-11-23 诊断挂起排查）。
+      // 原先 Spike 版启动后对首个已登录 Muse 账号跑一次握手诊断
       // （日常版不跑；见 muse_native::maybe_auto_diagnose）。
-      let app_for_diag = app.handle().clone();
-      let mgr_for_diag = Arc::clone(&session_mgr);
-      tauri::async_runtime::spawn(async move {
-        muse_native::maybe_auto_diagnose(&app_for_diag, &mgr_for_diag).await;
-      });
+      // 用户实测手动诊断一直卡在「诊断中」，即使 Rust 侧已有 60 秒超时
+      // 也没返回——先停掉启动自检，排除它与手动诊断互相干扰的可能，
+      // 等手动诊断跑通后再恢复。
+      // let app_for_diag = app.handle().clone();
+      // let mgr_for_diag = Arc::clone(&session_mgr);
+      // tauri::async_runtime::spawn(async move {
+      //   muse_native::maybe_auto_diagnose(&app_for_diag, &mgr_for_diag).await;
+      // });
 
       Ok(())
     })

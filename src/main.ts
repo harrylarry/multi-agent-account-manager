@@ -744,10 +744,26 @@ async function runSpikeDiagnose(): Promise<void> {
   spikeDiagnoseError = null;
   syncSpikeDiag();
   try {
-    spikeDiagnose = await invoke<SpikeDiagnoseResult>("muse_native_diagnose", {
-      providerId: "muse",
-      uuid: acc.uuid,
-    });
+    // 前端超时 70 秒：Rust 侧已有 60 秒整体超时，但如果 Rust 命令本身没返回
+    // （如 Tauri 桥挂住），前端也必须给用户一个明确结果，不能一直转圈。
+    // 70 秒 > Rust 60 秒，让 Rust 的超时结果优先返回。
+    spikeDiagnose = await Promise.race([
+      invoke<SpikeDiagnoseResult>("muse_native_diagnose", {
+        providerId: "muse",
+        uuid: acc.uuid,
+      }),
+      new Promise<never>((_, reject) =>
+        setTimeout(
+          () =>
+            reject(
+              new Error(
+                "前端超时（70 秒）：诊断命令没有返回。Rust 侧的 60 秒超时也没触发，可能是 Tauri 桥或运行时卡住了，请重启 App 再试。"
+              )
+            ),
+          70_000
+        )
+      ),
+    ]);
   } catch (e) {
     spikeDiagnose = null;
     spikeDiagnoseError = String(e);
