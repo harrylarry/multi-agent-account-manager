@@ -1,0 +1,142 @@
+name: Quick checks
+
+# 轻量校验，不产出 IPA。在 main 与 spike/native-client 的 push 上运行。
+#
+# 为什么没有 paths 过滤：工作流一旦被设为必需检查，路径过滤会让不相关改动
+# 长期 Pending。这里改为总是运行 changes job（约 15s）做分类，再按需跑后续 job。
+# 为什么没有 pull_request：PR 的 head 就是对应分支，push 的检查已挂在
+# 同一个 commit 上，再监听 pull_request 会对同一 commit 重复跑两遍。
+# 为什么没有 workflow_dispatch：GitHub 要求可手动触发的工作流存在于默认分支，
+# 本文件目前只在 spike 分支；合并进 main 后再按需加回。
+on:
+  push:
+    branches: ["main", "spike/native-client"]
+
+concurrency:
+  group: quick-checks-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  changes:
+    name: Detect changed areas
+    runs-on: ubuntu-latest
+    outputs:
+      web: ${{ steps.classify.outputs.web }}
+      rust: ${{ steps.classify.outputs.rust }}
+      workflows: ${{ steps.classify.outputs.workflows }}
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Classify changed files
+        id: classify
+        run: |
+          all_checks() {
+            echo "::notice::$1；回退为全量检查"
+            {
+              echo "web=true"
+              echo "rust=true"
+              echo "workflows=true"
+            } >> "$GITHUB_OUTPUT"
+            exit 0
+          }
+          base="${{ github.event.before }}"
+          if [ -z "$base" ] || [ "$base" = "0000000000000000000000000000000000000000" ]; then
+            all_checks "首次推送或缺少 before SHA"
+          fi
+          if ! git cat-file -e "$base^{commit}" 2>/dev/null; then
+            all_checks "before SHA 不在本地历史（force-push 或新分支）"
+          fi
+          if ! files=$(git diff --name-only --no-renames "$base" "${{ github.sha }}"); then
+            all_checks "git diff 失败"
+          fi
+          echo "changed files:"; echo "$files"
+          if echo "$files" | grep -qE '^(src/|index\.html|package(-lock)?\.json|tsconfig\.json|vite\.config\.ts|scripts/)'; then
+            web=true
+          else
+            web=false
+          fi
+          if echo "$files" | grep -q '^src-tauri/'; then
+            rust=true
+          else
+            rust=false
+          fi
+          if echo "$files" | grep -q '^\.github/workflows/'; then
+            workflows=true
+          else
+            workflows=false
+          fi
+          {
+            echo "web=$web"
+            echo "rust=$rust"
+            echo "workflows=$workflows"
+          } >> "$GITHUB_OUTPUT"
+
+  web:
+    name: Frontend (tsc + vite)
+    needs: changes
+    if: needs.changes.outputs.web == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@v6
+        with:
+          node-version: 22
+          cache: npm
+      - run: npm ci
+      - run: npm run build
+
+  actionlint:
+    name: actionlint
+    needs: changes
+    if: needs.changes.outputs.workflows == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      # 固定镜像版本，避免 latest 漂移；升级时改这一行并重跑本 job。
+      # 显式传入两个工作流文件（不依赖 actionlint 的默认目录扫描）。
+      # macos-15-intel 是 GitHub 托管标签（本仓库 #119–#123 实际跑过），
+      # 旧版 actionlint 的标签清单里没有，按消息精确忽略，避免误报。
+      - run: docker run --rm -v "$PWD:/repo" -w /repo rhysd/actionlint:1.7.12 -color -ignore 'label "macos-15-intel" is unknown' .github/workflows/*.yml
+
+  rust:
+    name: Rust check (iOS target)
+    needs: changes
+    if: needs.changes.outputs.rust == 'true'
+    runs-on: macos-15-intel
+    timeout-minutes: 30
+    env:
+      # tauri-utils 用 swift-rs 编译插件里的 Swift 时读这个变量（缺省回落 13.0），
+      # 而本 App 最低 iOS 是 17.0（tauri.ios.conf.json）。不设会让 cargo check
+      # 在插件 Swift 的 iOS 15+ API 上报可用性错误——那是构建上下文问题，不是源码错误。
+      IPHONEOS_DEPLOYMENT_TARGET: "17.0"
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@v6
+        with:
+          node-version: 22
+          cache: npm
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-apple-ios
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: ./src-tauri -> target
+      - run: npm ci
+      # tauri-build 编译期读取 ../dist，缺目录会直接失败。
+      - run: npm run build
+      # muse-native 是 src-tauri 的 path 依赖、不是 workspace 成员，不能用 -p；
+      # 对整个包 check 才能复用 src-tauri/Cargo.lock 与 target 目录。
+      - run: cargo check --manifest-path src-tauri/Cargo.toml --target aarch64-apple-ios

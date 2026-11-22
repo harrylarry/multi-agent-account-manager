@@ -36,6 +36,23 @@ const ICON_DRAG = `<svg width="16" height="16" viewBox="0 0 24 24" fill="current
 let snapshot: ManagerSnapshot | null = null;
 let modal: ModalMode = { kind: "none" };
 let optimisticSwitching: AccountKey | null = null;
+// Spike 原生诊断（0.1.22）：Muse 页底部显示诊断区。
+// 诊断结果不进 structuralSignature，改动后只同步诊断区 DOM，不重建列表。
+// 注：诊断区无条件显示（日常版也有，方便后续配合调试——用户 2026-11-23 定）。
+// Spike 徽章则按 bundle id 门控（is_spike_build 命令），只在 Spike 版显示。
+interface SpikeDiagnoseResult {
+  ok: boolean;
+  phase: string;
+  handshakeCompleted: boolean;
+  pingStatus: number | null;
+  cvmDetected: boolean;
+  error: string | null;
+}
+let spikeDiagnose: SpikeDiagnoseResult | null = null;
+let spikeDiagnoseRunning = false;
+let spikeDiagnoseError: string | null = null;
+// 是否 Spike 版（bundle id 门控）：只决定顶栏徽章显不显示；诊断区不门控。
+let isSpikeBuild = false;
 let busy = false;
 // Batch-1: a switch requested while another command is in flight is
 // queued (latest wins) instead of silently dropped.
@@ -681,6 +698,81 @@ function triggerAutoSync(): void {
   void invoke("trigger_quota_sync", { force: false }).catch(() => {});
 }
 
+// Spike 原生诊断（0.1.22）：诊断区只在 Spike 版的 Muse 页显示。
+// 结果只同步诊断区 DOM（syncSpikeDiag），不走 render()，不重建列表。
+function spikeDiagInnerHtml(): string {
+  const btnLabel = spikeDiagnoseRunning ? "诊断中…" : "运行诊断";
+  let resultHtml = "";
+  if (spikeDiagnose) {
+    const r = spikeDiagnose;
+    resultHtml = `
+      <div class="spike-diag-result ${r.ok ? "ok" : "fail"}">
+        <div>${r.ok ? "✓ 诊断通过" : "✗ 诊断失败"}（阶段：${escapeHtml(r.phase)}）</div>
+        <div>握手：${r.handshakeCompleted ? "✓ 完成" : "✗ 未完成"}</div>
+        <div>ping：${r.pingStatus !== null ? `HTTP ${r.pingStatus}` : "—"}</div>
+        <div>CVM：${r.cvmDetected ? "已检测到" : "未检测到"}</div>
+        ${r.error ? `<div>错误：${escapeHtml(r.error)}</div>` : ""}
+      </div>`;
+  } else if (spikeDiagnoseError) {
+    resultHtml = `<div class="spike-diag-result fail">错误：${escapeHtml(spikeDiagnoseError)}</div>`;
+  }
+  return `
+    <div class="spike-diag-header">
+      <span class="spike-diag-title">原生诊断（Spike）</span>
+      <button id="spike-diagnose-btn" class="mini-btn" type="button" ${spikeDiagnoseRunning ? "disabled" : ""}>${btnLabel}</button>
+    </div>
+    ${resultHtml}`;
+}
+
+function syncSpikeDiag(): void {
+  const el = document.querySelector<HTMLElement>(".spike-diag");
+  if (!el) return;
+  el.innerHTML = spikeDiagInnerHtml();
+}
+
+async function runSpikeDiagnose(): Promise<void> {
+  if (!snapshot || spikeDiagnoseRunning) return;
+  const acc = snapshot.accounts.find(
+    (a) => a.providerId === "muse" && a.authState === "authenticated"
+  );
+  if (!acc) {
+    spikeDiagnose = null;
+    spikeDiagnoseError = "没有已登录的 Muse 账号，请先登录一个测试账号。";
+    syncSpikeDiag();
+    return;
+  }
+  spikeDiagnoseRunning = true;
+  spikeDiagnoseError = null;
+  syncSpikeDiag();
+  try {
+    // 前端超时 70 秒：Rust 侧已有 60 秒整体超时，但如果 Rust 命令本身没返回
+    // （如 Tauri 桥挂住），前端也必须给用户一个明确结果，不能一直转圈。
+    // 70 秒 > Rust 60 秒，让 Rust 的超时结果优先返回。
+    spikeDiagnose = await Promise.race([
+      invoke<SpikeDiagnoseResult>("muse_native_diagnose", {
+        providerId: "muse",
+        uuid: acc.uuid,
+      }),
+      new Promise<never>((_, reject) =>
+        setTimeout(
+          () =>
+            reject(
+              new Error(
+                "前端超时（70 秒）：诊断命令没有返回。Rust 侧的 60 秒超时也没触发，可能是 Tauri 桥或运行时卡住了，请重启 App 再试。"
+              )
+            ),
+          70_000
+        )
+      ),
+    ]);
+  } catch (e) {
+    spikeDiagnose = null;
+    spikeDiagnoseError = String(e);
+  }
+  spikeDiagnoseRunning = false;
+  syncSpikeDiag();
+}
+
 function currentProvider(state: ManagerSnapshot): ProviderInfo {
   return (
     state.providers.find((p) => p.id === state.selectedProviderId) ??
@@ -956,10 +1048,23 @@ function renderMiddleContent(state: ManagerSnapshot, provider: ProviderInfo): st
       .join("");
   }
 
+  // Spike 原生诊断区：Muse 页显示（本分支即 Spike 分支）。
+  const spikeDiagHtml =
+    provider.id === "muse"
+      ? `<div class="spike-diag">${spikeDiagInnerHtml()}</div>`
+      : "";
+
+  // Spike 顶栏标识（0.1.22）：只在 Spike 版显示（bundle id 门控）。
+  const spikeBadgeHtml =
+    isSpikeBuild && provider.id === "muse"
+      ? `<span class="spike-badge" title="Spike 版">Spike</span>`
+      : "";
+
   return `
     <div class="column-header">
       <div class="provider-title-wrap">
         <span class="provider-title">${escapeHtml(provider.name)}</span>
+        ${spikeBadgeHtml}
         ${
           !provider.enabled
             ? `<span class="status-pill">${escapeHtml(provider.statusText)}</span>`
@@ -973,6 +1078,7 @@ function renderMiddleContent(state: ManagerSnapshot, provider: ProviderInfo): st
     ${noticeHtml}
     ${conflictsHtml}
     <div class="account-list${inReorder ? " reorder-mode" : ""}">${listBody}</div>
+    ${spikeDiagHtml}
     <!-- 0.1.21: the modal lives in its own overlay container and is
          filled by renderModalRoot(), not by this template — opening or
          closing it no longer rebuilds #app (see structuralSignature). -->
@@ -1567,6 +1673,12 @@ function bindDelegatedEvents(): void {
       }
       return;
     }
+    // Spike 原生诊断按钮（只在 Spike 版的 Muse 页存在）。
+    const diagBtn = target.closest<HTMLElement>("#spike-diagnose-btn");
+    if (diagBtn) {
+      await runSpikeDiagnose();
+      return;
+    }
     const providerBtn = target.closest<HTMLElement>("[data-provider]");
     if (providerBtn) {
       const nextId = providerBtn.dataset.provider as ProviderId;
@@ -1889,6 +2001,14 @@ async function bootstrap(): Promise<void> {
       }
     }
   });
+
+  // Spike 版判定：决定顶栏徽章显不显示。命令不存在（旧包）时 invoke
+  // 失败，isSpikeBuild 保持 false，徽章不显示（fail-closed）。
+  try {
+    isSpikeBuild = await invoke<boolean>("is_spike_build");
+  } catch {
+    isSpikeBuild = false;
+  }
 
   snapshot = await invoke<ManagerSnapshot>("get_manager_state");
   render();
