@@ -1,6 +1,6 @@
 [package]
 name = "multi-agent-account-manager"
-version = "0.1.13"
+version = "0.1.15"
 edition = "2021"
 rust-version = "1.85"
 
@@ -52,3 +52,4 @@ wry = { git = "https://github.com/harrylarry/wry", branch = "ios-bundle-fix" }
 # at the cost of a slower link step on CI.
 [profile.release]
 lto = true
+codegen-units = 1
