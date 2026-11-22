@@ -129,12 +129,28 @@ final class AccountWebViewController: UIViewController, WKNavigationDelegate, WK
     let backButton = UIButton(type: .system)
     backButton.setTitle("← 账号", for: .normal)
     backButton.titleLabel?.font = .systemFont(ofSize: 13)
+    // 0.1.20: make the button hug its title text. A .system button on
+    // iOS 15+ carries a default plain configuration whose content
+    // insets widen the button frame and centre the title inside it,
+    // so the "←" glyph sat far from the left edge and the frame's
+    // dead space pushed the title label (and the dot) right. Dropping
+    // the configuration and zeroing the edge insets makes the frame
+    // hug the "← 账号" text, with the glyph left-aligned.
+    backButton.configuration = nil
+    backButton.contentEdgeInsets = .zero
+    backButton.contentHorizontalAlignment = .leading
     backButton.translatesAutoresizingMaskIntoConstraints = false
     backButton.addTarget(self, action: #selector(backTapped), for: .touchUpInside)
 
     // 0.1.16: aggregate unread dot on the "← 账号" button — shown when
     // any parked account has an unread reply. Initial state comes from
     // the coordinator (Rust pushes updates via setUnreadBadge).
+    // 0.1.20: anchor the dot to the title text (titleLabel), not to
+    // the button frame — the frame used to be wider than the text, so
+    // the dot floated mid-bar near the title. Anchored to the text it
+    // sits at the top-right of "账号" and clearly belongs to the
+    // button; the title label starts 10pt after the button frame,
+    // leaving a clear gap between the dot and the title text.
     let unreadDot = UIView()
     unreadDot.backgroundColor = UIColor(hex: 0xEF4444)
     unreadDot.layer.cornerRadius = 4
@@ -142,12 +158,21 @@ final class AccountWebViewController: UIViewController, WKNavigationDelegate, WK
     unreadDot.isHidden = !AccountSessionCoordinator.shared.currentUnreadBadge()
     backButton.addSubview(unreadDot)
     unreadDotView = unreadDot
-    NSLayoutConstraint.activate([
-      unreadDot.widthAnchor.constraint(equalToConstant: 8),
-      unreadDot.heightAnchor.constraint(equalToConstant: 8),
-      unreadDot.centerXAnchor.constraint(equalTo: backButton.trailingAnchor, constant: -2),
-      unreadDot.centerYAnchor.constraint(equalTo: backButton.topAnchor, constant: 2),
-    ])
+    if let titleLabel = backButton.titleLabel {
+      NSLayoutConstraint.activate([
+        unreadDot.widthAnchor.constraint(equalToConstant: 8),
+        unreadDot.heightAnchor.constraint(equalToConstant: 8),
+        unreadDot.centerXAnchor.constraint(equalTo: titleLabel.trailingAnchor, constant: 2),
+        unreadDot.centerYAnchor.constraint(equalTo: titleLabel.topAnchor, constant: 1),
+      ])
+    } else {
+      NSLayoutConstraint.activate([
+        unreadDot.widthAnchor.constraint(equalToConstant: 8),
+        unreadDot.heightAnchor.constraint(equalToConstant: 8),
+        unreadDot.centerXAnchor.constraint(equalTo: backButton.trailingAnchor, constant: -2),
+        unreadDot.centerYAnchor.constraint(equalTo: backButton.topAnchor, constant: 2),
+      ])
+    }
 
     headerTitleLabel = UILabel()
     headerTitleLabel.text = "正在核验会话…"
@@ -239,7 +264,11 @@ final class AccountWebViewController: UIViewController, WKNavigationDelegate, WK
       progressView.trailingAnchor.constraint(equalTo: view.trailingAnchor),
       progressView.heightAnchor.constraint(equalToConstant: 2),
 
-      backButton.leadingAnchor.constraint(equalTo: topBar.leadingAnchor, constant: 10),
+      // 0.1.20: 8pt from the left edge — with the frame now hugging
+      // the text, the "←" glyph itself sits ~8pt from the edge, like
+      // a standard iOS back button (was 10pt + the configuration's
+      // inset, which pushed the glyph much further right).
+      backButton.leadingAnchor.constraint(equalTo: topBar.leadingAnchor, constant: 8),
       backButton.centerYAnchor.constraint(equalTo: topBar.centerYAnchor),
       backButton.topAnchor.constraint(greaterThanOrEqualTo: topBar.topAnchor, constant: 6),
       backButton.bottomAnchor.constraint(lessThanOrEqualTo: topBar.bottomAnchor, constant: -6),
