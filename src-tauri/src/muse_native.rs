@@ -24,6 +24,15 @@ use crate::storage::AuthState;
 /// 日常版 bundle id：自检只在 Spike 版（换了 bundle id 的包）里跑。
 const DAILY_IDENTIFIER: &str = "com.ldjx.accountmanager";
 
+/// Cookie 桥超时：15 秒。WKWebsiteDataStore 本地读 cookie 应毫秒级完成，
+/// 超时说明 Swift 桥没响应（getAllCookies 回调没回来）。
+#[cfg(not(target_os = "android"))]
+const COOKIE_TIMEOUT: Duration = Duration::from_secs(15);
+
+/// 诊断整体超时：60 秒。控制面（20s×N 请求）+ 握手（10s）+ ping（10s）
+/// 再慢也不应超过这个时间。超时返回明确的失败结果，不让前端一直转圈。
+const DIAGNOSE_TIMEOUT: Duration = Duration::from_secs(60);
+
 /// 诊断结果——只含阶段与状态，不含 cookie / token / 凭证值。
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -87,7 +96,27 @@ impl ControlPlaneFetch for ReqwestFetch {
 /// 跑一次原生握手诊断：取凭证 → WSS → Noise 握手 → connection.ping。
 /// 只做诊断，不发聊天、不做 watcher、不做通知、不改 UI。
 /// cookie 只在内存里用，控制面跑完立即 zeroize。
+/// 整体包一层 60 秒超时：任何一步卡住都返回明确的失败结果，不让前端一直转圈。
 pub async fn diagnose(
+  app: &AppHandle,
+  provider_id: &str,
+  uuid: &str,
+) -> Result<SpikeDiagnose, String> {
+  match tokio::time::timeout(
+    DIAGNOSE_TIMEOUT,
+    diagnose_inner(app, provider_id, uuid),
+  )
+  .await
+  {
+    Ok(r) => r,
+    Err(_) => Ok(SpikeDiagnose::fail(
+      "timeout",
+      "诊断整体超时（60 秒）：某一步卡住了，请重启 App 再试；如反复出现请反馈。",
+    )),
+  }
+}
+
+async fn diagnose_inner(
   app: &AppHandle,
   provider_id: &str,
   uuid: &str,
@@ -104,7 +133,11 @@ pub async fn diagnose(
   }
   #[cfg(not(target_os = "android"))]
   {
-    let mut cookies = fetch_session_cookies(app, uuid).await?;
+    let mut cookies = tokio::time::timeout(COOKIE_TIMEOUT, fetch_session_cookies(app, uuid))
+      .await
+      .map_err(|_| {
+        "取 muse.ai 会话 cookie 超时（15 秒）：Cookie 桥没响应，请重启 App 再试。".to_string()
+      })??;
     if cookies.is_empty() {
       return Ok(SpikeDiagnose::fail(
         "no_cookies",
