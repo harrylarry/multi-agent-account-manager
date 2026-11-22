@@ -10,7 +10,7 @@ name: Quick checks
 # 本文件目前只在 spike 分支；合并进 main 后再按需加回。
 on:
   push:
-    branches: ["main", "spike/native-client"]
+    branches: ["main", "spike/**"]
 
 concurrency:
   group: quick-checks-${{ github.ref }}

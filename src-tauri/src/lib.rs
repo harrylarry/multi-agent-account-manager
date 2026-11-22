@@ -148,6 +148,17 @@ async fn muse_native_diagnose(
   muse_native::diagnose(&app, &provider_id, &uuid).await
 }
 
+/// B1：`chat.subscribe` 探针（Issue #13 #5）。订阅 N 秒，只返回事件计数与去重结果。
+#[tauri::command]
+async fn muse_native_watch_probe(
+  app: AppHandle,
+  provider_id: String,
+  uuid: String,
+  seconds: u64,
+) -> Result<muse_native::WatchProbe, String> {
+  muse_native::watch_probe(&app, &provider_id, &uuid, seconds).await
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
   let builder = tauri::Builder::default();
@@ -255,6 +266,7 @@ pub fn run() {
       download_and_install_update,
       open_external_url,
       muse_native_diagnose,
+      muse_native_watch_probe,
       muse_native::is_spike_build,
     ])
     .run(tauri::generate_context!())

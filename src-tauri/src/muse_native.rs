@@ -11,9 +11,11 @@
 use muse_native_client::control_plane::ControlPlaneFetch;
 use muse_native_client::cookie::{SessionCookie, SessionCookies};
 use muse_native_client::gateway::{GatewayError, MuseGateway};
+use muse_native_client::transport::{HttpRequest, Service};
+use muse_native_client::watch::{WatchSummary, WatchTracker};
 use serde::Serialize;
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use tauri::AppHandle;
 use zeroize::Zeroize;
 
@@ -220,6 +222,140 @@ async fn diagnose_inner(
         })
       }
     }
+  }
+}
+
+/// B1 `chat.subscribe` 探针（Issue #13 #5）：订阅 N 秒，只统计事件数量与去重结果。
+/// 不返回任何事件文本、消息 id 或凭据，只给计数，便于真机核验。
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct WatchProbe {
+  pub ok: bool,
+  pub phase: String,
+  pub seconds: u64,
+  pub status: Option<u16>,
+  pub summary: WatchSummary,
+  pub error: Option<String>,
+}
+
+pub async fn watch_probe(
+  app: &AppHandle,
+  provider_id: &str,
+  uuid: &str,
+  seconds: u64,
+) -> Result<WatchProbe, String> {
+  if provider_id != ProviderId::Muse.as_str() {
+    return Err("订阅探针只支持 Muse 账号".to_string());
+  }
+  #[cfg(target_os = "android")]
+  {
+    let _ = (app, uuid, seconds);
+    return Err(
+      "订阅探针在 Android 上不可用（Cookie 桥只接了 iOS WKWebsiteDataStore）".to_string(),
+    );
+  }
+  #[cfg(not(target_os = "android"))]
+  {
+    let seconds = seconds.clamp(5, 60);
+    let app_owned = app.clone();
+    let uuid_owned = uuid.to_string();
+    let cookie_handle =
+      tokio::spawn(async move { fetch_session_cookies(&app_owned, &uuid_owned).await });
+    let mut cookies = tokio::select! {
+      res = cookie_handle => match res {
+        Ok(r) => r?,
+        Err(e) => return Err(format!("取 cookie 任务异常结束: {e}")),
+      },
+      _ = tokio::time::sleep(COOKIE_TIMEOUT) => {
+        return Err("取 muse.ai 会话 cookie 超时（15 秒）".to_string());
+      }
+    };
+    if cookies.is_empty() {
+      return Ok(WatchProbe {
+        ok: false,
+        phase: "no_cookies".to_string(),
+        seconds,
+        status: None,
+        summary: WatchSummary::default(),
+        error: Some("该账号在 Spike App 里还没有 muse.ai 登录态".to_string()),
+      });
+    }
+    let fetch = ReqwestFetch::new()?;
+    let gateway = MuseGateway::new(fetch);
+    let mut connected = match gateway.connect(&cookies).await {
+      Ok(c) => c,
+      Err(e) => {
+        cookies.zeroize();
+        return Ok(WatchProbe {
+          ok: false,
+          phase: "connect".to_string(),
+          seconds,
+          status: None,
+          summary: WatchSummary::default(),
+          error: Some(e.to_string()),
+        });
+      }
+    };
+    cookies.zeroize();
+
+    // chat.subscribe 入参：网页端会广告这些能力，其中 delta_stream 决定是否推送文本增量。
+    let body = br#"{"capabilities":["hotel_results","chat_cancel","delta_stream","custom_reactions","custom_reactions_facebook_thumbs_up_v1"]}"#.to_vec();
+    let req = HttpRequest {
+      service: Service::Daemon,
+      verb: "POST".to_string(),
+      path: "/chat/subscribe".to_string(),
+      headers: vec![
+        ("Content-Type".to_string(), "application/json".to_string()),
+        ("x-request-id".to_string(), uuid::Uuid::new_v4().to_string()),
+        ("x-app-id".to_string(), "hatch-web".to_string()),
+        ("Accept-Language".to_string(), "en-US".to_string()),
+      ],
+      body,
+    };
+    let mut sub = match connected.subscribe(req).await {
+      Ok(s) => s,
+      Err(e) => {
+        return Ok(WatchProbe {
+          ok: false,
+          phase: "subscribe".to_string(),
+          seconds,
+          status: None,
+          summary: WatchSummary::default(),
+          error: Some(e.to_string()),
+        });
+      }
+    };
+
+    let mut tracker = WatchTracker::new();
+    let deadline = Instant::now() + Duration::from_secs(seconds);
+    let mut error = None;
+    loop {
+      let left = deadline.saturating_duration_since(Instant::now());
+      if left.is_zero() {
+        break;
+      }
+      match sub.next_line(left).await {
+        Ok(Some(line)) => {
+          let _ = tracker.observe_line(&line);
+        }
+        Ok(None) => {
+          error = Some("订阅已结束".to_string());
+          break;
+        }
+        Err(e) => {
+          error = Some(e.to_string());
+          break;
+        }
+      }
+    }
+    Ok(WatchProbe {
+      ok: error.is_none(),
+      phase: "subscribed".to_string(),
+      seconds,
+      status: sub.status(),
+      summary: tracker.summary().clone(),
+      error,
+    })
   }
 }
 

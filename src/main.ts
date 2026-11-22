@@ -50,6 +50,28 @@ interface SpikeDiagnoseResult {
 }
 let spikeDiagnose: SpikeDiagnoseResult | null = null;
 let spikeDiagnoseRunning = false;
+interface SpikeWatchSummary {
+  events: number;
+  turnsStarted: number;
+  messagesStarted: number;
+  textDeltas: number;
+  messagesDone: number;
+  busy: number;
+  idle: number;
+  duplicates: number;
+  ignored: number;
+}
+interface SpikeWatchResult {
+  ok: boolean;
+  phase: string;
+  seconds: number;
+  status: number | null;
+  summary: SpikeWatchSummary;
+  error: string | null;
+}
+let spikeWatch: SpikeWatchResult | null = null;
+let spikeWatchRunning = false;
+let spikeWatchError: string | null = null;
 let spikeDiagnoseError: string | null = null;
 // 是否 Spike 版（bundle id 门控）：只决定顶栏徽章显不显示；诊断区不门控。
 let isSpikeBuild = false;
@@ -716,18 +738,66 @@ function spikeDiagInnerHtml(): string {
   } else if (spikeDiagnoseError) {
     resultHtml = `<div class="spike-diag-result fail">错误：${escapeHtml(spikeDiagnoseError)}</div>`;
   }
+  let watchHtml = "";
+  if (spikeWatch) {
+    const s = spikeWatch.summary;
+    watchHtml = `
+      <div class="spike-diag-result ${spikeWatch.ok ? "ok" : "fail"}">
+        <div>${spikeWatch.ok ? "✓ 订阅正常" : "✗ 订阅异常"}（${spikeWatch.seconds}s，HTTP ${spikeWatch.status ?? "—"}）</div>
+        <div>事件 ${s.events}：开始 ${s.turnsStarted}，消息 ${s.messagesStarted}，增量 ${s.textDeltas}，完成 ${s.messagesDone}</div>
+        <div>忙碌 ${s.busy}，空闲 ${s.idle}，重复 ${s.duplicates}，忽略 ${s.ignored}</div>
+        ${spikeWatch.error ? `<div>错误：${escapeHtml(spikeWatch.error)}</div>` : ""}
+      </div>`;
+  } else if (spikeWatchError) {
+    watchHtml = `<div class="spike-diag-result fail">错误：${escapeHtml(spikeWatchError)}</div>`;
+  }
   return `
     <div class="spike-diag-header">
       <span class="spike-diag-title">原生诊断（Spike）</span>
       <button id="spike-diagnose-btn" class="mini-btn" type="button" ${spikeDiagnoseRunning ? "disabled" : ""}>${btnLabel}</button>
+      <button id="spike-watch-btn" class="mini-btn" type="button" ${spikeWatchRunning ? "disabled" : ""}>${spikeWatchRunning ? "订阅中…" : "订阅探针 15s"}</button>
     </div>
-    ${resultHtml}`;
+    ${resultHtml}
+    ${watchHtml}`;
 }
 
 function syncSpikeDiag(): void {
   const el = document.querySelector<HTMLElement>(".spike-diag");
   if (!el) return;
   el.innerHTML = spikeDiagInnerHtml();
+}
+
+async function runSpikeWatch(): Promise<void> {
+  if (!snapshot || spikeWatchRunning) return;
+  const acc = snapshot.accounts.find(
+    (a) => a.providerId === "muse" && a.authState === "authenticated"
+  );
+  if (!acc) {
+    spikeWatch = null;
+    spikeWatchError = "没有已登录的 Muse 账号，请先登录一个测试账号。";
+    syncSpikeDiag();
+    return;
+  }
+  spikeWatchRunning = true;
+  spikeWatchError = null;
+  syncSpikeDiag();
+  try {
+    spikeWatch = await Promise.race([
+      invoke<SpikeWatchResult>("muse_native_watch_probe", {
+        providerId: "muse",
+        uuid: acc.uuid,
+        seconds: 15,
+      }),
+      new Promise<SpikeWatchResult>((_, reject) =>
+        setTimeout(() => reject(new Error("订阅探针超时（75 秒）")), 75_000)
+      ),
+    ]);
+  } catch (e) {
+    spikeWatch = null;
+    spikeWatchError = String(e);
+  }
+  spikeWatchRunning = false;
+  syncSpikeDiag();
 }
 
 async function runSpikeDiagnose(): Promise<void> {
@@ -1677,6 +1747,11 @@ function bindDelegatedEvents(): void {
     const diagBtn = target.closest<HTMLElement>("#spike-diagnose-btn");
     if (diagBtn) {
       await runSpikeDiagnose();
+      return;
+    }
+    const watchBtn = target.closest<HTMLElement>("#spike-watch-btn");
+    if (watchBtn) {
+      await runSpikeWatch();
       return;
     }
     const providerBtn = target.closest<HTMLElement>("[data-provider]");
