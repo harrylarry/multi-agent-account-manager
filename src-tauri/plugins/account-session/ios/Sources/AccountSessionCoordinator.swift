@@ -86,6 +86,9 @@ final class AccountSessionCoordinator {
   private var activeSpec: IosAccountSessionSpec?
   private var committedSpec: IosAccountSessionSpec?
   private weak var viewControllerRef: AccountWebViewController?
+  // 0.1.16: aggregate unread state (any parked account with a new
+  // reply) — drives the "← 账号" button dot.
+  private var hasUnreadBadge = false
 
   private init() {}
 
@@ -94,13 +97,22 @@ final class AccountSessionCoordinator {
       pluginInitialized = true
       eventChannel = channel
     }
-    // 0.1.15: a notification tap that cold-launched the app may have
-    // arrived before the channel existed; deliver the stored tap now.
-    flushPendingNotificationTap()
   }
 
   func attachViewController(_ vc: AccountWebViewController) {
     lock.withLock { viewControllerRef = vc }
+  }
+
+  /// 0.1.16: aggregate unread dot on the session "← 账号" button.
+  /// Rust owns the flags and pushes the aggregate whenever one flips.
+  /// Stored here so a newly opened session applies it in viewDidLoad.
+  func setUnreadBadge(_ hasUnread: Bool) {
+    lock.withLock { hasUnreadBadge = hasUnread }
+    currentViewController()?.setUnreadDotVisible(hasUnread)
+  }
+
+  func currentUnreadBadge() -> Bool {
+    lock.withLock { hasUnreadBadge }
   }
 
   func detachViewController(_ vc: AccountWebViewController) {
@@ -318,10 +330,17 @@ final class AccountSessionCoordinator {
 
   // MARK: - 0.1.15 task notifications
 
-  // Neither event is tied to the active session — a completion can be
-  // about a parked account — so there is no isCurrent guard here.
+  // 0.1.16: only PARKED accounts get flagged — the active account's
+  // completions are Muse web's own job (hamburger dot etc.), so the
+  // app never marks them. On the account list there is no active spec,
+  // so every completion flags normally.
 
   func emitTaskReplyDetected(providerId: String, uuid: String) {
+    if let cur = currentActiveSpec(),
+      cur.providerId == providerId && cur.uuid == uuid
+    {
+      return
+    }
     let ch: Channel? = lock.withLock { eventChannel }
     guard let ch else { return }
     let obj: JsonObject = [
@@ -330,37 +349,5 @@ final class AccountSessionCoordinator {
       "uuid": uuid,
     ]
     ch.send(obj)
-  }
-
-  func emitNotificationTapped(providerId: String, uuid: String) {
-    let ch: Channel? = lock.withLock { eventChannel }
-    guard let ch else { return }
-    let obj: JsonObject = [
-      "kind": "notificationTapped",
-      "providerId": providerId,
-      "uuid": uuid,
-    ]
-    ch.send(obj)
-    clearPendingNotificationTap()
-  }
-
-  // MARK: - Pending notification tap (cold launch)
-
-  private static let pendingTapKey = "maam.pendingNotificationTap"
-
-  func storePendingNotificationTap(providerId: String, uuid: String) {
-    UserDefaults.standard.set([providerId, uuid], forKey: Self.pendingTapKey)
-  }
-
-  func clearPendingNotificationTap() {
-    UserDefaults.standard.removeObject(forKey: Self.pendingTapKey)
-  }
-
-  private func flushPendingNotificationTap() {
-    guard
-      let pair = UserDefaults.standard.array(forKey: Self.pendingTapKey) as? [String],
-      pair.count == 2
-    else { return }
-    emitNotificationTapped(providerId: pair[0], uuid: pair[1])
   }
 }
