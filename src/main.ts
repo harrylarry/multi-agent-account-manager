@@ -1053,10 +1053,18 @@ function renderMiddleContent(state: ManagerSnapshot, provider: ProviderInfo): st
       ? `<div class="spike-diag">${spikeDiagInnerHtml()}</div>`
       : "";
 
+  // Spike 顶栏标识（0.1.22）：本分支即 Spike 分支，Muse 页标题旁常显；
+  // 合入 main 后日常版也会显示，届时按 bundle id 门控（同诊断区）。
+  const spikeBadgeHtml =
+    provider.id === "muse"
+      ? `<span class="spike-badge" title="Spike 版">Spike</span>`
+      : "";
+
   return `
     <div class="column-header">
       <div class="provider-title-wrap">
         <span class="provider-title">${escapeHtml(provider.name)}</span>
+        ${spikeBadgeHtml}
         ${
           !provider.enabled
             ? `<span class="status-pill">${escapeHtml(provider.statusText)}</span>`

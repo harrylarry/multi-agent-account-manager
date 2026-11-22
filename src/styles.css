@@ -1617,3 +1617,25 @@ body,
 .spike-diag-result.fail {
   color: var(--danger);
 }
+
+/* Spike 顶栏标识（0.1.22）：Spike 分支的 Muse 页标题旁显示。 */
+.spike-badge {
+  display: inline-flex;
+  align-items: center;
+  font-size: 10px;
+  font-weight: 650;
+  line-height: 1;
+  letter-spacing: 0.02em;
+  padding: 3px 6px;
+  border-radius: 999px;
+  background: var(--primary-soft);
+  color: var(--primary);
+  border: 1px solid rgba(0, 100, 224, 0.28);
+  flex-shrink: 0;
+  white-space: nowrap;
+}
+
+.mobile-shell .spike-badge {
+  font-size: 11px;
+  padding: 3px 7px;
+}
