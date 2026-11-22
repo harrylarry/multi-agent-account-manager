@@ -1,0 +1,9 @@
+{
+  "created_at": "2026-11-22T16:42:48Z",
+  "creator": "wally",
+  "description": "设计规划 v4 通过（2026-11-23），Phase 0 Spike（0.1.22）启动；Wally 静态 4 项已完成（测试盘点、storage.rs 对照、上游 v0.1.6 评估、Hark 审批探查）；19 项拆三类，Nova 代码 14 项拟 3 任务单。",
+  "doc": "静态结论：①叠号 0 测试、BotArk 48 文件约 6.1% 行数比且 muse-native 核心 0 测试；②storage.rs 原子写与 fail-closed 已达标，缺 0600；③上游 v0.1.6 代理仅 macOS/Windows、无认证 HTTP CONNECT，macOS 机制即 proxyConfigurations + 禁 failover，iOS 须 Swift 重写，Phase 2 cherry-pick 模型层；④Hark 无原生审批接口，审批走 WebView 回退。Spike 版为独立 App（换 bundle ID + 显示名，用户 2026-11-23 定）。验证账号不需提前指定，用户在 Spike App 里选测。",
+  "id": "f011",
+  "source_intent": null,
+  "title": "Spike 启动"
+}

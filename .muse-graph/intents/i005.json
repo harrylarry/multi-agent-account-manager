@@ -1,0 +1,18 @@
+{
+  "concluded_at": null,
+  "confirmed_at": null,
+  "created_at": "2026-11-22T16:42:49Z",
+  "creator": "wally",
+  "description": "Spike #5–#7、#15：chat.subscribe、egress.approvals、quota Server Action、原生发送（幂等+单发锁）。依赖 i004。见 Issue #13。",
+  "doc": "分支 spike/native-methods，自 i004 合入后的 main 切出。对照 BotArk chat.ts、quota.ts、methods.ts；docs/museai/QUOTA.md、SCHEDULES.md。发送安全约束：幂等键 UUID、单发锁、禁自动重发、发送日志；只在隔离会话验证。验收：订阅收事件、审批轮询有返回、额度拉到数值、发送零重复。",
+  "from": [
+    "f011"
+  ],
+  "id": "i005",
+  "issue": 13,
+  "requires_confirmation": false,
+  "status": "open",
+  "title": "订阅审批额度发送",
+  "to": null,
+  "worker": null
+}

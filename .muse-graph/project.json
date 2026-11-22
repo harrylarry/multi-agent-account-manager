@@ -1,8 +1,8 @@
 {
   "counters": {
-    "fact": 10,
+    "fact": 11,
     "hint": 0,
-    "intent": 3
+    "intent": 6
   },
   "created_at": "2026-11-22T10:10:00Z",
   "goal": "维护叠号 iOS 移植：修 bug、跟进上游、发版 ios-v*，保持双 Muse 协作顺畅",

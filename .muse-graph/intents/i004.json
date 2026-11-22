@@ -1,0 +1,18 @@
+{
+  "concluded_at": null,
+  "confirmed_at": null,
+  "created_at": "2026-11-22T16:42:48Z",
+  "creator": "wally",
+  "description": "Spike #1–#4：依赖 iOS 编译、Cookie 桥、认证链、Noise 握手；另 Spike 版为独立 App（换 bundle ID + 显示名）。见 Issue #12。",
+  "doc": "分支 spike/native-client。对照 BotArk qybaihe/botark v0.12.0：noise.ts、transport.ts、controlPlane.ts、methods.ts；docs/museai/PROTOCOL_FULL.md、NATIVE_CLIENT.md。验收：cargo test 通过 + #[cfg(test)] 覆盖握手向量与帧编解码；分支 IPA 在 Spike App 里登录非主力账号握手成功。bundle ID 改动单独提交，验包通过后 rebase 去掉再合入 main。核心项任一不通过如实报告、路线暂停。",
+  "from": [
+    "f011"
+  ],
+  "id": "i004",
+  "issue": 12,
+  "requires_confirmation": false,
+  "status": "open",
+  "title": "原生客户端骨架",
+  "to": null,
+  "worker": null
+}

@@ -1,0 +1,18 @@
+{
+  "concluded_at": null,
+  "confirmed_at": null,
+  "created_at": "2026-11-22T16:42:49Z",
+  "creator": "wally",
+  "description": "Spike #8–#11、#17–#18：VM 租约、CVM、后台 WSS、原生侧代理、Hark REST+SSE、模型指纹。依赖 i004/i005 + 验证账号 + 真机。见 Issue #14。",
+  "doc": "分支 spike/behavior-hark，自 i005 合入后的 main 切出。Hark 对照 BotArk harkClient.ts（REST+SSE 双轨，只做检测；Hark 无原生审批接口，审批走 WebView 回退）。指纹用 lmfpd Rust SDK，隔离会话发 3 条取样 prompt，本地评分。WS 侧代理证明 tokio-tungstenite 走 HTTP CONNECT 隧道（HTTP 侧 reqwest 已确认）。每项实测结论写进 fact。",
+  "from": [
+    "f011"
+  ],
+  "id": "i006",
+  "issue": 14,
+  "requires_confirmation": false,
+  "status": "open",
+  "title": "行为验证 Hark 指纹",
+  "to": null,
+  "worker": null
+}
