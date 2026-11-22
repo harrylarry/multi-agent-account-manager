@@ -13,6 +13,10 @@
 // was removed in 0.1.16 rather than kept as dead code; background
 // notifications are a separate, paused phase.
 //
+// 0.1.17: returning to the account list triggers one immediate sweep,
+// and samples identical to the previous one within 5s are ignored so
+// near-simultaneous sweeps can't defeat the 2-stable-checks debounce.
+//
 // Detection is heuristic: Muse's DOM has no stable message API, so the
 // script reports a message-count estimate (best of several common
 // selectors), a hash of the conversation tail, the text length, and
@@ -116,6 +120,9 @@ final class TaskWatcher: NSObject {
     var sawStopButton: Bool = false
     var stableCount: Int = 0
     var baselineSet: Bool = false
+    // 0.1.17: arrival time of the last accepted sample, for the
+    // near-duplicate guard in noteSample.
+    var lastSampleAt: Date?
   }
 
   private struct TaskSample {
@@ -182,6 +189,7 @@ final class TaskWatcher: NSObject {
     let key = "\(providerId)|\(uuid)"
     var state = states[key] ?? WatchState()
     let signature = "\(sample.msgCount)|\(sample.tailHash)|\(sample.working)"
+    let now = Date()
 
     // First sighting: record the baseline, never notify.
     guard state.baselineSet else {
@@ -189,9 +197,23 @@ final class TaskWatcher: NSObject {
       state.lastSignature = signature
       state.lastTailLen = sample.tailLen
       state.lastMsgCount = sample.msgCount
+      state.lastSampleAt = now
       states[key] = state
       return false
     }
+
+    // 0.1.17: near-simultaneous sweeps (foreground catch-up + the
+    // return-to-list refresh) can deliver two identical samples
+    // within a second; counting both would defeat the 2-stable-checks
+    // debounce. Ignore an identical sample that arrives within 5s of
+    // the previous one for this account.
+    if signature == state.lastSignature,
+      let lastAt = state.lastSampleAt,
+      now.timeIntervalSince(lastAt) < 5
+    {
+      return false
+    }
+    state.lastSampleAt = now
 
     guard signature != state.lastSignature else {
       state.stableCount += 1
@@ -241,7 +263,10 @@ final class TaskWatcher: NSObject {
 
   // MARK: - Parked sweep
 
-  private func sweepParkedPages() {
+  /// One sweep over all parked Muse pages. Called by the 20s timer,
+  /// the foreground-return catch-up, and (0.1.17) the coordinator
+  /// when the user returns to the account list. Main-thread only.
+  func sweepParkedPages() {
     for entry in RecentAccountPages.parkedKeys() {
       guard entry.providerId == "muse" else { continue }
       RecentAccountPages.probeParked(
