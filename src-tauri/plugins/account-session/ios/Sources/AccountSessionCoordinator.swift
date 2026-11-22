@@ -94,6 +94,9 @@ final class AccountSessionCoordinator {
       pluginInitialized = true
       eventChannel = channel
     }
+    // 0.1.15: a notification tap that cold-launched the app may have
+    // arrived before the channel existed; deliver the stored tap now.
+    flushPendingNotificationTap()
   }
 
   func attachViewController(_ vc: AccountWebViewController) {
@@ -276,26 +279,6 @@ final class AccountSessionCoordinator {
     ])
   }
 
-  func emitExternalAuthUnavailable(
-    switchSeq: Int64,
-    viewInstanceId: Int64,
-    reason: String
-  ) {
-    let ch: Channel? = lock.withLock {
-      if !isCurrent(switchSeq: switchSeq, viewInstanceId: viewInstanceId) {
-        return nil
-      }
-      return eventChannel
-    }
-    guard let ch else { return }
-    ch.send([
-      "kind": "externalAuthUnavailable",
-      "switchSeq": switchSeq,
-      "viewInstanceId": viewInstanceId,
-      "reason": reason,
-    ])
-  }
-
   func emitUpdateProgress(
     stage: String,
     downloaded: Int64,
@@ -331,5 +314,51 @@ final class AccountSessionCoordinator {
       "switchSeq": spec.switchSeq,
       "viewInstanceId": spec.viewInstanceId,
     ])
+  }
+
+  // MARK: - 0.1.15 task notifications
+
+  // Neither event is tied to the active session — a completion can be
+  // about a parked account — so there is no isCurrent guard here.
+
+  func emitTaskReplyDetected(providerId: String, uuid: String) {
+    let ch: Channel? = lock.withLock { eventChannel }
+    guard let ch else { return }
+    ch.send([
+      "kind": "taskReplyDetected",
+      "providerId": providerId,
+      "uuid": uuid,
+    ])
+  }
+
+  func emitNotificationTapped(providerId: String, uuid: String) {
+    let ch: Channel? = lock.withLock { eventChannel }
+    guard let ch else { return }
+    ch.send([
+      "kind": "notificationTapped",
+      "providerId": providerId,
+      "uuid": uuid,
+    ])
+    clearPendingNotificationTap()
+  }
+
+  // MARK: - Pending notification tap (cold launch)
+
+  private static let pendingTapKey = "maam.pendingNotificationTap"
+
+  func storePendingNotificationTap(providerId: String, uuid: String) {
+    UserDefaults.standard.set([providerId, uuid], forKey: Self.pendingTapKey)
+  }
+
+  func clearPendingNotificationTap() {
+    UserDefaults.standard.removeObject(forKey: Self.pendingTapKey)
+  }
+
+  private func flushPendingNotificationTap() {
+    guard
+      let pair = UserDefaults.standard.array(forKey: Self.pendingTapKey) as? [String],
+      pair.count == 2
+    else { return }
+    emitNotificationTapped(providerId: pair[0], uuid: pair[1])
   }
 }
