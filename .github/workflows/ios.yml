@@ -6,7 +6,17 @@ name: Build unsigned iOS IPA
 on:
   push:
     branches: ["main"]
+    # Docs-only pushes (markdown + graph files) don't need a build.
+    paths-ignore:
+      - '**.md'
+      - '.muse-graph/**'
   workflow_dispatch:
+
+# A new run on the same branch cancels the one still in progress,
+# so rapid successive pushes only build the latest head.
+concurrency:
+  group: ios-build-${{ github.ref }}
+  cancel-in-progress: true
 
 permissions:
   contents: read
