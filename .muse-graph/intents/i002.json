@@ -1,0 +1,20 @@
+{
+  "concluded_at": null,
+  "confirmed_at": null,
+  "created_at": "2026-11-22T10:44:30Z",
+  "creator": "wally",
+  "description": "按 Issue #8 做 0.1.21 UI 与性能优化（不做功能增加）：顶部栏与弹窗头字体对齐、CSS 字号收敛、红点与弹窗不再触发整列表重建。分支 ui-perf-0121。",
+  "doc": "UI：①顶部栏 backButton 13pt→15pt，与标题一致，红点锚在 titleLabel 上自动跟随，须视觉确认；②弹窗头关闭按钮 12pt→13pt，与域名一致；③CSS 14 档字号→6 档（10/11/12/13/14/16px），映射 9→10、10.5→11、11.5→12、12.5→12、13.5→14、14.5→14、15→16、16.5→16，保持层级，移动端同步。性能：④hasUnreadReply 从 structuralSignature 移除（已在 avatarSig 里，patchRows 就地更新红点），不再整页重建；⑤modal 独立出 #app（单独 overlay 容器），开/关不再重建列表。验收见 Issue #8。",
+  "from": [
+    "f001",
+    "f002",
+    "f006"
+  ],
+  "id": "i002",
+  "issue": 8,
+  "requires_confirmation": false,
+  "status": "open",
+  "title": "UI 与性能优化",
+  "to": null,
+  "worker": null
+}

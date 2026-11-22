@@ -1,0 +1,10 @@
+{
+  "created_at": "2026-11-22T10:44:30Z",
+  "creator": "wally",
+  "description": "用户 2026-11-22 实测 0.1.20 报告（Issue #8）：会话页顶部栏「← 账号」字体比右侧标题小。",
+  "doc": "实测确认：backButton.titleLabel 13pt，headerTitleLabel 15pt，差 2pt。账号列表别名（手机 14px）是行里最大字，不是问题所在。",
+  "id": "f006",
+  "refs": {"issue": 8},
+  "source_intent": null,
+  "title": "账号字体偏小"
+}
