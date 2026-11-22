@@ -125,6 +125,18 @@ pub struct MuseGateway<F: ControlPlaneFetch> {
   fetch: F,
 }
 
+/// rustls 0.23 的进程级 CryptoProvider：依赖图里 tokio-tungstenite 的
+/// rustls-tls-webpki-roots 只带 TLS 管道，Cargo.lock 中 rustls 未启用
+/// ring / aws-lc-rs 任一 provider feature，首次建 TLS 会 panic：
+/// "Could not automatically determine the process-level CryptoProvider..."。
+/// 这里用 Once 显式装 ring（rustls-webpki 已带 ring），重复调用无副作用。
+fn ensure_crypto_provider() {
+  static INIT: std::sync::Once = std::sync::Once::new();
+  INIT.call_once(|| {
+    let _ = rustls::crypto::ring::default_provider().install_default();
+  });
+}
+
 impl<F: ControlPlaneFetch> MuseGateway<F> {
   pub fn new(fetch: F) -> Self {
     Self { fetch }
@@ -132,6 +144,7 @@ impl<F: ControlPlaneFetch> MuseGateway<F> {
 
   /// 取凭证 → WSS → Noise 握手。成功返回已连接的网关（transport 就绪）。
   pub async fn connect(self, cookies: &SessionCookies) -> Result<ConnectedGateway, GatewayError> {
+    ensure_crypto_provider();
     let mut cp = MuseControlPlane::new(self.fetch, cookies.clone());
     let mut creds = cp.credentials(false).await?;
     drop(cp);

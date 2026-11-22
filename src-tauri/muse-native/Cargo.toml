@@ -12,6 +12,10 @@ futures-util = "0.3"
 getrandom = "0.3"
 hmac = "0.12"
 http = "1"
+# rustls 0.23 需要显式 crypto provider：tokio-tungstenite 的
+# rustls-tls-webpki-roots 只带 TLS 管道，不带 ring / aws-lc-rs 任一 provider，
+# 首次建 TLS 时 CryptoProvider 自动判定会 panic。ring 已由 rustls-webpki 引入。
+rustls = { version = "0.23", default-features = false, features = ["ring"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 sha2 = "0.10"
