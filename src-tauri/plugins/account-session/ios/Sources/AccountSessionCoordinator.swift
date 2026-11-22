@@ -324,21 +324,23 @@ final class AccountSessionCoordinator {
   func emitTaskReplyDetected(providerId: String, uuid: String) {
     let ch: Channel? = lock.withLock { eventChannel }
     guard let ch else { return }
-    ch.send([
+    let obj: JsonObject = [
       "kind": "taskReplyDetected",
       "providerId": providerId,
       "uuid": uuid,
-    ])
+    ]
+    ch.send(obj)
   }
 
   func emitNotificationTapped(providerId: String, uuid: String) {
     let ch: Channel? = lock.withLock { eventChannel }
     guard let ch else { return }
-    ch.send([
+    let obj: JsonObject = [
       "kind": "notificationTapped",
       "providerId": providerId,
       "uuid": uuid,
-    ])
+    ]
+    ch.send(obj)
     clearPendingNotificationTap()
   }
 
