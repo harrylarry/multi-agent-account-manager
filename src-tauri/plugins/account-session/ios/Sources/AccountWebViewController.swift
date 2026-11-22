@@ -128,7 +128,11 @@ final class AccountWebViewController: UIViewController, WKNavigationDelegate, WK
 
     let backButton = UIButton(type: .system)
     backButton.setTitle("← 账号", for: .normal)
-    backButton.titleLabel?.font = .systemFont(ofSize: 13)
+    // 0.1.21: 15pt, same as headerTitleLabel (was 13pt — the back
+    // label looked smaller than the title on-device, Issue #8).
+    // The unread dot is anchored to titleLabel, so it follows the
+    // larger text automatically and stays at the top-right of "账号".
+    backButton.titleLabel?.font = .systemFont(ofSize: 15)
     // 0.1.20: make the button hug its title text. A .system button on
     // iOS 15+ carries a default plain configuration whose content
     // insets widen the button frame and centre the title inside it,
@@ -232,7 +236,8 @@ final class AccountWebViewController: UIViewController, WKNavigationDelegate, WK
 
     let closePopupButton = UIButton(type: .system)
     closePopupButton.setTitle("关闭认证", for: .normal)
-    closePopupButton.titleLabel?.font = .systemFont(ofSize: 12)
+    // 0.1.21: 13pt, same as popupDomainLabel (was 12pt, Issue #8).
+    closePopupButton.titleLabel?.font = .systemFont(ofSize: 13)
     closePopupButton.translatesAutoresizingMaskIntoConstraints = false
     closePopupButton.addTarget(
       self, action: #selector(closePopupTapped), for: .touchUpInside)
