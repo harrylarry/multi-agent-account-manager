@@ -1611,6 +1611,17 @@ impl SessionManager {
       let _ = save_store_atomic(&locked.store_path, &locked.store);
     }
 
+    #[cfg(target_os = "ios")]
+    {
+      // 0.1.16: deleting an account can extinguish the aggregate dot
+      // on the "← 账号" button (it may have been the only unread one).
+      let any_unread = {
+        let locked = self.inner.lock().await;
+        locked.store.accounts.iter().any(|a| a.has_unread_reply)
+      };
+      let _ = crate::platform::ios::set_unread_badge(app, any_unread).await;
+    }
+
     Ok(self.get_snapshot().await)
   }
 
@@ -3053,19 +3064,22 @@ impl SessionManager {
       uuid: account.uuid.clone(),
     };
 
-    {
+    // 0.1.16: if a flag was cleared, the aggregate dot on the "← 账号"
+    // button may need to go out — the block reports the new aggregate.
+    let badge_sync = {
       let mut locked = self.inner.lock().await;
       if self.current_seq.load(Ordering::SeqCst) != expected_seq {
         return Ok(Self::snapshot_from_locked(&locked));
       }
       locked.active_slot = Some(ActiveSessionSlot {
-        account_key: key,
+        account_key: key.clone(),
         view_instance_id,
         switch_seq: expected_seq,
         committed: false,
       });
       // 0.1.15: opening the account clears its unread-reply flag — the
       // user is looking at the reply now.
+      let mut cleared_flag = false;
       if let Some(acc) = locked
         .store
         .accounts
@@ -3075,8 +3089,17 @@ impl SessionManager {
         if acc.has_unread_reply {
           acc.has_unread_reply = false;
           let _ = save_store_atomic(&locked.store_path, &locked.store);
+          cleared_flag = true;
         }
       }
+      if cleared_flag {
+        Some(locked.store.accounts.iter().any(|a| a.has_unread_reply))
+      } else {
+        None
+      }
+    };
+    if let Some(any_unread) = badge_sync {
+      let _ = crate::platform::ios::set_unread_badge(app, any_unread).await;
     }
 
     let spec = get_provider(account.provider_id);
@@ -3500,9 +3523,10 @@ impl SessionManager {
           )
           .await;
       }
-      // 0.1.15: task watcher saw a new reply for an account (active or
-      // parked). Mark it unread in the manager list; the flag clears
-      // when the account is opened (open_ios_session).
+      // 0.1.15: task watcher saw a new reply for a parked account
+      // (0.1.16: the active account never reaches here — the Swift
+      // coordinator skips it). Mark it unread in the manager list;
+      // the flag clears when the account is opened (open_ios_session).
       IosSessionEvent::TaskReplyDetected {
         provider_id,
         uuid,
@@ -3535,30 +3559,9 @@ impl SessionManager {
         if let Some(snap) = snap_opt {
           self.emit_snapshot(app, &snap);
         }
-      }
-      // 0.1.15: the user tapped a task-completion notification. Switch
-      // to that account (not a cold start, so a parked page is reused).
-      // Mirrors the RecreateRequested recovery path.
-      IosSessionEvent::NotificationTapped {
-        provider_id,
-        uuid,
-      } => {
-        let Some(pid) = ProviderId::parse(&provider_id) else {
-          return;
-        };
-        let Some(norm_uuid) = normalize_uuid(&uuid) else {
-          return;
-        };
-        let _ = self
-          .switch_account_internal(
-            app,
-            AccountKey {
-              provider_id: pid,
-              uuid: norm_uuid,
-            },
-            false,
-          )
-          .await;
+        // 0.1.16: a newly set flag lights the aggregate dot on the
+        // "← 账号" button (a flag was just set, so it is on).
+        let _ = crate::platform::ios::set_unread_badge(app, true).await;
       }
     }
   }
