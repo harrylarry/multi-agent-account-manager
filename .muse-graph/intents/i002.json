@@ -1,5 +1,5 @@
 {
-  "concluded_at": null,
+  "concluded_at": "2026-11-22T10:52:41Z",
   "confirmed_at": null,
   "created_at": "2026-11-22T10:44:30Z",
   "creator": "wally",
@@ -13,8 +13,8 @@
   "id": "i002",
   "issue": 8,
   "requires_confirmation": false,
-  "status": "open",
+  "status": "done",
   "title": "UI 与性能优化",
-  "to": null,
-  "worker": null
+  "to": "f007",
+  "worker": "nova"
 }
