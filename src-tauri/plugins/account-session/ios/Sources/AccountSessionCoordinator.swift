@@ -11,6 +11,7 @@
 
 import Foundation
 import Tauri
+import UIKit
 
 struct IosAccountSessionSpec {
   let providerId: String
@@ -90,7 +91,25 @@ final class AccountSessionCoordinator {
   // reply) — drives the "← 账号" button dot.
   private var hasUnreadBadge = false
 
-  private init() {}
+  // 0.1.17: return to the account list when the app comes back after
+  // a long absence (5 min) instead of resuming the stale page.
+  private static let backgroundReturnThreshold: TimeInterval = 300
+  private var backgroundedAt: Date?
+  private var backgroundObserver: NSObjectProtocol?
+  private var foregroundObserver: NSObjectProtocol?
+
+  private init() {
+    backgroundObserver = NotificationCenter.default.addObserver(
+      forName: UIApplication.didEnterBackgroundNotification,
+      object: nil,
+      queue: .main
+    ) { [weak self] _ in self?.backgroundedAt = Date() }
+    foregroundObserver = NotificationCenter.default.addObserver(
+      forName: UIApplication.willEnterForegroundNotification,
+      object: nil,
+      queue: .main
+    ) { [weak self] _ in self?.returnToListIfAwayLong() }
+  }
 
   func setEventChannel(_ channel: Channel) {
     lock.withLock {
@@ -274,6 +293,19 @@ final class AccountSessionCoordinator {
     ])
   }
 
+  /// 0.1.17: if the app was away for 5+ minutes, close the open
+  /// session back to the account list (same path as "← 账号") instead
+  /// of resuming the stale page. No-op when no session is open or the
+  /// absence was short; the VC itself skips the return while an OAuth
+  /// popup is open.
+  private func returnToListIfAwayLong() {
+    guard let at = backgroundedAt,
+      Date().timeIntervalSince(at) >= Self.backgroundReturnThreshold
+    else { return }
+    backgroundedAt = nil
+    currentViewController()?.returnToListAfterLongAbsence()
+  }
+
   func emitActivityClosed(switchSeq: Int64, viewInstanceId: Int64) {
     let ch: Channel? = lock.withLock {
       if activeSpec?.switchSeq == switchSeq
@@ -283,6 +315,11 @@ final class AccountSessionCoordinator {
       }
       return eventChannel
     }
+    // 0.1.17: returning to the list refreshes the dots immediately —
+    // sweep the parked pages once instead of waiting for the next 20s
+    // tick. Runs after activeSpec is cleared above, so the just-closed
+    // account is treated as parked, not skipped.
+    TaskWatcher.shared.sweepParkedPages()
     guard let ch else { return }
     ch.send([
       "kind": "activityClosed",
