@@ -36,6 +36,8 @@ final class AccountWebViewController: UIViewController, WKNavigationDelegate, WK
   private var popupWebContainer: UIView!
   // Batch-1: thin load-progress bar under the top bar.
   private var progressView: UIProgressView!
+  // 0.1.16: aggregate unread dot on the "← 账号" button.
+  private var unreadDotView: UIView?
   private var progressObservation: NSKeyValueObservation?
 
   // MARK: - Session state
@@ -124,6 +126,23 @@ final class AccountWebViewController: UIViewController, WKNavigationDelegate, WK
     backButton.titleLabel?.font = .systemFont(ofSize: 13)
     backButton.translatesAutoresizingMaskIntoConstraints = false
     backButton.addTarget(self, action: #selector(backTapped), for: .touchUpInside)
+
+    // 0.1.16: aggregate unread dot on the "← 账号" button — shown when
+    // any parked account has an unread reply. Initial state comes from
+    // the coordinator (Rust pushes updates via setUnreadBadge).
+    let unreadDot = UIView()
+    unreadDot.backgroundColor = UIColor(hex: 0xEF4444)
+    unreadDot.layer.cornerRadius = 4
+    unreadDot.translatesAutoresizingMaskIntoConstraints = false
+    unreadDot.isHidden = !AccountSessionCoordinator.shared.currentUnreadBadge()
+    backButton.addSubview(unreadDot)
+    unreadDotView = unreadDot
+    NSLayoutConstraint.activate([
+      unreadDot.widthAnchor.constraint(equalToConstant: 8),
+      unreadDot.heightAnchor.constraint(equalToConstant: 8),
+      unreadDot.centerXAnchor.constraint(equalTo: backButton.trailingAnchor, constant: -2),
+      unreadDot.centerYAnchor.constraint(equalTo: backButton.topAnchor, constant: 2),
+    ])
 
     headerTitleLabel = UILabel()
     headerTitleLabel.text = "正在核验会话…"
@@ -289,6 +308,13 @@ final class AccountWebViewController: UIViewController, WKNavigationDelegate, WK
 
   @objc private func closePopupTapped() {
     destroyPopupWebView()
+  }
+
+  /// 0.1.16: shows/hides the aggregate unread dot on the "← 账号"
+  /// button. No-op before the view loads (viewDidLoad applies the
+  /// stored state when the dot is created).
+  func setUnreadDotVisible(_ visible: Bool) {
+    unreadDotView?.isHidden = !visible
   }
 
   // MARK: - Session binding
@@ -1000,9 +1026,8 @@ final class AccountWebViewController: UIViewController, WKNavigationDelegate, WK
           AccountSessionCoordinator.shared.isCurrent(
             switchSeq: spec.switchSeq, viewInstanceId: spec.viewInstanceId)
         else { return }
-        let alias = AccountSessionCoordinator.shared.currentActiveSpec()?.alias ?? spec.alias
         if TaskWatcher.shared.noteSample(
-          providerId: spec.providerId, uuid: spec.uuid, alias: alias, result: result)
+          providerId: spec.providerId, uuid: spec.uuid, result: result)
         {
           self.stableProbeCount = 0
         }
