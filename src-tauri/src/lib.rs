@@ -171,7 +171,7 @@ async fn muse_native_approvals_probe(
   muse_native::approvals_probe(&app, &provider_id, &uuid).await
 }
 
-/// B3：只读拉一次额度（Server Action 优先，REST 兜底），失败时带每步诊断。
+/// B3：只读拉一次额度（Server Action 冷发现 + 重试），失败时带每步诊断。
 #[derive(serde::Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct QuotaProbe {
@@ -186,6 +186,7 @@ async fn muse_native_quota_probe(
   app: AppHandle,
   provider_id: String,
   uuid: String,
+  cache: tauri::State<'_, std::sync::Arc<quota::ActionCache>>,
 ) -> Result<QuotaProbe, String> {
   if provider_id != "muse" {
     return Err("额度探针只支持 Muse 账号".to_string());
@@ -193,20 +194,42 @@ async fn muse_native_quota_probe(
   let cookie = match muse_native::cookie_header_for(&app, &uuid).await {
     Ok(c) => c,
     Err(e) => {
-      return Ok(QuotaProbe { ok: false, quota: None, diag: vec![], error: Some(e) })
+      return Ok(QuotaProbe {
+        ok: false,
+        quota: None,
+        diag: vec![],
+        error: Some(e),
+      })
     }
   };
-  let (quota, diag) = quota::fetch_quota(&cookie, None).await;
-  Ok(QuotaProbe {
-    ok: quota.is_some(),
-    error: if quota.is_some() {
-      None
-    } else {
-      Some("额度获取失败（见下方每步诊断）".to_string())
-    },
-    quota,
-    diag,
-  })
+  let cached = cache.get();
+  let (result, mut diag) = quota::fetch_quota_v2(&cookie, cached.as_deref()).await;
+  if let Some(c) = cached.as_deref() {
+    diag.insert(0, format!("使用缓存 action {}", &c[..8.min(c.len())]));
+  }
+  match result {
+    Ok(q) => {
+      cache.set(q.action_id.clone());
+      Ok(QuotaProbe {
+        ok: true,
+        quota: Some(q),
+        diag,
+        error: None,
+      })
+    }
+    Err(e) => {
+      // 会话失效时清缓存，避免继续用过期 id 打上游。
+      if matches!(e, quota::QuotaError::SessionExpired) {
+        cache.set(None);
+      }
+      Ok(QuotaProbe {
+        ok: false,
+        quota: None,
+        diag,
+        error: Some(e.to_string()),
+      })
+    }
+  }
 }
 
 /// B4：发送一条消息到隔离测试会话（单发锁 + 台账在 muse_native::send_probe）。
@@ -346,6 +369,7 @@ pub fn run() {
     })
     .manage(std::sync::Arc::new(send_ledger::SendLedger::new()))
     .manage(std::sync::Arc::new(muse_native::LivenessState::default()))
+    .manage(std::sync::Arc::new(quota::ActionCache::default()))
     .invoke_handler(tauri::generate_handler![
       get_manager_state,
       select_provider,

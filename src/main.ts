@@ -2074,8 +2074,18 @@ function bindDelegatedEvents(): void {
     }
     const copyBtn = target.closest<HTMLElement>("#spike-copy-btn");
     if (copyBtn) {
+      // 只复制诊断内容：克隆后剔除按钮，避免把「运行诊断/额度探针…」写进剪贴板。
       const el = document.querySelector<HTMLElement>(".spike-diag");
-      const text = el?.innerText ?? "";
+      let text = "";
+      if (el) {
+        const clone = el.cloneNode(true) as HTMLElement;
+        clone.querySelectorAll("button").forEach((b) => b.remove());
+        text = (clone.innerText || "")
+          .split("\n")
+          .map((l) => l.trim())
+          .filter((l) => l.length > 0)
+          .join("\n");
+      }
       try {
         await navigator.clipboard.writeText(text);
       } catch {
