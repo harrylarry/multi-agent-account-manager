@@ -31,6 +31,8 @@
     "allow-muse-native-watch-probe",
     "allow-muse-native-approvals-probe",
     "allow-muse-native-quota-probe",
-    "allow-muse-native-send-probe"
+    "allow-muse-native-send-probe",
+    "allow-muse-native-liveness-start",
+    "allow-muse-native-liveness-status"
   ]
 }

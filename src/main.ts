@@ -98,6 +98,11 @@ interface SpikeQuotaProbe {
 let spikeQuotaProbe: SpikeQuotaProbe | null = null;
 let spikeQuotaRunning = false;
 let spikeQuotaError: string | null = null;
+interface SpikeLiveness {
+  running: boolean; startedMs: number; connectedMs: number | null;
+  lastEventMs: number | null; endedMs: number | null; events: number; error: string | null;
+}
+let spikeLive: SpikeLiveness | null = null;
 interface SpikeSendResult {
   ok: boolean; status: string; sendId: string;
   ack: unknown; sessionId: string | null; error: string | null;
@@ -771,6 +776,20 @@ function spikeDiagInnerHtml(): string {
   } else if (spikeDiagnoseError) {
     resultHtml = `<div class="spike-diag-result fail">错误：${escapeHtml(spikeDiagnoseError)}</div>`;
   }
+  let liveHtml = "";
+  if (spikeLive) {
+    const l = spikeLive;
+    const fmt = (ms: number) => new Date(ms).toLocaleTimeString();
+    const alive = l.running
+      ? Math.round((Date.now() - (l.connectedMs ?? l.startedMs)) / 1000)
+      : (l.endedMs && l.connectedMs ? Math.round((l.endedMs - l.connectedMs) / 1000) : 0);
+    liveHtml = `
+      <div class="spike-diag-result ${l.error ? "fail" : "ok"}">
+        <div>${l.running ? "● 存活中" : "■ 已结束"}：连接存活 ${alive}s，事件 ${l.events}</div>
+        <div>建立 ${l.connectedMs ? fmt(l.connectedMs) : "—"}　最后事件 ${l.lastEventMs ? fmt(l.lastEventMs) : "—"}　结束 ${l.endedMs ? fmt(l.endedMs) : "—"}</div>
+        ${l.error ? `<div>结束原因：${escapeHtml(l.error)}</div>` : ""}
+      </div>`;
+  }
   let sendHtml = "";
   if (spikeSend) {
     const r = spikeSend;
@@ -856,13 +875,15 @@ function spikeDiagInnerHtml(): string {
       <button id="spike-approvals-btn" class="mini-btn" type="button" ${spikeApprovalsRunning ? "disabled" : ""}>${spikeApprovalsRunning ? "查询中…" : "审批探针"}</button>
       <button id="spike-quota-btn" class="mini-btn" type="button" ${spikeQuotaRunning ? "disabled" : ""}>${spikeQuotaRunning ? "查询中…" : "额度探针"}</button>
       <button id="spike-send-btn" class="mini-btn" type="button" ${spikeSendRunning ? "disabled" : ""}>${spikeSendRunning ? "发送中…" : "发送探针"}</button>
+      <button id="spike-live-btn" class="mini-btn" type="button" ${spikeLive?.running ? "disabled" : ""}>${spikeLive?.running ? "存活中…" : "存活探针 5min"}</button>
       <button id="spike-copy-btn" class="mini-btn" type="button">复制结果</button>
     </div>
     ${resultHtml}
     ${watchHtml}
     ${approvalsHtml}
     ${quotaHtml}
-    ${sendHtml}`;
+    ${sendHtml}
+    ${liveHtml}`;
 }
 
 function syncSpikeDiag(): void {
@@ -881,6 +902,30 @@ function pickWatchAccount(): AccountRecord | undefined {
   return snapshot.accounts.find(
     (a) => a.providerId === "muse" && a.authState === "authenticated"
   );
+}
+
+async function refreshSpikeLive(): Promise<void> {
+  try {
+    spikeLive = await invoke<SpikeLiveness>("muse_native_liveness_status");
+  } catch (e) {
+    spikeLive = null;
+  }
+  syncSpikeDiag();
+}
+
+async function startSpikeLive(): Promise<void> {
+  if (!snapshot) return;
+  const acc = pickWatchAccount();
+  if (!acc) return;
+  try {
+    spikeLive = await invoke<SpikeLiveness>("muse_native_liveness_start", {
+      uuid: acc.uuid,
+      seconds: 300,
+    });
+  } catch (e) {
+    spikeLive = null;
+  }
+  syncSpikeDiag();
 }
 
 async function runSpikeSend(): Promise<void> {
@@ -1959,6 +2004,15 @@ function bindDelegatedEvents(): void {
     const watchBtn = target.closest<HTMLElement>("#spike-watch-btn");
     if (watchBtn) {
       await runSpikeWatch();
+      return;
+    }
+    const liveBtn = target.closest<HTMLElement>("#spike-live-btn");
+    if (liveBtn) {
+      if (spikeLive?.running) {
+        await refreshSpikeLive();
+      } else {
+        await startSpikeLive();
+      }
       return;
     }
     const sendBtn = target.closest<HTMLElement>("#spike-send-btn");

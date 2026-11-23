@@ -234,6 +234,26 @@ async fn muse_native_send_probe(
   .await)
 }
 
+/// #10：开始一次存活探针（长连接 + 订阅，记录到断开为止）。
+#[tauri::command]
+fn muse_native_liveness_start(
+  app: AppHandle,
+  uuid: String,
+  seconds: u64,
+  state: tauri::State<'_, std::sync::Arc<muse_native::LivenessState>>,
+) -> muse_native::Liveness {
+  muse_native::liveness_start(&app, &state, &uuid, seconds);
+  state.snapshot()
+}
+
+/// #10：读取存活探针当前状态/结果。
+#[tauri::command]
+fn muse_native_liveness_status(
+  state: tauri::State<'_, std::sync::Arc<muse_native::LivenessState>>,
+) -> muse_native::Liveness {
+  state.snapshot()
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
   let builder = tauri::Builder::default();
@@ -325,6 +345,7 @@ pub fn run() {
       Ok(())
     })
     .manage(std::sync::Arc::new(send_ledger::SendLedger::new()))
+    .manage(std::sync::Arc::new(muse_native::LivenessState::default()))
     .invoke_handler(tauri::generate_handler![
       get_manager_state,
       select_provider,
@@ -346,6 +367,8 @@ pub fn run() {
       muse_native_approvals_probe,
       muse_native_quota_probe,
       muse_native_send_probe,
+      muse_native_liveness_start,
+      muse_native_liveness_status,
       muse_native::is_spike_build,
     ])
     .run(tauri::generate_context!())

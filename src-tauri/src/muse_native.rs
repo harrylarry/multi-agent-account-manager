@@ -385,6 +385,180 @@ pub async fn send_probe(
   }
 }
 
+/// #10 存活探针状态：记录一条长连接从建立到断开的时间线。
+#[derive(Debug, Clone, Serialize, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct Liveness {
+  pub running: bool,
+  pub started_ms: u128,
+  pub connected_ms: Option<u128>,
+  pub last_event_ms: Option<u128>,
+  pub ended_ms: Option<u128>,
+  pub events: u64,
+  pub error: Option<String>,
+}
+
+#[derive(Default)]
+pub struct LivenessState {
+  inner: std::sync::Mutex<Liveness>,
+}
+
+impl LivenessState {
+  pub fn snapshot(&self) -> Liveness {
+    self.inner.lock().unwrap().clone()
+  }
+  fn set<F: FnOnce(&mut Liveness)>(&self, f: F) {
+    f(&mut self.inner.lock().unwrap());
+  }
+}
+
+fn now_ms_u128() -> u128 {
+  std::time::SystemTime::now()
+    .duration_since(std::time::UNIX_EPOCH)
+    .map(|d| d.as_millis())
+    .unwrap_or(0)
+}
+
+/// 开一条长连接并持续读事件，直到超时或断开；结果写进共享状态。
+/// 用途是实测「App 退到后台后连接还能活多久」，不做保活、不重连。
+pub fn liveness_start(
+  app: &AppHandle,
+  state: &std::sync::Arc<LivenessState>,
+  uuid: &str,
+  seconds: u64,
+) {
+  if state.snapshot().running {
+    return;
+  }
+  let seconds = seconds.clamp(30, 3600);
+  state.set(|l| {
+    *l = Liveness {
+      running: true,
+      started_ms: now_ms_u128(),
+      ..Default::default()
+    }
+  });
+
+  let app_owned = app.clone();
+  let uuid_owned = uuid.to_string();
+  let state_owned = state.clone();
+  tokio::spawn(async move {
+    #[cfg(target_os = "android")]
+    {
+      let _ = (app_owned, uuid_owned, seconds);
+      state_owned.set(|l| {
+        l.running = false;
+        l.ended_ms = Some(now_ms_u128());
+        l.error = Some("Android 不可用".to_string());
+      });
+      return;
+    }
+    #[cfg(not(target_os = "android"))]
+    {
+      let cookies = match fetch_session_cookies(&app_owned, &uuid_owned).await {
+        Ok(c) => c,
+        Err(e) => {
+          state_owned.set(|l| {
+            l.running = false;
+            l.ended_ms = Some(now_ms_u128());
+            l.error = Some(e);
+          });
+          return;
+        }
+      };
+      if cookies.is_empty() {
+        state_owned.set(|l| {
+          l.running = false;
+          l.ended_ms = Some(now_ms_u128());
+          l.error = Some("无登录态".to_string());
+        });
+        return;
+      }
+      let fetch = match ReqwestFetch::new() {
+        Ok(f) => f,
+        Err(e) => {
+          state_owned.set(|l| {
+            l.running = false;
+            l.ended_ms = Some(now_ms_u128());
+            l.error = Some(e);
+          });
+          return;
+        }
+      };
+      let gateway = MuseGateway::new(fetch);
+      let mut cookies = cookies;
+      let connected = match gateway.connect(&cookies).await {
+        Ok(c) => c,
+        Err(e) => {
+          cookies.zeroize();
+          state_owned.set(|l| {
+            l.running = false;
+            l.ended_ms = Some(now_ms_u128());
+            l.error = Some(e.to_string());
+          });
+          return;
+        }
+      };
+      cookies.zeroize();
+      state_owned.set(|l| l.connected_ms = Some(now_ms_u128()));
+
+      let body = br#"{"capabilities":["hotel_results","chat_cancel","delta_stream","custom_reactions","custom_reactions_facebook_thumbs_up_v1"]}"#.to_vec();
+      let req = HttpRequest {
+        service: Service::Daemon,
+        verb: "POST".to_string(),
+        path: "/chat/subscribe".to_string(),
+        headers: vec![
+          ("Content-Type".to_string(), "application/json".to_string()),
+          ("x-request-id".to_string(), uuid::Uuid::new_v4().to_string()),
+          ("x-app-id".to_string(), "hatch-web".to_string()),
+        ],
+        body,
+      };
+      let mut sub = match connected.subscribe(req).await {
+        Ok(s) => s,
+        Err(e) => {
+          state_owned.set(|l| {
+            l.running = false;
+            l.ended_ms = Some(now_ms_u128());
+            l.error = Some(e.to_string());
+          });
+          return;
+        }
+      };
+      let deadline = Instant::now() + Duration::from_secs(seconds);
+      let mut error = None;
+      loop {
+        let left = deadline.saturating_duration_since(Instant::now());
+        if left.is_zero() {
+          break;
+        }
+        match sub.next_line(left).await {
+          Ok(Some(_line)) => {
+            state_owned.set(|l| {
+              l.events += 1;
+              l.last_event_ms = Some(now_ms_u128());
+            });
+          }
+          Ok(None) => {
+            error = Some("订阅结束".to_string());
+            break;
+          }
+          Err(GatewayError::Timeout(_)) => break,
+          Err(e) => {
+            error = Some(e.to_string());
+            break;
+          }
+        }
+      }
+      state_owned.set(|l| {
+        l.running = false;
+        l.ended_ms = Some(now_ms_u128());
+        l.error = error;
+      });
+    }
+  });
+}
+
 /// 取一次会话 cookie 头（B3 额度用）。调用方用后立即丢弃，不落盘不打印。
 pub async fn cookie_header_for(app: &AppHandle, uuid: &str) -> Result<String, String> {
   #[cfg(target_os = "android")]
