@@ -162,47 +162,17 @@ fn looks_like_login_page(text: &str) -> bool {
 }
 
 /// 页面里引用的 JS chunk 路径（兼容 `static/chunks/` 与 `static/immutable/chunks/`）。
+/// 只用同源相对路径，绝不返回跨域 URL（静态资源不携带 Cookie，也不跟随重定向）。
 pub fn chunk_paths(text: &str) -> Vec<String> {
+  let re = regex::Regex::new(r"static/(?:immutable/)?chunks/[A-Za-z0-9~._-]+\.js")
+    .expect("chunk regex");
   let mut out: Vec<String> = Vec::new();
   let mut seen: HashSet<String> = HashSet::new();
-  let bytes = text.as_bytes();
-  let mut i = 0usize;
-  while i + 1 < bytes.len() {
-    if bytes[i] == b's' && text[i..].starts_with("static/") {
-      // allowed: static/chunks/xxx.js 或 static/immutable/chunks/xxx.js
-      let rest = &text[i..];
-      let path_start = if let Some(p) = rest.find('/') {
-        i + p + 1
-      } else {
-        i
-      };
-      let rest2 = &text[path_start..];
-      let (seg, skip) = if rest2.starts_with("immutable/") {
-        (14usize, 14usize)
-      } else if rest2.starts_with("chunks/") {
-        (7usize, 7usize)
-      } else {
-        (0, 0)
-      };
-      if seg > 0 {
-        let file_start = path_start + skip;
-        let tail = &text[file_start..];
-        if let Some(end) = tail.find(".js") {
-          let name = &tail[..end + 3];
-          let valid = !name.is_empty()
-            && name.chars().all(|c| c.is_ascii_alphanumeric() || "~.-_".contains(c));
-          if valid {
-            let full = format!("/_next/{}", &text[i..file_start + end + 3]);
-            if seen.insert(full.clone()) {
-              out.push(full);
-            }
-            i = file_start + end + 3;
-            continue;
-          }
-        }
-      }
+  for m in re.find_iter(text) {
+    let full = format!("/_next/{}", m.as_str());
+    if seen.insert(full.clone()) {
+      out.push(full);
     }
-    i += 1;
   }
   out
 }
