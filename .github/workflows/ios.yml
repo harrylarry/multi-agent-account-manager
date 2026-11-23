@@ -52,13 +52,14 @@ jobs:
       # App icons are synced by tauri.ios.conf.json's beforeBuildCommand
       # (scripts/sync-ios-resources.mjs) before the Xcode build runs.
       # Spike 变体只覆盖 bundle id 与显示名，main 默认仍是日常版。
+      # 双分支写法避免未加引号的变量展开（SC2086）。
       - name: Build unsigned IPA
         run: |
-          args=""
           if [ "${{ inputs.spike }}" = "true" ]; then
-            args="--config src-tauri/tauri.spike.conf.json"
+            npm run tauri -- ios build --no-sign --ci --config src-tauri/tauri.spike.conf.json
+          else
+            npm run tauri -- ios build --no-sign --ci
           fi
-          npm run tauri -- ios build --no-sign --ci $args
       - name: Locate unsigned IPA
         run: |
           ipa=$(find src-tauri/gen/apple -name '*.ipa' -type f | head -n 1)
