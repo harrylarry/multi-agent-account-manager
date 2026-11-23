@@ -16,3 +16,4 @@ src-tauri/plugins/account-session/android/.tauri
 *.p12
 keystore.properties
 src-tauri/muse-native/target
+src-tauri/lmfpd-probe/target
