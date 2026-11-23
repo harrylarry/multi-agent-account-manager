@@ -26,13 +26,15 @@ regex = "1"
 [target.'cfg(not(any(target_os = "android", target_os = "ios")))'.dependencies]
 tauri = { version = "=2.12.6", features = ["unstable"] }
 open = "5"
-reqwest = { version = "0.13", default-features = false, features = ["native-tls", "http2", "system-proxy"] }
+# socks feature：控制面 HTTP 走 socks5:// 代理需要（WSS 侧的 SOCKS5 在
+# muse-native/proxy.rs 自行实现握手，与此无关）。
+reqwest = { version = "0.13", default-features = false, features = ["native-tls", "http2", "system-proxy", "socks"] }
 sha2 = "0.10"
 
 # Spike 0.1.22 (#3 认证链)：iOS 上控制面也需要 reqwest；用平台 native-tls
 #（Security framework），与桌面端同一 TLS 栈，不引入新的 C 编译依赖。
 [target.'cfg(target_os = "ios")'.dependencies]
-reqwest = { version = "0.13", default-features = false, features = ["native-tls", "http2"] }
+reqwest = { version = "0.13", default-features = false, features = ["native-tls", "http2", "socks"] }
 
 [target.'cfg(target_os = "macos")'.dependencies]
 objc2 = "0.6"

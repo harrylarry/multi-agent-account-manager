@@ -286,6 +286,20 @@ async fn muse_native_fingerprint_probe(
   Ok(muse_native::fingerprint_probe(&app, &ledger, &uuid).await)
 }
 
+/// #11/#16：用指定代理验证控制面 + WSS 隧道 + Noise + ping（fail-closed）。
+#[tauri::command]
+async fn muse_native_proxy_probe(
+  app: AppHandle,
+  provider_id: String,
+  uuid: String,
+  proxy_uri: String,
+) -> Result<muse_native::ProxyProbe, String> {
+  if provider_id != "muse" {
+    return Err("代理探针只支持 Muse 账号".to_string());
+  }
+  Ok(muse_native::proxy_probe(&app, &uuid, &proxy_uri).await)
+}
+
 /// #10：开始一次存活探针（长连接 + 订阅，记录到断开为止）。
 #[tauri::command]
 fn muse_native_liveness_start(
@@ -421,6 +435,7 @@ pub fn run() {
       muse_native_quota_probe,
       muse_native_send_probe,
       muse_native_fingerprint_probe,
+      muse_native_proxy_probe,
       muse_native_liveness_start,
       muse_native_liveness_status,
       muse_native_lease_probe,

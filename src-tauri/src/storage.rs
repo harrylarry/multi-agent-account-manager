@@ -17,6 +17,46 @@ pub struct AccountKey {
   pub uuid: String,
 }
 
+/// #11/#16：每账号 1:1 代理引用。
+///
+/// 安全约束（开发计划 §3.5 / P2-2）：
+/// - `uri` 只保存 scheme://host:port，**不含明文口令**；口令放 Keychain，
+///   这里仅保存 `credential_ref`（Keychain 项的引用名）。
+/// - `fail_closed` 恒为 true：代理异常只能阻断，不能自动切池或清掉代理设置。
+///   反序列化端用 `#[serde(default)]` 保证老账户缺失字段时也为 true。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ProxySetting {
+  /// scheme://host[:port]，可含 user@ 但不得含 :password。
+  pub uri: String,
+  /// Keychain 中口令项的引用名；None 表示代理无需认证。
+  #[serde(default)]
+  pub credential_ref: Option<String>,
+  /// 用户显式启用。故障逻辑不得改写此字段。
+  #[serde(default)]
+  pub enabled: bool,
+}
+
+impl ProxySetting {
+  /// 强制 fail-closed：无论存储里写什么，代理启用时都不允许直连回退。
+  /// 这里不提供关闭它的字段——这是结构性的，不是配置开关。
+  pub fn fail_closed(&self) -> bool {
+    true
+  }
+
+  /// 脱敏展示串：去掉 userinfo 与 query，绝不含口令。
+  pub fn display_safe(&self) -> String {
+    let rest = self
+      .uri
+      .split_once("://")
+      .map(|(_, r)| r)
+      .unwrap_or(&self.uri);
+    let authority = rest.split('/').next().unwrap_or(rest);
+    let host_part = authority.rsplit_once('@').map(|(_, h)| h).unwrap_or(authority);
+    host_part.to_string()
+  }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "camelCase")]
 pub struct QuotaDetail {
@@ -70,6 +110,9 @@ pub struct AccountRecord {
   /// while it was not active. Cleared when the account is opened.
   #[serde(default)]
   pub has_unread_reply: bool,
+  /// #11/#16：每账号 1:1 代理引用（脱敏存储，fail-closed）。
+  #[serde(default)]
+  pub proxy: Option<ProxySetting>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -390,5 +433,45 @@ pub fn load_or_migrate_store(path: &Path) -> LoadedAccountsStore {
     store,
     conflicts: Vec::new(),
     startup_notice: None,
+  }
+}
+
+#[cfg(test)]
+mod proxy_tests {
+  use super::*;
+
+  #[test]
+  fn proxy_display_safe_hides_userinfo() {
+    let p = ProxySetting {
+      uri: "http://alice:p%40ss@p.example:8080".to_string(),
+      credential_ref: Some("kc-proxy-p.example".to_string()),
+      enabled: true,
+    };
+    let safe = p.display_safe();
+    assert!(!safe.contains("alice"), "脱敏串不得含用户名: {safe}");
+    assert!(!safe.contains("p%40ss"), "脱敏串不得含口令: {safe}");
+    assert!(safe.contains("p.example:8080"), "脱敏串应保留 host:port: {safe}");
+  }
+
+  #[test]
+  fn proxy_is_always_fail_closed() {
+    let p = ProxySetting {
+      uri: "socks5://p.example".to_string(),
+      credential_ref: None,
+      enabled: true,
+    };
+    assert!(p.fail_closed());
+  }
+
+  #[test]
+  fn account_record_without_proxy_field_deserializes() {
+    // 老账户 JSON 无 proxy 字段，必须能反序列化为 None（向后兼容）。
+    let json = r#"{
+      "providerId":"muse","uuid":"u-1","alias":"a","createdAtMs":1,
+      "autoAlias":false,"avatarUrl":null,"quotaText":null,"quotaPercent":null,
+      "quotaDetail":null,"authState":"unknown","hasUnreadReply":false
+    }"#;
+    let rec: AccountRecord = serde_json::from_str(json).expect("老账户应能反序列化");
+    assert!(rec.proxy.is_none());
   }
 }

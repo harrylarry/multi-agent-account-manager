@@ -33,6 +33,7 @@
     "allow-muse-native-quota-probe",
     "allow-muse-native-send-probe",
     "allow-muse-native-fingerprint-probe",
+    "allow-muse-native-proxy-probe",
     "allow-muse-native-liveness-start",
     "allow-muse-native-liveness-status",
     "allow-muse-native-lease-probe"

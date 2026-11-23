@@ -70,8 +70,20 @@ struct ReqwestFetch {
 #[cfg(not(target_os = "android"))]
 impl ReqwestFetch {
   fn new() -> Result<Self, String> {
-    let client = reqwest::Client::builder()
-      .timeout(Duration::from_secs(20))
+    Self::new_with_proxy(None)
+  }
+
+  /// #11/#16：控制面 HTTP 客户端可绑定逐账号代理。
+  /// `proxy_uri` 为 scheme://[user:pass@]host[:port]；含认证时由 reqwest
+  /// 从 URI 解析凭证。代理无效/不被支持时返回 Err（fail-closed，绝不静默直连）。
+  fn new_with_proxy(proxy_uri: Option<&str>) -> Result<Self, String> {
+    let mut builder = reqwest::Client::builder().timeout(Duration::from_secs(20));
+    if let Some(uri) = proxy_uri {
+      let proxy = reqwest::Proxy::all(uri)
+        .map_err(|e| format!("代理 URI 无效（不会回退直连）: {e}"))?;
+      builder = builder.proxy(proxy);
+    }
+    let client = builder
       .build()
       .map_err(|e| format!("创建 HTTP 客户端失败: {e}"))?;
     Ok(Self { client })
@@ -1271,6 +1283,119 @@ pub async fn approvals_probe(
       first: list.into_iter().next(),
       error: if status < 400 { None } else { Some(format!("egress.approvals HTTP {status}")) },
     })
+  }
+}
+
+/// #11/#16 代理探针结果。只含阶段、状态码与脱敏代理串，不含 cookie /
+/// token / 代理口令。`failClosed` 恒为 true：代理失败只阻断，不直连。
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ProxyProbe {
+  pub ok: bool,
+  pub phase: String,
+  pub tunnel_via: Option<String>,
+  pub proxy_scheme: Option<String>,
+  pub handshake_completed: bool,
+  pub ping_status: Option<u16>,
+  pub fail_closed: bool,
+  pub error: Option<String>,
+}
+
+impl ProxyProbe {
+  fn fail(phase: &str, tunnel_via: Option<String>, scheme: Option<String>, error: impl Into<String>) -> Self {
+    Self {
+      ok: false,
+      phase: phase.to_string(),
+      tunnel_via,
+      proxy_scheme: scheme,
+      handshake_completed: false,
+      ping_status: None,
+      fail_closed: true,
+      error: Some(error.into()),
+    }
+  }
+}
+
+/// #11/#16：用指定代理跑一次控制面 + WSS + Noise + ping，验证隧道可行。
+/// `proxy_uri` 形如 http[s]://[user:pass@]host[:port] 或 socks5://[...]。
+/// 任何失败都 fail-closed（阻断并报错），不会改用直连。
+#[cfg(not(target_os = "android"))]
+pub async fn proxy_probe(app: &AppHandle, uuid: &str, proxy_uri: &str) -> ProxyProbe {
+  // 先解析代理 URI：非法则直接失败（不建任何连接）。
+  let cfg = match muse_native_client::proxy::ProxyConfig::parse(proxy_uri) {
+    Ok(c) => c,
+    Err(e) => return ProxyProbe::fail("proxy_uri", None, None, format!("代理配置无效: {e}")),
+  };
+  let tunnel_via = cfg.display_safe();
+  let scheme = match cfg.scheme() {
+    muse_native_client::proxy::ProxyScheme::Http => "http",
+    muse_native_client::proxy::ProxyScheme::Https => "https",
+    muse_native_client::proxy::ProxyScheme::Socks5 => "socks5",
+  }
+  .to_string();
+
+  let app_owned = app.clone();
+  let uuid_owned = uuid.to_string();
+  let cookie_handle =
+    tokio::spawn(async move { fetch_session_cookies(&app_owned, &uuid_owned).await });
+  let mut cookies = match tokio::select! {
+    res = cookie_handle => match res {
+      Ok(r) => match r {
+        Ok(c) => c,
+        Err(e) => return ProxyProbe::fail("cookies", Some(tunnel_via), Some(scheme), e),
+      },
+      Err(e) => return ProxyProbe::fail("cookies", Some(tunnel_via), Some(scheme), format!("取 cookie 任务异常: {e}")),
+    },
+    _ = tokio::time::sleep(COOKIE_TIMEOUT) => {
+      return ProxyProbe::fail("cookies", Some(tunnel_via), Some(scheme), "取会话 cookie 超时（15 秒）");
+    }
+  };
+  if cookies.is_empty() {
+    return ProxyProbe::fail(
+      "cookies",
+      Some(tunnel_via),
+      Some(scheme),
+      "该账号未登录 muse.ai：请先在 Spike App 里登录 Muse 测试账号。",
+    );
+  }
+
+  // 控制面 HTTP 走同一代理（HTTP 侧），WSS 走代理隧道（WS 侧）。
+  let fetch = match ReqwestFetch::new_with_proxy(Some(proxy_uri)) {
+    Ok(f) => f,
+    Err(e) => return ProxyProbe::fail("proxy_http", Some(tunnel_via), Some(scheme), e),
+  };
+  let gateway = MuseGateway::new(fetch);
+  let mut connected = match gateway.connect_via_proxy(&cookies, &cfg).await {
+    Ok(c) => c,
+    Err(e) => {
+      cookies.zeroize();
+      return ProxyProbe::fail("tunnel", Some(tunnel_via), Some(scheme), e.to_string());
+    }
+  };
+  cookies.zeroize();
+
+  match connected.ping().await {
+    Ok(status) => {
+      connected.close().await;
+      ProxyProbe {
+        ok: status < 400,
+        phase: "ready".to_string(),
+        tunnel_via: Some(tunnel_via),
+        proxy_scheme: Some(scheme),
+        handshake_completed: true,
+        ping_status: Some(status),
+        fail_closed: true,
+        error: if status < 400 {
+          None
+        } else {
+          Some(format!("connection.ping HTTP {status}"))
+        },
+      }
+    }
+    Err(e) => {
+      connected.close().await;
+      ProxyProbe::fail("ping", Some(tunnel_via), Some(scheme), e.to_string())
+    }
   }
 }
 
