@@ -461,7 +461,8 @@ async fn fetch_chunks_no_cookie(
       }));
     }
     for h in handles {
-      if let Ok(Ok(Some(body))) = h.await {
+      // spawn 的闭包返回 Option<String>，JoinError 只需忽略。
+      if let Ok(Some(body)) = h.await {
         out.push(body);
       }
     }

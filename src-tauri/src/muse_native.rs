@@ -184,7 +184,7 @@ async fn diagnose_inner(
     );
     let fetch = ReqwestFetch::new()?;
     let gateway = MuseGateway::new(fetch);
-    let mut connected = match gateway.connect(&cookies).await {
+    let connected = match gateway.connect(&cookies).await {
       Ok(c) => c,
       Err(e) => {
         cookies.zeroize();
