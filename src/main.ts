@@ -775,6 +775,7 @@ function spikeDiagInnerHtml(): string {
       <span class="spike-diag-title">原生诊断（Spike）</span>
       <button id="spike-diagnose-btn" class="mini-btn" type="button" ${spikeDiagnoseRunning ? "disabled" : ""}>${btnLabel}</button>
       <button id="spike-watch-btn" class="mini-btn" type="button" ${spikeWatchRunning ? "disabled" : ""}>${spikeWatchRunning ? "订阅中…" : "订阅探针 15s"}</button>
+      <button id="spike-copy-btn" class="mini-btn" type="button">复制结果</button>
     </div>
     ${resultHtml}
     ${watchHtml}`;
@@ -1782,6 +1783,26 @@ function bindDelegatedEvents(): void {
     const watchBtn = target.closest<HTMLElement>("#spike-watch-btn");
     if (watchBtn) {
       await runSpikeWatch();
+      return;
+    }
+    const copyBtn = target.closest<HTMLElement>("#spike-copy-btn");
+    if (copyBtn) {
+      const el = document.querySelector<HTMLElement>(".spike-diag");
+      const text = el?.innerText ?? "";
+      try {
+        await navigator.clipboard.writeText(text);
+      } catch {
+        const ta = document.createElement("textarea");
+        ta.value = text;
+        document.body.appendChild(ta);
+        ta.select();
+        document.execCommand("copy");
+        ta.remove();
+      }
+      copyBtn.textContent = "已复制";
+      setTimeout(() => {
+        copyBtn.textContent = "复制结果";
+      }, 1200);
       return;
     }
     const providerBtn = target.closest<HTMLElement>("[data-provider]");

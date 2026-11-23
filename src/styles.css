@@ -1618,6 +1618,13 @@ body,
   color: var(--danger);
 }
 
+/* Spike 诊断区允许选中与复制（全局 user-select: none 会挡住）。 */
+.spike-diag,
+.spike-diag * {
+  user-select: text;
+  -webkit-user-select: text;
+}
+
 /* Spike 顶栏标识（0.1.22）：Spike 分支的 Muse 页标题旁显示。 */
 .spike-badge {
   display: inline-flex;
