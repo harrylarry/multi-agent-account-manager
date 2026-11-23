@@ -11,6 +11,11 @@ on:
       - '**.md'
       - '.muse-graph/**'
   workflow_dispatch:
+    inputs:
+      spike:
+        description: '构建 Spike 变体（bundle id com.ldjx.accountmanager.spike）'
+        type: boolean
+        default: false
 
 # A new run on the same branch cancels the one still in progress,
 # so rapid successive pushes only build the latest head.
@@ -46,7 +51,14 @@ jobs:
       - run: npm run tauri -- ios init --ci --skip-targets-install
       # App icons are synced by tauri.ios.conf.json's beforeBuildCommand
       # (scripts/sync-ios-resources.mjs) before the Xcode build runs.
-      - run: npm run tauri -- ios build --no-sign --ci
+      # Spike 变体只覆盖 bundle id 与显示名，main 默认仍是日常版。
+      - name: Build unsigned IPA
+        run: |
+          args=""
+          if [ "${{ inputs.spike }}" = "true" ]; then
+            args="--config src-tauri/tauri.spike.conf.json"
+          fi
+          npm run tauri -- ios build --no-sign --ci $args
       - name: Locate unsigned IPA
         run: |
           ipa=$(find src-tauri/gen/apple -name '*.ipa' -type f | head -n 1)
