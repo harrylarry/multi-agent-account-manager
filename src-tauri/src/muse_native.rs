@@ -592,6 +592,85 @@ pub fn liveness_start(
   });
 }
 
+/// #8 VM 租约观测结果（不含任何凭据）。
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct LeaseProbe {
+  pub ok: bool,
+  pub phase: String,
+  /// 网关主机（只保留域名，便于对照不同 VM）。
+  pub gateway_host: String,
+  pub vm_name: String,
+  pub first_expires_at_ms: Option<i64>,
+  pub ttl_seconds: Option<i64>,
+  /// 连续两次 lease 的到期时间是否变化：用于判断上游是否续租。
+  pub renewed: Option<bool>,
+  pub second_expires_at_ms: Option<i64>,
+  pub error: Option<String>,
+}
+
+/// #8：执行一次（或两次）`lease-vm`，报告租期字段与续租表现。
+/// 只读控制面，不建立 Noise 连接、不发消息、不打印 token。
+pub async fn lease_probe(app: &AppHandle, uuid: &str, twice: bool) -> Result<LeaseProbe, String> {
+  let cookie = cookie_header_for(app, uuid).await?;
+  let cookies = muse_native_client::cookie::SessionCookies::from_header(&cookie);
+  let fetch = ReqwestFetch::new()?;
+  let mut cp = muse_native_client::control_plane::MuseControlPlane::new(fetch, cookies);
+  let lease = match cp.lease_vm().await {
+    Ok(l) => l,
+    Err(e) => {
+      return Ok(LeaseProbe {
+        ok: false,
+        phase: "lease".to_string(),
+        gateway_host: String::new(),
+        vm_name: String::new(),
+        first_expires_at_ms: None,
+        ttl_seconds: None,
+        renewed: None,
+        second_expires_at_ms: None,
+        error: Some(e.to_string()),
+      })
+    }
+  };
+  let host = lease
+    .gateway_url
+    .split("://")
+    .nth(1)
+    .unwrap_or(&lease.gateway_url)
+    .split('/')
+    .next()
+    .unwrap_or("")
+    .to_string();
+  let first = lease.expires_at_ms;
+  let ttl = lease.ttl_seconds;
+  let vm_name = lease.vm_name.clone();
+
+  let (renewed, second) = if twice {
+    tokio::time::sleep(Duration::from_secs(2)).await;
+    match cp.lease_vm().await {
+      Ok(l2) => (
+        Some(l2.expires_at_ms != first),
+        l2.expires_at_ms,
+      ),
+      Err(_) => (None, None),
+    }
+  } else {
+    (None, None)
+  };
+
+  Ok(LeaseProbe {
+    ok: true,
+    phase: "leased".to_string(),
+    gateway_host: host,
+    vm_name,
+    first_expires_at_ms: first,
+    ttl_seconds: ttl,
+    renewed,
+    second_expires_at_ms: second,
+    error: None,
+  })
+}
+
 /// 取一次会话 cookie 头（B3 额度用）。调用方用后立即丢弃，不落盘不打印。
 pub async fn cookie_header_for(app: &AppHandle, uuid: &str) -> Result<String, String> {
   #[cfg(target_os = "android")]

@@ -81,6 +81,10 @@ pub struct VmLease {
   pub vm_id: String,
   pub vm_name: String,
   pub gateway_url: String,
+  /// 上游若返回租约到期时间（毫秒归一后），保留用于 #8 观测。
+  pub expires_at_ms: Option<i64>,
+  /// 上游若返回剩余租期（秒）。
+  pub ttl_seconds: Option<i64>,
 }
 
 pub struct MuseControlPlane<F: ControlPlaneFetch> {
@@ -88,6 +92,28 @@ pub struct MuseControlPlane<F: ControlPlaneFetch> {
   cookies: SessionCookies,
   lease: Option<VmLease>,
   wake_retry: u32,
+}
+
+/// 从任意数字/字符串字段读时间戳并归一到毫秒（>1e12 视为已是毫秒）。
+fn read_ts(v: Option<&serde_json::Value>) -> Option<i64> {
+  let raw = v?;
+  let n = raw
+    .as_i64()
+    .or_else(|| raw.as_f64().map(|f| f as i64))
+    .or_else(|| raw.as_str().and_then(|s| s.trim().parse::<i64>().ok()))?;
+  if n <= 0 {
+    return None;
+  }
+  Some(if n < 1_000_000_000_000 { n * 1000 } else { n })
+}
+
+fn read_secs(v: Option<&serde_json::Value>) -> Option<i64> {
+  let raw = v?;
+  raw
+    .as_i64()
+    .or_else(|| raw.as_f64().map(|f| f as i64))
+    .or_else(|| raw.as_str().and_then(|s| s.trim().parse::<i64>().ok()))
+    .filter(|n| *n > 0)
 }
 
 impl<F: ControlPlaneFetch> MuseControlPlane<F> {
@@ -270,6 +296,18 @@ impl<F: ControlPlaneFetch> MuseControlPlane<F> {
               vm_id,
               vm_name,
               gateway_url,
+              expires_at_ms: read_ts(
+                d.get("expiresAt")
+                  .or_else(|| d.get("leaseExpiresAt"))
+                  .or_else(|| d.get("expires_at"))
+                  .or_else(|| d.get("lease_expires_at")),
+              ),
+              ttl_seconds: read_secs(
+                d.get("ttl")
+                  .or_else(|| d.get("ttlSeconds"))
+                  .or_else(|| d.get("ttl_seconds"))
+                  .or_else(|| d.get("leaseTtlSeconds")),
+              ),
             };
             self.lease = Some(lease.clone());
             return Ok(lease);
@@ -576,5 +614,21 @@ mod tests {
     );
     assert_eq!(vm_id_from_gateway("wss://abc.metaaivm.com.evil.com/"), None);
     assert_eq!(vm_id_from_gateway("wss://bad_host.metaaivm.com/"), None);
+  }
+
+  #[test]
+  fn lease_expiry_parsing() {
+    use serde_json::json;
+    // 秒 → 毫秒
+    assert_eq!(read_ts(Some(&json!(1762100300))), Some(1_762_100_300_000));
+    // 已是毫秒则保持
+    assert_eq!(read_ts(Some(&json!(1762100300000i64))), Some(1_762_100_300_000));
+    // 字符串数字
+    assert_eq!(read_ts(Some(&json!("1762100300"))), Some(1_762_100_300_000));
+    // 非法/缺失
+    assert_eq!(read_ts(None), None);
+    assert_eq!(read_ts(Some(&json!(0))), None);
+    assert_eq!(read_secs(Some(&json!(3600))), Some(3600));
+    assert_eq!(read_secs(Some(&json!(-5))), None);
   }
 }

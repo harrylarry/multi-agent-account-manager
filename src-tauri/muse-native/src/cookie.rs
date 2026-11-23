@@ -23,6 +23,25 @@ pub struct SessionCookies {
 }
 
 impl SessionCookies {
+  /// 从 `a=1; b=2` 形式的 Cookie 头解析（用于只拿到 header 字符串的调用点）。
+  pub fn from_header(header: &str) -> Self {
+    let cookies = header
+      .split(';')
+      .filter_map(|part| {
+        let (name, value) = part.trim().split_once('=')?;
+        let name = name.trim();
+        if name.is_empty() {
+          return None;
+        }
+        Some(SessionCookie {
+          name: name.to_string(),
+          value: value.trim().to_string(),
+        })
+      })
+      .collect();
+    Self { cookies }
+  }
+
   pub fn is_empty(&self) -> bool {
     self.cookies.is_empty()
   }
@@ -45,5 +64,14 @@ impl SessionCookies {
   /// 诊断用：只返回 cookie 名（绝不返回 value）。
   pub fn names(&self) -> Vec<&str> {
     self.cookies.iter().map(|c| c.name.as_str()).collect()
+  }
+
+  #[test]
+  fn from_header_parses_pairs() {
+    let c = SessionCookies::from_header("a=1; b=x=y; ;c=3");
+    assert_eq!(c.len(), 3);
+    assert_eq!(c.names(), vec!["a", "b", "c"]);
+    assert_eq!(c.cookie_header(), "a=1; b=x=y; c=3");
+    assert!(SessionCookies::from_header("").is_empty());
   }
 }

@@ -232,6 +232,20 @@ async fn muse_native_quota_probe(
   }
 }
 
+/// #8：VM 租约探针（只读控制面）。
+#[tauri::command]
+async fn muse_native_lease_probe(
+  app: AppHandle,
+  provider_id: String,
+  uuid: String,
+  twice: Option<bool>,
+) -> Result<muse_native::LeaseProbe, String> {
+  if provider_id != "muse" {
+    return Err("租约探针只支持 Muse 账号".to_string());
+  }
+  muse_native::lease_probe(&app, &uuid, twice.unwrap_or(true)).await
+}
+
 /// B4：发送一条消息到隔离测试会话（单发锁 + 台账在 muse_native::send_probe）。
 #[tauri::command]
 async fn muse_native_send_probe(
@@ -393,6 +407,7 @@ pub fn run() {
       muse_native_send_probe,
       muse_native_liveness_start,
       muse_native_liveness_status,
+      muse_native_lease_probe,
       muse_native::is_spike_build,
     ])
     .run(tauri::generate_context!())

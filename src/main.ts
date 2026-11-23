@@ -107,6 +107,14 @@ interface SpikeLiveness {
 let spikeLive: SpikeLiveness | null = null;
 let spikeLiveError: string | null = null;
 let spikeLiveRefreshing = false;
+interface SpikeLease {
+  ok: boolean; phase: string; gatewayHost: string; vmName: string;
+  firstExpiresAtMs: number | null; ttlSeconds: number | null;
+  renewed: boolean | null; secondExpiresAtMs: number | null; error: string | null;
+}
+let spikeLease: SpikeLease | null = null;
+let spikeLeaseRunning = false;
+let spikeLeaseError: string | null = null;
 interface SpikeSendResult {
   ok: boolean; status: string; sendId: string;
   ack: unknown; sessionId: string | null; error: string | null;
@@ -804,6 +812,20 @@ function spikeDiagInnerHtml(): string {
   if (!spikeLive && spikeLiveError) {
     liveHtml = `<div class="spike-diag-result fail">存活探针错误：${escapeHtml(spikeLiveError)}</div>`;
   }
+  let leaseHtml = "";
+  if (spikeLease) {
+    const l = spikeLease;
+    const fmt = (ms: number | null) => (ms ? new Date(ms).toLocaleString() : "—");
+    leaseHtml = `
+      <div class="spike-diag-result ${l.ok ? "ok" : "fail"}">
+        <div>${l.ok ? "✓ 已取得 VM 租约" : "✗ 租约获取失败"}（阶段 ${escapeHtml(l.phase)}）</div>
+        ${l.ok ? `<div>VM：${escapeHtml(l.vmName || "—")}　网关：${escapeHtml(l.gatewayHost || "—")}</div>` : ""}
+        ${l.ok ? `<div>到期 ${fmt(l.firstExpiresAtMs)}　TTL ${l.ttlSeconds ?? "—"}s　续租 ${l.renewed === null ? "未测" : l.renewed ? "有变化" : "无变化"}</div>` : ""}
+        ${l.error ? `<div>错误：${escapeHtml(l.error)}</div>` : ""}
+      </div>`;
+  } else if (spikeLeaseError) {
+    leaseHtml = `<div class="spike-diag-result fail">租约探针错误：${escapeHtml(spikeLeaseError)}</div>`;
+  }
   let sendHtml = "";
   if (spikeSend) {
     const r = spikeSend;
@@ -890,6 +912,7 @@ function spikeDiagInnerHtml(): string {
       <button id="spike-quota-btn" class="mini-btn" type="button" ${spikeQuotaRunning ? "disabled" : ""}>${spikeQuotaRunning ? "查询中…" : "额度探针"}</button>
       <button id="spike-send-btn" class="mini-btn" type="button" ${spikeSendRunning ? "disabled" : ""}>${spikeSendRunning ? "发送中…" : "发送探针"}</button>
       <button id="spike-live-btn" class="mini-btn" type="button" ${spikeLive?.running ? "disabled" : ""}>${spikeLive?.running ? "存活中…" : "存活探针 5min"}</button>
+      <button id="spike-lease-btn" class="mini-btn" type="button" ${spikeLeaseRunning ? "disabled" : ""}>${spikeLeaseRunning ? "观测中…" : "租约探针"}</button>
       <button id="spike-copy-btn" class="mini-btn" type="button">复制结果</button>
     </div>
     ${resultHtml}
@@ -897,7 +920,8 @@ function spikeDiagInnerHtml(): string {
     ${approvalsHtml}
     ${quotaHtml}
     ${sendHtml}
-    ${liveHtml}`;
+    ${liveHtml}
+    ${leaseHtml}`;
 }
 
 function syncSpikeDiag(): void {
@@ -967,6 +991,37 @@ async function startSpikeLive(): Promise<void> {
   } catch (e) {
     spikeLiveError = String(e);
   }
+  syncSpikeDiag();
+}
+
+async function runSpikeLease(): Promise<void> {
+  if (!snapshot || spikeLeaseRunning) return;
+  const acc = pickWatchAccount();
+  if (!acc) {
+    spikeLease = null;
+    spikeLeaseError = "没有已登录的 Muse 账号。";
+    syncSpikeDiag();
+    return;
+  }
+  spikeLeaseRunning = true;
+  spikeLeaseError = null;
+  syncSpikeDiag();
+  try {
+    spikeLease = await Promise.race([
+      invoke<SpikeLease>("muse_native_lease_probe", {
+        providerId: "muse",
+        uuid: acc.uuid,
+        twice: true,
+      }),
+      new Promise<SpikeLease>((_, reject) =>
+        setTimeout(() => reject(new Error("租约探针超时（60 秒）")), 60_000)
+      ),
+    ]);
+  } catch (e) {
+    spikeLease = null;
+    spikeLeaseError = String(e);
+  }
+  spikeLeaseRunning = false;
   syncSpikeDiag();
 }
 
@@ -2046,6 +2101,11 @@ function bindDelegatedEvents(): void {
     const watchBtn = target.closest<HTMLElement>("#spike-watch-btn");
     if (watchBtn) {
       await runSpikeWatch();
+      return;
+    }
+    const leaseBtn = target.closest<HTMLElement>("#spike-lease-btn");
+    if (leaseBtn) {
+      await runSpikeLease();
       return;
     }
     const liveBtn = target.closest<HTMLElement>("#spike-live-btn");
