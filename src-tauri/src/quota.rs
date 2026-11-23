@@ -114,7 +114,10 @@ pub fn parse_subscription(v: &Value) -> Option<QuotaSnapshot> {
   };
   let pct = i(&usage, &["percentUsed", "percent_used"]).unwrap_or(-1);
   let state = s(&usage, &["state", "quotaStatus", "quota_status"]);
-  let resets = i(&usage, &["resetsAt", "resets_at"]).unwrap_or(0);
+  // 上游时间戳是秒（10 位），前端按毫秒渲染，这里统一归一到毫秒。
+  let resets = i(&usage, &["resetsAt", "resets_at"])
+    .map(|v| if v > 0 && v < 1_000_000_000_000 { v * 1000 } else { v })
+    .unwrap_or(0);
   if tier_name.is_empty() && pct < 0 && state.is_empty() {
     return None;
   }
@@ -663,6 +666,29 @@ mod tests {
   fn parse_flight_rejects_success_false_without_subscription() {
     let text = "1:{\"success\":false,\"message\":\"nope\"}\n2:{\"success\":true,\"ok\":1}";
     assert!(parse_flight_subscription(text).is_none());
+  }
+
+  #[test]
+  fn resets_seconds_are_normalized_to_ms() {
+    let v: serde_json::Value = serde_json::from_str(
+      r#"{"subscription":{"tier":{"name":"Muse 免费版"},"usage":{"percentUsed":4,"state":"METERED","resetsAt":1762100300}}}"#,
+    )
+    .unwrap();
+    let q = parse_subscription(&v).expect("quota");
+    assert_eq!(q.tier, "Muse 免费版");
+    assert_eq!(q.percent_used, 4);
+    // 秒 → 毫秒
+    assert_eq!(q.resets_at_ms, 1_762_100_300_000);
+  }
+
+  #[test]
+  fn resets_already_in_ms_are_kept() {
+    let v: serde_json::Value = serde_json::from_str(
+      r#"{"subscription":{"tier":{"name":"Pro"},"usage":{"percentUsed":1,"resetsAt":1762100300000}}}"#,
+    )
+    .unwrap();
+    let q = parse_subscription(&v).expect("quota");
+    assert_eq!(q.resets_at_ms, 1_762_100_300_000);
   }
 
   #[test]
