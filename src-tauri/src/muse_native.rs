@@ -421,7 +421,7 @@ fn now_ms_u128() -> u128 {
 
 /// 开一条长连接并持续读事件，直到超时或断开；结果写进共享状态。
 /// 用途是实测「App 退到后台后连接还能活多久」，不做保活、不重连。
-pub async fn liveness_start(
+pub fn liveness_start(
   app: &AppHandle,
   state: &std::sync::Arc<LivenessState>,
   uuid: &str,
