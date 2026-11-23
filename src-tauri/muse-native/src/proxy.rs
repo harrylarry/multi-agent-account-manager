@@ -24,6 +24,9 @@ use zeroize::Zeroizing;
 
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(15);
 const MAX_HEAD: usize = 64 * 1024;
+/// SOCKS5 用户名/密码子协商的长度上限（RFC 1929：ULEN/PLEN 各 1 字节）。
+/// HTTP Basic 无硬限制，但统一按此校验可避免 `len as u8` 截断出错误认证包。
+pub const MAX_CREDENTIAL_LEN: usize = 255;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ProxyScheme {
@@ -59,6 +62,8 @@ pub enum ProxyError {
   InvalidUri(String),
   UnsupportedScheme(String),
   MissingCredentials,
+  /// 用户名/密码超过 SOCKS5 单字节长度上限。
+  CredentialTooLong(usize),
   AuthFailed,
   ConnectRejected(u16),
   Socks5Rejected(u8),
@@ -77,6 +82,9 @@ impl fmt::Display for ProxyError {
       ProxyError::InvalidUri(m) => write!(f, "代理 URI 非法: {m}"),
       ProxyError::UnsupportedScheme(s) => write!(f, "不支持的代理协议: {s}"),
       ProxyError::MissingCredentials => write!(f, "代理要求认证但未提供用户名/密码"),
+      ProxyError::CredentialTooLong(n) => {
+        write!(f, "代理用户名/密码超过 {MAX_CREDENTIAL_LEN} 字节（{n} 字节）")
+      }
       ProxyError::AuthFailed => write!(f, "代理认证失败（407 / SOCKS5 认证未通过）"),
       ProxyError::ConnectRejected(s) => write!(f, "代理拒绝 CONNECT: HTTP {s}"),
       ProxyError::Socks5Rejected(c) => write!(f, "SOCKS5 目标连接被拒绝: REP={c}"),
@@ -105,12 +113,7 @@ impl ProxyConfig {
     let (scheme, rest) = uri
       .split_once("://")
       .ok_or_else(|| ProxyError::InvalidUri("缺少 :// 分隔符".to_string()))?;
-    let scheme = match scheme.to_ascii_lowercase().as_str() {
-      "http" => ProxyScheme::Http,
-      "https" => ProxyScheme::Https,
-      "socks5" | "socks5h" => ProxyScheme::Socks5,
-      other => return Err(ProxyError::UnsupportedScheme(other.to_string())),
-    };
+    let scheme = scheme_from_str(scheme)?;
     let rest = rest
       .split('/')
       .next()
@@ -131,12 +134,29 @@ impl ProxyConfig {
         let (u, p) = ui
           .split_once(':')
           .ok_or_else(|| ProxyError::InvalidUri("认证信息缺少 ':'".to_string()))?;
+        // 凭据按 RFC 3986 百分号编码传入；这里解码回真实字节再发认证。
+        let u = percent_decode(u)?;
+        let p = percent_decode(p)?;
         if u.is_empty() || p.is_empty() {
           return Err(ProxyError::InvalidUri("认证用户名或密码为空".to_string()));
         }
+        // SOCKS5 的 ULEN/PLEN 是单字节；超长会被 `as u8` 截断，发出错误认证帧。
+        // 这里在解析阶段就拒绝，避免「看起来配置了、实际认证包是坏的」。
+        if u.len() > MAX_CREDENTIAL_LEN {
+          return Err(ProxyError::InvalidUri(format!(
+            "认证用户名超过 {MAX_CREDENTIAL_LEN} 字节（{} 字节）",
+            u.len()
+          )));
+        }
+        if p.len() > MAX_CREDENTIAL_LEN {
+          return Err(ProxyError::InvalidUri(format!(
+            "认证密码超过 {MAX_CREDENTIAL_LEN} 字节（{} 字节）",
+            p.len()
+          )));
+        }
         (
-          Some(u.to_string()),
-          Some(Zeroizing::new(p.to_string())),
+          Some(u),
+          Some(Zeroizing::new(p)),
         )
       }
       None => (None, None),
@@ -151,6 +171,39 @@ impl ProxyConfig {
     })
   }
 
+  /// 仅校验 URI 形状（scheme / host / port / userinfo 语法），不要求提供密码。
+  ///
+  /// 供配置保存前调用：密码存在 Keychain，`uri` 里只允许出现用户名。
+  pub fn validate_shape(uri: &str) -> Result<(), ProxyError> {
+    let (scheme, rest) = uri
+      .split_once("://")
+      .ok_or_else(|| ProxyError::InvalidUri("缺少 :// 分隔符".to_string()))?;
+    let scheme = scheme_from_str(scheme)?;
+    let rest = rest.split('/').next().unwrap_or("");
+    if rest.is_empty() {
+      return Err(ProxyError::InvalidUri("缺少 host".to_string()));
+    }
+    let (authority, userinfo) = match rest.rsplit_once('@') {
+      Some((u, a)) => (a, Some(u)),
+      None => (rest, None),
+    };
+    if let Some(ui) = userinfo {
+      if ui.is_empty() {
+        return Err(ProxyError::InvalidUri("代理用户名为空".to_string()));
+      }
+      if let Some((u, p)) = ui.split_once(':') {
+        if u.is_empty() || p.is_empty() {
+          return Err(ProxyError::InvalidUri("代理用户名或密码为空".to_string()));
+        }
+        if u.len() > MAX_CREDENTIAL_LEN || p.len() > MAX_CREDENTIAL_LEN {
+          return Err(ProxyError::CredentialTooLong(u.len().max(p.len())));
+        }
+      }
+    }
+    parse_host_port(authority, scheme)?;
+    Ok(())
+  }
+
   pub fn scheme(&self) -> ProxyScheme {
     self.scheme
   }
@@ -163,6 +216,21 @@ impl ProxyConfig {
       .map(|u| format!("{u}@"))
       .unwrap_or_default();
     format!("{}://{}{}:{}", scheme_name(self.scheme), user, self.host, self.port)
+  }
+
+  /// 组装**含凭据**的完整 URI，仅供进程内 HTTP 客户端（如 reqwest）使用。
+  /// 返回值含明文密码：不得写日志、不得进 UI、不得持久化。
+  pub fn to_credentialed_uri(&self) -> String {
+    let user = match (&self.username, &self.password) {
+      (Some(u), Some(p)) => format!("{}:{}@", percent_encode(u), percent_encode(p.as_str())),
+      (Some(u), None) => format!("{}@", percent_encode(u)),
+      _ => String::new(),
+    };
+    format!("{}://{}{}:{}", scheme_name(self.scheme), user, self.host, self.port)
+  }
+
+  pub fn has_credentials(&self) -> bool {
+    self.username.is_some() && self.password.is_some()
   }
 
   /// 打通到目标的隧道。任何失败都返回 Err；调用方不得回退直连。
@@ -296,6 +364,66 @@ fn scheme_name(s: ProxyScheme) -> &'static str {
   }
 }
 
+fn scheme_from_str(s: &str) -> Result<ProxyScheme, ProxyError> {
+  match s.to_ascii_lowercase().as_str() {
+    "http" => Ok(ProxyScheme::Http),
+    "https" => Ok(ProxyScheme::Https),
+    "socks5" | "socks5h" => Ok(ProxyScheme::Socks5),
+    other => Err(ProxyError::UnsupportedScheme(other.to_string())),
+  }
+}
+
+/// 解码 `%XX`。非法编码直接报错，避免把坏口令静默发出去。
+fn percent_decode(s: &str) -> Result<String, ProxyError> {
+  if !s.contains('%') {
+    return Ok(s.to_string());
+  }
+  let bytes = s.as_bytes();
+  let mut out = Vec::with_capacity(bytes.len());
+  let mut i = 0;
+  while i < bytes.len() {
+    if bytes[i] == b'%' {
+      if i + 2 >= bytes.len() {
+        return Err(ProxyError::InvalidUri("百分号编码不完整".to_string()));
+      }
+      let hi = hex_val(bytes[i + 1])
+        .ok_or_else(|| ProxyError::InvalidUri("百分号编码非法".to_string()))?;
+      let lo = hex_val(bytes[i + 2])
+        .ok_or_else(|| ProxyError::InvalidUri("百分号编码非法".to_string()))?;
+      out.push(hi * 16 + lo);
+      i += 3;
+    } else {
+      out.push(bytes[i]);
+      i += 1;
+    }
+  }
+  String::from_utf8(out)
+    .map_err(|_| ProxyError::InvalidUri("百分号解码后不是合法 UTF-8".to_string()))
+}
+
+fn hex_val(b: u8) -> Option<u8> {
+  match b {
+    b'0'..=b'9' => Some(b - b'0'),
+    b'a'..=b'f' => Some(b - b'a' + 10),
+    b'A'..=b'F' => Some(b - b'A' + 10),
+    _ => None,
+  }
+}
+
+/// userinfo 的百分号编码：只保留 RFC 3986 unreserved 字符。
+fn percent_encode(s: &str) -> String {
+  let mut out = String::with_capacity(s.len());
+  for b in s.as_bytes() {
+    match b {
+      b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'.' | b'_' | b'~' => {
+        out.push(*b as char)
+      }
+      _ => out.push_str(&format!("%{b:02X}")),
+    }
+  }
+  out
+}
+
 fn parse_host_port(authority: &str, scheme: ProxyScheme) -> Result<(String, u16), ProxyError> {
   let default_port = match scheme {
     ProxyScheme::Http => 80,
@@ -343,8 +471,11 @@ fn parse_port(s: &str) -> Result<u16, ProxyError> {
   if s.is_empty() {
     return Err(ProxyError::InvalidUri("端口为空".to_string()));
   }
-  s.parse::<u16>()
-    .map_err(|_| ProxyError::InvalidUri(format!("非法端口: {s}")))
+  match s.parse::<u16>() {
+    Ok(0) => Err(ProxyError::InvalidUri("端口不能为 0".to_string())),
+    Ok(p) => Ok(p),
+    Err(_) => Err(ProxyError::InvalidUri(format!("非法端口: {s}"))),
+  }
 }
 
 fn ensure_crypto_provider() {
@@ -428,6 +559,10 @@ async fn socks5_handshake(
       let (Some(u), Some(p)) = (&cfg.username, &cfg.password) else {
         return Err(ProxyError::MissingCredentials);
       };
+      // parse() 已校验长度；这里是最后一道防线，避免 `as u8` 静默截断。
+      if u.len() > MAX_CREDENTIAL_LEN || p.len() > MAX_CREDENTIAL_LEN {
+        return Err(ProxyError::CredentialTooLong(u.len().max(p.len())));
+      }
       let mut auth = vec![0x01, u.len() as u8];
       auth.extend_from_slice(u.as_bytes());
       auth.push(p.len() as u8);
@@ -609,6 +744,74 @@ mod tests {
     assert_eq!(base64_encode(b""), "");
   }
 
+  #[test]
+  fn credential_length_boundary() {
+    let ok_user = "u".repeat(MAX_CREDENTIAL_LEN);
+    let ok_pass = "p".repeat(MAX_CREDENTIAL_LEN);
+    assert!(
+      ProxyConfig::parse(&format!("socks5://{ok_user}:{ok_pass}@p.example:1080")).is_ok(),
+      "255 字节用户名/密码应被接受"
+    );
+    let too_long = "x".repeat(MAX_CREDENTIAL_LEN + 1);
+    match ProxyConfig::parse(&format!("socks5://{too_long}:p@p.example:1080")) {
+      Err(ProxyError::InvalidUri(m)) => assert!(m.contains("用户名"), "{m}"),
+      other => panic!("超长用户名必须被拒绝，实际: {other:?}"),
+    }
+    match ProxyConfig::parse(&format!("socks5://u:{too_long}@p.example:1080")) {
+      Err(ProxyError::InvalidUri(m)) => assert!(m.contains("密码"), "{m}"),
+      other => panic!("超长密码必须被拒绝，实际: {other:?}"),
+    }
+    // UTF-8 多字节按字节计：128 个中文字符 = 384 字节，超限。
+    let cjk = "密".repeat(128);
+    assert!(ProxyConfig::parse(&format!("socks5://u:{cjk}@p.example:1080")).is_err());
+  }
+
+  #[test]
+  fn empty_credential_rejected() {
+    assert!(matches!(
+      ProxyConfig::parse("socks5://:pass@p.example:1080"),
+      Err(ProxyError::InvalidUri(_))
+    ));
+    assert!(matches!(
+      ProxyConfig::parse("socks5://user:@p.example:1080"),
+      Err(ProxyError::InvalidUri(_))
+    ));
+  }
+
+  #[test]
+  fn percent_encoded_credentials_are_decoded() {
+    let cfg =
+      ProxyConfig::parse("socks5://user%40corp:p%40ss%3Aw0rd%21@p.example:1080").unwrap();
+    assert_eq!(cfg.username.as_deref(), Some("user@corp"));
+    assert_eq!(
+      cfg.password.as_deref().map(|p| p.as_str()),
+      Some("p@ss:w0rd!")
+    );
+  }
+
+  #[test]
+  fn bad_percent_encoding_rejected() {
+    assert!(matches!(
+      ProxyConfig::parse("socks5://u:%ZZ@p.example:1080"),
+      Err(ProxyError::InvalidUri(_))
+    ));
+    assert!(matches!(
+      ProxyConfig::parse("socks5://u:%4@p.example:1080"),
+      Err(ProxyError::InvalidUri(_))
+    ));
+  }
+
+  #[test]
+  fn validate_shape_allows_user_only_without_password() {
+    assert!(ProxyConfig::validate_shape("socks5://alice@socks.example:1080").is_ok());
+    assert!(ProxyConfig::validate_shape("http://p.example:8080").is_ok());
+    assert!(ProxyConfig::validate_shape("https://[::1]:8443").is_ok());
+    assert!(ProxyConfig::validate_shape("http://:8080").is_err());
+    assert!(ProxyConfig::validate_shape("ftp://p.example").is_err());
+    assert!(ProxyConfig::validate_shape("http://p.example:0").is_err());
+    assert!(ProxyConfig::validate_shape("http://:pass@p.example:8080").is_err());
+  }
+
   #[tokio::test]
   async fn http_connect_request_format_no_auth() {
     let (port, server) = mock(|mut s: TcpStream| async move {
@@ -731,6 +934,39 @@ mod tests {
     .await;
     let cfg = ProxyConfig::parse(&format!("socks5://up:secret@127.0.0.1:{port}")).unwrap();
     assert!(cfg.connect("10.0.0.7", 8080).await.is_ok());
+    server.await.unwrap();
+  }
+
+  /// 255 字节用户名的认证帧不能被 `as u8` 截断：ULEN 必须正好是 255。
+  #[tokio::test]
+  async fn socks5_max_length_user_is_not_truncated() {
+    let user = "u".repeat(MAX_CREDENTIAL_LEN);
+    let user_for_mock = user.clone();
+    let (port, server) = mock(move |mut s: TcpStream| async move {
+      assert_eq!(read_exact_2(&mut s).await.unwrap(), [0x05, 0x01]);
+      assert_eq!(read_exact_n(&mut s, 1).await.unwrap(), vec![0x02]);
+      s.write_all(&[0x05, 0x02]).await.unwrap();
+      let head = read_exact_n(&mut s, 2).await.unwrap();
+      assert_eq!(head[0], 0x01);
+      assert_eq!(head[1], 255, "ULEN 必须为 255，不能被截断为 0 或其他值");
+      assert_eq!(
+        read_exact_n(&mut s, 255).await.unwrap(),
+        user_for_mock.as_bytes()
+      );
+      assert_eq!(read_exact_n(&mut s, 1).await.unwrap(), vec![3]);
+      assert_eq!(read_exact_n(&mut s, 3).await.unwrap(), b"pwd");
+      s.write_all(&[0x01, 0x00]).await.unwrap();
+      let _ = read_exact_n(&mut s, 4).await.unwrap();
+      let _ = read_exact_n(&mut s, 1).await.unwrap();
+      let _ = read_exact_n(&mut s, 14).await.unwrap();
+      let _ = read_exact_2(&mut s).await.unwrap();
+      s.write_all(&[0x05, 0x00, 0x00, 0x01, 0, 0, 0, 0, 0, 0])
+        .await
+        .unwrap();
+    })
+    .await;
+    let cfg = ProxyConfig::parse(&format!("socks5://{user}:pwd@127.0.0.1:{port}")).unwrap();
+    assert!(cfg.connect("target.example", 443).await.is_ok());
     server.await.unwrap();
   }
 

@@ -45,15 +45,12 @@ pub struct Collected {
   pub saw_busy: bool,
 }
 
-/// 建立 `chat.subscribe` 长连接。返回的 `Subscription` 必须在本轮发送**之前**创建。
-pub async fn open_subscription<S>(gw: ConnectedGateway<S>) -> Result<Subscription<S>, GatewayError>
-where
-  S: AsyncRead + AsyncWrite + Unpin,
-{
+/// 构造 `chat.subscribe` 请求（供直连与代理两条路径复用）。
+pub fn subscription_request() -> HttpRequest {
   let body = serde_json::json!({ "capabilities": SUBSCRIBE_CAPABILITIES })
     .to_string()
     .into_bytes();
-  let req = HttpRequest {
+  HttpRequest {
     service: Service::Daemon,
     verb: "POST".to_string(),
     path: "/chat/subscribe".to_string(),
@@ -64,8 +61,15 @@ where
       ("Accept-Language".to_string(), "en-US".to_string()),
     ],
     body,
-  };
-  gw.subscribe(req).await
+  }
+}
+
+/// 建立 `chat.subscribe` 长连接。返回的 `Subscription` 必须在本轮发送**之前**创建。
+pub async fn open_subscription<S>(gw: ConnectedGateway<S>) -> Result<Subscription<S>, GatewayError>
+where
+  S: AsyncRead + AsyncWrite + Unpin,
+{
+  gw.subscribe(subscription_request()).await
 }
 
 /// 从订阅里收文本，直到 `message_done`、超时或断流。

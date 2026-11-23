@@ -36,6 +36,12 @@ sha2 = "0.10"
 [target.'cfg(target_os = "ios")'.dependencies]
 reqwest = { version = "0.13", default-features = false, features = ["native-tls", "http2", "socks"] }
 
+[target.'cfg(any(target_os = "ios", target_os = "macos"))'.dependencies]
+# #11/#16：代理口令写入系统 Keychain（Security.framework 的 generic password），
+# `accounts.json` 只保留 credential_ref，不放明文密码。passwords 模块同时支持
+# iOS 与 macOS。
+security-framework = "3"
+
 [target.'cfg(target_os = "macos")'.dependencies]
 objc2 = "0.6"
 block2 = "0.6"

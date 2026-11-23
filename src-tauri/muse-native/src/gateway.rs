@@ -31,6 +31,9 @@ use zeroize::Zeroize;
 /// 经代理隧道、再包一层到目标站点 TLS 的字节流。
 pub type ProxyTlsStream = tokio_rustls::client::TlsStream<TunnelStream>;
 
+/// 直连（未配置代理）时的底层 WS 流类型。
+pub type DirectStream = MaybeTlsStream<TcpStream>;
+
 pub const NOISE_URL: &str = "wss://hatch.metaaivm.com/v1/noise";
 pub const APP_ID: &str = "hatch-web";
 const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);

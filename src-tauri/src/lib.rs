@@ -1,16 +1,31 @@
 mod muse_native;
 mod platform;
+mod probe_cancel;
 mod providers;
 mod quota;
+mod secrets;
 mod send_ledger;
 mod session_manager;
 mod storage;
 mod updater;
 
+#[cfg(not(target_os = "android"))]
+mod egress;
+
 use session_manager::{ManagerSnapshot, SessionManager, APP_TITLE};
 use std::sync::Arc;
 use tauri::{AppHandle, Manager, State};
 use updater::{InstallUpdateOutcome, InstallUpdateRequest, UpdateCheckResult};
+
+/// #11/#16：取账号的代理设置，交给原生探针做统一出站决策。
+async fn account_proxy_setting(
+  mgr: &SessionManager,
+  provider_id: &str,
+  uuid: &str,
+) -> Option<storage::ProxySetting> {
+  let pid = providers::ProviderId::parse(provider_id)?;
+  mgr.proxy_setting(pid, uuid).await
+}
 
 #[tauri::command]
 async fn get_manager_state(mgr: State<'_, Arc<SessionManager>>) -> Result<ManagerSnapshot, String> {
@@ -146,8 +161,10 @@ async fn muse_native_diagnose(
   app: AppHandle,
   provider_id: String,
   uuid: String,
+  mgr: State<'_, Arc<SessionManager>>,
 ) -> Result<muse_native::SpikeDiagnose, String> {
-  muse_native::diagnose(&app, &provider_id, &uuid).await
+  let setting = account_proxy_setting(&mgr, &provider_id, &uuid).await;
+  muse_native::diagnose(&app, &provider_id, &uuid, setting).await
 }
 
 /// B1：`chat.subscribe` 探针（Issue #13 #5）。订阅 N 秒，只返回事件计数与去重结果。
@@ -157,8 +174,10 @@ async fn muse_native_watch_probe(
   provider_id: String,
   uuid: String,
   seconds: u64,
+  mgr: State<'_, Arc<SessionManager>>,
 ) -> Result<muse_native::WatchProbe, String> {
-  muse_native::watch_probe(&app, &provider_id, &uuid, seconds).await
+  let setting = account_proxy_setting(&mgr, &provider_id, &uuid).await;
+  muse_native::watch_probe(&app, &provider_id, &uuid, seconds, setting.as_ref()).await
 }
 
 /// B2：只读拉取 `egress.approvals`。
@@ -167,8 +186,10 @@ async fn muse_native_approvals_probe(
   app: AppHandle,
   provider_id: String,
   uuid: String,
+  mgr: State<'_, Arc<SessionManager>>,
 ) -> Result<muse_native::ApprovalsProbe, String> {
-  muse_native::approvals_probe(&app, &provider_id, &uuid).await
+  let setting = account_proxy_setting(&mgr, &provider_id, &uuid).await;
+  muse_native::approvals_probe(&app, &provider_id, &uuid, setting.as_ref()).await
 }
 
 /// B3：只读拉一次额度（Server Action 冷发现 + 重试），失败时带每步诊断。
@@ -239,11 +260,13 @@ async fn muse_native_lease_probe(
   provider_id: String,
   uuid: String,
   twice: Option<bool>,
+  mgr: State<'_, Arc<SessionManager>>,
 ) -> Result<muse_native::LeaseProbe, String> {
   if provider_id != "muse" {
     return Err("租约探针只支持 Muse 账号".to_string());
   }
-  muse_native::lease_probe(&app, &uuid, twice.unwrap_or(true)).await
+  let setting = account_proxy_setting(&mgr, &provider_id, &uuid).await;
+  muse_native::lease_probe(&app, &uuid, twice.unwrap_or(true), setting.as_ref()).await
 }
 
 /// B4：发送一条消息到隔离测试会话（单发锁 + 台账在 muse_native::send_probe）。
@@ -256,10 +279,15 @@ async fn muse_native_send_probe(
   node_id: String,
   session_id: Option<String>,
   ledger: tauri::State<'_, std::sync::Arc<send_ledger::SendLedger>>,
+  mgr: State<'_, Arc<SessionManager>>,
+  cancel: State<'_, Arc<probe_cancel::ProbeCancel>>,
 ) -> Result<muse_native::SendOutcome, String> {
   if provider_id != "muse" {
     return Err("发送探针只支持 Muse 账号".to_string());
   }
+  let setting = account_proxy_setting(&mgr, &provider_id, &uuid).await;
+  let dir = app.path().app_data_dir().map_err(|e| e.to_string())?;
+  let secrets = secrets::Secrets::new(&dir);
   Ok(muse_native::send_probe(
     &app,
     &ledger,
@@ -267,6 +295,9 @@ async fn muse_native_send_probe(
     &text,
     &node_id,
     session_id.as_deref(),
+    setting.as_ref(),
+    &secrets,
+    &cancel,
   )
   .await)
 }
@@ -279,11 +310,24 @@ async fn muse_native_fingerprint_probe(
   provider_id: String,
   uuid: String,
   ledger: tauri::State<'_, std::sync::Arc<send_ledger::SendLedger>>,
+  mgr: State<'_, Arc<SessionManager>>,
+  cancel: State<'_, Arc<probe_cancel::ProbeCancel>>,
 ) -> Result<muse_native::FingerprintProbe, String> {
   if provider_id != "muse" {
     return Err("指纹探针只支持 Muse 账号".to_string());
   }
-  Ok(muse_native::fingerprint_probe(&app, &ledger, &uuid).await)
+  let setting = account_proxy_setting(&mgr, &provider_id, &uuid).await;
+  let dir = app.path().app_data_dir().map_err(|e| e.to_string())?;
+  let secrets = secrets::Secrets::new(&dir);
+  Ok(muse_native::fingerprint_probe(
+    &app,
+    &ledger,
+    &uuid,
+    setting.as_ref(),
+    &secrets,
+    &cancel,
+  )
+  .await)
 }
 
 /// #11/#16：用指定代理验证控制面 + WSS 隧道 + Noise + ping（fail-closed）。
@@ -300,6 +344,133 @@ async fn muse_native_proxy_probe(
   Ok(muse_native::proxy_probe(&app, &uuid, &proxy_uri).await)
 }
 
+/// 账号代理配置的脱敏视图（不含口令）。
+#[derive(serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ProxySettingView {
+  pub enabled: bool,
+  pub display: String,
+  pub has_credentials: bool,
+}
+
+fn uri_userinfo(uri: &str) -> Option<&str> {
+  let authority = uri.split_once("://")?.1.split('/').next()?;
+  authority.rsplit_once('@').map(|(ui, _)| ui)
+}
+
+/// #11/#16：保存账号代理。口令只进 Keychain，`accounts.json` 仅存引用。
+#[tauri::command]
+async fn muse_native_set_account_proxy(
+  app: AppHandle,
+  provider_id: String,
+  uuid: String,
+  uri: String,
+  username: Option<String>,
+  password: Option<String>,
+  enabled: bool,
+  mgr: State<'_, Arc<SessionManager>>,
+) -> Result<ProxySettingView, String> {
+  let pid = providers::ProviderId::parse(&provider_id)
+    .ok_or_else(|| format!("未知 provider: {provider_id}"))?;
+  if pid != providers::ProviderId::Muse {
+    return Err("代理配置只支持 Muse 账号".to_string());
+  }
+  let uri = uri.trim().to_string();
+  if let Some(ui) = uri_userinfo(&uri) {
+    if ui.contains(':') {
+      return Err("代理 URI 不得包含明文密码；请用独立字段提交并由 Keychain 保存".to_string());
+    }
+  }
+  muse_native_client::proxy::ProxyConfig::validate_shape(&uri).map_err(|e| e.to_string())?;
+
+  let username = username
+    .map(|u| u.trim().to_string())
+    .filter(|u| !u.is_empty());
+  let has_user = username.is_some() || uri_userinfo(&uri).map(|u| !u.is_empty()).unwrap_or(false);
+  let password = password.filter(|p| !p.is_empty());
+
+  let dir = app.path().app_data_dir().map_err(|e| e.to_string())?;
+  let secrets = secrets::Secrets::new(&dir);
+  let reference = format!("proxy-{uuid}");
+
+  // 先构造并校验设置，再落凭据，避免把半成品写进 Keychain。
+  let setting = storage::ProxySetting {
+    uri: uri.clone(),
+    username,
+    credential_ref: if has_user { Some(reference.clone()) } else { None },
+    enabled,
+  };
+  setting.validate()?;
+  if has_user && password.is_none() {
+    return Err("启用了代理认证，但没有提供代理密码".to_string());
+  }
+
+  if has_user {
+    secrets.set(&reference, password.as_deref().unwrap_or(""))?;
+  } else {
+    // 切回无认证：清掉旧口令，避免残留。
+    let _ = secrets.delete(&reference);
+  }
+  mgr.set_account_proxy(pid, &uuid, Some(setting.clone())).await?;
+
+  Ok(ProxySettingView {
+    enabled: setting.enabled,
+    display: setting.display_safe(),
+    has_credentials: setting.credential_ref.is_some(),
+  })
+}
+
+/// #11/#16：读取账号代理的脱敏视图。
+#[tauri::command]
+async fn muse_native_get_account_proxy(
+  provider_id: String,
+  uuid: String,
+  mgr: State<'_, Arc<SessionManager>>,
+) -> Result<Option<ProxySettingView>, String> {
+  let pid = providers::ProviderId::parse(&provider_id)
+    .ok_or_else(|| format!("未知 provider: {provider_id}"))?;
+  Ok(mgr.proxy_setting(pid, &uuid).await.map(|s| ProxySettingView {
+    enabled: s.enabled,
+    display: s.display_safe(),
+    has_credentials: s.credential_ref.is_some(),
+  }))
+}
+
+/// #11/#16：清除账号代理（连同 Keychain 中的口令）。
+#[tauri::command]
+async fn muse_native_clear_account_proxy(
+  app: AppHandle,
+  provider_id: String,
+  uuid: String,
+  mgr: State<'_, Arc<SessionManager>>,
+) -> Result<(), String> {
+  let pid = providers::ProviderId::parse(&provider_id)
+    .ok_or_else(|| format!("未知 provider: {provider_id}"))?;
+  let dir = app.path().app_data_dir().map_err(|e| e.to_string())?;
+  let secrets = secrets::Secrets::new(&dir);
+  if let Some(existing) = mgr.proxy_setting(pid, &uuid).await {
+    if let Some(reference) = existing.credential_ref {
+      let _ = secrets.delete(&reference);
+    }
+  }
+  let _ = secrets.delete(&format!("proxy-{uuid}"));
+  mgr.set_account_proxy(pid, &uuid, None).await
+}
+
+/// #11/#16：请求取消该账号正在运行的长任务（指纹/发送/订阅等）。
+/// 只停止发起新请求；已发出的发送按 UNKNOWN 记账，不重发。
+#[tauri::command]
+fn muse_native_cancel_probe(
+  provider_id: String,
+  uuid: String,
+  cancel: State<'_, Arc<probe_cancel::ProbeCancel>>,
+) -> Result<bool, String> {
+  if provider_id != "muse" {
+    return Err("取消探针只支持 Muse 账号".to_string());
+  }
+  Ok(cancel.cancel(&uuid))
+}
+
 /// #10：开始一次存活探针（长连接 + 订阅，记录到断开为止）。
 #[tauri::command]
 fn muse_native_liveness_start(
@@ -307,8 +478,10 @@ fn muse_native_liveness_start(
   uuid: String,
   seconds: u64,
   state: tauri::State<'_, std::sync::Arc<muse_native::LivenessState>>,
+  mgr: State<'_, Arc<SessionManager>>,
 ) -> muse_native::Liveness {
-  muse_native::liveness_start(&app, &state, &uuid, seconds);
+  let setting = account_proxy_setting(&mgr, "muse", &uuid).await;
+  muse_native::liveness_start(&app, &state, &uuid, seconds, setting);
   state.snapshot()
 }
 
@@ -412,6 +585,7 @@ pub fn run() {
     })
     .manage(std::sync::Arc::new(send_ledger::SendLedger::new()))
     .manage(std::sync::Arc::new(muse_native::LivenessState::default()))
+    .manage(std::sync::Arc::new(probe_cancel::ProbeCancel::new()))
     .manage(std::sync::Arc::new(quota::ActionCache::default()))
     .invoke_handler(tauri::generate_handler![
       get_manager_state,
@@ -436,6 +610,10 @@ pub fn run() {
       muse_native_send_probe,
       muse_native_fingerprint_probe,
       muse_native_proxy_probe,
+      muse_native_set_account_proxy,
+      muse_native_get_account_proxy,
+      muse_native_clear_account_proxy,
+      muse_native_cancel_probe,
       muse_native_liveness_start,
       muse_native_liveness_status,
       muse_native_lease_probe,

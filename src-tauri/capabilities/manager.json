@@ -34,6 +34,10 @@
     "allow-muse-native-send-probe",
     "allow-muse-native-fingerprint-probe",
     "allow-muse-native-proxy-probe",
+    "allow-muse-native-set-account-proxy",
+    "allow-muse-native-get-account-proxy",
+    "allow-muse-native-clear-account-proxy",
+    "allow-muse-native-cancel-probe",
     "allow-muse-native-liveness-start",
     "allow-muse-native-liveness-status",
     "allow-muse-native-lease-probe"

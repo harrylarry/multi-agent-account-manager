@@ -143,10 +143,16 @@ interface SpikeFingerprintResult {
   referenceBuiltAt: string; method: string;
   samples: Array<{ expectedCount: number; parsedNumbers: number; minimumNumbers: number; accepted: boolean }>;
 }
+interface SpikeFingerprintSendRecord {
+  probeId: string; sendStatus: string; textDone: boolean;
+  sampleUsed: boolean; error: string | null;
+}
 interface SpikeFingerprintProbe {
   ok: boolean; phase: string; verdict: string; identification: boolean;
   result: SpikeFingerprintResult | null;
-  probesSent: number; samplesCollected: number; sessionId: string | null;
+  probesSent: number; probesConfirmed: number; samplesCollected: number;
+  sends: SpikeFingerprintSendRecord[];
+  sessionId: string | null;
   error: string | null;
 }
 let spikeFingerprint: SpikeFingerprintProbe | null = null;
@@ -162,6 +168,13 @@ let spikeProxy: SpikeProxyProbe | null = null;
 let spikeProxyRunning = false;
 let spikeProxyError: string | null = null;
 let spikeProxyUri = "";
+// #11/#16 账号级代理配置（脱敏视图；口令只进 Keychain）。
+interface SpikeProxySettingView {
+  enabled: boolean; display: string; hasCredentials: boolean;
+}
+let spikeProxySettingView: SpikeProxySettingView | null = null;
+let spikeProxySaveMsg: string | null = null;
+let spikeProxyBusy = false;
 let spikeDiagnoseError: string | null = null;
 // 是否 Spike 版（bundle id 门控）：只决定顶栏徽章显不显示；诊断区不门控。
 let isSpikeBuild = false;
@@ -953,6 +966,13 @@ function spikeDiagInnerHtml(): string {
     watchHtml = `<div class="spike-diag-result fail">错误：${escapeHtml(spikeWatchError)}</div>`;
   }
   let proxyHtml = "";
+  if (spikeProxySettingView) {
+    const v = spikeProxySettingView;
+    proxyHtml += `<div class="hint">账号代理：${v.enabled ? "已启用" : "未启用"}　${escapeHtml(v.display)}${v.hasCredentials ? "（口令在 Keychain）" : ""}</div>`;
+  }
+  if (spikeProxySaveMsg) {
+    proxyHtml += `<div class="hint">${escapeHtml(spikeProxySaveMsg)}</div>`;
+  }
   if (spikeProxy) {
     const p = spikeProxy;
     proxyHtml = `
@@ -990,11 +1010,20 @@ function spikeDiagInnerHtml(): string {
           )
           .join("　")
       : "";
+    const sendsHtml = f.sends && f.sends.length
+      ? f.sends
+          .map(
+            (s) =>
+              `<div>探针 ${escapeHtml(s.probeId)}：${escapeHtml(s.sendStatus)}${s.textDone ? "（回复完成）" : ""}${s.sampleUsed ? "（入样）" : ""}${s.error ? `｜${escapeHtml(s.error)}` : ""}</div>`
+          )
+          .join("")
+      : "";
     const cls = f.verdict === "scored" ? "ok" : f.verdict === "partial" ? "" : "fail";
     fingerprintHtml = `
       <div class="spike-diag-result ${cls}">
         <div>${f.ok ? "✓" : "■"} 指纹探针：${escapeHtml(verdictLabel[f.verdict] ?? f.verdict)}（阶段 ${escapeHtml(f.phase)}）</div>
-        <div>发出探针 ${f.probesSent}/3　采到样本 ${f.samplesCollected}　参与评分 ${r?.usedSamples ?? 0}/${r?.requiredSamples ?? 3}</div>
+        <div>发出探针 ${f.probesSent}/3　发送确认 ${f.probesConfirmed ?? 0}　采到样本 ${f.samplesCollected}　参与评分 ${r?.usedSamples ?? 0}/${r?.requiredSamples ?? 3}</div>
+        ${sendsHtml ? `<div class="hint">${sendsHtml}</div>` : ""}
         ${r && r.prediction ? `<div>候选首位：${escapeHtml(r.predictionName || r.prediction)}　家族 ${escapeHtml(r.familyPredictionName || r.familyPrediction)}</div>` : ""}
         ${r?.calibrated && r.probability != null ? `<div>校准置信度：${(r.probability * 100).toFixed(1)}%（${escapeHtml(r.probabilityStatus)}，闭集参考）</div>` : ""}
         ${candHtml ? `<div>${candHtml}</div>` : ""}
@@ -1019,12 +1048,17 @@ function spikeDiagInnerHtml(): string {
       <button id="spike-lease-btn" class="mini-btn" type="button" ${spikeLeaseRunning ? "disabled" : ""}>${spikeLeaseRunning ? "观测中…" : "租约探针"}</button>
       <button id="spike-fingerprint-btn" class="mini-btn" type="button" ${spikeFingerprintRunning ? "disabled" : ""}>${spikeFingerprintRunning ? "检测中…" : "指纹探针 3 条"}</button>
       <button id="spike-proxy-btn" class="mini-btn" type="button" ${spikeProxyRunning ? "disabled" : ""}>${spikeProxyRunning ? "验证中…" : "代理探针"}</button>
+      <button id="spike-stop-btn" class="mini-btn" type="button">停止</button>
       <button id="spike-copy-btn" class="mini-btn" type="button">复制结果</button>
     </div>
     <div class="spike-diag-proxy-row">
-      <label>代理 URI（http[s]://[user:pass@]host[:port] 或 socks5://）：</label>
-      <input id="spike-proxy-uri" type="text" placeholder="http://127.0.0.1:8080" value="${escapeHtml(spikeProxyUri)}" />
-      <span class="hint">仅测试代理；失败即阻断，不直连。口令请勿写入公开日志。</span>
+      <label>代理 URI（不含密码）：</label>
+      <input id="spike-proxy-uri" type="text" placeholder="socks5://host:1080" value="${escapeHtml(spikeProxyUri)}" />
+      <input id="spike-proxy-user" type="text" placeholder="用户名（可选）" />
+      <input id="spike-proxy-pass" type="password" placeholder="密码（仅存 Keychain）" />
+      <button id="spike-proxy-save-btn" class="mini-btn" type="button" ${spikeProxyBusy ? "disabled" : ""}>保存为账号代理</button>
+      <button id="spike-proxy-clear-btn" class="mini-btn" type="button" ${spikeProxyBusy ? "disabled" : ""}>清除</button>
+      <span class="hint">口令只写入系统 Keychain；失败即阻断，不回退直连。</span>
     </div>
     ${resultHtml}
     ${watchHtml}
@@ -1041,6 +1075,26 @@ function syncSpikeDiag(): void {
   const el = document.querySelector<HTMLElement>(".spike-diag");
   if (!el) return;
   el.innerHTML = spikeDiagInnerHtml();
+  void loadSpikeProxy();
+}
+
+// 首次打开诊断面板时读取账号当前代理配置（脱敏视图）。
+let spikeProxyLoaded = false;
+async function loadSpikeProxy(): Promise<void> {
+  if (spikeProxyLoaded || !snapshot) return;
+  const acc = pickWatchAccount();
+  if (!acc) return;
+  spikeProxyLoaded = true;
+  try {
+    spikeProxySettingView = await invoke<SpikeProxySettingView | null>(
+      "muse_native_get_account_proxy",
+      { providerId: "muse", uuid: acc.uuid }
+    );
+  } catch {
+    spikeProxySettingView = null;
+  }
+  const el = document.querySelector<HTMLElement>(".spike-diag");
+  if (el) el.innerHTML = spikeDiagInnerHtml();
 }
 
 function pickWatchAccount(): AccountRecord | undefined {
@@ -1205,9 +1259,27 @@ async function runSpikeFingerprint(): Promise<void> {
   } catch (e) {
     spikeFingerprint = null;
     spikeFingerprintError = String(e);
+    // 前端超时不能代替后端取消：显式请求后端停止，避免继续发探针。
+    void cancelSpikeProbe();
   }
   spikeFingerprintRunning = false;
   syncSpikeDiag();
+}
+
+// 代理 URI 脱敏：确认弹窗、日志、错误里只允许出现 scheme://[user@]host:port。
+function redactProxyUri(uri: string): string {
+  const trimmed = uri.trim();
+  const schemeEnd = trimmed.indexOf("://");
+  if (schemeEnd < 0) return "（代理 URI 格式无效）";
+  const scheme = trimmed.slice(0, schemeEnd + 3);
+  const rest = trimmed.slice(schemeEnd + 3);
+  const authority = rest.split("/")[0] ?? "";
+  const at = authority.lastIndexOf("@");
+  if (at < 0) return `${scheme}${authority}`;
+  const userinfo = authority.slice(0, at);
+  const host = authority.slice(at + 1);
+  const user = userinfo.split(":")[0] ?? "";
+  return `${scheme}${user ? `${user}@` : ""}${host}`;
 }
 
 // #11/#16 代理探针：用指定测试代理验证控制面 + WSS 隧道。仅对非主力测试账号；
@@ -1228,7 +1300,7 @@ async function runSpikeProxy(): Promise<void> {
     return;
   }
   const confirmed = window.confirm(
-    `将对测试账号「${acc.alias}」用代理 ${spikeProxyUri} 跑一次隧道验证（控制面 + WSS + ping）。` +
+    `将对测试账号「${acc.alias}」用代理 ${redactProxyUri(spikeProxyUri)} 跑一次隧道验证（控制面 + WSS + ping）。` +
       "确认这是你自己的测试代理、该账号是非主力测试账号后继续。"
   );
   if (!confirmed) return;
@@ -1249,8 +1321,100 @@ async function runSpikeProxy(): Promise<void> {
   } catch (e) {
     spikeProxy = null;
     spikeProxyError = String(e);
+    // 前端超时/异常不能代替后端取消：显式请求后端停止，避免继续发请求。
+    void cancelSpikeProbe();
   }
   spikeProxyRunning = false;
+  syncSpikeDiag();
+}
+
+// 保存账号级代理：口令只进 Keychain，前端与 accounts.json 都不保留明文。
+async function saveSpikeProxy(): Promise<void> {
+  if (!snapshot || spikeProxyBusy) return;
+  const acc = pickWatchAccount();
+  if (!acc) {
+    spikeProxySaveMsg = "没有已登录的 Muse 账号";
+    syncSpikeDiag();
+    return;
+  }
+  const uri = (document.querySelector<HTMLInputElement>("#spike-proxy-uri")?.value ?? "").trim();
+  const username = (document.querySelector<HTMLInputElement>("#spike-proxy-user")?.value ?? "").trim();
+  const password = document.querySelector<HTMLInputElement>("#spike-proxy-pass")?.value ?? "";
+  spikeProxyUri = uri;
+  if (!uri) {
+    spikeProxySaveMsg = "请填写代理 URI";
+    syncSpikeDiag();
+    return;
+  }
+  const ok = window.confirm(
+    `把代理 ${redactProxyUri(uri)} 保存为账号「${acc.alias}」的专用代理？口令只写入系统 Keychain。`
+  );
+  if (!ok) return;
+  spikeProxyBusy = true;
+  spikeProxySaveMsg = "保存中…";
+  syncSpikeDiag();
+  try {
+    spikeProxySettingView = await invoke<SpikeProxySettingView>(
+      "muse_native_set_account_proxy",
+      {
+        providerId: "muse",
+        uuid: acc.uuid,
+        uri,
+        username: username || null,
+        password: password || null,
+        enabled: true,
+      }
+    );
+    spikeProxySaveMsg = "已保存：口令写入 Keychain，accounts.json 只保留引用";
+  } catch (e) {
+    spikeProxySaveMsg = `保存失败：${String(e)}`;
+  }
+  spikeProxyBusy = false;
+  syncSpikeDiag();
+}
+
+async function clearSpikeProxy(): Promise<void> {
+  if (!snapshot || spikeProxyBusy) return;
+  const acc = pickWatchAccount();
+  if (!acc) {
+    spikeProxySaveMsg = "没有已登录的 Muse 账号";
+    syncSpikeDiag();
+    return;
+  }
+  if (!window.confirm(`清除账号「${acc.alias}」的代理配置？清除后将走系统网络。`)) return;
+  spikeProxyBusy = true;
+  spikeProxySaveMsg = "清除中…";
+  syncSpikeDiag();
+  try {
+    await invoke("muse_native_clear_account_proxy", {
+      providerId: "muse",
+      uuid: acc.uuid,
+    });
+    spikeProxySettingView = null;
+    spikeProxySaveMsg = "已清除账号代理（含 Keychain 口令）";
+  } catch (e) {
+    spikeProxySaveMsg = `清除失败：${String(e)}`;
+  }
+  spikeProxyBusy = false;
+  syncSpikeDiag();
+}
+
+// 后端取消：Promise.race 超时后仍会调用它，确保 Rust 侧停止发起新请求。
+async function cancelSpikeProbe(): Promise<void> {
+  if (!snapshot) return;
+  const acc = pickWatchAccount();
+  if (!acc) return;
+  try {
+    const hit = await invoke<boolean>("muse_native_cancel_probe", {
+      providerId: "muse",
+      uuid: acc.uuid,
+    });
+    spikeProxySaveMsg = hit
+      ? "已请求停止：不再发起新的请求/发送"
+      : "没有正在运行的长任务";
+  } catch (e) {
+    spikeProxySaveMsg = `停止失败：${String(e)}`;
+  }
   syncSpikeDiag();
 }
 
@@ -2326,6 +2490,21 @@ function bindDelegatedEvents(): void {
       const input = document.querySelector<HTMLInputElement>("#spike-proxy-uri");
       spikeProxyUri = input?.value ?? spikeProxyUri;
       await runSpikeProxy();
+      return;
+    }
+    const proxySaveBtn = target.closest<HTMLElement>("#spike-proxy-save-btn");
+    if (proxySaveBtn) {
+      await saveSpikeProxy();
+      return;
+    }
+    const proxyClearBtn = target.closest<HTMLElement>("#spike-proxy-clear-btn");
+    if (proxyClearBtn) {
+      await clearSpikeProxy();
+      return;
+    }
+    const stopBtn = target.closest<HTMLElement>("#spike-stop-btn");
+    if (stopBtn) {
+      await cancelSpikeProbe();
       return;
     }
     const quotaBtn = target.closest<HTMLElement>("#spike-quota-btn");

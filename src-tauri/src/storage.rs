@@ -27,9 +27,12 @@ pub struct AccountKey {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ProxySetting {
-  /// scheme://host[:port]，可含 user@ 但不得含 :password。
+  /// scheme://host[:port]，可含 user@，但**不得含 :password**。
   pub uri: String,
-  /// Keychain 中口令项的引用名；None 表示代理无需认证。
+  /// 代理认证用户名。与 `uri` 里的 user@ 二选一（都以 `uri` 为准）。
+  #[serde(default)]
+  pub username: Option<String>,
+  /// Keychain 中口令项的 account 名；None 表示代理无需认证。
   #[serde(default)]
   pub credential_ref: Option<String>,
   /// 用户显式启用。故障逻辑不得改写此字段。
@@ -42,6 +45,69 @@ impl ProxySetting {
   /// 这里不提供关闭它的字段——这是结构性的，不是配置开关。
   pub fn fail_closed(&self) -> bool {
     true
+  }
+
+  /// `uri` 的 authority 里是否带用户名。
+  fn uri_has_user(&self) -> bool {
+    self
+      .uri
+      .split_once("://")
+      .map(|(_, r)| r.split('/').next().unwrap_or(r))
+      .and_then(|authority| authority.rsplit_once('@').map(|(ui, _)| !ui.is_empty()))
+      .unwrap_or(false)
+  }
+
+  /// 生效的用户名（`uri` 中的 user@ 优先，其次 `username` 字段）。
+  pub fn effective_username(&self) -> Option<String> {
+    if let Some((ui, _)) = self
+      .uri
+      .split_once("://")
+      .map(|(_, r)| r.split('/').next().unwrap_or(r))
+      .and_then(|authority| authority.rsplit_once('@'))
+    {
+      if !ui.is_empty() {
+        return Some(ui.to_string());
+      }
+    }
+    self.username.as_deref().filter(|u| !u.is_empty()).map(str::to_string)
+  }
+
+  /// 保存/启用前校验。拒绝：
+  /// - `uri` 中带明文密码（口令只允许存 Keychain）；
+  /// - scheme / host / port 非法；
+  /// - 用户名与 Keychain 引用不成对（否则认证必然失败）。
+  pub fn validate(&self) -> Result<(), String> {
+    if !self.enabled {
+      return Ok(());
+    }
+    let authority = self
+      .uri
+      .split_once("://")
+      .map(|(_, r)| r.split('/').next().unwrap_or(r))
+      .unwrap_or("");
+    if let Some((ui, _)) = authority.rsplit_once('@') {
+      if ui.contains(':') {
+        return Err("代理 URI 不得包含明文密码；密码只允许存入 Keychain".to_string());
+      }
+    }
+    muse_native_client::proxy::ProxyConfig::validate_shape(&self.uri)
+      .map_err(|e| e.to_string())?;
+
+    let has_user = self.uri_has_user()
+      || self
+        .username
+        .as_deref()
+        .map(|u| !u.is_empty())
+        .unwrap_or(false);
+    let has_ref = self
+      .credential_ref
+      .as_deref()
+      .map(|r| !r.is_empty())
+      .unwrap_or(false);
+    if has_user != has_ref {
+      return Err("代理用户名与 Keychain 凭据引用必须同时设置（或同时留空）".to_string());
+    }
+    Ok(())
   }
 
   /// 脱敏展示串：去掉 userinfo 与 query，绝不含口令。
@@ -444,6 +510,7 @@ mod proxy_tests {
   fn proxy_display_safe_hides_userinfo() {
     let p = ProxySetting {
       uri: "http://alice:p%40ss@p.example:8080".to_string(),
+      username: None,
       credential_ref: Some("kc-proxy-p.example".to_string()),
       enabled: true,
     };
@@ -457,10 +524,85 @@ mod proxy_tests {
   fn proxy_is_always_fail_closed() {
     let p = ProxySetting {
       uri: "socks5://p.example".to_string(),
+      username: None,
       credential_ref: None,
       enabled: true,
     };
     assert!(p.fail_closed());
+  }
+
+  #[test]
+  fn validate_rejects_inline_password() {
+    let p = ProxySetting {
+      uri: "http://alice:secret@p.example:8080".to_string(),
+      username: None,
+      credential_ref: None,
+      enabled: true,
+    };
+    let err = p.validate().expect_err("明文密码必须被拒绝");
+    assert!(err.contains("明文密码"), "{err}");
+  }
+
+  #[test]
+  fn validate_requires_username_and_credential_pair() {
+    let orphan_user = ProxySetting {
+      uri: "http://alice@p.example:8080".to_string(),
+      username: None,
+      credential_ref: None,
+      enabled: true,
+    };
+    assert!(orphan_user.validate().is_err(), "有用户名却无 Keychain 引用应被拒");
+
+    let paired = ProxySetting {
+      uri: "http://alice@p.example:8080".to_string(),
+      username: None,
+      credential_ref: Some("proxy-account-1".to_string()),
+      enabled: true,
+    };
+    assert!(paired.validate().is_ok(), "{:?}", paired.validate());
+
+    let no_auth = ProxySetting {
+      uri: "socks5://p.example:1080".to_string(),
+      username: None,
+      credential_ref: None,
+      enabled: true,
+    };
+    assert!(no_auth.validate().is_ok());
+  }
+
+  #[test]
+  fn validate_rejects_bad_host_and_port() {
+    for uri in ["p.example", "ftp://p.example", "http://:8080", "http://p.example:0"] {
+      let p = ProxySetting {
+        uri: uri.to_string(),
+        username: None,
+        credential_ref: None,
+        enabled: true,
+      };
+      assert!(p.validate().is_err(), "{uri} 应被拒绝");
+    }
+  }
+
+  #[test]
+  fn disabled_setting_skips_validation() {
+    let p = ProxySetting {
+      uri: "not-a-uri".to_string(),
+      username: None,
+      credential_ref: None,
+      enabled: false,
+    };
+    assert!(p.validate().is_ok(), "未启用的配置不参与校验");
+  }
+
+  #[test]
+  fn effective_username_prefers_uri_user() {
+    let p = ProxySetting {
+      uri: "http://alice@p.example:8080".to_string(),
+      username: Some("bob".to_string()),
+      credential_ref: Some("ref".to_string()),
+      enabled: true,
+    };
+    assert_eq!(p.effective_username().as_deref(), Some("alice"));
   }
 
   #[test]
@@ -473,5 +615,12 @@ mod proxy_tests {
     }"#;
     let rec: AccountRecord = serde_json::from_str(json).expect("老账户应能反序列化");
     assert!(rec.proxy.is_none());
+  }
+
+  #[test]
+  fn proxy_legacy_json_without_username_field_deserializes() {
+    let json = r#"{"uri":"socks5://p.example:1080","credentialRef":null,"enabled":false}"#;
+    let p: ProxySetting = serde_json::from_str(json).expect("老代理配置应能反序列化");
+    assert!(p.username.is_none());
   }
 }

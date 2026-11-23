@@ -5,7 +5,7 @@ use crate::providers::{
 };
 use crate::storage::{
   detect_conflicts, load_or_migrate_store, normalize_uuid, now_ms, save_store_atomic, AccountKey,
-  AccountRecord, AccountsStoreFile, AuthState, ConflictItem, QuotaDetail,
+  AccountRecord, AccountsStoreFile, AuthState, ConflictItem, ProxySetting, QuotaDetail,
 };
 use serde::Serialize;
 use std::collections::HashMap;
@@ -992,6 +992,38 @@ impl SessionManager {
         modal_active: false,
       }),
     }
+  }
+
+  /// #11/#16：读取某账号的代理设置（脱敏存储；口令在 Keychain）。
+  pub async fn proxy_setting(&self, provider: ProviderId, uuid: &str) -> Option<ProxySetting> {
+    let inner = self.inner.lock().await;
+    inner
+      .store
+      .accounts
+      .iter()
+      .find(|a| a.provider_id == provider && a.uuid == uuid)
+      .and_then(|a| a.proxy.clone())
+  }
+
+  /// #11/#16：写入/清除某账号的代理设置并落盘。`None` 表示清除。
+  pub async fn set_account_proxy(
+    &self,
+    provider: ProviderId,
+    uuid: &str,
+    proxy: Option<ProxySetting>,
+  ) -> Result<(), String> {
+    let mut inner = self.inner.lock().await;
+    let store_path = inner.store_path.clone();
+    let Some(target) = inner
+      .store
+      .accounts
+      .iter_mut()
+      .find(|a| a.provider_id == provider && a.uuid == uuid)
+    else {
+      return Err("账号不存在".to_string());
+    };
+    target.proxy = proxy;
+    save_store_atomic(&store_path, &inner.store)
   }
 
   fn snapshot_from_locked(locked: &InnerState) -> ManagerSnapshot {
