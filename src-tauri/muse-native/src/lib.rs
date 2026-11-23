@@ -39,5 +39,8 @@ pub mod liveness;
 pub mod methods;
 pub mod noise;
 pub mod protobuf;
+// #11/#16 原生侧逐客户端代理（HTTP CONNECT / TLS CONNECT / SOCKS5，
+// 结构性 fail-closed）。
+pub mod proxy;
 pub mod transport;
 pub mod watch;
