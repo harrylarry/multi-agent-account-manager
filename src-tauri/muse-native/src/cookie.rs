@@ -66,6 +66,12 @@ impl SessionCookies {
     self.cookies.iter().map(|c| c.name.as_str()).collect()
   }
 
+}
+
+#[cfg(test)]
+mod tests {
+  use super::*;
+
   #[test]
   fn from_header_parses_pairs() {
     let c = SessionCookies::from_header("a=1; b=x=y; ;c=3");
