@@ -386,19 +386,7 @@ pub async fn send_probe(
 }
 
 /// #10 存活探针状态：记录一条长连接从建立到断开的时间线。
-#[derive(Debug, Clone, Serialize, Default)]
-#[serde(rename_all = "camelCase")]
-pub struct Liveness {
-  pub running: bool,
-  /// 当前阶段：cookies / connect / subscribe / reading / done
-  pub phase: String,
-  pub started_ms: u128,
-  pub connected_ms: Option<u128>,
-  pub last_event_ms: Option<u128>,
-  pub ended_ms: Option<u128>,
-  pub events: u64,
-  pub error: Option<String>,
-}
+pub use muse_native_client::liveness::Liveness;
 
 #[derive(Default)]
 pub struct LivenessState {
@@ -414,10 +402,10 @@ impl LivenessState {
   }
 }
 
-fn now_ms_u128() -> u128 {
+fn observation_now_ms() -> u64 {
   std::time::SystemTime::now()
     .duration_since(std::time::UNIX_EPOCH)
-    .map(|d| d.as_millis())
+    .map(|d| d.as_millis().min(u64::MAX as u128) as u64)
     .unwrap_or(0)
 }
 
@@ -429,18 +417,15 @@ pub fn liveness_start(
   uuid: &str,
   seconds: u64,
 ) {
-  if state.snapshot().running {
-    return;
-  }
   let seconds = seconds.clamp(30, 3600);
-  state.set(|l| {
-    *l = Liveness {
-      running: true,
-      phase: "cookies".to_string(),
-      started_ms: now_ms_u128(),
-      ..Default::default()
+  // Check-and-set under one lock: concurrent starts must not create two probes.
+  {
+    let mut current = state.inner.lock().unwrap();
+    if current.running {
+      return;
     }
-  });
+    *current = Liveness::started(observation_now_ms());
+  }
 
   let app_owned = app.clone();
   let uuid_owned = uuid.to_string();
@@ -452,7 +437,7 @@ pub fn liveness_start(
       let _ = (app_owned, uuid_owned, seconds);
       state_owned.set(|l| {
         l.running = false;
-        l.ended_ms = Some(now_ms_u128());
+        l.ended_ms = Some(observation_now_ms());
         l.error = Some("Android 不可用".to_string());
       });
       return;
@@ -469,7 +454,7 @@ pub fn liveness_start(
           state_owned.set(|l| {
             l.running = false;
             l.phase = "cookies-timeout".to_string();
-            l.ended_ms = Some(now_ms_u128());
+            l.ended_ms = Some(observation_now_ms());
             l.error = Some("取 cookie 超时（15 秒）".to_string());
           });
           return;
@@ -479,7 +464,7 @@ pub fn liveness_start(
           state_owned.set(|l| {
             l.running = false;
             l.phase = "cookies-error".to_string();
-            l.ended_ms = Some(now_ms_u128());
+            l.ended_ms = Some(observation_now_ms());
             l.error = Some(e);
           });
           return;
@@ -490,7 +475,7 @@ pub fn liveness_start(
         state_owned.set(|l| {
           l.running = false;
           l.phase = "no-cookies".to_string();
-          l.ended_ms = Some(now_ms_u128());
+          l.ended_ms = Some(observation_now_ms());
           l.error = Some("无登录态".to_string());
         });
         return;
@@ -500,7 +485,7 @@ pub fn liveness_start(
         Err(e) => {
           state_owned.set(|l| {
             l.running = false;
-            l.ended_ms = Some(now_ms_u128());
+            l.ended_ms = Some(observation_now_ms());
             l.error = Some(e);
           });
           return;
@@ -514,7 +499,7 @@ pub fn liveness_start(
           state_owned.set(|l| {
             l.running = false;
             l.phase = "connect-timeout".to_string();
-            l.ended_ms = Some(now_ms_u128());
+            l.ended_ms = Some(observation_now_ms());
             l.error = Some("建连超时（60 秒）".to_string());
           });
           return;
@@ -525,17 +510,14 @@ pub fn liveness_start(
           state_owned.set(|l| {
             l.running = false;
             l.phase = "connect-error".to_string();
-            l.ended_ms = Some(now_ms_u128());
+            l.ended_ms = Some(observation_now_ms());
             l.error = Some(e.to_string());
           });
           return;
         }
       };
       cookies.zeroize();
-      state_owned.set(|l| {
-        l.connected_ms = Some(now_ms_u128());
-        l.phase = "subscribe".to_string();
-      });
+      state_owned.set(|l| l.connected(observation_now_ms()));
 
       let body = br#"{"capabilities":["hotel_results","chat_cancel","delta_stream","custom_reactions","custom_reactions_facebook_thumbs_up_v1"]}"#.to_vec();
       let req = HttpRequest {
@@ -549,49 +531,63 @@ pub fn liveness_start(
         ],
         body,
       };
-      let mut sub = match connected.subscribe(req).await {
-        Ok(s) => s,
-        Err(e) => {
+      let mut sub = match tokio::time::timeout(Duration::from_secs(15), connected.subscribe(req)).await {
+        Err(_) => {
+          state_owned.set(|l| l.finish(observation_now_ms(), "subscribe_timeout", Some("订阅发送超时（15 秒）".into())));
+          return;
+        }
+        Ok(Ok(s)) => s,
+        Ok(Err(e)) => {
           state_owned.set(|l| {
             l.running = false;
-            l.ended_ms = Some(now_ms_u128());
+            l.ended_ms = Some(observation_now_ms());
             l.error = Some(e.to_string());
           });
           return;
         }
       };
-      state_owned.set(|l| l.phase = "reading".to_string());
-      let deadline = Instant::now() + Duration::from_secs(seconds);
+      state_owned.set(|l| l.reading(observation_now_ms(), seconds));
+      let mut end_reason = "window_elapsed";
       let mut error = None;
       loop {
-        let left = deadline.saturating_duration_since(Instant::now());
-        if left.is_zero() {
+        let now = observation_now_ms();
+        state_owned.set(|l| l.observe(now));
+        let snapshot = state_owned.snapshot();
+        if snapshot.expired(now) {
           break;
         }
-        match sub.next_line(left).await {
-          Ok(Some(_line)) => {
-            state_owned.set(|l| {
-              l.events += 1;
-              l.last_event_ms = Some(now_ms_u128());
-            });
+        // Poll in short slices to record observation gaps. These are local task
+        // polls, not network heartbeats and not evidence of a live remote peer.
+        let left_ms = snapshot.deadline_ms.unwrap_or(now).saturating_sub(now);
+        let slice = Duration::from_millis(left_ms.min(5000));
+        let result = sub.next_line(slice).await;
+        let observed = observation_now_ms();
+        state_owned.set(|l| l.observe(observed));
+        match result {
+          Ok(Some(line)) => {
+            // A buffered row read on resume was received at an unknown time.
+            if state_owned.snapshot().expired(observed) {
+              break;
+            }
+            let is_event = serde_json::from_str::<serde_json::Value>(&line)
+              .ok()
+              .and_then(|v| v.get("type").and_then(|t| t.as_str()).map(|t| t == "event"))
+              .unwrap_or(false);
+            state_owned.set(|l| l.record_line(observed, is_event));
           }
           Ok(None) => {
-            error = Some("订阅结束".to_string());
+            end_reason = "stream_ended";
             break;
           }
-          Err(GatewayError::Timeout(_)) => break,
+          Err(GatewayError::Timeout(_)) => continue,
           Err(e) => {
+            end_reason = "read_error";
             error = Some(e.to_string());
             break;
           }
         }
       }
-      state_owned.set(|l| {
-        l.running = false;
-        l.phase = "done".to_string();
-        l.ended_ms = Some(now_ms_u128());
-        l.error = error;
-      });
+      state_owned.set(|l| l.finish(observation_now_ms(), end_reason, error));
     }
   });
 }

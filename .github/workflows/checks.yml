@@ -141,5 +141,10 @@ jobs:
       # 对整个包 check 才能复用 src-tauri/Cargo.lock 与 target 目录。
       - run: cargo check --manifest-path src-tauri/Cargo.toml --target aarch64-apple-ios
       # 纯逻辑测试（watch/transport/noise）跑宿主 target，不需要 Xcode。
+      # muse-native 的纯逻辑单测（含 liveness 观测语义）。
       - name: cargo test (muse-native)
         run: cargo test --manifest-path src-tauri/muse-native/Cargo.toml
+      # 主 crate 的单元测试（send_ledger / quota 解析）跑宿主 target：
+      # iOS target 只能编译不能执行，所以这里不带 --target。
+      - name: cargo test (main crate lib)
+        run: cargo test --manifest-path src-tauri/Cargo.toml --lib

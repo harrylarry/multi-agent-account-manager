@@ -100,9 +100,13 @@ let spikeQuotaRunning = false;
 let spikeQuotaError: string | null = null;
 interface SpikeLiveness {
   running: boolean; phase: string; startedMs: number; connectedMs: number | null;
-  lastEventMs: number | null; endedMs: number | null; events: number; error: string | null;
+  deadlineMs: number | null; observedAtMs: number; maxObservationGapMs: number;
+  lastEventMs: number | null; endedMs: number | null; lines: number;
+  events: number; endReason: string | null; error: string | null;
 }
 let spikeLive: SpikeLiveness | null = null;
+let spikeLiveError: string | null = null;
+let spikeLiveRefreshing = false;
 interface SpikeSendResult {
   ok: boolean; status: string; sendId: string;
   ack: unknown; sessionId: string | null; error: string | null;
@@ -780,15 +784,25 @@ function spikeDiagInnerHtml(): string {
   if (spikeLive) {
     const l = spikeLive;
     const fmt = (ms: number) => new Date(ms).toLocaleTimeString();
-    const alive = l.running
-      ? Math.round((Date.now() - (l.connectedMs ?? l.startedMs)) / 1000)
-      : (l.endedMs && l.connectedMs ? Math.round((l.endedMs - l.connectedMs) / 1000) : 0);
+    const observedElapsed = l.connectedMs
+      ? Math.max(0, Math.round(((l.endedMs ?? Date.now()) - l.connectedMs) / 1000))
+      : 0;
+    const gapSeconds = Math.round((l.maxObservationGapMs ?? 0) / 1000);
+    const suspendedGap = gapSeconds >= 15;
+    const windowSeconds = l.deadlineMs && l.connectedMs
+      ? Math.max(0, Math.round((l.deadlineMs - l.connectedMs) / 1000))
+      : 0;
     liveHtml = `
       <div class="spike-diag-result ${l.error ? "fail" : "ok"}">
-        <div>${l.running ? "● 存活中" : "■ 已结束"}（阶段 ${escapeHtml(l.phase || "—")}）：连接存活 ${alive}s，事件 ${l.events}</div>
-        <div>建立 ${l.connectedMs ? fmt(l.connectedMs) : "—"}　最后事件 ${l.lastEventMs ? fmt(l.lastEventMs) : "—"}　结束 ${l.endedMs ? fmt(l.endedMs) : "—"}</div>
-        ${l.error ? `<div>结束原因：${escapeHtml(l.error)}</div>` : ""}
+        <div>${l.running ? "● 探针任务运行中" : "■ 探针已结束"}（阶段 ${escapeHtml(l.phase || "—")}）</div>
+        <div>订阅窗口 ${windowSeconds}s；墙钟经过 ${observedElapsed}s；事件 ${l.events}（读行 ${l.lines}）</div>
+        <div>建立 ${l.connectedMs ? fmt(l.connectedMs) : "—"}　最后事件 ${l.lastEventMs ? fmt(l.lastEventMs) : "—"}　观测结束 ${l.endedMs ? fmt(l.endedMs) : "—"}</div>
+        <div>最大任务观测间隔 ${gapSeconds}s${suspendedGap ? "（存在未观测区间，不能证明连接持续存活）" : ""}；结束原因 ${escapeHtml(l.endReason || "—")}</div>
+        ${l.error ? `<div>错误：${escapeHtml(l.error)}</div>` : ""}
       </div>`;
+  }
+  if (!spikeLive && spikeLiveError) {
+    liveHtml = `<div class="spike-diag-result fail">存活探针错误：${escapeHtml(spikeLiveError)}</div>`;
   }
   let sendHtml = "";
   if (spikeSend) {
@@ -905,10 +919,16 @@ function pickWatchAccount(): AccountRecord | undefined {
 }
 
 async function refreshSpikeLive(): Promise<void> {
+  // Guards against overlapping polls: a slow bridge must not queue up calls.
+  if (spikeLiveRefreshing) return;
+  spikeLiveRefreshing = true;
   try {
     spikeLive = await invoke<SpikeLiveness>("muse_native_liveness_status");
+    spikeLiveError = null;
   } catch (e) {
-    spikeLive = null;
+    spikeLiveError = String(e);
+  } finally {
+    spikeLiveRefreshing = false;
   }
   syncSpikeDiag();
 }
@@ -942,9 +962,10 @@ async function startSpikeLive(): Promise<void> {
       uuid: acc.uuid,
       seconds: 300,
     });
+    spikeLiveError = null;
     startLiveTimer();
   } catch (e) {
-    spikeLive = null;
+    spikeLiveError = String(e);
   }
   syncSpikeDiag();
 }
@@ -2408,7 +2429,12 @@ async function bootstrap(): Promise<void> {
   // active again (foreground / focus). No periodic background sync.
   triggerAutoSync();
   document.addEventListener("visibilitychange", () => {
-    if (!document.hidden) triggerAutoSync();
+    if (!document.hidden) {
+      triggerAutoSync();
+      // 回前台立刻取一次存活探针状态：后台期间定时器不会运行，
+      // 界面上的秒数是旧的，必须以真实快照为准。
+      if (spikeLive?.running) void refreshSpikeLive();
+    }
   });
   window.addEventListener("focus", () => triggerAutoSync());
   setTimeout(() => {

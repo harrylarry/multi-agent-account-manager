@@ -31,6 +31,7 @@ pub mod control_plane;
 pub mod cookie;
 #[cfg(not(target_os = "android"))]
 pub mod gateway;
+pub mod liveness;
 pub mod methods;
 pub mod noise;
 pub mod protobuf;
