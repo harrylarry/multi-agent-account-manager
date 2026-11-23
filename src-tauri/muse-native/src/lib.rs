@@ -30,6 +30,8 @@ pub mod chat_send;
 #[cfg(not(target_os = "android"))]
 pub mod collect;
 pub mod control_plane;
+// #18 模型指纹评分编排层（lmfpd 本地评分；不含联网发送）。
+pub mod fingerprint;
 pub mod cookie;
 #[cfg(not(target_os = "android"))]
 pub mod gateway;
