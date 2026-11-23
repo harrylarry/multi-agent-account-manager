@@ -226,6 +226,194 @@ async fn diagnose_inner(
   }
 }
 
+/// B4 发送结果（字段与前端契约一致）。
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SendOutcome {
+  pub ok: bool,
+  pub status: String,
+  pub send_id: String,
+  pub ack: Option<serde_json::Value>,
+  pub session_id: Option<String>,
+  pub error: Option<String>,
+}
+
+/// 发送一条消息：申请单发锁 → 建连 → 发一次 → 按结果记账。
+/// 超时/断线一律记 UNKNOWN，绝不自动重发。
+pub async fn send_probe(
+  app: &AppHandle,
+  ledger: &crate::send_ledger::SendLedger,
+  uuid: &str,
+  text: &str,
+  node_id: &str,
+  session_id: Option<&str>,
+) -> SendOutcome {
+  use crate::send_ledger::SendError;
+  let conversation = session_id.unwrap_or("new").to_string();
+  let send_id = match ledger.begin(uuid, &conversation, text) {
+    Ok(id) => id,
+    Err(SendError::Busy(existing)) => {
+      return SendOutcome {
+        ok: false,
+        status: "BUSY".to_string(),
+        send_id: existing,
+        ack: None,
+        session_id: session_id.map(str::to_string),
+        error: Some("该账号已有一条发送在进行中（不排队）".to_string()),
+      }
+    }
+    Err(SendError::Unknown(e)) => {
+      return SendOutcome {
+        ok: false,
+        status: "ERROR".to_string(),
+        send_id: String::new(),
+        ack: None,
+        session_id: None,
+        error: Some(e),
+      }
+    }
+  };
+
+  #[cfg(target_os = "android")]
+  {
+    let _ = (app, node_id, text);
+    ledger.fail(&send_id, "Android 不可用".to_string());
+    return SendOutcome {
+      ok: false, status: "DEFINITIVELY_FAILED".to_string(), send_id,
+      ack: None, session_id: session_id.map(str::to_string),
+      error: Some("发送探针在 Android 上不可用".to_string()),
+    };
+  }
+
+  #[cfg(not(target_os = "android"))]
+  {
+    let app_owned = app.clone();
+    let uuid_owned = uuid.to_string();
+    let handle = tokio::spawn(async move { fetch_session_cookies(&app_owned, &uuid_owned).await });
+    let mut cookies = match tokio::time::timeout(COOKIE_TIMEOUT, handle).await {
+      Err(_) => {
+        ledger.fail(&send_id, "取 cookie 超时".to_string());
+        return SendOutcome {
+          ok: false, status: "DEFINITIVELY_FAILED".to_string(), send_id,
+          ack: None, session_id: session_id.map(str::to_string),
+          error: Some("取 muse.ai 会话 cookie 超时（15 秒）".to_string()),
+        };
+      }
+      Ok(Ok(Ok(c))) => c,
+      Ok(Ok(Err(e))) => {
+        ledger.fail(&send_id, e.clone());
+        return SendOutcome {
+          ok: false, status: "DEFINITIVELY_FAILED".to_string(), send_id,
+          ack: None, session_id: session_id.map(str::to_string), error: Some(e),
+        };
+      }
+      Ok(Err(e)) => {
+        ledger.fail(&send_id, e.to_string());
+        return SendOutcome {
+          ok: false, status: "DEFINITIVELY_FAILED".to_string(), send_id,
+          ack: None, session_id: session_id.map(str::to_string),
+          error: Some(format!("取 cookie 任务异常: {e}")),
+        };
+      }
+    };
+    if cookies.is_empty() {
+      ledger.fail(&send_id, "无登录态".to_string());
+      return SendOutcome {
+        ok: false, status: "DEFINITIVELY_FAILED".to_string(), send_id,
+        ack: None, session_id: session_id.map(str::to_string),
+        error: Some("该账号还没有 muse.ai 登录态".to_string()),
+      };
+    }
+
+    let fetch = match ReqwestFetch::new() {
+      Ok(f) => f,
+      Err(e) => {
+        cookies.zeroize();
+        ledger.fail(&send_id, e.clone());
+        return SendOutcome {
+          ok: false, status: "DEFINITIVELY_FAILED".to_string(), send_id,
+          ack: None, session_id: session_id.map(str::to_string), error: Some(e),
+        };
+      }
+    };
+    let gateway = MuseGateway::new(fetch);
+    let mut connected = match gateway.connect(&cookies).await {
+      Ok(c) => c,
+      Err(e) => {
+        cookies.zeroize();
+        ledger.fail(&send_id, e.to_string());
+        return SendOutcome {
+          ok: false, status: "DEFINITIVELY_FAILED".to_string(), send_id,
+          ack: None, session_id: session_id.map(str::to_string),
+          error: Some(e.to_string()),
+        };
+      }
+    };
+    cookies.zeroize();
+    ledger.mark_in_flight(&send_id);
+
+    match muse_native_client::chat_send::send_message(
+      &mut connected,
+      text,
+      node_id,
+      session_id,
+      Duration::from_secs(30),
+    )
+    .await
+    {
+      Ok((ack, sid)) => {
+        ledger.confirm(&send_id);
+        SendOutcome {
+          ok: true,
+          status: "CONFIRMED".to_string(),
+          send_id,
+          ack: Some(ack),
+          session_id: sid,
+          error: None,
+        }
+      }
+      Err(e) => {
+        ledger.mark_unknown(&send_id, e.to_string());
+        SendOutcome {
+          ok: false, status: "UNKNOWN".to_string(), send_id,
+          ack: None, session_id: session_id.map(str::to_string),
+          error: Some(e.to_string()),
+        }
+      }
+    }
+  }
+}
+
+/// 取一次会话 cookie 头（B3 额度用）。调用方用后立即丢弃，不落盘不打印。
+pub async fn cookie_header_for(app: &AppHandle, uuid: &str) -> Result<String, String> {
+  #[cfg(target_os = "android")]
+  {
+    let _ = (app, uuid);
+    return Err("该功能在 Android 上不可用".to_string());
+  }
+  #[cfg(not(target_os = "android"))]
+  {
+    let app_owned = app.clone();
+    let uuid_owned = uuid.to_string();
+    let handle = tokio::spawn(async move { fetch_session_cookies(&app_owned, &uuid_owned).await });
+    let mut cookies = tokio::select! {
+      res = handle => match res {
+        Ok(r) => r?,
+        Err(e) => return Err(format!("取 cookie 任务异常结束: {e}")),
+      },
+      _ = tokio::time::sleep(COOKIE_TIMEOUT) => {
+        return Err("取 muse.ai 会话 cookie 超时（15 秒）".to_string());
+      }
+    };
+    if cookies.is_empty() {
+      return Err("该账号还没有 muse.ai 登录态".to_string());
+    }
+    let header = cookies.cookie_header();
+    cookies.zeroize();
+    Ok(header)
+  }
+}
+
 /// B1 `chat.subscribe` 探针（Issue #13 #5）：订阅 N 秒，只统计事件数量与去重结果。
 /// 不返回任何事件文本、消息 id 或凭据，只给计数，便于真机核验。
 #[derive(Debug, Clone, Serialize)]

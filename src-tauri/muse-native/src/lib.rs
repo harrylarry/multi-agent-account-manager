@@ -25,6 +25,8 @@
 // - watch: chat.subscribe 事件归一化与去重（B1，Issue #13 #5）。
 
 pub mod approvals;
+#[cfg(not(target_os = "android"))]
+pub mod chat_send;
 pub mod control_plane;
 pub mod cookie;
 #[cfg(not(target_os = "android"))]

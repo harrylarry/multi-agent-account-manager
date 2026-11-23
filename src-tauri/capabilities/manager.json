@@ -29,6 +29,8 @@
     "allow-open-external-url",
     "allow-muse-native-diagnose",
     "allow-muse-native-watch-probe",
-    "allow-muse-native-approvals-probe"
+    "allow-muse-native-approvals-probe",
+    "allow-muse-native-quota-probe",
+    "allow-muse-native-send-probe"
   ]
 }

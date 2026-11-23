@@ -89,6 +89,19 @@ interface SpikeApprovalsResult {
 let spikeApprovals: SpikeApprovalsResult | null = null;
 let spikeApprovalsRunning = false;
 let spikeApprovalsError: string | null = null;
+interface SpikeQuota {
+  tier: string; percentUsed: number; state: string; resetsAtMs: number; source: string;
+}
+let spikeQuota: SpikeQuota | null = null;
+let spikeQuotaRunning = false;
+let spikeQuotaError: string | null = null;
+interface SpikeSendResult {
+  ok: boolean; status: string; sendId: string;
+  ack: unknown; sessionId: string | null; error: string | null;
+}
+let spikeSend: SpikeSendResult | null = null;
+let spikeSendRunning = false;
+let spikeSendError: string | null = null;
 let spikeDiagnoseError: string | null = null;
 // 是否 Spike 版（bundle id 门控）：只决定顶栏徽章显不显示；诊断区不门控。
 let isSpikeBuild = false;
@@ -755,6 +768,34 @@ function spikeDiagInnerHtml(): string {
   } else if (spikeDiagnoseError) {
     resultHtml = `<div class="spike-diag-result fail">错误：${escapeHtml(spikeDiagnoseError)}</div>`;
   }
+  let sendHtml = "";
+  if (spikeSend) {
+    const r = spikeSend;
+    const ackId =
+      r.ack && typeof r.ack === "object" && "message_id" in (r.ack as Record<string, unknown>)
+        ? String((r.ack as Record<string, unknown>).message_id)
+        : "—";
+    sendHtml = `
+      <div class="spike-diag-result ${r.ok ? "ok" : "fail"}">
+        <div>${r.ok ? "✓ 已发送并收到 ack" : "✗ 发送未确认"}（${escapeHtml(r.status)}）</div>
+        <div>sendId：${escapeHtml(r.sendId)}　message_id：${escapeHtml(ackId)}</div>
+        ${r.sessionId ? `<div>会话：${escapeHtml(r.sessionId)}</div>` : ""}
+        ${r.error ? `<div>说明：${escapeHtml(r.error)}</div>` : ""}
+      </div>`;
+  } else if (spikeSendError) {
+    sendHtml = `<div class="spike-diag-result fail">错误：${escapeHtml(spikeSendError)}</div>`;
+  }
+  let quotaHtml = "";
+  if (spikeQuota) {
+    const q = spikeQuota;
+    quotaHtml = `
+      <div class="spike-diag-result ok">
+        <div>✓ 额度：${escapeHtml(q.tier || "—")}　已用 ${q.percentUsed}%　状态 ${escapeHtml(q.state || "—")}</div>
+        <div>重置：${q.resetsAtMs ? new Date(q.resetsAtMs).toLocaleString() : "—"}　来源：${escapeHtml(q.source)}</div>
+      </div>`;
+  } else if (spikeQuotaError) {
+    quotaHtml = `<div class="spike-diag-result fail">错误：${escapeHtml(spikeQuotaError)}</div>`;
+  }
   let approvalsHtml = "";
   if (spikeApprovals) {
     const a = spikeApprovals;
@@ -800,11 +841,15 @@ function spikeDiagInnerHtml(): string {
       <button id="spike-diagnose-btn" class="mini-btn" type="button" ${spikeDiagnoseRunning ? "disabled" : ""}>${btnLabel}</button>
       <button id="spike-watch-btn" class="mini-btn" type="button" ${spikeWatchRunning ? "disabled" : ""}>${spikeWatchRunning ? "订阅中…" : "订阅探针 15s"}</button>
       <button id="spike-approvals-btn" class="mini-btn" type="button" ${spikeApprovalsRunning ? "disabled" : ""}>${spikeApprovalsRunning ? "查询中…" : "审批探针"}</button>
+      <button id="spike-quota-btn" class="mini-btn" type="button" ${spikeQuotaRunning ? "disabled" : ""}>${spikeQuotaRunning ? "查询中…" : "额度探针"}</button>
+      <button id="spike-send-btn" class="mini-btn" type="button" ${spikeSendRunning ? "disabled" : ""}>${spikeSendRunning ? "发送中…" : "发送探针"}</button>
       <button id="spike-copy-btn" class="mini-btn" type="button">复制结果</button>
     </div>
     ${resultHtml}
     ${watchHtml}
-    ${approvalsHtml}`;
+    ${approvalsHtml}
+    ${quotaHtml}
+    ${sendHtml}`;
 }
 
 function syncSpikeDiag(): void {
@@ -823,6 +868,68 @@ function pickWatchAccount(): AccountRecord | undefined {
   return snapshot.accounts.find(
     (a) => a.providerId === "muse" && a.authState === "authenticated"
   );
+}
+
+async function runSpikeSend(): Promise<void> {
+  if (!snapshot || spikeSendRunning) return;
+  const acc = pickWatchAccount();
+  if (!acc) {
+    spikeSend = null;
+    spikeSendError = "没有已登录的 Muse 账号。";
+    syncSpikeDiag();
+    return;
+  }
+  spikeSendRunning = true;
+  spikeSendError = null;
+  syncSpikeDiag();
+  try {
+    // 隔离测试会话：内容是无语义整数，不含隐私，也不发往用户主聊天。
+    const probeText = `[spike b4] ${Math.floor(Math.random() * 1e6)}`;
+    spikeSend = await Promise.race([
+      invoke<SpikeSendResult>("muse_native_send_probe", {
+        providerId: "muse",
+        uuid: acc.uuid,
+        text: probeText,
+        nodeId: "",
+        sessionId: null,
+      }),
+      new Promise<SpikeSendResult>((_, reject) =>
+        setTimeout(() => reject(new Error("发送探针超时（60 秒）")), 60_000)
+      ),
+    ]);
+  } catch (e) {
+    spikeSend = null;
+    spikeSendError = String(e);
+  }
+  spikeSendRunning = false;
+  syncSpikeDiag();
+}
+
+async function runSpikeQuota(): Promise<void> {
+  if (!snapshot || spikeQuotaRunning) return;
+  const acc = pickWatchAccount();
+  if (!acc) {
+    spikeQuota = null;
+    spikeQuotaError = "没有已登录的 Muse 账号。";
+    syncSpikeDiag();
+    return;
+  }
+  spikeQuotaRunning = true;
+  spikeQuotaError = null;
+  syncSpikeDiag();
+  try {
+    spikeQuota = await Promise.race([
+      invoke<SpikeQuota>("muse_native_quota_probe", { providerId: "muse", uuid: acc.uuid }),
+      new Promise<SpikeQuota>((_, reject) =>
+        setTimeout(() => reject(new Error("额度探针超时（60 秒）")), 60_000)
+      ),
+    ]);
+  } catch (e) {
+    spikeQuota = null;
+    spikeQuotaError = String(e);
+  }
+  spikeQuotaRunning = false;
+  syncSpikeDiag();
 }
 
 async function runSpikeApprovals(): Promise<void> {
@@ -1839,6 +1946,16 @@ function bindDelegatedEvents(): void {
     const watchBtn = target.closest<HTMLElement>("#spike-watch-btn");
     if (watchBtn) {
       await runSpikeWatch();
+      return;
+    }
+    const sendBtn = target.closest<HTMLElement>("#spike-send-btn");
+    if (sendBtn) {
+      await runSpikeSend();
+      return;
+    }
+    const quotaBtn = target.closest<HTMLElement>("#spike-quota-btn");
+    if (quotaBtn) {
+      await runSpikeQuota();
       return;
     }
     const approvalsBtn = target.closest<HTMLElement>("#spike-approvals-btn");

@@ -1,6 +1,8 @@
 mod muse_native;
 mod platform;
 mod providers;
+mod quota;
+mod send_ledger;
 mod session_manager;
 mod storage;
 mod updater;
@@ -169,6 +171,45 @@ async fn muse_native_approvals_probe(
   muse_native::approvals_probe(&app, &provider_id, &uuid).await
 }
 
+/// B3：只读拉一次额度（Server Action 优先，REST 兜底）。
+#[tauri::command]
+async fn muse_native_quota_probe(
+  app: AppHandle,
+  provider_id: String,
+  uuid: String,
+) -> Result<quota::QuotaSnapshot, String> {
+  if provider_id != "muse" {
+    return Err("额度探针只支持 Muse 账号".to_string());
+  }
+  let cookie = muse_native::cookie_header_for(&app, &uuid).await?;
+  quota::fetch_quota(&cookie, None).await
+}
+
+/// B4：发送一条消息到隔离测试会话（单发锁 + 台账在 muse_native::send_probe）。
+#[tauri::command]
+async fn muse_native_send_probe(
+  app: AppHandle,
+  provider_id: String,
+  uuid: String,
+  text: String,
+  node_id: String,
+  session_id: Option<String>,
+  ledger: tauri::State<'_, std::sync::Arc<send_ledger::SendLedger>>,
+) -> Result<muse_native::SendOutcome, String> {
+  if provider_id != "muse" {
+    return Err("发送探针只支持 Muse 账号".to_string());
+  }
+  Ok(muse_native::send_probe(
+    &app,
+    &ledger,
+    &uuid,
+    &text,
+    &node_id,
+    session_id.as_deref(),
+  )
+  .await)
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
   let builder = tauri::Builder::default();
@@ -259,6 +300,7 @@ pub fn run() {
 
       Ok(())
     })
+    .manage(std::sync::Arc::new(send_ledger::SendLedger::new()))
     .invoke_handler(tauri::generate_handler![
       get_manager_state,
       select_provider,
@@ -278,6 +320,8 @@ pub fn run() {
       muse_native_diagnose,
       muse_native_watch_probe,
       muse_native_approvals_probe,
+      muse_native_quota_probe,
+      muse_native_send_probe,
       muse_native::is_spike_build,
     ])
     .run(tauri::generate_context!())
