@@ -342,6 +342,8 @@ pub async fn watch_probe(
           error = Some("订阅已结束".to_string());
           break;
         }
+        // 探针窗口到期：长连接空闲时本来就不会有下一行，属正常结束。
+        Err(GatewayError::Timeout(_)) => break,
         Err(e) => {
           error = Some(e.to_string());
           break;

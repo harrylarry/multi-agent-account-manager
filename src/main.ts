@@ -60,6 +60,7 @@ interface SpikeWatchSummary {
   idle: number;
   duplicates: number;
   ignored: number;
+  eventsByName?: Record<string, number>;
 }
 interface SpikeWatchResult {
   ok: boolean;
@@ -746,6 +747,13 @@ function spikeDiagInnerHtml(): string {
         <div>${spikeWatch.ok ? "✓ 订阅正常" : "✗ 订阅异常"}（${spikeWatch.seconds}s，HTTP ${spikeWatch.status ?? "—"}）</div>
         <div>事件 ${s.events}：开始 ${s.turnsStarted}，消息 ${s.messagesStarted}，增量 ${s.textDeltas}，完成 ${s.messagesDone}</div>
         <div>忙碌 ${s.busy}，空闲 ${s.idle}，重复 ${s.duplicates}，忽略 ${s.ignored}</div>
+        <div>事件名：${escapeHtml(
+          Object.entries(s.eventsByName ?? {})
+            .sort((a, b) => b[1] - a[1])
+            .slice(0, 5)
+            .map(([k, v]) => `${k}×${v}`)
+            .join("，") || "—"
+        )}</div>
         ${spikeWatch.error ? `<div>错误：${escapeHtml(spikeWatch.error)}</div>` : ""}
       </div>`;
   } else if (spikeWatchError) {
