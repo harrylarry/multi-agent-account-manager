@@ -124,6 +124,34 @@ interface SpikeSendResult {
 let spikeSend: SpikeSendResult | null = null;
 let spikeSendRunning = false;
 let spikeSendError: string | null = null;
+// #18 模型指纹：只有 verdict=scored 才是有效识别；partial 只有候选排名；
+// indeterminate 不可判定（样本不足/请求或参考库失败）。
+interface SpikeFingerprintResult {
+  verdict: "scored" | "partial" | "indeterminate";
+  identification: boolean;
+  prediction: string;
+  predictionName: string;
+  familyPrediction: string;
+  familyPredictionName: string;
+  candidates: Array<{
+    model: string; displayName: string; family: string; familyName: string;
+    score: number; probability: number | null;
+  }>;
+  usedSamples: number; requiredSamples: number;
+  calibrated: boolean; probability: number | null; probabilityStatus: string;
+  evidenceLabel: string; evidenceReason: string;
+  referenceBuiltAt: string; method: string;
+  samples: Array<{ expectedCount: number; parsedNumbers: number; minimumNumbers: number; accepted: boolean }>;
+}
+interface SpikeFingerprintProbe {
+  ok: boolean; phase: string; verdict: string; identification: boolean;
+  result: SpikeFingerprintResult | null;
+  probesSent: number; samplesCollected: number; sessionId: string | null;
+  error: string | null;
+}
+let spikeFingerprint: SpikeFingerprintProbe | null = null;
+let spikeFingerprintRunning = false;
+let spikeFingerprintError: string | null = null;
 let spikeDiagnoseError: string | null = null;
 // 是否 Spike 版（bundle id 门控）：只决定顶栏徽章显不显示；诊断区不门控。
 let isSpikeBuild = false;
@@ -914,6 +942,49 @@ function spikeDiagInnerHtml(): string {
   } else if (spikeWatchError) {
     watchHtml = `<div class="spike-diag-result fail">错误：${escapeHtml(spikeWatchError)}</div>`;
   }
+  let fingerprintHtml = "";
+  if (spikeFingerprint) {
+    const f = spikeFingerprint;
+    const r = f.result;
+    const verdictLabel: Record<string, string> = {
+      scored: "已判定（校准置信度）",
+      partial: "仅候选排名（样本不足，不算有效识别）",
+      indeterminate: "不可判定（无候选）",
+    };
+    const candHtml = r && r.candidates.length
+      ? r.candidates
+          .slice(0, 5)
+          .map(
+            (c, i) =>
+              `<div>#${i + 1} ${escapeHtml(c.displayName || c.model)}（${escapeHtml(c.familyName || c.family)}）　score ${c.score.toFixed(3)}${c.probability != null ? `　p=${c.probability.toFixed(3)}` : ""}</div>`
+          )
+          .join("")
+      : "";
+    const sampleHtml = r && r.samples.length
+      ? r.samples
+          .map(
+            (s, i) =>
+              `探针${i + 1}：解析 ${s.parsedNumbers}/${s.expectedCount}（阈值 ${s.minimumNumbers}，${s.accepted ? "有效" : "无效"}）`
+          )
+          .join("　")
+      : "";
+    const cls = f.verdict === "scored" ? "ok" : f.verdict === "partial" ? "" : "fail";
+    fingerprintHtml = `
+      <div class="spike-diag-result ${cls}">
+        <div>${f.ok ? "✓" : "■"} 指纹探针：${escapeHtml(verdictLabel[f.verdict] ?? f.verdict)}（阶段 ${escapeHtml(f.phase)}）</div>
+        <div>发出探针 ${f.probesSent}/3　采到样本 ${f.samplesCollected}　参与评分 ${r?.usedSamples ?? 0}/${r?.requiredSamples ?? 3}</div>
+        ${r && r.prediction ? `<div>候选首位：${escapeHtml(r.predictionName || r.prediction)}　家族 ${escapeHtml(r.familyPredictionName || r.familyPrediction)}</div>` : ""}
+        ${r?.calibrated && r.probability != null ? `<div>校准置信度：${(r.probability * 100).toFixed(1)}%（${escapeHtml(r.probabilityStatus)}，闭集参考）</div>` : ""}
+        ${candHtml ? `<div>${candHtml}</div>` : ""}
+        ${sampleHtml ? `<div class="hint">${escapeHtml(sampleHtml)}</div>` : ""}
+        ${r?.evidenceReason ? `<div class="hint">${escapeHtml(r.evidenceLabel)}：${escapeHtml(r.evidenceReason)}</div>` : ""}
+        ${r?.referenceBuiltAt ? `<div class="hint">参考库 ${escapeHtml(r.referenceBuiltAt)}　${escapeHtml(r.method)}</div>` : ""}
+        ${f.sessionId ? `<div class="hint">隔离会话 ${escapeHtml(f.sessionId)}</div>` : ""}
+        ${f.error ? `<div>错误：${escapeHtml(f.error)}</div>` : ""}
+      </div>`;
+  } else if (spikeFingerprintError) {
+    fingerprintHtml = `<div class="spike-diag-result fail">指纹探针错误：${escapeHtml(spikeFingerprintError)}</div>`;
+  }
   return `
     <div class="spike-diag-header">
       <span class="spike-diag-title">原生诊断（Spike）</span>
@@ -924,6 +995,7 @@ function spikeDiagInnerHtml(): string {
       <button id="spike-send-btn" class="mini-btn" type="button" ${spikeSendRunning ? "disabled" : ""}>${spikeSendRunning ? "发送中…" : "发送探针"}</button>
       <button id="spike-live-btn" class="mini-btn" type="button" ${spikeLive?.running ? "disabled" : ""}>${spikeLive?.running ? "存活中…" : "存活探针 5min"}</button>
       <button id="spike-lease-btn" class="mini-btn" type="button" ${spikeLeaseRunning ? "disabled" : ""}>${spikeLeaseRunning ? "观测中…" : "租约探针"}</button>
+      <button id="spike-fingerprint-btn" class="mini-btn" type="button" ${spikeFingerprintRunning ? "disabled" : ""}>${spikeFingerprintRunning ? "检测中…" : "指纹探针 3 条"}</button>
       <button id="spike-copy-btn" class="mini-btn" type="button">复制结果</button>
     </div>
     ${resultHtml}
@@ -932,7 +1004,8 @@ function spikeDiagInnerHtml(): string {
     ${quotaHtml}
     ${sendHtml}
     ${liveHtml}
-    ${leaseHtml}`;
+    ${leaseHtml}
+    ${fingerprintHtml}`;
 }
 
 function syncSpikeDiag(): void {
@@ -1068,6 +1141,43 @@ async function runSpikeSend(): Promise<void> {
     spikeSendError = String(e);
   }
   spikeSendRunning = false;
+  syncSpikeDiag();
+}
+
+// #18 模型指纹：只应对已授权的**非主力测试账号**手动触发。探针内容是
+// 无语义整数计数（不含隐私），发往隔离会话；3 条样本不足则显示不可判定。
+async function runSpikeFingerprint(): Promise<void> {
+  if (!snapshot || spikeFingerprintRunning) return;
+  const acc = pickWatchAccount();
+  if (!acc) {
+    spikeFingerprint = null;
+    spikeFingerprintError = "没有已登录的 Muse 账号。";
+    syncSpikeDiag();
+    return;
+  }
+  const confirmed = window.confirm(
+    `将对测试账号「${acc.alias}」的隔离会话发送 3 条无语义计数探针（不是聊天内容），` +
+      "采到回答后在本地评分，不会上传第三方。确认该账号是非主力测试账号后继续。"
+  );
+  if (!confirmed) return;
+  spikeFingerprintRunning = true;
+  spikeFingerprintError = null;
+  syncSpikeDiag();
+  try {
+    spikeFingerprint = await Promise.race([
+      invoke<SpikeFingerprintProbe>("muse_native_fingerprint_probe", {
+        providerId: "muse",
+        uuid: acc.uuid,
+      }),
+      new Promise<SpikeFingerprintProbe>((_, reject) =>
+        setTimeout(() => reject(new Error("指纹探针超时（5 分钟）")), 300_000)
+      ),
+    ]);
+  } catch (e) {
+    spikeFingerprint = null;
+    spikeFingerprintError = String(e);
+  }
+  spikeFingerprintRunning = false;
   syncSpikeDiag();
 }
 
@@ -2131,6 +2241,11 @@ function bindDelegatedEvents(): void {
     const sendBtn = target.closest<HTMLElement>("#spike-send-btn");
     if (sendBtn) {
       await runSpikeSend();
+      return;
+    }
+    const fingerprintBtn = target.closest<HTMLElement>("#spike-fingerprint-btn");
+    if (fingerprintBtn) {
+      await runSpikeFingerprint();
       return;
     }
     const quotaBtn = target.closest<HTMLElement>("#spike-quota-btn");

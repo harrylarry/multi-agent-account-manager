@@ -11,6 +11,7 @@
 use muse_native_client::control_plane::ControlPlaneFetch;
 use muse_native_client::cookie::{SessionCookie, SessionCookies};
 use muse_native_client::approvals::{parse_pending, ApprovalItem};
+use muse_native_client::fingerprint::{self, FingerprintError, FingerprintResult, Sample};
 use muse_native_client::gateway::{GatewayError, MuseGateway};
 use muse_native_client::transport::{HttpRequest, Service};
 use muse_native_client::watch::{WatchSummary, WatchTracker};
@@ -381,6 +382,252 @@ pub async fn send_probe(
           error: Some(e.to_string()),
         }
       }
+    }
+  }
+}
+
+/// #18 模型指纹探针结果。verdict/identification 的语义：
+/// - `scored`：三条有效样本 + 校准置信度，是**有效识别结果**；
+/// - `partial`：部分样本，只给候选排名，不算有效识别；
+/// - `indeterminate`：不可判定（样本不足 / 请求或参考库失败），无候选。
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct FingerprintProbe {
+  pub ok: bool,
+  pub phase: String,
+  pub verdict: String,
+  pub identification: bool,
+  pub result: Option<FingerprintResult>,
+  /// 本次实际发出的探针条数（不代表成功采集数）。
+  pub probes_sent: usize,
+  /// 本次实际采到并送评分的样本数。
+  pub samples_collected: usize,
+  /// 隔离会话 id（非敏感，便于人工核对探针落在测试会话里）。
+  pub session_id: Option<String>,
+  pub error: Option<String>,
+}
+
+impl FingerprintProbe {
+  fn fail(phase: &str, verdict: &str, error: impl Into<String>) -> Self {
+    Self {
+      ok: false,
+      phase: phase.to_string(),
+      verdict: verdict.to_string(),
+      identification: false,
+      result: None,
+      probes_sent: 0,
+      samples_collected: 0,
+      session_id: None,
+      error: Some(error.into()),
+    }
+  }
+}
+
+/// #18：在隔离会话里发 3 条无语义计数探针，收齐回答后本地评分。
+///
+/// 安全约束：
+/// - 全程占用单发锁（一次指纹评估视为一笔发送事务），期间不再接受其他发送；
+/// - 每条探针"先订后发"，正文只从 chat.subscribe 收，绝不从别处拼；
+/// - 拿到明确 ack 才算发出；超时/断线不重发，样本不足就返回"不可判定"；
+/// - cookie 只内存传递，用完 zeroize；结果不含正文、不含任何凭据。
+pub async fn fingerprint_probe(
+  app: &AppHandle,
+  ledger: &crate::send_ledger::SendLedger,
+  uuid: &str,
+) -> FingerprintProbe {
+  #[cfg(target_os = "android")]
+  {
+    let _ = (app, ledger, uuid);
+    return FingerprintProbe::fail("android", "indeterminate", "指纹探针在 Android 上不可用");
+  }
+
+  #[cfg(not(target_os = "android"))]
+  {
+    use crate::send_ledger::SendError;
+
+    // 一次指纹评估 = 一笔发送事务：占用单发锁，防止与手动发送交错。
+    let send_id = match ledger.begin(uuid, "fingerprint-isolated", "[fingerprint] 3 probes") {
+      Ok(id) => id,
+      Err(SendError::Busy(existing)) => {
+        return FingerprintProbe::fail(
+          "busy",
+          "indeterminate",
+          format!("该账号已有发送在进行中（单发锁），请稍后再试：{existing}"),
+        )
+      }
+      Err(SendError::Unknown(e)) => return FingerprintProbe::fail("ledger", "indeterminate", e),
+    };
+    ledger.mark_in_flight(&send_id);
+
+    // 取 cookie（独立任务 + 竞速，避免同步阻塞打穿运行时）。
+    let app_owned = app.clone();
+    let uuid_owned = uuid.to_string();
+    let cookie_handle =
+      tokio::spawn(async move { fetch_session_cookies(&app_owned, &uuid_owned).await });
+    let mut cookies = tokio::select! {
+      res = cookie_handle => match res {
+        Ok(Ok(c)) => c,
+        Ok(Err(e)) => {
+          ledger.fail(&send_id, e.clone());
+          return FingerprintProbe::fail("cookies", "indeterminate", e);
+        }
+        Err(e) => {
+          ledger.fail(&send_id, e.to_string());
+          return FingerprintProbe::fail("cookies", "indeterminate", format!("取 cookie 任务异常: {e}"));
+        }
+      },
+      _ = tokio::time::sleep(COOKIE_TIMEOUT) => {
+        ledger.fail(&send_id, "取 cookie 超时".to_string());
+        return FingerprintProbe::fail("cookies", "indeterminate", "取 muse.ai 会话 cookie 超时（15 秒）");
+      }
+    };
+    if cookies.is_empty() {
+      cookies.zeroize();
+      ledger.fail(&send_id, "无登录态".to_string());
+      return FingerprintProbe::fail("no_cookies", "indeterminate", "该账号还没有 muse.ai 登录态");
+    }
+
+    // 生成 3 条真实探针题（lmfpd 生成器，计数 292–332，无语义无隐私）。
+    let probes = match fingerprint::generate_probes() {
+      Ok(p) => p,
+      Err(e) => {
+        cookies.zeroize();
+        ledger.fail(&send_id, e.to_string());
+        return FingerprintProbe::fail("generate", "indeterminate", e.to_string());
+      }
+    };
+
+    // 加载参考库（首次联网下载，之后 SDK 缓存）。失败不伪造候选。
+    let detector = match fingerprint::FingerprintDetector::load() {
+      Ok(d) => d,
+      Err(e) => {
+        cookies.zeroize();
+        ledger.fail(&send_id, e.to_string());
+        return FingerprintProbe::fail("reference_bank", "indeterminate", e.to_string());
+      }
+    };
+
+    let mut samples: Vec<Sample> = Vec::new();
+    let mut session_id: Option<String> = None;
+    let mut probes_sent = 0usize;
+    let mut first_error: Option<String> = None;
+
+    for probe in &probes {
+      // 先订：订阅连接必须在发送之前建立，避免漏掉正文增量头。
+      let sub_fetch = match ReqwestFetch::new() {
+        Ok(f) => f,
+        Err(e) => {
+          first_error.get_or_insert(format!("订阅 HTTP 客户端失败: {e}"));
+          continue;
+        }
+      };
+      let sub_gw = match MuseGateway::new(sub_fetch).connect(&cookies).await {
+        Ok(c) => c,
+        Err(e) => {
+          first_error.get_or_insert(format!("订阅连接失败: {e}"));
+          continue;
+        }
+      };
+      let mut sub = match muse_native_client::collect::open_subscription(sub_gw).await {
+        Ok(s) => s,
+        Err(e) => {
+          first_error.get_or_insert(format!("订阅失败: {e}"));
+          continue;
+        }
+      };
+
+      // 后发：同一隔离会话（首条建会话，后续复用其 session_id）。
+      let send_fetch = match ReqwestFetch::new() {
+        Ok(f) => f,
+        Err(e) => {
+          first_error.get_or_insert(format!("发送 HTTP 客户端失败: {e}"));
+          continue;
+        }
+      };
+      let send_gw = match MuseGateway::new(send_fetch).connect(&cookies).await {
+        Ok(c) => c,
+        Err(e) => {
+          first_error.get_or_insert(format!("发送连接失败: {e}"));
+          continue;
+        }
+      };
+      match muse_native_client::chat_send::send_message(
+        send_gw,
+        &probe.prompt,
+        "",
+        session_id.as_deref(),
+        Duration::from_secs(30),
+      )
+      .await
+      {
+        Ok((ack, sid)) => {
+          probes_sent += 1;
+          if session_id.is_none() {
+            session_id = sid.clone();
+          }
+          let msg_id = ack.get("message_id").and_then(|v| v.as_str()).map(str::to_string);
+          let collected = muse_native_client::collect::collect_text(
+            &mut sub,
+            msg_id.as_deref(),
+            Duration::from_secs(90),
+            Duration::from_secs(10),
+          )
+          .await;
+          if !collected.text.is_empty() {
+            samples.push(Sample {
+              text: collected.text,
+              expected_count: probe.expected_count,
+            });
+          } else {
+            first_error.get_or_insert(format!(
+              "探针 {} 未采到正文（结束原因 {}）",
+              probe.id, collected.ended_by
+            ));
+          }
+        }
+        Err(e) => {
+          // 明确 ack 没拿到：不重发，记一条失败，继续下一条探针。
+          first_error.get_or_insert(format!("发送探针 {} 失败: {e}", probe.id));
+        }
+      }
+    }
+
+    // cookie 不再需要，立即清零。
+    cookies.zeroize();
+
+    let samples_collected = samples.len();
+    let result = if samples.is_empty() {
+      fingerprint::FingerprintResult::indeterminate(
+        first_error
+          .unwrap_or_else(|| "三条探针均未采到有效正文".to_string()),
+        detector.built_at().to_string(),
+      )
+    } else {
+      match detector.score(&samples) {
+        Ok(r) => r,
+        Err(FingerprintError::Scoring(e)) => fingerprint::FingerprintResult::indeterminate(
+          format!("评分失败: {e}"),
+          detector.built_at().to_string(),
+        ),
+        Err(e) => fingerprint::FingerprintResult::indeterminate(
+          e.to_string(),
+          detector.built_at().to_string(),
+        ),
+      }
+    };
+
+    let ok = result.identification || result.verdict == fingerprint::Verdict::Partial;
+    ledger.confirm(&send_id);
+    FingerprintProbe {
+      ok,
+      phase: "done".to_string(),
+      verdict: result.verdict.as_str().to_string(),
+      identification: result.identification,
+      result: Some(result),
+      probes_sent,
+      samples_collected,
+      session_id,
+      error: None,
     }
   }
 }

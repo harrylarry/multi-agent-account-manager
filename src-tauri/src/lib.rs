@@ -271,6 +271,21 @@ async fn muse_native_send_probe(
   .await)
 }
 
+/// #18：模型指纹探针（隔离会话发 3 条计数探针 + lmfpd 本地评分）。
+/// verdict 只有 scored 才是有效识别；partial 只是候选排名；indeterminate 不可判定。
+#[tauri::command]
+async fn muse_native_fingerprint_probe(
+  app: AppHandle,
+  provider_id: String,
+  uuid: String,
+  ledger: tauri::State<'_, std::sync::Arc<send_ledger::SendLedger>>,
+) -> Result<muse_native::FingerprintProbe, String> {
+  if provider_id != "muse" {
+    return Err("指纹探针只支持 Muse 账号".to_string());
+  }
+  Ok(muse_native::fingerprint_probe(&app, &ledger, &uuid).await)
+}
+
 /// #10：开始一次存活探针（长连接 + 订阅，记录到断开为止）。
 #[tauri::command]
 fn muse_native_liveness_start(
@@ -405,6 +420,7 @@ pub fn run() {
       muse_native_approvals_probe,
       muse_native_quota_probe,
       muse_native_send_probe,
+      muse_native_fingerprint_probe,
       muse_native_liveness_start,
       muse_native_liveness_status,
       muse_native_lease_probe,
