@@ -12,6 +12,10 @@ use serde_json::Value;
 use std::time::Duration;
 
 const ORIGIN: &str = "https://muse.ai";
+/// BotArk `docs/museai/QUOTA.md` 记录的已知 action id（可能随发版轮换，仅作首个候选）。
+const FALLBACK_ACTION_ID: &str = "409b972cbb33d3e372f4ca9d3c8332677217064f62";
+/// 与网关一致的 UA：部分 Server Action 会校验来源浏览器。
+const UA: &str = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/156.0.0.0 Safari/537.36";
 
 #[derive(Debug, Clone, Default, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -113,6 +117,29 @@ pub fn find_action_id(text: &str) -> Option<String> {
     }
     from = start;
   }
+  // 兜底：任意位置出现 fetchSubscriptionAction，在其前后 120 字符里找 40–44 位 hex。
+  if let Some(p) = text.find("fetchSubscriptionAction") {
+    let lo = p.saturating_sub(120);
+    let hi = (p + 120).min(text.len());
+    let window = &text[lo..hi];
+    let bytes = window.as_bytes();
+    let mut i = 0usize;
+    while i < bytes.len() {
+      if bytes[i].is_ascii_hexdigit() {
+        let start = i;
+        while i < bytes.len() && bytes[i].is_ascii_hexdigit() {
+          i += 1;
+        }
+        let run = &window[start..i];
+        let all_digits_and_hex_ok = run.chars().all(|c| c.is_ascii_hexdigit());
+        if all_digits_and_hex_ok && (40..=44).contains(&run.len()) {
+          return Some(run.to_string());
+        }
+      } else {
+        i += 1;
+      }
+    }
+  }
   None
 }
 
@@ -129,6 +156,7 @@ async fn post_action(
     .header("Origin", ORIGIN)
     .header("Referer", format!("{ORIGIN}/"))
     .header("Cookie", cookie)
+    .header("User-Agent", UA)
     .body(r#"[{"includeAgreement":false}]"#)
     .send()
     .await
@@ -152,6 +180,9 @@ async fn get_text(
     .header("Accept", accept)
     .header("Accept-Language", "en-US")
     .header("Cookie", cookie)
+    .header("User-Agent", UA)
+    .header("Origin", ORIGIN)
+    .header("Referer", format!("{ORIGIN}/"))
     .send()
     .await
     .map_err(|e| e.to_string())?;
@@ -217,27 +248,53 @@ pub async fn fetch_quota(cookie: &str, cached_action: Option<&str>) -> Result<Qu
     .timeout(Duration::from_secs(20))
     .build()
     .map_err(|e| e.to_string())?;
+  let mut tried: Vec<String> = Vec::new();
+
+  let mut candidates: Vec<String> = Vec::new();
   if let Some(id) = cached_action {
-    if let Some(q) = post_action(&client, cookie, id).await? {
-      return Ok(q);
+    candidates.push(id.to_string());
+  }
+  candidates.push(FALLBACK_ACTION_ID.to_string());
+
+  for id in &candidates {
+    match post_action(&client, cookie, id).await {
+      Ok(Some(q)) => return Ok(q),
+      Ok(None) => tried.push(format!("action {}:no-json", &id[..8.min(id.len())])),
+      Err(e) => tried.push(format!("action {}:{}", &id[..8.min(id.len())], e)),
     }
   }
-  if let Some(id) = discover_action_id(&client, cookie).await {
-    if let Some(q) = post_action(&client, cookie, &id).await? {
-      return Ok(q);
-    }
-  }
-  for ep in ["/api/subscription", "/api/hatch/subscription", "/api/billing/subscription"] {
-    if let Ok(body) = get_text(&client, cookie, &format!("{ORIGIN}{ep}"), "application/json").await {
-      if let Ok(v) = serde_json::from_str::<Value>(&body) {
-        if let Some(mut q) = parse_subscription(&v) {
-          q.source = "rest".to_string();
-          return Ok(q);
+
+  match discover_action_id(&client, cookie).await {
+    Some(id) => {
+      if !candidates.contains(&id) {
+        match post_action(&client, cookie, &id).await {
+          Ok(Some(q)) => return Ok(q),
+          Ok(None) => tried.push("discovered:no-json".to_string()),
+          Err(e) => tried.push(format!("discovered:{e}")),
         }
       }
     }
+    None => tried.push("discover:none".to_string()),
   }
-  Err("quota: fetchSubscriptionAction unavailable".to_string())
+
+  for ep in ["/api/subscription", "/api/hatch/subscription", "/api/billing/subscription"] {
+    match get_text(&client, cookie, &format!("{ORIGIN}{ep}"), "application/json").await {
+      Ok(body) => {
+        if let Ok(v) = serde_json::from_str::<Value>(&body) {
+          if let Some(mut q) = parse_subscription(&v) {
+            q.source = "rest".to_string();
+            return Ok(q);
+          }
+          tried.push(format!("rest {ep}:no-quota"));
+        } else {
+          tried.push(format!("rest {ep}:not-json"));
+        }
+      }
+      Err(e) => tried.push(format!("rest {ep}:{e}")),
+    }
+  }
+
+  Err(format!("quota unavailable（{}）", tried.join("；")))
 }
 
 #[cfg(test)]
@@ -276,6 +333,14 @@ mod tests {
     assert_eq!(find_action_id(&js), Some(hex.clone()));
     let far = format!(r#"createServerReference("{hex}");{}{}"#, "x".repeat(400), "fetchSubscriptionAction");
     assert_eq!(find_action_id(&far), None);
+  }
+
+  #[test]
+  fn finds_action_id_loose_pattern() {
+    let hex = "b".repeat(42);
+    let js = format!(r#"minified.fetchSubscriptionAction,{hex},other,"#);
+    assert_eq!(find_action_id(&js), Some(hex));
+    assert!(find_action_id("no hex here fetchSubscriptionAction").is_none());
   }
 
   #[test]
