@@ -73,6 +73,7 @@ interface SpikeWatchResult {
 let spikeWatch: SpikeWatchResult | null = null;
 let spikeWatchRunning = false;
 let spikeWatchError: string | null = null;
+let spikeWatchAccount: string | null = null;
 let spikeDiagnoseError: string | null = null;
 // 是否 Spike 版（bundle id 门控）：只决定顶栏徽章显不显示；诊断区不门控。
 let isSpikeBuild = false;
@@ -745,6 +746,7 @@ function spikeDiagInnerHtml(): string {
     watchHtml = `
       <div class="spike-diag-result ${spikeWatch.ok ? "ok" : "fail"}">
         <div>${spikeWatch.ok ? "✓ 订阅正常" : "✗ 订阅异常"}（${spikeWatch.seconds}s，HTTP ${spikeWatch.status ?? "—"}）</div>
+        <div>账号：${escapeHtml(spikeWatchAccount ?? "—")}（优先当前活跃账号）</div>
         <div>事件 ${s.events}：开始 ${s.turnsStarted}，消息 ${s.messagesStarted}，增量 ${s.textDeltas}，完成 ${s.messagesDone}</div>
         <div>忙碌 ${s.busy}，空闲 ${s.idle}，重复 ${s.duplicates}，忽略 ${s.ignored}</div>
         <div>事件名：${escapeHtml(
@@ -775,11 +777,22 @@ function syncSpikeDiag(): void {
   el.innerHTML = spikeDiagInnerHtml();
 }
 
-async function runSpikeWatch(): Promise<void> {
-  if (!snapshot || spikeWatchRunning) return;
-  const acc = snapshot.accounts.find(
+function pickWatchAccount(): AccountRecord | undefined {
+  if (!snapshot) return undefined;
+  const active = snapshot.activeAccount;
+  if (active) {
+    const a = snapshot.accounts.find((x) => isSameKey(active, x));
+    if (a && a.providerId === "muse" && a.authState === "authenticated") return a;
+  }
+  return snapshot.accounts.find(
     (a) => a.providerId === "muse" && a.authState === "authenticated"
   );
+}
+
+async function runSpikeWatch(): Promise<void> {
+  if (!snapshot || spikeWatchRunning) return;
+  const acc = pickWatchAccount();
+  spikeWatchAccount = acc?.alias ?? null;
   if (!acc) {
     spikeWatch = null;
     spikeWatchError = "没有已登录的 Muse 账号，请先登录一个测试账号。";
