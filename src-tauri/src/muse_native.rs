@@ -337,7 +337,7 @@ pub async fn send_probe(
       }
     };
     let gateway = MuseGateway::new(fetch);
-    let mut connected = match gateway.connect(&cookies).await {
+    let connected = match gateway.connect(&cookies).await {
       Ok(c) => c,
       Err(e) => {
         cookies.zeroize();
@@ -352,8 +352,9 @@ pub async fn send_probe(
     cookies.zeroize();
     ledger.mark_in_flight(&send_id);
 
+    // 发送用一次性连接：mark_in_flight 之后所有权交给 send_message。
     match muse_native_client::chat_send::send_message(
-      &mut connected,
+      connected,
       text,
       node_id,
       session_id,

@@ -40,7 +40,7 @@ pub fn build_params(text: &str, node_id: &str, session_id: Option<&str>) -> Valu
 
 /// 发送一次并等待 ack（首个非 event 行）。返回 (ack JSON, session_id)。
 pub async fn send_message(
-  gw: &mut ConnectedGateway,
+  gw: ConnectedGateway,
   text: &str,
   node_id: &str,
   session_id: Option<&str>,
