@@ -603,19 +603,45 @@ pub struct LeaseProbe {
   pub vm_name: String,
   pub first_expires_at_ms: Option<i64>,
   pub ttl_seconds: Option<i64>,
-  /// 连续两次 lease 的到期时间是否变化：用于判断上游是否续租。
-  pub renewed: Option<bool>,
+  /// 上游是否真的返回了到期字段；缺失时一切都只能算「不可观测」。
+  pub expiry_field_present: bool,
+  /// `not_attempted` / `unobservable` / `unchanged` / `changed`。
+  /// 注意：`changed` 只代表**到期字段变化**，不等于自动续租。
+  pub renewal: String,
+  /// 是否已确认存在自动续租行为。只有长期观测到多次「到期时间随租期前移」
+  /// 才能置 true；单次探针永远无法确认，故当前恒为 false。
+  pub renewal_confirmed: bool,
   pub second_expires_at_ms: Option<i64>,
+  /// 本次探针实际发出的控制面调用（vmType + 结果），用于评估副作用。
+  pub calls: Vec<String>,
+  /// 副作用说明：探针不调用 wake，但 lease-vm 本身是否会导致 VM 分配/唤醒属于未验证。
+  pub side_effects_note: String,
   pub error: Option<String>,
 }
 
-/// #8：执行一次（或两次）`lease-vm`，报告租期字段与续租表现。
-/// 只读控制面，不建立 Noise 连接、不发消息、不打印 token。
+/// 两次租约的到期字段对比结论。刻意不让「字段变化」等同于「自动续租」。
+pub fn renewal_verdict(first: Option<i64>, second: Option<i64>) -> &'static str {
+  match (first, second) {
+    // 两次都拿不到到期字段：无法判断，不能报「无变化」。
+    (None, None) => "unobservable",
+    // 一次有、一次没有：连字段稳定性都不成立。
+    (a, b) if a.is_some() != b.is_some() => "unobservable",
+    (Some(a), Some(b)) if a == b => "unchanged",
+    (Some(_), Some(_)) => "changed",
+  }
+}
+
+/// #8：只读控制面执行 `lease-vm`，报告租期字段与「到期字段是否变化」。
+/// 明确不做的事：不调用 `wake()`、不建 Noise 连接、不发消息、不打印 token。
+/// 未验证的是：`lease-vm` 在服务端是否会造成 VM 分配或唤醒（见 side_effects_note）。
 pub async fn lease_probe(app: &AppHandle, uuid: &str, twice: bool) -> Result<LeaseProbe, String> {
   let cookie = cookie_header_for(app, uuid).await?;
   let cookies = muse_native_client::cookie::SessionCookies::from_header(&cookie);
   let fetch = ReqwestFetch::new()?;
   let mut cp = muse_native_client::control_plane::MuseControlPlane::new(fetch, cookies);
+  let note = "探针不调用 wake()；每次 lease_vm 依次尝试 standard 与 hatch_vm（最多 2 次 POST /api/hatch/lease-vm）。\该接口在服务端是否触发 VM 分配/唤醒未经证实，因此不要把本探针当作「无副作用」。"
+    .to_string();
+
   let lease = match cp.lease_vm().await {
     Ok(l) => l,
     Err(e) => {
@@ -626,12 +652,17 @@ pub async fn lease_probe(app: &AppHandle, uuid: &str, twice: bool) -> Result<Lea
         vm_name: String::new(),
         first_expires_at_ms: None,
         ttl_seconds: None,
-        renewed: None,
+        expiry_field_present: false,
+        renewal: "not_attempted".to_string(),
+        renewal_confirmed: false,
         second_expires_at_ms: None,
+        calls: cp.lease_calls.clone(),
+        side_effects_note: note,
         error: Some(e.to_string()),
       })
     }
   };
+
   let host = lease
     .gateway_url
     .split("://")
@@ -641,21 +672,24 @@ pub async fn lease_probe(app: &AppHandle, uuid: &str, twice: bool) -> Result<Lea
     .next()
     .unwrap_or("")
     .to_string();
+
   let first = lease.expires_at_ms;
   let ttl = lease.ttl_seconds;
   let vm_name = lease.vm_name.clone();
 
-  let (renewed, second) = if twice {
+  let (renewal, second) = if !twice {
+    ("not_attempted".to_string(), None)
+  } else {
     tokio::time::sleep(Duration::from_secs(2)).await;
     match cp.lease_vm().await {
-      Ok(l2) => (
-        Some(l2.expires_at_ms != first),
-        l2.expires_at_ms,
-      ),
-      Err(_) => (None, None),
+      Ok(l2) => {
+        let second = l2.expires_at_ms;
+        // 关键：两者都缺失 → 不可观测；相等 → 字段未变化；
+        // 不等 → 仅说明字段变了，不能据此断言自动续租。
+        (renewal_verdict(first, second).to_string(), second)
+      }
+      Err(_) => ("unobservable".to_string(), None),
     }
-  } else {
-    (None, None)
   };
 
   Ok(LeaseProbe {
@@ -665,8 +699,12 @@ pub async fn lease_probe(app: &AppHandle, uuid: &str, twice: bool) -> Result<Lea
     vm_name,
     first_expires_at_ms: first,
     ttl_seconds: ttl,
-    renewed,
+    expiry_field_present: first.is_some() || ttl.is_some(),
+    renewal,
+    renewal_confirmed: false,
     second_expires_at_ms: second,
+    calls: cp.lease_calls.clone(),
+    side_effects_note: note,
     error: None,
   })
 }
@@ -1046,5 +1084,24 @@ pub async fn maybe_auto_diagnose(app: &AppHandle, mgr: &Arc<SessionManager>) {
       r.ok, r.phase, r.handshake_completed, r.ping_status, r.cvm_detected, r.error
     ),
     Err(e) => eprintln!("[muse-native] spike auto-diagnose failed: {e}"),
+  }
+
+  #[test]
+  fn renewal_verdict_cases() {
+    // 都缺失 → 不可观测（关键回归：不能当成「无变化」）
+    assert_eq!(renewal_verdict(None, None), "unobservable");
+    // 相等 → 未变化
+    assert_eq!(
+      renewal_verdict(Some(1_762_100_300_000), Some(1_762_100_300_000)),
+      "unchanged"
+    );
+    // 不等 → 字段变化，但语义上≠自动续租（转换在 UI 文案里强调）
+    assert_eq!(
+      renewal_verdict(Some(1_762_100_300_000), Some(1_762_100_400_000)),
+      "changed"
+    );
+    // 一有一缺 → 不可观测
+    assert_eq!(renewal_verdict(Some(1), None), "unobservable");
+    assert_eq!(renewal_verdict(None, Some(1)), "unobservable");
   }
 }

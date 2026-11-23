@@ -92,6 +92,8 @@ pub struct MuseControlPlane<F: ControlPlaneFetch> {
   cookies: SessionCookies,
   lease: Option<VmLease>,
   wake_retry: u32,
+  /// 每次 `lease-vm` 尝试的轨迹（vmType + 结果），只读诊断用。
+  pub lease_calls: Vec<String>,
 }
 
 /// 从任意数字/字符串字段读时间戳并归一到毫秒（>1e12 视为已是毫秒）。
@@ -123,6 +125,7 @@ impl<F: ControlPlaneFetch> MuseControlPlane<F> {
       cookies,
       lease: None,
       wake_retry: 0,
+      lease_calls: Vec::new(),
     }
   }
 
@@ -259,6 +262,10 @@ impl<F: ControlPlaneFetch> MuseControlPlane<F> {
         .await
       {
         Ok(d) => {
+          self.lease_calls.push(format!(
+            "lease-vm({vm_type}) → {}",
+            d.get("status").and_then(|v| v.as_str()).unwrap_or("unknown")
+          ));
           let gateway_url = d
             .get("gatewayUrl")
             .and_then(|v| v.as_str())
@@ -324,6 +331,7 @@ impl<F: ControlPlaneFetch> MuseControlPlane<F> {
           ));
         }
         Err(e) => {
+          self.lease_calls.push(format!("lease-vm({vm_type}) → 失败"));
           if e.code == Some(ControlPlaneCode::SignedOut) {
             return Err(e);
           }

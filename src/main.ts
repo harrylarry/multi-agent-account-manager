@@ -110,7 +110,9 @@ let spikeLiveRefreshing = false;
 interface SpikeLease {
   ok: boolean; phase: string; gatewayHost: string; vmName: string;
   firstExpiresAtMs: number | null; ttlSeconds: number | null;
-  renewed: boolean | null; secondExpiresAtMs: number | null; error: string | null;
+  expiryFieldPresent: boolean; renewal: string; renewalConfirmed: boolean;
+  secondExpiresAtMs: number | null; calls: string[]; sideEffectsNote: string;
+  error: string | null;
 }
 let spikeLease: SpikeLease | null = null;
 let spikeLeaseRunning = false;
@@ -816,11 +818,20 @@ function spikeDiagInnerHtml(): string {
   if (spikeLease) {
     const l = spikeLease;
     const fmt = (ms: number | null) => (ms ? new Date(ms).toLocaleString() : "—");
+    const renewalLabel: Record<string, string> = {
+      not_attempted: "未测（只取一次租约）",
+      unobservable: "不可观测（到期字段缺失或前后不一致）",
+      unchanged: "到期字段未变化",
+      changed: "到期字段变化（≠ 自动续租）",
+    };
     leaseHtml = `
       <div class="spike-diag-result ${l.ok ? "ok" : "fail"}">
         <div>${l.ok ? "✓ 已取得 VM 租约" : "✗ 租约获取失败"}（阶段 ${escapeHtml(l.phase)}）</div>
         ${l.ok ? `<div>VM：${escapeHtml(l.vmName || "—")}　网关：${escapeHtml(l.gatewayHost || "—")}</div>` : ""}
-        ${l.ok ? `<div>到期 ${fmt(l.firstExpiresAtMs)}　TTL ${l.ttlSeconds ?? "—"}s　续租 ${l.renewed === null ? "未测" : l.renewed ? "有变化" : "无变化"}</div>` : ""}
+        ${l.ok ? `<div>到期 ${fmt(l.firstExpiresAtMs)}　TTL ${l.ttlSeconds ?? "—"}s　到期字段${l.expiryFieldPresent ? "存在" : "缺失"}</div>` : ""}
+        ${l.ok ? `<div>续租：${escapeHtml(renewalLabel[l.renewal] ?? l.renewal)}${l.renewalConfirmed ? "" : "　（未确认）"}</div>` : ""}
+        ${l.calls.length ? `<div>调用：${escapeHtml(l.calls.join("；"))}</div>` : ""}
+        ${l.ok ? `<div class="hint">${escapeHtml(l.sideEffectsNote)}</div>` : ""}
         ${l.error ? `<div>错误：${escapeHtml(l.error)}</div>` : ""}
       </div>`;
   } else if (spikeLeaseError) {
