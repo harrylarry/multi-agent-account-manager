@@ -236,13 +236,13 @@ async fn muse_native_send_probe(
 
 /// #10：开始一次存活探针（长连接 + 订阅，记录到断开为止）。
 #[tauri::command]
-fn muse_native_liveness_start(
+async fn muse_native_liveness_start(
   app: AppHandle,
   uuid: String,
   seconds: u64,
   state: tauri::State<'_, std::sync::Arc<muse_native::LivenessState>>,
 ) -> muse_native::Liveness {
-  muse_native::liveness_start(&app, &state, &uuid, seconds);
+  muse_native::liveness_start(&app, &state, &uuid, seconds).await;
   state.snapshot()
 }
 

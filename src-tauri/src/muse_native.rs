@@ -421,7 +421,7 @@ fn now_ms_u128() -> u128 {
 
 /// 开一条长连接并持续读事件，直到超时或断开；结果写进共享状态。
 /// 用途是实测「App 退到后台后连接还能活多久」，不做保活、不重连。
-pub fn liveness_start(
+pub async fn liveness_start(
   app: &AppHandle,
   state: &std::sync::Arc<LivenessState>,
   uuid: &str,
@@ -442,7 +442,8 @@ pub fn liveness_start(
   let app_owned = app.clone();
   let uuid_owned = uuid.to_string();
   let state_owned = state.clone();
-  tokio::spawn(async move {
+  // 用 Tauri 的运行时 spawn：即使命令在非 tokio 上下文被调用也不会 panic。
+  tauri::async_runtime::spawn(async move {
     #[cfg(target_os = "android")]
     {
       let _ = (app_owned, uuid_owned, seconds);
