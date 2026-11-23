@@ -580,6 +580,53 @@ pub async fn fetch_text(
     .map_err(|e| e.to_string())
 }
 
+/// #11/#16（补 W）：把每账号代理写入 iOS 侧 WKWebView 配置。
+///
+/// iOS 17+ 只有 `WKWebsiteDataStore.proxyConfigurations` 能影响 WKWebView 的
+/// 出站，Rust 侧的 reqwest / 网关隧道都管不到它，所以必须单独下发一次。
+/// 口令不走这个接口：Swift 侧按 `proxy-<uuid>` 从同一个 Keychain service
+/// 读取（见主 crate `secrets.rs` 的 `SERVICE`）。
+#[cfg(target_os = "ios")]
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SetAccountProxyPayload {
+  pub uuid: String,
+  /// http | https | socks5 | socks5h
+  pub scheme: String,
+  pub host: String,
+  pub port: u16,
+  #[serde(skip_serializing_if = "Option::is_none")]
+  pub username: Option<String>,
+  pub enabled: bool,
+}
+
+#[cfg(target_os = "ios")]
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SetAccountProxyResponse {
+  /// 配置是否已实际应用（iOS < 17 或参数非法时为 false）。
+  #[serde(default)]
+  pub applied: bool,
+  /// 该账号的会话当前正打开：新配置要重新打开会话才生效。
+  #[serde(default)]
+  pub session_open: bool,
+  #[serde(default)]
+  pub reason: Option<String>,
+}
+
+#[cfg(target_os = "ios")]
+pub async fn set_account_proxy(
+  app: &AppHandle,
+  payload: SetAccountProxyPayload,
+) -> Result<SetAccountProxyResponse, String> {
+  let bridge = app.state::<IosSessionBridge<tauri::Wry>>();
+  bridge
+    .0
+    .run_mobile_plugin_async("setAccountProxy", payload)
+    .await
+    .map_err(|e| e.to_string())
+}
+
 // Batch-1: background quota sync (iOS). Rust passes the accounts to sync
 // (already filtered: enabled, not the active one); Swift probes each
 // account's parked page or a hidden one-shot webview and returns the

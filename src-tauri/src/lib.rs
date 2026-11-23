@@ -208,10 +208,35 @@ async fn muse_native_quota_probe(
   provider_id: String,
   uuid: String,
   cache: tauri::State<'_, std::sync::Arc<quota::ActionCache>>,
+  mgr: State<'_, Arc<SessionManager>>,
 ) -> Result<QuotaProbe, String> {
   if provider_id != "muse" {
     return Err("额度探针只支持 Muse 账号".to_string());
   }
+  // 额度请求也属于账号出站流量：启用代理的账号必须经代理，解析失败即失败。
+  let setting = account_proxy_setting(&mgr, &provider_id, &uuid).await;
+  let egress = match egress::resolve_for_app(&app, setting.as_ref()) {
+    Ok(e) => e,
+    Err(e) => {
+      return Ok(QuotaProbe {
+        ok: false,
+        quota: None,
+        diag: vec![format!("出站策略不可用（未回退直连）: {e}")],
+        error: Some(e),
+      })
+    }
+  };
+  let client = match egress.http_client(std::time::Duration::from_secs(15), false) {
+    Ok(c) => c,
+    Err(e) => {
+      return Ok(QuotaProbe {
+        ok: false,
+        quota: None,
+        diag: vec![format!("HTTP 客户端不可用: {e}")],
+        error: Some(e.to_string()),
+      })
+    }
+  };
   let cookie = match muse_native::cookie_header_for(&app, &uuid).await {
     Ok(c) => c,
     Err(e) => {
@@ -224,7 +249,10 @@ async fn muse_native_quota_probe(
     }
   };
   let cached = cache.get();
-  let (result, mut diag) = quota::fetch_quota_v2(&cookie, cached.as_deref()).await;
+  let (result, mut diag) = quota::fetch_quota_v2(&client, &cookie, cached.as_deref()).await;
+  if egress.is_proxy() {
+    diag.insert(0, format!("出站：经代理 {}", egress.display));
+  }
   if let Some(c) = cached.as_deref() {
     diag.insert(0, format!("使用缓存 action {}", &c[..8.min(c.len())]));
   }
@@ -344,6 +372,15 @@ async fn muse_native_proxy_probe(
   Ok(muse_native::proxy_probe(&app, &uuid, &proxy_uri).await)
 }
 
+/// 平台原生 WebView 侧的代理应用结果。
+#[derive(serde::Serialize, Clone)]
+#[serde(rename_all = "camelCase")]
+pub struct WebviewProxyView {
+  pub applied: bool,
+  pub session_open: bool,
+  pub reason: Option<String>,
+}
+
 /// 账号代理配置的脱敏视图（不含口令）。
 #[derive(serde::Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -351,6 +388,77 @@ pub struct ProxySettingView {
   pub enabled: bool,
   pub display: String,
   pub has_credentials: bool,
+  /// iOS：账号 WebView（WKWebView）侧的代理应用结果；其它平台为 `None`（不适用，
+  /// 桌面 WebView 走系统代理）。`None` 不代表“已生效”，只代表“无此层”。
+  pub webview: Option<WebviewProxyView>,
+}
+
+/// #11/#16（补 W）：把账号代理下发给 iOS 侧的 WKWebView。
+///
+/// WKWebView 的出站不受 Rust reqwest / 网关隧道影响，iOS 17+ 只能通过
+/// `WKWebsiteDataStore.proxyConfigurations` 设置，所以必须单独下发一次。
+/// 口令不下发：Swift 按 `proxy-<uuid>` 从同一个 Keychain service 读取。
+#[cfg(target_os = "ios")]
+async fn apply_webview_proxy(
+  app: &AppHandle,
+  uuid: &str,
+  setting: Option<&storage::ProxySetting>,
+) -> Option<WebviewProxyView> {
+  use platform::ios::{SetAccountProxyPayload, set_account_proxy};
+
+  let payload = match setting {
+    Some(s) if s.enabled => match muse_native_client::proxy::ProxyConfig::parse_endpoint(&s.uri) {
+      Ok(ep) => SetAccountProxyPayload {
+        uuid: uuid.to_string(),
+        scheme: ep.scheme.to_string(),
+        host: ep.host,
+        port: ep.port,
+        // 端点里的用户名优先；单独填的 username 字段兜底（uri 不带 userinfo 的情形）。
+        username: ep.username.or_else(|| s.effective_username()),
+        enabled: true,
+      },
+      Err(e) => {
+        return Some(WebviewProxyView {
+          applied: false,
+          session_open: false,
+          reason: Some(format!("代理端点无法下发给 WebView: {e}")),
+        })
+      }
+    },
+    // 未配置 / 未启用：清除 WebView 侧配置。
+    _ => SetAccountProxyPayload {
+      uuid: uuid.to_string(),
+      scheme: "http".to_string(),
+      host: String::new(),
+      port: 0,
+      username: None,
+      enabled: false,
+    },
+  };
+
+  Some(match set_account_proxy(app, payload).await {
+    Ok(r) => WebviewProxyView {
+      applied: r.applied,
+      session_open: r.session_open,
+      reason: r.reason,
+    },
+    Err(e) => WebviewProxyView {
+      applied: false,
+      session_open: false,
+      reason: Some(format!("下发 WebView 代理失败: {e}")),
+    },
+  })
+}
+
+#[cfg(not(target_os = "ios"))]
+async fn apply_webview_proxy(
+  _app: &AppHandle,
+  _uuid: &str,
+  _setting: Option<&storage::ProxySetting>,
+) -> Option<WebviewProxyView> {
+  // 桌面 / Android 没有“每账号 WebView 代理”这一层（桌面 WKWebView/WebView2
+  // 走系统代理）。明确返回 None，不伪装成已生效。
+  None
 }
 
 fn uri_userinfo(uri: &str) -> Option<&str> {
@@ -413,10 +521,16 @@ async fn muse_native_set_account_proxy(
   }
   mgr.set_account_proxy(pid, &uuid, Some(setting.clone())).await?;
 
+  // 先落 Rust 侧配置，再下发到 WebView：即使下发失败，账号的 Rust 出站
+  // 仍然是 fail-closed（不会因为 WebView 失败而退回直连）。
+  // enabled=false 时 helper 内部会清除 WebView 侧配置。
+  let webview = apply_webview_proxy(&app, &uuid, Some(&setting)).await;
+
   Ok(ProxySettingView {
     enabled: setting.enabled,
     display: setting.display_safe(),
     has_credentials: setting.credential_ref.is_some(),
+    webview,
   })
 }
 
@@ -433,6 +547,7 @@ async fn muse_native_get_account_proxy(
     enabled: s.enabled,
     display: s.display_safe(),
     has_credentials: s.credential_ref.is_some(),
+    webview: None,
   }))
 }
 
@@ -454,7 +569,10 @@ async fn muse_native_clear_account_proxy(
     }
   }
   let _ = secrets.delete(&format!("proxy-{uuid}"));
-  mgr.set_account_proxy(pid, &uuid, None).await
+  mgr.set_account_proxy(pid, &uuid, None).await?;
+  // WebView 侧同步清除；失败不回滚 Rust 侧（清除本身是安全方向）。
+  let _ = apply_webview_proxy(&app, &uuid, None).await;
+  Ok(())
 }
 
 /// #11/#16：请求取消该账号正在运行的长任务（指纹/发送/订阅等）。
@@ -473,7 +591,7 @@ fn muse_native_cancel_probe(
 
 /// #10：开始一次存活探针（长连接 + 订阅，记录到断开为止）。
 #[tauri::command]
-fn muse_native_liveness_start(
+async fn muse_native_liveness_start(
   app: AppHandle,
   uuid: String,
   seconds: u64,

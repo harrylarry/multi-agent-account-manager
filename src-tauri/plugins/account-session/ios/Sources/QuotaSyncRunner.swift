@@ -176,7 +176,16 @@ enum QuotaSyncRunner {
         return
       }
       let config = WKWebViewConfiguration()
-      config.websiteDataStore = WKWebsiteDataStore(forIdentifier: identifier)
+      let store = WKWebsiteDataStore(forIdentifier: identifier)
+      config.websiteDataStore = store
+      // #11/#16：后台额度同步也是账号出站流量——启用代理的账号必须走代理；
+      // 代理不可用则直接放弃本次探测（fail-closed，不回退直连）。
+      if let proxy = AccountProxyStore.config(for: target.uuid), proxy.enabled {
+        if !AccountProxyApplier.apply(cfg: proxy, uuid: target.uuid, to: store) {
+          finish(nil)
+          return
+        }
+      }
       config.defaultWebpagePreferences.allowsContentJavaScript = true
       config.preferences.javaScriptCanOpenWindowsAutomatically = false
       config.userContentController.addUserScript(

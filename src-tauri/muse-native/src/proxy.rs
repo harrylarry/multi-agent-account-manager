@@ -107,6 +107,16 @@ impl From<io::Error> for ProxyError {
   }
 }
 
+/// 代理端点（不含任何凭据），用于把配置下发给平台原生层。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ProxyEndpoint {
+  /// `http` | `https` | `socks5`
+  pub scheme: &'static str,
+  pub host: String,
+  pub port: u16,
+  pub username: Option<String>,
+}
+
 impl ProxyConfig {
   /// 解析 `http[s]://[user:pass@]host[:port]` 或 `socks5://[...]`。
   pub fn parse(uri: &str) -> Result<Self, ProxyError> {
@@ -172,7 +182,6 @@ impl ProxyConfig {
   }
 
   /// 仅校验 URI 形状（scheme / host / port / userinfo 语法），不要求提供密码。
-  ///
   /// 供配置保存前调用：密码存在 Keychain，`uri` 里只允许出现用户名。
   pub fn validate_shape(uri: &str) -> Result<(), ProxyError> {
     let (scheme, rest) = uri
@@ -204,8 +213,56 @@ impl ProxyConfig {
     Ok(())
   }
 
+  /// 解析出**端点信息**（scheme / host / port / 用户名），不需要也不保留密码。
+  ///
+  /// 用于把代理配置下发给平台原生层（如 iOS 的
+  /// `WKWebsiteDataStore.proxyConfigurations`）：原生层拿不到也不需要口令，
+  /// 口令由它自己从同一个 Keychain 条目读取。
+  pub fn parse_endpoint(uri: &str) -> Result<ProxyEndpoint, ProxyError> {
+    Self::validate_shape(uri)?;
+    let (scheme, rest) = uri
+      .split_once("://")
+      .ok_or_else(|| ProxyError::InvalidUri("缺少 :// 分隔符".to_string()))?;
+    let scheme = scheme_from_str(scheme)?;
+    let rest = rest.split('/').next().unwrap_or("");
+    let (authority, userinfo) = match rest.rsplit_once('@') {
+      Some((u, a)) => (a, Some(u)),
+      None => (rest, None),
+    };
+    let (host, port) = parse_host_port(authority, scheme)?;
+    let username = match userinfo {
+      Some(ui) => {
+        let (u, _p) = ui.split_once(':').unwrap_or((ui, ""));
+        if u.is_empty() {
+          return Err(ProxyError::InvalidUri("代理用户名为空".to_string()));
+        }
+        Some(percent_decode(u)?)
+      }
+      None => None,
+    };
+    Ok(ProxyEndpoint {
+      scheme: scheme_name(scheme),
+      host,
+      port,
+      username,
+    })
+  }
+
   pub fn scheme(&self) -> ProxyScheme {
     self.scheme
+  }
+
+  pub fn host(&self) -> &str {
+    &self.host
+  }
+
+  pub fn port(&self) -> u16 {
+    self.port
+  }
+
+  /// `http` | `https` | `socks5`。
+  pub fn scheme_name(&self) -> &'static str {
+    scheme_name(self.scheme)
   }
 
   /// 脱敏串，可安全进日志 / UI：scheme://[user@]host:port，绝不含密码。
@@ -764,6 +821,30 @@ mod tests {
     // UTF-8 多字节按字节计：128 个中文字符 = 384 字节，超限。
     let cjk = "密".repeat(128);
     assert!(ProxyConfig::parse(&format!("socks5://u:{cjk}@p.example:1080")).is_err());
+  }
+
+  #[test]
+  fn parse_endpoint_never_requires_or_returns_password() {
+    // 只有用户名（无密码）：endpoint 能解析出来，供原生层下发。
+    let ep = ProxyConfig::parse_endpoint("http://user@p.example:8080").unwrap();
+    assert_eq!(ep.scheme, "http");
+    assert_eq!(ep.host, "p.example");
+    assert_eq!(ep.port, 8080);
+    assert_eq!(ep.username.as_deref(), Some("user"));
+
+    // 带密码的 URI 也允许：endpoint 只取用户名，绝不带出口令。
+    let ep = ProxyConfig::parse_endpoint("socks5://u%40c:p%40ss@p.example:1080").unwrap();
+    assert_eq!(ep.scheme, "socks5");
+    assert_eq!(ep.username.as_deref(), Some("u@c"));
+
+    // 无认证：username 为 None。
+    let ep = ProxyConfig::parse_endpoint("https://p.example:3128").unwrap();
+    assert!(ep.username.is_none());
+
+    // 形状非法一律拒绝，避免把坏配置下发给原生层。
+    assert!(ProxyConfig::parse_endpoint("p.example:8080").is_err());
+    assert!(ProxyConfig::parse_endpoint("http://p.example:0").is_err());
+    assert!(ProxyConfig::parse_endpoint("ftp://p.example:21").is_err());
   }
 
   #[test]

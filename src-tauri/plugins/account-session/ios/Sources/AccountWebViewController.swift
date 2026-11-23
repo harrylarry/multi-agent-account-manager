@@ -403,8 +403,18 @@ final class AccountWebViewController: UIViewController, WKNavigationDelegate, WK
         loadingIndicator.stopAnimating()
         return
       }
-      config.websiteDataStore = WKWebsiteDataStore(forIdentifier: identifier)
+      let store = WKWebsiteDataStore(forIdentifier: identifier)
+      config.websiteDataStore = store
       DataStoreRegistry.markCreated(spec.uuid)
+      // #11/#16：每账号独立代理。代理不可用时 fail-closed（不回退直连）。
+      if let proxy = AccountProxyStore.config(for: spec.uuid), proxy.enabled {
+        if !AccountProxyApplier.apply(cfg: proxy, uuid: spec.uuid, to: store) {
+          mainLoadFailed = true
+          headerTitleLabel.text = "该设备不支持 WebView 代理（需要 iOS 17+）"
+          loadingIndicator.stopAnimating()
+          return
+        }
+      }
       config.defaultWebpagePreferences.allowsContentJavaScript = true
       config.preferences.javaScriptCanOpenWindowsAutomatically = false
       // Batch-1: on iPhone WKWebView plays every <video> fullscreen by

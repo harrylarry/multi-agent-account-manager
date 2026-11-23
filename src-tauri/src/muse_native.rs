@@ -1434,7 +1434,7 @@ pub async fn proxy_probe(app: &AppHandle, uuid: &str, proxy_uri: &str) -> ProxyP
   let uuid_owned = uuid.to_string();
   let cookie_handle =
     tokio::spawn(async move { fetch_session_cookies(&app_owned, &uuid_owned).await });
-  let mut cookies = match tokio::select! {
+  let mut cookies = tokio::select! {
     res = cookie_handle => match res {
       Ok(r) => match r {
         Ok(c) => c,

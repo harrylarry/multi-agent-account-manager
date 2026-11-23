@@ -169,8 +169,13 @@ let spikeProxyRunning = false;
 let spikeProxyError: string | null = null;
 let spikeProxyUri = "";
 // #11/#16 账号级代理配置（脱敏视图；口令只进 Keychain）。
+interface SpikeWebviewProxyView {
+  applied: boolean; sessionOpen: boolean; reason: string | null;
+}
 interface SpikeProxySettingView {
   enabled: boolean; display: string; hasCredentials: boolean;
+  /** iOS：账号 WebView 侧的代理下发结果；null 表示该平台没有这一层。 */
+  webview?: SpikeWebviewProxyView | null;
 }
 let spikeProxySettingView: SpikeProxySettingView | null = null;
 let spikeProxySaveMsg: string | null = null;
@@ -969,6 +974,15 @@ function spikeDiagInnerHtml(): string {
   if (spikeProxySettingView) {
     const v = spikeProxySettingView;
     proxyHtml += `<div class="hint">账号代理：${v.enabled ? "已启用" : "未启用"}　${escapeHtml(v.display)}${v.hasCredentials ? "（口令在 Keychain）" : ""}</div>`;
+    const wv = v.webview;
+    if (wv) {
+      const desc = wv.applied
+        ? wv.sessionOpen
+          ? "已写入（当前会话需重新打开才生效）"
+          : "已写入"
+        : `未生效：${wv.reason ?? "该设备不支持 WebView 代理"}`;
+      proxyHtml += `<div class="hint">账号 WebView：${escapeHtml(desc)}</div>`;
+    }
   }
   if (spikeProxySaveMsg) {
     proxyHtml += `<div class="hint">${escapeHtml(spikeProxySaveMsg)}</div>`;
@@ -1266,6 +1280,24 @@ async function runSpikeFingerprint(): Promise<void> {
   syncSpikeDiag();
 }
 
+// 保存代理后的结果摘要：把 iOS WebView 侧的下发结果如实说明，
+// 不让“Rust 侧已保存”被误读成“整个账号已生效”。
+function proxySaveSummary(
+  view: SpikeProxySettingView | null,
+  base: string,
+): string {
+  const webview = view?.webview;
+  if (!webview) return base;
+  if (webview.applied) {
+    if (webview.sessionOpen) {
+      return `${base}；WebView 代理已写入，当前会话需重新打开后生效`;
+    }
+    return `${base}；WebView 代理已写入`;
+  }
+  const reason = webview.reason ?? "该设备不支持 WebView 代理";
+  return `${base}；但 WebView 侧未生效：${reason}`;
+}
+
 // 代理 URI 脱敏：确认弹窗、日志、错误里只允许出现 scheme://[user@]host:port。
 function redactProxyUri(uri: string): string {
   const trimmed = uri.trim();
@@ -1365,7 +1397,7 @@ async function saveSpikeProxy(): Promise<void> {
         enabled: true,
       }
     );
-    spikeProxySaveMsg = "已保存：口令写入 Keychain，accounts.json 只保留引用";
+    spikeProxySaveMsg = proxySaveSummary(spikeProxySettingView, "已保存：口令写入 Keychain，accounts.json 只保留引用");
   } catch (e) {
     spikeProxySaveMsg = `保存失败：${String(e)}`;
   }

@@ -18,7 +18,6 @@
 use serde::Serialize;
 use serde_json::Value;
 use std::collections::HashSet;
-use std::time::Duration;
 
 const ORIGIN: &str = "https://muse.ai";
 const ACTION_NAME: &str = "fetchSubscriptionAction";
@@ -514,19 +513,15 @@ async fn post_action(
 /// 一次完整额度查询，返回 (结果, 诊断行)。
 /// 1. 有缓存 action 先试；2. 400/404/409 → 重新发现并重试一次；
 /// 3. 401/403/登录页 → 会话失效；4. 解析出 Flight subscription 才算通过。
+///
+/// `client` 由调用方按账号出站策略构造（`AccountEgress::http_client`），
+/// 本模块不自建客户端：否则启用代理的账号会在这里退回直连。
 pub async fn fetch_quota_v2(
+  client: &reqwest::Client,
   cookie: &str,
   cached_action: Option<&str>,
 ) -> (Result<QuotaSnapshot, QuotaError>, Vec<String>) {
   let mut diag: Vec<String> = Vec::new();
-  let client = match reqwest::Client::builder()
-    .timeout(Duration::from_secs(15))
-    .redirect(reqwest::redirect::Policy::none())
-    .build()
-  {
-    Ok(c) => c,
-    Err(e) => return (Err(QuotaError::Network(e.to_string())), diag),
-  };
 
   // 判定一次 POST 结果的语义，避免两处重复。
   fn classify(
@@ -567,7 +562,7 @@ pub async fn fetch_quota_v2(
   }
 
   if let Some(id) = cached_action {
-    match post_action(&client, ORIGIN, cookie, id).await {
+    match post_action(client, ORIGIN, cookie, id).await {
       Ok((status, ctype, body)) => match classify(status, &ctype, &body) {
         Ok(Some(mut q)) => {
           q.action_id = Some(id.to_string());
@@ -582,7 +577,7 @@ pub async fn fetch_quota_v2(
     diag.push("无缓存 action，执行冷发现".into());
   }
 
-  let discovered = match discover_action_id(&client, Some(cookie), ORIGIN, &mut diag).await {
+  let discovered = match discover_action_id(client, Some(cookie), ORIGIN, &mut diag).await {
     Ok(Some(id)) => id,
     Ok(None) => {
       return (
@@ -596,7 +591,7 @@ pub async fn fetch_quota_v2(
   };
   diag.push(format!("发现 action id {}", &discovered[..8.min(discovered.len())]));
 
-  match post_action(&client, ORIGIN, cookie, &discovered).await {
+  match post_action(client, ORIGIN, cookie, &discovered).await {
     Ok((status, ctype, body)) => match classify(status, &ctype, &body) {
       Ok(Some(mut q)) => {
         q.action_id = Some(discovered);

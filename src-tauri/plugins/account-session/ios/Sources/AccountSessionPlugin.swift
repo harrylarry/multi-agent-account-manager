@@ -18,6 +18,7 @@
 // into the decoder's userInfo).
 
 import Foundation
+import Network
 import Tauri
 import UIKit
 import WebKit
@@ -73,8 +74,7 @@ private struct FetchTextArgs: Decodable {
 }
 
 // Batch-1: background quota sync targets (Rust filters out the active
-// account — the foreground probe already covers it).
-private struct SyncAccountTarget: Decodable {
+// account — the foreground probe already covers it).private struct SyncAccountTarget: Decodable {
   let providerId: String
   let uuid: String
   let entryUrl: String
@@ -82,6 +82,17 @@ private struct SyncAccountTarget: Decodable {
 
 private struct SyncAccountQuotasArgs: Decodable {
   let accounts: [SyncAccountTarget]
+}
+
+// #11/#16（补 W）：每账号 WebView 代理。口令不经这里传递——Swift 侧按
+// `proxy-<uuid>` 直接读 Keychain（service 与 Rust secrets.rs 一致）。
+private struct SetAccountProxyArgs: Decodable {
+  let uuid: String
+  let scheme: String
+  let host: String
+  let port: UInt16
+  let username: String?
+  let enabled: Bool
 }
 
 class AccountSessionPlugin: Plugin {
@@ -225,6 +236,75 @@ class AccountSessionPlugin: Plugin {
     DispatchQueue.main.async {
       AccountSessionCoordinator.shared.setUnreadBadge(args.hasUnread)
       invoke.resolve()
+    }
+  }
+
+  /// #11/#16（补 W）：把每账号代理写入 WKWebView 配置。
+  ///
+  /// iOS 17+ 的 `WKWebsiteDataStore.proxyConfigurations` 是 WKWebView 唯一的
+  /// 代理入口：Rust 侧的 reqwest / 网关隧道都影响不到 WebView 内部请求，
+  /// 所以必须单独下发一次。口令不在这里传（Swift 按 `proxy-<uuid>` 读 Keychain）。
+  ///
+  /// 只落配置 + 丢弃该账号缓存页；返回 applied / sessionOpen 交给上层提示。
+  @objc public func setAccountProxy(_ invoke: Invoke) throws {
+    let args = try invoke.parseArgs(SetAccountProxyArgs.self)
+    DispatchQueue.main.async {
+      // 关闭代理：直接删配置（此时 scheme/host/port 无意义，不校验）。
+      if !args.enabled {
+        let result = AccountSessionCoordinator.shared.setAccountProxy(
+          uuid: args.uuid, config: nil)
+        invoke.resolve([
+          "applied": true,
+          "sessionOpen": result.sessionOpen,
+        ])
+        return
+      }
+
+      let scheme = args.scheme.lowercased()
+      guard ["http", "https", "socks5", "socks5h"].contains(scheme) else {
+        invoke.reject("代理协议不支持（仅 http/https/socks5/socks5h）")
+        return
+      }
+      let host = args.host.trimmingCharacters(in: .whitespacesAndNewlines)
+      guard !host.isEmpty, !host.contains("/"), !host.contains("://") else {
+        invoke.reject("代理主机无效")
+        return
+      }
+      guard let port = NWEndpoint.Port(rawValue: args.port) else {
+        invoke.reject("代理端口无效")
+        return
+      }
+
+      let username = args.username?.trimmingCharacters(in: .whitespacesAndNewlines)
+      let cfg = AccountProxyConfig(
+        scheme: scheme,
+        host: host,
+        port: port.rawValue,
+        username: (username?.isEmpty ?? true) ? nil : username,
+        enabled: true
+      )
+
+      var reason: String?
+      guard let identifier = UUID(uuidString: args.uuid) else {
+        invoke.reject("无效的会话标识")
+        return
+      }
+      // 用一个临时 store 试装一次，确认这份配置在本机能真正生效
+      //（iOS 17+ 才有 proxyConfigurations）。不 markCreated——它只用于验证。
+      let probeStore = WKWebsiteDataStore(forIdentifier: identifier)
+      let applied = AccountProxyApplier.apply(cfg: cfg, uuid: args.uuid, to: probeStore)
+      if !applied {
+        reason = "该设备不支持 WebView 代理（需要 iOS 17+）；该账号的 WebView 将按 fail-closed 阻断，不会回退直连"
+      }
+
+      let result = AccountSessionCoordinator.shared.setAccountProxy(uuid: args.uuid, config: cfg)
+
+      var payload: [String: Any] = [
+        "applied": applied && result.applied,
+        "sessionOpen": result.sessionOpen,
+      ]
+      if let reason { payload["reason"] = reason }
+      invoke.resolve(payload)
     }
   }
 

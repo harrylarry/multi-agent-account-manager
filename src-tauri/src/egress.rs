@@ -10,7 +10,16 @@
 //! `resolve` 自身失败（URI 非法、Keychain 缺凭据）同样返回 `Err`，调用方不得
 //! 自行降级直连，否则就破坏了账号级 fail-closed。
 //!
-//! 未接入本入口的路径（见呼叫点清单）在真机验收前标记为 UNVERIFIED。
+//! 未接入本入口的路径（真机验收前标记为 UNVERIFIED）：
+//!
+//! - `updater.rs` 的更新检查/下载：**不是账号流量**（走 GitHub Releases），
+//!   刻意不经账号出站策略；如需代理应在系统层配置。
+//! - `platform::ios` 的 WebView 出站（WKWebView / 后台额度同步的隐藏 WebView）：
+//!   Rust 管不到 WebKit 内部请求，改由 `AccountProxy.swift`
+//!   （`WKWebsiteDataStore.proxyConfigurations`，`allowFailover = false`）承担，
+//!   配置由 `lib.rs::apply_webview_proxy` 下发。**iOS 真机未验证**。
+//! - Android：主 crate 没有 reqwest 依赖（`quota.rs` 等），该目标当前整体
+//!   不可编译——本切片之前就如此，未在本次修复范围内，Android 一律 BLOCKED。
 
 use crate::secrets::Secrets;
 use crate::storage::ProxySetting;
@@ -23,6 +32,7 @@ use muse_native_client::gateway::{
 use muse_native_client::proxy::ProxyConfig;
 use muse_native_client::transport::HttpRequest;
 use std::time::Duration;
+use zeroize::Zeroize;
 
 pub enum EgressKind {
   Direct,
@@ -91,7 +101,7 @@ impl AccountEgress {
     // 组装含凭据的进程内 URI；随后立即 parse 掉，不保留明文副本。
     let mut uri = compose_uri(&s.uri, username.as_deref(), password.as_deref());
     let cfg = ProxyConfig::parse(&uri).map_err(|e| EgressError::Invalid(e.to_string()));
-    uri.clear();
+    uri.zeroize();
     let cfg = cfg?;
     let display = cfg.display_safe();
     Ok(Self {
@@ -110,6 +120,32 @@ impl AccountEgress {
       EgressKind::Direct => ReqwestFetch::new().map_err(EgressError::Http),
       EgressKind::Proxy(cfg) => ReqwestFetch::for_proxy(cfg).map_err(EgressError::Http),
     }
+  }
+
+  /// 需要自定义超时/重定向策略的调用方（如额度探针）用这个入口。
+  /// 代理绑定与 [`Self::http`] 完全一致，构造失败一律 Err（fail-closed）。
+  pub fn http_client(
+    &self,
+    timeout: Duration,
+    follow_redirects: bool,
+  ) -> Result<reqwest::Client, EgressError> {
+    let mut builder = reqwest::Client::builder().timeout(timeout);
+    if !follow_redirects {
+      builder = builder.redirect(reqwest::redirect::Policy::none());
+    }
+    if let EgressKind::Proxy(cfg) = &self.kind {
+      // 含凭据的 URI 只在本函数内存在，构造完立即清空。
+      let mut uri = cfg.to_credentialed_uri();
+      let proxy = reqwest::Proxy::all(&uri);
+      uri.zeroize();
+      let proxy = proxy.map_err(|e| {
+        EgressError::Http(format!("代理 URI 无效（不会回退直连）: {e}"))
+      })?;
+      builder = builder.proxy(proxy);
+    }
+    builder
+      .build()
+      .map_err(|e| EgressError::Http(format!("创建 HTTP 客户端失败: {e}")))
   }
 
   /// 建立到 Muse 网关的连接。Direct 走系统网络；Proxy 走代理隧道，
@@ -260,7 +296,7 @@ impl ReqwestFetch {
     // 只在进程内传递含凭据的 URI，构造完 client 后立即丢弃字符串。
     let mut uri = cfg.to_credentialed_uri();
     let out = Self::build(Some(&uri));
-    uri.clear();
+    uri.zeroize();
     out
   }
 

@@ -202,6 +202,28 @@ final class AccountSessionCoordinator {
     lock.withLock { activeSpec?.uuid == uuid }
   }
 
+  // MARK: - #11/#16（补 W）：每账号 WKWebView 代理
+
+  /// 写入/清除某账号的 WebView 代理，并丢弃该账号缓存的页面，
+  /// 让下次打开按新配置重建 WebView（WKWebsiteDataStore 的
+  /// proxyConfigurations 只在 WebView 创建时读取一次，改已有的 store 不保证生效）。
+  ///
+  /// 返回 (是否已应用, 该账号会话是否正开着)。
+  /// 会话开着时**不**强行重载当前页面：换代理等于换出口，用户可能正在
+  /// 输入；这里只回报 sessionOpen，由 Rust/前端提示用户重开会话。
+  func setAccountProxy(uuid: String, config: AccountProxyConfig?) -> (applied: Bool, sessionOpen: Bool) {
+    AccountProxyStore.set(uuid: uuid, config: config)
+    RecentAccountPages.discardProfile(uuid)
+    TaskWatcher.shared.forget(uuid: uuid)
+    let sessionOpen = lock.withLock { activeSpec?.uuid == uuid }
+    return (true, sessionOpen)
+  }
+
+  /// 该账号当前是否已有持久化的 WebView 代理配置（不含口令）。
+  func accountProxyConfig(uuid: String) -> AccountProxyConfig? {
+    AccountProxyStore.config(for: uuid)
+  }
+
   static func hostMatchesAllowed(_ url: URL?, allowedHosts: [String]) -> Bool {
     guard let url, url.scheme?.lowercased() == "https",
       let host = url.host?.lowercased()
