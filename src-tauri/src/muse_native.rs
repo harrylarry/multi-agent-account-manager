@@ -235,6 +235,10 @@ pub struct WatchProbe {
   pub seconds: u64,
   pub status: Option<u16>,
   pub summary: WatchSummary,
+  pub lines: u64,
+  pub non_event: u64,
+  pub parse_errors: u64,
+  pub type_counts: std::collections::BTreeMap<String, u64>,
   pub error: Option<String>,
 }
 
@@ -277,6 +281,10 @@ pub async fn watch_probe(
         seconds,
         status: None,
         summary: WatchSummary::default(),
+        lines: 0,
+        non_event: 0,
+        parse_errors: 0,
+        type_counts: Default::default(),
         error: Some("该账号在 Spike App 里还没有 muse.ai 登录态".to_string()),
       });
     }
@@ -292,6 +300,10 @@ pub async fn watch_probe(
           seconds,
           status: None,
           summary: WatchSummary::default(),
+          lines: 0,
+          non_event: 0,
+          parse_errors: 0,
+          type_counts: Default::default(),
           error: Some(e.to_string()),
         });
       }
@@ -321,6 +333,10 @@ pub async fn watch_probe(
           seconds,
           status: None,
           summary: WatchSummary::default(),
+          lines: 0,
+          non_event: 0,
+          parse_errors: 0,
+          type_counts: Default::default(),
           error: Some(e.to_string()),
         });
       }
@@ -329,6 +345,10 @@ pub async fn watch_probe(
     let mut tracker = WatchTracker::new();
     let deadline = Instant::now() + Duration::from_secs(seconds);
     let mut error = None;
+    let mut lines: u64 = 0;
+    let mut non_event: u64 = 0;
+    let mut parse_errors: u64 = 0;
+    let mut type_counts: std::collections::BTreeMap<String, u64> = Default::default();
     loop {
       let left = deadline.saturating_duration_since(Instant::now());
       if left.is_zero() {
@@ -336,7 +356,23 @@ pub async fn watch_probe(
       }
       match sub.next_line(left).await {
         Ok(Some(line)) => {
-          let _ = tracker.observe_line(&line);
+          lines += 1;
+          match serde_json::from_str::<serde_json::Value>(&line) {
+            Ok(v) => {
+              let ty = v
+                .get("type")
+                .and_then(|x| x.as_str())
+                .unwrap_or("<none>")
+                .to_string();
+              *type_counts.entry(ty.clone()).or_insert(0) += 1;
+              if ty == "event" {
+                let _ = tracker.observe_line(&line);
+              } else {
+                non_event += 1;
+              }
+            }
+            Err(_) => parse_errors += 1,
+          }
         }
         Ok(None) => {
           error = Some("订阅已结束".to_string());
@@ -356,6 +392,10 @@ pub async fn watch_probe(
       seconds,
       status: sub.status(),
       summary: tracker.summary().clone(),
+      lines,
+      non_event,
+      parse_errors,
+      type_counts,
       error,
     })
   }

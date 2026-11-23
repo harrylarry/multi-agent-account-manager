@@ -61,6 +61,10 @@ interface SpikeWatchSummary {
   duplicates: number;
   ignored: number;
   eventsByName?: Record<string, number>;
+  lines?: number;
+  nonEvent?: number;
+  parseErrors?: number;
+  typeCounts?: Record<string, number>;
 }
 interface SpikeWatchResult {
   ok: boolean;
@@ -749,6 +753,11 @@ function spikeDiagInnerHtml(): string {
         <div>账号：${escapeHtml(spikeWatchAccount ?? "—")}（优先当前活跃账号）</div>
         <div>事件 ${s.events}：开始 ${s.turnsStarted}，消息 ${s.messagesStarted}，增量 ${s.textDeltas}，完成 ${s.messagesDone}</div>
         <div>忙碌 ${s.busy}，空闲 ${s.idle}，重复 ${s.duplicates}，忽略 ${s.ignored}</div>
+        <div>原始：${spikeWatch.summary.lines ?? 0} 行（非 event ${spikeWatch.summary.nonEvent ?? 0}，坏行 ${spikeWatch.summary.parseErrors ?? 0}）　类型：${escapeHtml(
+          Object.entries(spikeWatch.summary.typeCounts ?? {})
+            .map(([k, v]) => `${k}×${v}`)
+            .join("，") || "—"
+        )}</div>
         <div>事件名：${escapeHtml(
           Object.entries(s.eventsByName ?? {})
             .sort((a, b) => b[1] - a[1])
