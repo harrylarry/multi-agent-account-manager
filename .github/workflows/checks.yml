@@ -148,3 +148,33 @@ jobs:
       # iOS target 只能编译不能执行，所以这里不带 --target。
       - name: cargo test (main crate lib)
         run: cargo test --manifest-path src-tauri/Cargo.toml --lib
+
+  # #18 最小实验：lmfpd 能否为 iOS 编译 + 能否用参考库对「已采集回答」离线评分。
+  # 独立 crate（src-tauri/lmfpd-probe），不进入 App 依赖图；这里只做可行性验证。
+  lmfpd-probe:
+    name: lmfpd experiment (iOS target + offline scoring)
+    needs: changes
+    if: needs.changes.outputs.rust == 'true'
+    runs-on: macos-15-intel
+    timeout-minutes: 30
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-apple-ios
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: ./src-tauri/lmfpd-probe -> target
+      - name: cargo check (iOS target)
+        run: cargo check --manifest-path src-tauri/lmfpd-probe/Cargo.toml --target aarch64-apple-ios
+      - name: build host binary
+        run: cargo build --manifest-path src-tauri/lmfpd-probe/Cargo.toml
+      - name: score real replies offline
+        run: |
+          cat > /tmp/outputs.json <<'JSON'
+          [{"text":"1, 2, 3, 4, 5, 6, 7, 8, 9, 10","expectedCount": 10}]
+          JSON
+          ./src-tauri/lmfpd-probe/target/debug/lmfpd-probe --default --outputs /tmp/outputs.json
