@@ -387,6 +387,8 @@ async fn muse_native_proxy_probe(
 pub struct WebviewProxyView {
   pub applied: bool,
   pub session_open: bool,
+  /// 下发失败时 WebView 出口停在隔离态（不可达代理 + 禁止 failover）。
+  pub quarantined: bool,
   pub reason: Option<String>,
 }
 
@@ -417,6 +419,7 @@ async fn apply_webview_proxy(
   Some(WebviewProxyView {
     applied: outcome.applied,
     session_open: outcome.session_open,
+    quarantined: outcome.quarantined,
     reason: outcome.reason,
   })
 }
@@ -473,6 +476,21 @@ async fn muse_native_set_account_proxy(
     return Err("启用了代理认证，但没有提供代理密码".to_string());
   }
 
+  // **先隔离，再保存**：已打开的 WebView 不能等到保存完才停旧出口。
+  // 顺序是「隔离旧出口 → 落配置 → 下发新配置」：
+  // - 隔离失败（设备无法在网络层阻断）→ 拒绝保存，否则会在窗口期继续走旧出口；
+  // - 保存失败 → 保持隔离（fail-closed），下次打开仍按旧配置重建；
+  // - 下发失败 → 保持隔离，不让 WebView 用系统网络直连。
+  let quarantined = webview_proxy::quarantine(
+    &app,
+    &uuid,
+    Some("代理配置正在变更，当前会话已停止出站（请重新打开该账号）".to_string()),
+  )
+  .await;
+  if let Some(reason) = quarantined.failed() {
+    return Err(format!("无法隔离当前 WebView 出站，已拒绝保存代理：{reason}"));
+  }
+
   if has_user {
     secrets.set(&reference, password.as_deref().unwrap_or(""))?;
   } else {
@@ -481,9 +499,7 @@ async fn muse_native_set_account_proxy(
   }
   mgr.set_account_proxy(pid, &uuid, Some(setting.clone())).await?;
 
-  // 先落 Rust 侧配置，再下发到 WebView：即使下发失败，账号的 Rust 出站
-  // 仍然是 fail-closed（不会因为 WebView 失败而退回直连）。
-  // enabled=false 时 helper 内部会清除 WebView 侧配置。
+  // 再下发新配置：成功即替换隔离；enabled=false 时 helper 会清除 WebView 配置。
   let webview = apply_webview_proxy(&app, &uuid, Some(&setting)).await;
 
   Ok(ProxySettingView {
@@ -535,8 +551,19 @@ async fn muse_native_clear_account_proxy(
     }
   }
   let _ = secrets.delete(&format!("proxy-{uuid}"));
+  // 同样先隔离：清凭据到下发之间，已打开的 WebView 不能还按旧代理跑。
+  let quarantined = webview_proxy::quarantine(
+    &app,
+    &uuid,
+    Some("代理已清除，当前会话已停止出站（请重新打开该账号）".to_string()),
+  )
+  .await;
+  if let Some(reason) = quarantined.failed() {
+    return Err(format!("无法隔离当前 WebView 出站，已拒绝清除代理：{reason}"));
+  }
   mgr.set_account_proxy(pid, &uuid, None).await?;
-  // WebView 侧同步清除；失败不回滚 Rust 侧（清除本身是安全方向）。
+  // WebView 侧同步清除并解除隔离；失败不回滚 Rust 侧（清除本身是安全方向），
+  // 隔离态会让该账号继续发不出去，属于 fail-closed。
   let _ = apply_webview_proxy(&app, &uuid, None).await;
   Ok(())
 }
@@ -595,8 +622,21 @@ pub fn run() {
   builder
     .setup(|app| {
       let app_data_dir = app.path().app_data_dir()?;
-      let session_mgr = Arc::new(SessionManager::new(app_data_dir));
+      let session_mgr = Arc::new(SessionManager::new(app_data_dir.clone()));
       app.manage(Arc::clone(&session_mgr));
+
+      // 发送台账的状态日志：进程异常退出后，未定论的发送在重启时改判 UNKNOWN，
+      // 不会被当成「没发过」而重发。日志损坏则拒绝发送（fail-closed）。
+      let (ledger, recovery) = send_ledger::SendLedger::open(app_data_dir.join("send-ledger.json"));
+      if recovery.corrupt {
+        eprintln!("[send-ledger] 状态日志损坏：本次运行拒绝一切新发送（fail-closed）");
+      } else if recovery.restored > 0 {
+        eprintln!(
+          "[send-ledger] 恢复 {} 条记录，其中 {} 条未定论改判 UNKNOWN",
+          recovery.restored, recovery.marked_unknown
+        );
+      }
+      app.manage(Arc::new(ledger));
 
       #[cfg(desktop)]
       {
@@ -672,7 +712,6 @@ pub fn run() {
 
       Ok(())
     })
-    .manage(std::sync::Arc::new(send_ledger::SendLedger::new()))
     .manage(std::sync::Arc::new(muse_native::LivenessState::default()))
     .manage(std::sync::Arc::new(probe_cancel::ProbeCancel::new()))
     .manage(std::sync::Arc::new(quota::ActionCache::default()))

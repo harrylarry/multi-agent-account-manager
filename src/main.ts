@@ -171,6 +171,8 @@ let spikeProxyUri = "";
 // #11/#16 账号级代理配置（脱敏视图；口令只进 Keychain）。
 interface SpikeWebviewProxyView {
   applied: boolean; sessionOpen: boolean; reason: string | null;
+  /** iOS：下发失败时 WebView 出口停在隔离态（不可达代理，不会回退直连）。 */
+  quarantined?: boolean;
 }
 interface SpikeProxySettingView {
   enabled: boolean; display: string; hasCredentials: boolean;
@@ -1295,6 +1297,9 @@ function proxySaveSummary(
     return `${base}；WebView 代理已写入`;
   }
   const reason = webview.reason ?? "该设备不支持 WebView 代理";
+  if (webview.quarantined) {
+    return `${base}；但 WebView 侧未生效，出口已被隔离（不会直连）：${reason}`;
+  }
   return `${base}；但 WebView 侧未生效：${reason}`;
 }
 

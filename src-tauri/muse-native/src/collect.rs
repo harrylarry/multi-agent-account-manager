@@ -9,12 +9,13 @@
 //! 本模块只做「收集」，不做评分、不做判定：拿不到就报拿不到，绝不猜文本。
 
 use std::time::Duration;
-use tokio::io::{AsyncRead, AsyncWrite};
 
+use crate::chat_send::LineSource;
 use crate::gateway::{ConnectedGateway, GatewayError, Subscription};
 use crate::transport::{HttpRequest, Service};
 use crate::watch::{parse_event, WatchKind};
 use serde::Serialize;
+use tokio::io::{AsyncRead, AsyncWrite};
 
 /// 网页端广告的能力集合（含 `delta_stream`，否则服务端不推正文增量）。
 pub const SUBSCRIBE_CAPABILITIES: &[&str] = &[
@@ -76,14 +77,17 @@ where
 ///
 /// `total` 是整轮预算；`per_line` 是单行等待上限（避免一次 read 卡死整轮）。
 /// `message_id` 若给定，只累积该消息的增量；否则累积第一份到达的正文。
-pub async fn collect_text<S>(
-  sub: &mut Subscription<S>,
+///
+/// 泛型于 [`LineSource`]：直连/代理的 `Subscription` 与测试用的假数据源
+/// 走同一套解析逻辑，「采集中被取消」的语义才能被单测覆盖。
+pub async fn collect_text<L>(
+  sub: &mut L,
   message_id: Option<&str>,
   total: Duration,
   per_line: Duration,
 ) -> Collected
 where
-  S: AsyncRead + AsyncWrite + Unpin,
+  L: LineSource,
 {
   let deadline = tokio::time::Instant::now() + total;
   let mut out = Collected::default();
@@ -158,6 +162,86 @@ where
 #[cfg(test)]
 mod tests {
   use super::*;
+  use std::collections::VecDeque;
+  use tokio::sync::watch;
+
+  /// 假数据源：按脚本吐行；`stall` 为真时吐完就永久挂起（模拟「采集中流不动」）。
+  struct Scripted {
+    lines: VecDeque<String>,
+    stall: bool,
+  }
+
+  impl Scripted {
+    fn new(lines: &[&str], stall: bool) -> Self {
+      Self {
+        lines: lines.iter().map(|s| s.to_string()).collect(),
+        stall,
+      }
+    }
+  }
+
+  impl LineSource for Scripted {
+    fn http_status(&self) -> Option<u16> {
+      None
+    }
+
+    async fn next_line(&mut self, _wait: Duration) -> Result<Option<String>, GatewayError> {
+      if let Some(l) = self.lines.pop_front() {
+        return Ok(Some(l));
+      }
+      if self.stall {
+        std::future::pending::<()>().await;
+      }
+      Ok(None)
+    }
+  }
+
+  #[tokio::test]
+  async fn collect_accumulates_matching_deltas_until_done() {
+    let mut src = Scripted::new(
+      &[
+        r#"{"type":"event","event":"delta.message_start","seq":1,"payload":{"message_id":"m1"}}"#,
+        r#"{"type":"event","event":"delta.text_append","seq":2,"payload":{"message_id":"m1","text":"he"}}"#,
+        r#"{"type":"event","event":"delta.text_append","seq":3,"payload":{"message_id":"other","text":"NO"}}"#,
+        r#"{"type":"event","event":"delta.text_append","seq":4,"payload":{"message_id":"m1","text":"llo"}}"#,
+        r#"{"type":"event","event":"delta.message_done","seq":5,"payload":{"message_id":"m1","status":"ok"}}"#,
+      ],
+      false,
+    );
+    let got = collect_text(&mut src, None, Duration::from_secs(2), Duration::from_secs(1)).await;
+    assert!(got.done);
+    assert_eq!(got.ended_by, "done");
+    assert_eq!(got.text, "hello");
+    assert_eq!(got.text_deltas, 2);
+  }
+
+  #[tokio::test]
+  async fn collect_reports_closed_stream_without_done() {
+    let mut src = Scripted::new(
+      &[r#"{"type":"event","event":"delta.text_append","seq":1,"payload":{"message_id":"m1","text":"hi"}}"#],
+      false,
+    );
+    let got = collect_text(&mut src, None, Duration::from_secs(2), Duration::from_secs(1)).await;
+    assert!(!got.done, "断流不能被当成收完");
+    assert_eq!(got.ended_by, "closed");
+    assert_eq!(got.text, "hi");
+  }
+
+  /// 采集中被取消必须在毫秒级生效（不能等 90 秒预算走完）。
+  #[tokio::test]
+  async fn collect_can_be_cancelled_mid_stream() {
+    let mut src = Scripted::new(&[], true);
+    let (tx, mut rx) = watch::channel(false);
+    tokio::spawn(async move {
+      tokio::time::sleep(Duration::from_millis(10)).await;
+      let _ = tx.send(true);
+    });
+    let outcome = tokio::select! {
+      _ = collect_text(&mut src, None, Duration::from_secs(90), Duration::from_secs(90)) => "collected",
+      _ = rx.changed() => "cancelled",
+    };
+    assert_eq!(outcome, "cancelled");
+  }
 
   #[test]
   fn default_collected_is_empty_and_not_done() {

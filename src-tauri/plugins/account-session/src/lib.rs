@@ -610,6 +610,34 @@ pub struct SetAccountProxyResponse {
   /// 该账号的会话当前正打开：新配置要重新打开会话才生效。
   #[serde(default)]
   pub session_open: bool,
+  /// WebView 出口是否处于隔离态（下发失败时保持隔离）。
+  #[serde(default)]
+  pub quarantined: bool,
+  #[serde(default)]
+  pub reason: Option<String>,
+}
+
+/// #11/#16（补 W）：隔离某账号 WebView 出口的参数。
+/// Rust 在保存新代理**之前**调用，用来关掉「保存与下发之间」的时间窗口。
+#[cfg(target_os = "ios")]
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct QuarantineProxyPayload {
+  pub uuid: String,
+  #[serde(skip_serializing_if = "Option::is_none")]
+  pub reason: Option<String>,
+}
+
+#[cfg(target_os = "ios")]
+#[derive(Debug, Clone, Deserialize, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct QuarantineProxyResponse {
+  /// 是否已把该 data store 的出口换成不可达端点。
+  #[serde(default)]
+  pub engaged: bool,
+  /// 该账号的会话当前正打开（已被阻断）。
+  #[serde(default)]
+  pub session_open: bool,
   #[serde(default)]
   pub reason: Option<String>,
 }
@@ -623,6 +651,20 @@ pub async fn set_account_proxy(
   bridge
     .0
     .run_mobile_plugin_async("setAccountProxy", payload)
+    .await
+    .map_err(|e| e.to_string())
+}
+
+/// #11/#16（补 W）：在改配置前隔离该账号的 WebView 出口。
+#[cfg(target_os = "ios")]
+pub async fn quarantine_account_proxy(
+  app: &AppHandle,
+  payload: QuarantineProxyPayload,
+) -> Result<QuarantineProxyResponse, String> {
+  let bridge = app.state::<IosSessionBridge<tauri::Wry>>();
+  bridge
+    .0
+    .run_mobile_plugin_async("quarantineAccountProxy", payload)
     .await
     .map_err(|e| e.to_string())
 }

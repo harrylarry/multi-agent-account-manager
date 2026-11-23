@@ -22,6 +22,7 @@ use std::fmt;
 use std::time::Duration;
 use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::net::TcpStream;
+use tokio::sync::watch;
 use tokio_tungstenite::client_async;
 use tokio_tungstenite::tungstenite::handshake::client::generate_key;
 use tokio_tungstenite::tungstenite::protocol::Message;
@@ -54,6 +55,10 @@ pub enum GatewayError {
   Reset(u32, String),
   /// #11/#16：代理隧道建立失败。fail-closed——绝不回退直连。
   Proxy(ProxyError),
+  /// 请求在写入过程中被本地取消。已写出的帧无法撤回，调用方按结果不明处理。
+  Cancelled,
+  /// 收到了响应，但它不是一条合法的发送 ack（错误体 / 缺 message_id）。
+  Protocol(String),
 }
 
 impl fmt::Display for GatewayError {
@@ -73,6 +78,8 @@ impl fmt::Display for GatewayError {
       GatewayError::Http(s) => write!(f, "HTTP {s}"),
       GatewayError::Reset(code, reason) => write!(f, "stream reset ({code}{reason})"),
       GatewayError::Proxy(e) => write!(f, "proxy tunnel failed (no direct fallback): {e}"),
+      GatewayError::Cancelled => write!(f, "cancelled before the request finished writing"),
+      GatewayError::Protocol(m) => write!(f, "unexpected response: {m}"),
     }
   }
 }
@@ -393,19 +400,70 @@ where
   }
 
   /// 发起长连接订阅（一次连接一个订阅），把连接移交给 `Subscription` 按行读取。
-  pub async fn subscribe(mut self, req: HttpRequest) -> Result<Subscription<S>, GatewayError> {
-    let (stream_id, frames) = self.transport.encrypt_request(&req)?;
-    for frame in frames {
-      self.ws.send(Message::Binary(frame.into())).await?;
+  ///
+  /// 不知道写没写出去时不要用这个：用 [`Self::subscribe_tracked`]，
+  /// 它会把「已经写了几帧」带回来。
+  pub async fn subscribe(self, req: HttpRequest) -> Result<Subscription<S>, GatewayError> {
+    self.subscribe_tracked(req, None).await.result
+  }
+
+  /// 与 [`Self::subscribe`] 相同，但报告**已经写到线上的帧数**。
+  ///
+  /// 一条请求会被 Noise 切成多帧（`encrypt_request`）。`ws.send` 的 `Err`
+  /// 只说明「这一帧没写成功」，前面那些帧可能已经在 TCP 缓冲区里、甚至
+  /// 已被对端读到。因此调用方**不能**把 `Err` 等同于「请求没发出去」，
+  /// 只能看 `wrote_frames`：0 才是确定没开始，>0 一律是结果不明。
+  ///
+  /// `cancel`：写入过程中允许被中断（每帧之间检查一次）。被中断时同样
+  /// 按 `wrote_frames` 判断——已经写出的帧无法撤回。
+  pub async fn subscribe_tracked(
+    mut self,
+    req: HttpRequest,
+    mut cancel: Option<&mut watch::Receiver<bool>>,
+  ) -> SubscribeAttempt<S> {
+    let (stream_id, frames) = match self.transport.encrypt_request(&req) {
+      Ok(v) => v,
+      // 加密/序列化阶段失败：一个字节都没写出去。
+      Err(e) => {
+        return SubscribeAttempt {
+          wrote_frames: 0,
+          result: Err(e.into()),
+        }
+      }
+    };
+    let mut sink = WsSink { ws: &mut self.ws };
+    let wrote = write_frames(&mut sink, frames, cancel).await;
+    let wrote_frames = wrote.wrote;
+    if let Some(err) = wrote.error {
+      return SubscribeAttempt {
+        wrote_frames,
+        result: Err(err),
+      };
     }
-    Ok(Subscription {
-      ws: self.ws,
-      transport: self.transport,
-      stream_id,
-      status: None,
-      buf: String::new(),
-      ended: false,
-    })
+    SubscribeAttempt {
+      wrote_frames,
+      result: Ok(Subscription {
+        ws: self.ws,
+        transport: self.transport,
+        stream_id,
+        status: None,
+        buf: String::new(),
+        ended: false,
+      }),
+    }
+  }
+}
+
+/// 一次订阅尝试的结果，`wrote_frames` 是**已经写进 WS 的帧数**。
+pub struct SubscribeAttempt<S> {
+  pub wrote_frames: usize,
+  pub result: Result<Subscription<S>, GatewayError>,
+}
+
+impl<S> SubscribeAttempt<S> {
+  /// 请求是否可能已经到达服务端。`true` 时任何失败都只能记 UNKNOWN。
+  pub fn possibly_on_wire(&self) -> bool {
+    self.wrote_frames > 0
   }
 }
 
@@ -464,7 +522,23 @@ where
         Message::Binary(data) => {
           if let Some(frame) = self.transport.decrypt(&data)? {
             match frame {
-              InboundFrame::Response { status, .. } => self.status = Some(status),
+              InboundFrame::Response {
+                status,
+                body,
+                end_body,
+                ..
+              } => {
+                // 响应头帧**可以**自带正文（unary 的常见形态）。以前这里只取
+                // status、把 body 丢掉：如果 ack 正好在这个帧里，就会被误判成
+                // 「ended without ack」。这里一并拼进缓冲，交给上层按行解析。
+                self.status = Some(status);
+                if !body.is_empty() {
+                  self.buf.push_str(&String::from_utf8_lossy(&body));
+                }
+                if end_body {
+                  self.ended = true;
+                }
+              }
               InboundFrame::BodyChunk {
                 data, end_body, ..
               } => {
@@ -578,6 +652,77 @@ where
   pub async fn close(mut self) {
     let _ = self.ws.send(Message::Close(None)).await;
   }
+}
+
+
+/// 逐帧写入的抽象。抽出来的唯一目的是让「写到一半失败 / 写到一半被取消」
+/// 可被单测覆盖——这是 `on_wire` 判定更容易出错的地方，不能只靠肉眼推理。
+#[allow(async_fn_in_trait)]
+trait FrameSink {
+  async fn send_frame(&mut self, frame: Vec<u8>) -> Result<(), GatewayError>;
+}
+
+struct WsSink<'a, S> {
+  ws: &'a mut WebSocketStream<S>,
+}
+
+impl<S> FrameSink for WsSink<'_, S>
+where
+  S: AsyncRead + AsyncWrite + Unpin,
+{
+  async fn send_frame(&mut self, frame: Vec<u8>) -> Result<(), GatewayError> {
+    self.ws.send(Message::Binary(frame.into())).await.map_err(Into::into)
+  }
+}
+
+struct WriteOutcome {
+  wrote: usize,
+  error: Option<GatewayError>,
+}
+
+/// 把请求切成帧逐条写出，并在每帧之间检查取消。
+///
+/// 返回的 `wrote` 是**已经成功写进 WS 的帧数**，即使随后出错也不会回退：
+/// 已经写出的字节无法撤回。
+async fn write_frames<K: FrameSink>(
+  sink: &mut K,
+  frames: Vec<Vec<u8>>,
+  mut cancel: Option<&mut watch::Receiver<bool>>,
+) -> WriteOutcome {
+  let mut wrote = 0usize;
+  for frame in frames {
+    if let Some(rx) = cancel.as_deref_mut() {
+      if *rx.borrow_and_update() {
+        return WriteOutcome {
+          wrote,
+          error: Some(GatewayError::Cancelled),
+        };
+      }
+    }
+    let sent = match cancel.as_deref_mut() {
+      Some(rx) => tokio::select! {
+        r = sink.send_frame(frame) => Some(r),
+        _ = rx.changed() => None,
+      },
+      None => Some(sink.send_frame(frame).await),
+    };
+    match sent {
+      None => {
+        return WriteOutcome {
+          wrote,
+          error: Some(GatewayError::Cancelled),
+        }
+      }
+      Some(Err(e)) => {
+        return WriteOutcome {
+          wrote,
+          error: Some(e),
+        }
+      }
+      Some(Ok(())) => wrote += 1,
+    }
+  }
+  WriteOutcome { wrote, error: None }
 }
 
 #[cfg(test)]
@@ -724,5 +869,79 @@ mod tests {
       matches!(&result, Err(GatewayError::Proxy(_))),
       "代理不可达必须传播为 GatewayError::Proxy"
     );
+  }
+
+  // ---- 写入阶段的 on_wire 判定（不依赖真实 WSS）----------------------
+
+  struct MockSink {
+    fail_at: Option<usize>,
+    stall_at: Option<usize>,
+    seen: usize,
+  }
+
+  impl FrameSink for MockSink {
+    async fn send_frame(&mut self, _frame: Vec<u8>) -> Result<(), GatewayError> {
+      self.seen += 1;
+      if Some(self.seen) == self.stall_at {
+        std::future::pending::<()>().await;
+      }
+      if Some(self.seen) == self.fail_at {
+        return Err(GatewayError::Ws("write failed".to_string()));
+      }
+      Ok(())
+    }
+  }
+
+  fn frames(n: usize) -> Vec<Vec<u8>> {
+    (0..n).map(|i| vec![i as u8]).collect()
+  }
+
+  #[tokio::test]
+  async fn write_frames_all_ok() {
+    let mut sink = MockSink { fail_at: None, stall_at: None, seen: 0 };
+    let out = write_frames(&mut sink, frames(3), None).await;
+    assert_eq!(out.wrote, 3);
+    assert!(out.error.is_none());
+  }
+
+  /// 关键回归：第 2 帧写失败时，第 1 帧已经在线上 → 不能报告「没发出去」。
+  #[tokio::test]
+  async fn write_frames_failure_after_partial_write_keeps_count() {
+    let mut sink = MockSink { fail_at: Some(2), stall_at: None, seen: 0 };
+    let out = write_frames(&mut sink, frames(3), None).await;
+    assert_eq!(out.wrote, 1, "第 1 帧已经写出去，必须计入");
+    assert!(matches!(out.error, Some(GatewayError::Ws(_))));
+  }
+
+  #[tokio::test]
+  async fn write_frames_failure_on_first_frame_writes_nothing() {
+    let mut sink = MockSink { fail_at: Some(1), stall_at: None, seen: 0 };
+    let out = write_frames(&mut sink, frames(2), None).await;
+    assert_eq!(out.wrote, 0, "首帧失败才是真正的「没开始」");
+  }
+
+  #[tokio::test]
+  async fn write_frames_cancel_mid_write_keeps_written_count() {
+    let mut sink = MockSink { fail_at: None, stall_at: Some(2), seen: 0 };
+    let (tx, rx) = watch::channel(false);
+    let mut rx = rx;
+    tokio::spawn(async move {
+      tokio::time::sleep(Duration::from_millis(10)).await;
+      let _ = tx.send(true);
+    });
+    let out = write_frames(&mut sink, frames(3), Some(&mut rx)).await;
+    assert_eq!(out.wrote, 1);
+    assert!(matches!(out.error, Some(GatewayError::Cancelled)));
+  }
+
+  #[tokio::test]
+  async fn write_frames_cancel_before_start_writes_nothing() {
+    let mut sink = MockSink { fail_at: None, stall_at: None, seen: 0 };
+    let (tx, rx) = watch::channel(true);
+    let mut rx = rx;
+    drop(tx);
+    let out = write_frames(&mut sink, frames(2), Some(&mut rx)).await;
+    assert_eq!(out.wrote, 0);
+    assert!(matches!(out.error, Some(GatewayError::Cancelled)));
   }
 }

@@ -351,57 +351,74 @@ pub async fn send_probe(
     ledger.mark_in_flight(&send_id);
 
     // 发送用一次性连接：mark_in_flight 之后所有权交给 send_message。
-    let send_outcome = tokio::select! {
-      r = connected.send_message(text, node_id, session_id, Duration::from_secs(30)) => Some(r),
-      _ = cancel_token.cancelled() => None,
-    };
-    match send_outcome {
-      None => {
-        // 取消发生在发送阶段：可能已发出，按 UNKNOWN 记账，绝不重发。
-        ledger.mark_unknown(&send_id, "发送阶段被取消".to_string());
+    // 取消令牌直接传给发送侧：写入每一帧之间、等 ack 时都能中断，
+    // 并带回「已经写了几帧」，而不是在外面 select! 里丢掉这个信息。
+    let tracked = connected
+      .send_message_cancellable(
+        text,
+        node_id,
+        session_id,
+        Duration::from_secs(30),
+        Some(cancel_token.receiver()),
+      )
+      .await;
+    if matches!(tracked.outcome, Err(GatewayError::Cancelled)) {
+      // 取消发生在发送阶段：可能已发出，按 UNKNOWN 记账，绝不重发。
+      ledger.mark_unknown(&send_id, "发送阶段被取消".to_string());
+      return SendOutcome {
+        ok: false,
+        status: "UNKNOWN".to_string(),
+        send_id,
+        ack: None,
+        session_id: session_id.map(str::to_string),
+        error: Some(format!(
+          "发送阶段被用户取消（已写出 {} 帧，结果不明，未重发）",
+          tracked.wrote_frames
+        )),
+      };
+    }
+    match tracked.outcome {
+      Ok(ack) => {
+        ledger.confirm(&send_id);
         SendOutcome {
-          ok: false, status: "UNKNOWN".to_string(), send_id,
-          ack: None, session_id: session_id.map(str::to_string),
-          error: Some("发送阶段被用户取消（结果不明，未重发）".to_string()),
+          ok: true,
+          status: "CONFIRMED".to_string(),
+          send_id,
+          ack: Some(ack.raw),
+          session_id: ack.session_id,
+          error: None,
         }
       }
-      Some(tracked) => match tracked.outcome {
-        Ok((ack, sid)) => {
-          ledger.confirm(&send_id);
+      Err(e) => {
+        // 请求已写到线上而拿不到 ack → 上游可能已收到，只能 UNKNOWN。
+        // 一帧都没写出去 → 这次发送确实没有开始，可以明确失败。
+        let detail = if tracked.on_wire {
+          format!("请求已发出但未拿到 ack（结果不明，未重发）: {e}")
+        } else {
+          format!("请求未能发出: {e}")
+        };
+        if tracked.on_wire {
+          ledger.mark_unknown(&send_id, detail.clone());
           SendOutcome {
-            ok: true,
-            status: "CONFIRMED".to_string(),
+            ok: false,
+            status: "UNKNOWN".to_string(),
             send_id,
-            ack: Some(ack),
-            session_id: sid,
-            error: None,
+            ack: None,
+            session_id: session_id.map(str::to_string),
+            error: Some(detail),
+          }
+        } else {
+          ledger.fail(&send_id, detail.clone());
+          SendOutcome {
+            ok: false,
+            status: "DEFINITIVELY_FAILED".to_string(),
+            send_id,
+            ack: None,
+            session_id: session_id.map(str::to_string),
+            error: Some(detail),
           }
         }
-        Err(e) => {
-          // 请求已写到线上而拿不到 ack → 上游可能已收到，只能 UNKNOWN。
-          // 请求根本没写出去 → 这次发送没有开始，可以明确失败。
-          let detail = if tracked.on_wire {
-            format!("请求已发出但未拿到 ack（结果不明，未重发）: {e}")
-          } else {
-            format!("请求未能发出: {e}")
-          };
-          if tracked.on_wire {
-            ledger.mark_unknown(&send_id, detail.clone());
-            SendOutcome {
-              ok: false, status: "UNKNOWN".to_string(), send_id,
-              ack: None, session_id: session_id.map(str::to_string),
-              error: Some(detail),
-            }
-          } else {
-            ledger.fail(&send_id, detail.clone());
-            SendOutcome {
-              ok: false, status: "DEFINITIVELY_FAILED".to_string(), send_id,
-              ack: None, session_id: session_id.map(str::to_string),
-              error: Some(detail),
-            }
-          }
-        }
-      },
+      }
     }
   }
 }
@@ -636,103 +653,116 @@ pub async fn fingerprint_probe(
           continue;
         }
       };
-      // 发送前可被后端取消：取消后不再把这条探针发出去。
-      let send_outcome = tokio::select! {
-        r = send_gw.send_message(&probe.prompt, "", session_id.as_deref(), Duration::from_secs(30)) => Some(r),
-        _ = cancel_token.cancelled() => None,
-      };
-      match send_outcome {
-        None => {
-          let msg = format!("探针 {} 在发送阶段被取消，不重发", probe.id);
-          first_error.get_or_insert(msg.clone());
-          ledger.mark_unknown(&send_id, msg.clone());
-          sends.push(FingerprintSendRecord {
-            probe_id: probe.id.clone(),
-            send_status: "UNKNOWN".to_string(),
-            text_done: false,
-            sample_used: false,
-            error: Some(msg),
-          });
-          break;
-        }
-        Some(tracked) => match tracked.outcome {
-          Ok((ack, sid)) => {
-            probes_sent += 1;
-            if session_id.is_none() {
-              session_id = sid.clone();
-            }
-            let msg_id = ack.get("message_id").and_then(|v| v.as_str()).map(str::to_string);
-            let collected = tokio::select! {
-              c = sub.collect(
-                msg_id.as_deref(),
-                Duration::from_secs(90),
-                Duration::from_secs(10),
-              ) => Some(c),
-              _ = cancel_token.cancelled() => None,
-            };
+      // 发送前/发送中可被后端取消：写入每帧之间与等 ack 时都会中断。
+      let tracked = send_gw
+        .send_message_cancellable(
+          &probe.prompt,
+          "",
+          session_id.as_deref(),
+          Duration::from_secs(30),
+          Some(cancel_token.receiver()),
+        )
+        .await;
+      if matches!(tracked.outcome, Err(GatewayError::Cancelled)) {
+        let msg = format!(
+          "探针 {} 在发送阶段被取消（已写出 {} 帧），不重发",
+          probe.id, tracked.wrote_frames
+        );
+        first_error.get_or_insert(msg.clone());
+        ledger.mark_unknown(&send_id, msg.clone());
+        sends.push(FingerprintSendRecord {
+          probe_id: probe.id.clone(),
+          send_status: "UNKNOWN".to_string(),
+          text_done: false,
+          sample_used: false,
+          error: Some(msg),
+        });
+        break;
+      }
+      match tracked.outcome {
+        Ok(ack) => {
+          probes_sent += 1;
+          if session_id.is_none() {
+            session_id = ack.session_id.clone();
+          }
+          let msg_id = Some(ack.message_id.clone());
+          let collected = tokio::select! {
+            c = sub.collect(
+              msg_id.as_deref(),
+              Duration::from_secs(90),
+              Duration::from_secs(10),
+            ) => Some(c),
+            _ = cancel_token.cancelled() => None,
+          };
             let Some(collected) = collected else {
-              let msg = format!("探针 {} 在采集阶段被取消，不重发", probe.id);
-              first_error.get_or_insert(msg.clone());
-              ledger.mark_unknown(&send_id, msg.clone());
-              sends.push(FingerprintSendRecord {
-                probe_id: probe.id.clone(),
-                send_status: "UNKNOWN".to_string(),
-                text_done: false,
-                sample_used: false,
-                error: Some(msg),
-              });
-              break;
-            };
-            // 有效样本必须「真的收完」：以 message_done 为完成信号，不能只看非空。
-            if collected.done {
-              probes_confirmed += 1;
-              ledger.confirm(&send_id);
-              let usable = !collected.text.trim().is_empty();
-              if usable {
-                samples.push(Sample {
-                  text: collected.text,
-                  expected_count: probe.expected_count,
-                });
-              } else {
-                first_error.get_or_insert(format!("探针 {} 已回复但正文为空", probe.id));
-              }
-              sends.push(FingerprintSendRecord {
-                probe_id: probe.id.clone(),
-                send_status: "CONFIRMED".to_string(),
-                text_done: true,
-                sample_used: usable,
-                error: if usable {
-                  None
-                } else {
-                  Some("已回复但正文为空".to_string())
-                },
+            let msg = format!("探针 {} 在采集阶段被取消，不重发", probe.id);
+            first_error.get_or_insert(msg.clone());
+            ledger.mark_unknown(&send_id, msg.clone());
+            sends.push(FingerprintSendRecord {
+              probe_id: probe.id.clone(),
+              send_status: "UNKNOWN".to_string(),
+              text_done: false,
+              sample_used: false,
+              error: Some(msg),
+            });
+            break;
+          };
+          // 有效样本必须「真的收完」：以 message_done 为完成信号，不能只看非空。
+          if collected.done {
+            probes_confirmed += 1;
+            ledger.confirm(&send_id);
+            let usable = !collected.text.trim().is_empty();
+            if usable {
+              samples.push(Sample {
+                text: collected.text,
+                expected_count: probe.expected_count,
               });
             } else {
-              // 发出去了但没收到 message_done（超时 / 断流）：结果不明，绝不重发。
-              let msg = format!("探针 {} 采集未完成（{}），不重发", probe.id, collected.ended_by);
-              first_error.get_or_insert(msg.clone());
-              ledger.mark_unknown(&send_id, msg.clone());
-              sends.push(FingerprintSendRecord {
-                probe_id: probe.id.clone(),
-                send_status: "UNKNOWN".to_string(),
-                text_done: false,
-                sample_used: false,
-                error: Some(msg),
-              });
+              first_error.get_or_insert(format!("探针 {} 已回复但正文为空", probe.id));
             }
-        },
+            sends.push(FingerprintSendRecord {
+              probe_id: probe.id.clone(),
+              send_status: "CONFIRMED".to_string(),
+              text_done: true,
+              sample_used: usable,
+              error: if usable {
+                None
+              } else {
+                Some("已回复但正文为空".to_string())
+              },
+            });
+          } else {
+            // 发出去了但没收到 message_done（超时 / 断流）：结果不明，绝不重发。
+            let msg = format!(
+              "探针 {} 采集未完成（{}），不重发",
+              probe.id, collected.ended_by
+            );
+            first_error.get_or_insert(msg.clone());
+            ledger.mark_unknown(&send_id, msg.clone());
+            sends.push(FingerprintSendRecord {
+              probe_id: probe.id.clone(),
+              send_status: "UNKNOWN".to_string(),
+              text_done: false,
+              sample_used: false,
+              error: Some(msg),
+            });
+          }
+        }
         Err(e) => {
-          // 拿不到 ack：只有「请求确实没写出去」才算这次发送没有开始；
+          // 拿不到 ack：只有「一帧都没写出去」才算这次发送没有开始；
           // 已经写到线上的一律 UNKNOWN（上游可能已收到），都不重发。
           let (status, msg) = if tracked.on_wire {
             (
               "UNKNOWN",
-              format!("探针 {} 已发出但未拿到 ack（结果不明，不重发）: {e}", probe.id),
+              format!(
+                "探针 {} 已发出 {} 帧但未拿到 ack（结果不明，不重发）: {e}",
+                probe.id, tracked.wrote_frames
+              ),
             )
           } else {
             (
               "DEFINITIVELY_FAILED",
-              format!("探针 {} 请求未发出: {e}", probe.id),
+              format!("探针 {} 请求未发出（0 帧）: {e}", probe.id),
             )
           };
           first_error.get_or_insert(msg.clone());
@@ -749,7 +779,6 @@ pub async fn fingerprint_probe(
             error: Some(msg),
           });
         }
-      },
       }
     }
 

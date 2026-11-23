@@ -61,6 +61,13 @@ impl CancelToken {
     }
     false
   }
+
+  /// 底层 watch 接收端。传进 `send_message_cancellable` / `read_ack` 后，
+  /// 取消可以在**写入每一帧之间**和**等 ack**时生效，而不是只在两个阶段
+  /// 之间（外层 `select!` 只能砍掉整段 future，拿不到写到第几帧）。
+  pub fn receiver(&mut self) -> &mut watch::Receiver<bool> {
+    &mut self.rx
+  }
 }
 
 /// 任务结束时注销的 RAII guard。带唯一 id，避免误删同账号下的其它任务。

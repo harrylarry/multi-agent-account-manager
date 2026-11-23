@@ -8,7 +8,9 @@
 // - allowFailover = false：代理不可用时不得回退直连（fail-closed）；
 // - 配置变更后丢弃该账号缓存的 WebView，下次打开按新配置重建；
 // - **本地配置损坏**（无法解码）视为「所有账号都不可放行」，而不是当作
-//   「没有配置」——后者会静默走直连，属于绕过代理。
+//   「没有配置」——后者会静默走直连，属于绕过代理；
+// - **所有** WebView（可见会话 / 缓存页 / 隐藏额度同步）都必须经
+//   `AccountProxyResolver` 解析出口，不允许各自读 store 后「没读到就当直连」。
 //
 // 真机验收前状态：UNVERIFIED。iOS 编译与真实代理连通性需在 Xcode / 设备上验证。
 
@@ -57,24 +59,40 @@ enum AccountProxyStore {
     return .ok(map)
   }
 
-  static func all() -> [String: AccountProxyConfig] {
+  /// 直接取整张表。**只给写入路径与诊断用**：读的时候必须走
+  /// `AccountProxyResolver`，否则 `corrupt` 会被当成「空表 = 没代理」，
+  /// 于是静默直连（这正是补充 W 要堵的漏洞）。
+  static func rawMap() -> [String: AccountProxyConfig]? {
     if case .ok(let map) = load() { return map }
-    return [:]
+    return nil
   }
 
-  static func config(for uuid: String) -> AccountProxyConfig? {
-    all()[uuid]
-  }
+  /// 「明确直连」的显式标记。
+  ///
+  /// 不能用「删掉条目」表示直连：解析器把「没有条目」判为未知态（下发失败 /
+  /// 两端未同步）并阻断。两种语义完全不同，必须分开存。
+  static let directMarker = AccountProxyConfig(
+    scheme: "http", host: "", port: 0, username: nil, enabled: false)
 
-  /// 写入/删除某账号配置。store 已损坏时用本次写入覆盖它（Rust 是权威源，
-  /// 下发即修复），不会保留坏数据。
+  /// 写入某账号的出口配置（含「明确直连」）。store 已损坏时用本次写入覆盖它
+  /// （Rust 是权威源，下发即修复），不会保留坏数据。
   static func set(uuid: String, config: AccountProxyConfig?) {
-    var map = all()
-    if let config {
+    // 损坏时从空表重建：Rust 是权威源，下一次下发会补齐其它账号；
+    // 期间其它账号因「没有可信配置」被阻断（fail-closed，见解析器）。
+    var map = rawMap() ?? [:]
+    if let config, config.enabled {
       map[uuid] = config
     } else {
-      map.removeValue(forKey: uuid)
+      map[uuid] = directMarker
     }
+    guard let data = try? JSONEncoder().encode(map) else { return }
+    UserDefaults.standard.set(data, forKey: key)
+  }
+
+  /// 删除某账号的条目（删除账号时用）。删掉后该账号回到「未知」态。
+  static func remove(uuid: String) {
+    var map = rawMap() ?? [:]
+    map.removeValue(forKey: uuid)
     guard let data = try? JSONEncoder().encode(map) else { return }
     UserDefaults.standard.set(data, forKey: key)
   }
@@ -138,7 +156,13 @@ enum AccountProxyApplier {
   static func apply(cfg: AccountProxyConfig, uuid: String, to store: WKWebsiteDataStore)
     -> AccountProxyApplyResult
   {
-    guard cfg.enabled else { return .notConfigured }
+    guard cfg.enabled else {
+      // 「关闭代理」必须把 store 上的旧配置（含隔离态）清掉，否则会一直连不出去。
+      if #available(iOS 17.0, *) {
+        clear(store: store)
+      }
+      return .notConfigured
+    }
     guard #available(iOS 17.0, *) else { return .unsupported }
     guard let port = NWEndpoint.Port(rawValue: cfg.port) else { return .unsupported }
     let endpoint = NWEndpoint.hostPort(host: NWEndpoint.Host(cfg.host), port: port)
@@ -170,5 +194,95 @@ enum AccountProxyApplier {
     }
     store.proxyConfigurations = [proxy]
     return .applied
+  }
+
+  /// 清除该 DataStore 的代理配置（也用于解除隔离）。
+  @available(iOS 17.0, *)
+  static func clear(store: WKWebsiteDataStore) {
+    store.proxyConfigurations = []
+  }
+}
+
+/// 一个账号「该怎么出站」的唯一解析结果。
+enum AccountProxyResolution {
+  /// 明确没有代理（Rust 下发过 enabled=false 的条目）。
+  case direct
+  /// 有代理配置，按它应用。
+  case use(AccountProxyConfig)
+  /// 无法确认出口：必须阻断，不得当作直连。
+  case blocked(String)
+
+  var blockReason: String? {
+    if case .blocked(let r) = self { return r }
+    return nil
+  }
+}
+
+/// **所有** WebView / 隐藏额度同步的唯一代理解析入口。
+///
+/// 三种状态必须分开（补充 W 的第三条）：
+/// - `.corrupt`：本地配置坏了 → 全部阻断；
+/// - 表中**没有这个账号**（含整表尚不存在）：无法证明它是直连 → 阻断。
+///   Rust 每次打开会话与每次额度同步前都会先下发该账号的条目（enabled=false
+///   也是显式条目），所以「没有条目」只可能是下发失败或还没同步，属未知态；
+/// - 有条目：enabled=false → 直连；enabled=true → 按配置应用。
+enum AccountProxyResolver {
+  static func resolve(uuid: String) -> AccountProxyResolution {
+    switch AccountProxyStore.load() {
+    case .corrupt:
+      return .blocked("本地代理配置损坏，无法确认出口，已按 fail-closed 阻断；请在管理端重新保存代理")
+    case .missing:
+      return .blocked("尚未收到该账号的出口配置（fail-closed）：请回到账号列表重新打开该账号")
+    case .ok(let map):
+      guard let cfg = map[uuid] else {
+        return .blocked("尚未收到该账号的出口配置（fail-closed）：请回到账号列表重新打开该账号")
+      }
+      return cfg.enabled ? .use(cfg) : .direct
+    }
+  }
+
+  /// 把解析结果落到 DataStore 上。返回 nil 表示可用；返回字符串表示阻断原因。
+  static func apply(uuid: String, to store: WKWebsiteDataStore) -> String? {
+    switch resolve(uuid: uuid) {
+    case .blocked(let reason):
+      return reason
+    case .direct:
+      if #available(iOS 17.0, *) {
+        AccountProxyApplier.clear(store: store)
+      }
+      return nil
+    case .use(let cfg):
+      let result = AccountProxyApplier.apply(cfg: cfg, uuid: uuid, to: store)
+      return result.blockReason
+    }
+  }
+}
+
+/// 网络层隔离：把一个账号的 DataStore 出口指向**不可达端点**。
+///
+/// 为什么需要它：`stopLoading()` / 隐藏 WebView / 取消导航都**不**能证明
+/// 已建立的 XHR、WebSocket、EventSource 停了 —— JS 定时器还会继续发请求。
+/// WebKit 没有「杀掉这个 data store 全部连接」的 API，能保证不再外流的
+/// 只有一件事：把出口换成一个连不通的代理，并关掉 failover。之后该 store
+/// 上任何**新**连接（包括残留进程发起的）都会在 CONNECT 阶段失败。
+///
+/// 已建立的连接由调用方销毁 WebView（内容进程随之终止）来断。
+enum AccountProxyQuarantine {
+  /// 本机回环 + 未监听端口：连接立即被拒，不会有任何字节离开设备。
+  private static let deadPort: UInt16 = 9
+
+  /// 返回是否成功把出口隔离。`false` 表示当前系统版本无法隔离，
+  /// 调用方必须改用「销毁 WebView」并拒绝重新打开。
+  static func engage(uuid: String) -> Bool {
+    guard #available(iOS 17.0, *) else { return false }
+    guard let identifier = UUID(uuidString: uuid) else { return false }
+    guard let port = NWEndpoint.Port(rawValue: deadPort) else { return false }
+    let store = WKWebsiteDataStore(forIdentifier: identifier)
+    let endpoint = NWEndpoint.hostPort(host: .ipv4(.loopback), port: port)
+    let proxy = ProxyConfiguration(httpCONNECTProxy: endpoint, tlsOptions: nil)
+    // 不可达时**不得**回退直连——这是隔离的全部意义。
+    proxy.allowFailover = false
+    store.proxyConfigurations = [proxy]
+    return true
   }
 }

@@ -81,6 +81,13 @@ enum QuotaSyncRunner {
         return
       }
       let target = targets[index]
+      // #11/#16（补 W）：出站策略必须先解析。配置损坏 / 该账号还没有可信
+      // 配置时直接跳过本次同步——宁可没有额度，也不能绕过代理拿一份
+      // 「看起来正常」的数据。
+      if AccountProxyResolver.resolve(uuid: target.uuid).blockReason != nil {
+        step(index + 1)
+        return
+      }
       // Cheap path first: a parked page already holds the live session.
       RecentAccountPages.probeParked(
         providerId: target.providerId, uuid: target.uuid,
@@ -178,15 +185,11 @@ enum QuotaSyncRunner {
       let config = WKWebViewConfiguration()
       let store = WKWebsiteDataStore(forIdentifier: identifier)
       config.websiteDataStore = store
-      // #11/#16：后台额度同步也是账号出站流量——启用代理的账号必须走代理；
-      // 代理不可用（不支持 / 缺口令 / 配置损坏）则放弃本次探测，
-      // 绝不回退直连拿一份「看起来正常」的额度。
-      if let proxy = AccountProxyStore.config(for: target.uuid), proxy.enabled {
-        let result = AccountProxyApplier.apply(cfg: proxy, uuid: target.uuid, to: store)
-        if result.blockReason != nil {
-          finish(nil)
-          return
-        }
+      // #11/#16：后台额度同步也是账号出站流量——必须走与可见会话**同一个**
+      // 解析入口。损坏/缺失/缺口令/不支持都放弃本次探测，绝不回退直连。
+      if AccountProxyResolver.apply(uuid: target.uuid, to: store) != nil {
+        finish(nil)
+        return
       }
       config.defaultWebpagePreferences.allowsContentJavaScript = true
       config.preferences.javaScriptCanOpenWindowsAutomatically = false

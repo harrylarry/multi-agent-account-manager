@@ -96,6 +96,12 @@ private struct SetAccountProxyArgs: Decodable {
   let enabled: Bool
 }
 
+// #11/#16（补 W）：在「Rust 保存」与「Swift 下发」之间先隔离旧出口。
+private struct QuarantineProxyArgs: Decodable {
+  let uuid: String
+  let reason: String?
+}
+
 class AccountSessionPlugin: Plugin {
 
   @objc public func subscribeEvents(_ invoke: Invoke) throws {
@@ -191,6 +197,8 @@ class AccountSessionPlugin: Plugin {
       }
       RecentAccountPages.discardProfile(args.uuid)
       TaskWatcher.shared.forget(uuid: args.uuid)
+      // 账号被删除：出口条目也一并删掉（保留会让 uuid 复用者继承旧策略）。
+      AccountProxyStore.remove(uuid: args.uuid)
       guard DataStoreRegistry.contains(args.uuid) else {
         invoke.resolve()
         return
@@ -250,13 +258,15 @@ class AccountSessionPlugin: Plugin {
   @objc public func setAccountProxy(_ invoke: Invoke) throws {
     let args = try invoke.parseArgs(SetAccountProxyArgs.self)
     DispatchQueue.main.async {
-      // 关闭代理：直接删配置（此时 scheme/host/port 无意义，不校验）。
+      // 关闭代理：删配置（此时 scheme/host/port 无意义，不校验），
+      // 同时把 store 上可能残留的隔离/旧代理清掉，让直连真正可用。
       if !args.enabled {
         let result = AccountSessionCoordinator.shared.setAccountProxy(
           uuid: args.uuid, config: nil)
         invoke.resolve([
           "applied": true,
           "sessionOpen": result.sessionOpen,
+          "quarantined": false,
         ])
         return
       }
@@ -304,8 +314,37 @@ class AccountSessionPlugin: Plugin {
       var payload: [String: Any] = [
         "applied": applied,
         "sessionOpen": stored.sessionOpen,
+        "quarantined": false,
       ]
-      if let reason = result.blockReason { payload["reason"] = reason }
+      if let reason = result.blockReason {
+        // 试装失败：store 上没有可信的新代理，保持隔离态（上面 apply 已把它
+        // 换成新配置或维持原样，两种都不会回退直连），并把原因交给上层提示。
+        payload["reason"] = reason
+        payload["quarantined"] = true
+      }
+      invoke.resolve(payload)
+    }
+  }
+
+  /// #11/#16（补 W）：隔离该账号的 WebView 出口。
+  ///
+  /// Rust 在**保存新代理之前**调用：先把该账号 data store 的出口指向不可达
+  /// 端点并销毁正在打开的 WebView，再落配置、再下发。这样「保存成功但下发
+  /// 失败」「App 重启两端未同步」「已打开会话」都不会在窗口期继续走旧出口。
+  @objc public func quarantineAccountProxy(_ invoke: Invoke) throws {
+    let args = try invoke.parseArgs(QuarantineProxyArgs.self)
+    DispatchQueue.main.async {
+      let result = AccountSessionCoordinator.shared.quarantine(
+        uuid: args.uuid,
+        reason: args.reason ?? "代理配置正在变更，当前会话已停止出站（请重新打开该账号）"
+      )
+      var payload: [String: Any] = [
+        "engaged": result.engaged,
+        "sessionOpen": result.sessionOpen,
+      ]
+      if !result.engaged {
+        payload["reason"] = "该设备无法隔离 WebView 出口（需要 iOS 17+）"
+      }
       invoke.resolve(payload)
     }
   }

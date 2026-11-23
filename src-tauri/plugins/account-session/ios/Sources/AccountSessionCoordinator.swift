@@ -12,6 +12,7 @@
 import Foundation
 import Tauri
 import UIKit
+import WebKit
 
 struct IosAccountSessionSpec {
   let providerId: String
@@ -208,15 +209,23 @@ final class AccountSessionCoordinator {
   /// 让下次打开按新配置重建 WebView（WKWebsiteDataStore 的
   /// proxyConfigurations 只在 WebView 创建时读取一次，改已有的 store 不保证生效）。
   ///
-  /// **正在打开的会话会被立即阻断出站**：换出口时旧 WebView 仍在按旧配置
-  /// （可能是直连）发请求，只用提示代替阻断就等于绕过代理。用户需要返回
-  /// 账号列表重新打开，届时按新配置重建。
+  /// **正在打开的会话会被彻底销毁**：换出口时旧 WebView 仍在按旧配置
+  /// （可能是直连）发请求，只 stopLoading / 隐藏都是不够的——已建立的
+  /// XHR/WebSocket 还在跑。这里先由 Rust 侧 quarantine 把 data store 的
+  /// 出口指向不可达端点，再把 WebView 从视图层级移除（内容进程随之终止）。
   ///
   /// 返回 (是否已落配置, 该账号会话是否曾被阻断)。
   func setAccountProxy(uuid: String, config: AccountProxyConfig?) -> (applied: Bool, sessionOpen: Bool) {
     AccountProxyStore.set(uuid: uuid, config: config)
     RecentAccountPages.discardProfile(uuid)
     TaskWatcher.shared.forget(uuid: uuid)
+    // 关闭代理时要把 store 上可能残留的隔离/旧代理清掉；开启时由下发方
+    // （plugin.setAccountProxy）在同一个 store 上应用新配置。
+    if config?.enabled != true {
+      if #available(iOS 17.0, *), let identifier = UUID(uuidString: uuid) {
+        AccountProxyApplier.clear(store: WKWebsiteDataStore(forIdentifier: identifier))
+      }
+    }
 
     var liveVC: AccountWebViewController?
     var sessionOpen = false
@@ -235,9 +244,38 @@ final class AccountSessionCoordinator {
     return (true, sessionOpen)
   }
 
-  /// 该账号当前是否已有持久化的 WebView 代理配置（不含口令）。
+  /// 先隔离再改配置：关闭 Rust 保存与 Swift 下发之间的时间窗口。
+  ///
+  /// 调用顺序（Rust `muse_native_set_account_proxy`）：
+  /// 1. `quarantine` —— 立刻把该账号 data store 的出口换成不可达端点，
+  ///    并销毁正在打开的 WebView；此后旧配置（可能是直连）再也发不出去；
+  /// 2. 落 Rust 侧配置；
+  /// 3. `push` 新配置 —— 成功即替换隔离，失败则保持隔离（fail-closed）。
+  ///
+  /// 隔离只作用于 DataStore 与内存中的视图，**不写** UserDefaults：
+  /// 若第 2 步失败，持久化配置仍是旧值，下次打开按旧配置重建，
+  /// 不会出现「内存说没代理、实际有代理」的分裂。
+  func quarantine(uuid: String, reason: String) -> (engaged: Bool, sessionOpen: Bool) {
+    let engaged = AccountProxyQuarantine.engage(uuid: uuid)
+    RecentAccountPages.discardProfile(uuid)
+    TaskWatcher.shared.forget(uuid: uuid)
+
+    var liveVC: AccountWebViewController?
+    var sessionOpen = false
+    lock.withLock {
+      if activeSpec?.uuid == uuid {
+        sessionOpen = true
+        liveVC = viewControllerRef
+      }
+    }
+    liveVC?.blockEgress(reason: reason)
+    return (engaged, sessionOpen)
+  }
+
+  /// 该账号当前的持久化出口配置（不含口令）；`nil` 表示没有可信条目。
+  /// **只给诊断/界面用**，出站决策必须走 `AccountProxyResolver`。
   func accountProxyConfig(uuid: String) -> AccountProxyConfig? {
-    AccountProxyStore.config(for: uuid)
+    AccountProxyStore.rawMap()?[uuid]
   }
 
   static func hostMatchesAllowed(_ url: URL?, allowedHosts: [String]) -> Bool {

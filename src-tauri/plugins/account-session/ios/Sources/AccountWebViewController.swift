@@ -54,6 +54,8 @@ final class AccountWebViewController: UIViewController, WKNavigationDelegate, WK
   /// #11/#16（补 W）：非 nil 时该会话已被阻断（代理由启用变为不可用、代理变更、
   /// 本地配置损坏等），所有主框架导航一律取消，不放行任何直连请求。
   private var egressBlockedReason: String?
+  /// 阻断时是否已经销毁过 WebView，避免在导航回调里重复销毁。
+  private var egressTornDown = false
   private var egressBlockLabel: UILabel?
   // 0.1.11 (generalized in 0.1.18): set when the popup navigates to a
   // non-allowlisted host — the popup is doing external auth. The popup
@@ -380,18 +382,50 @@ final class AccountWebViewController: UIViewController, WKNavigationDelegate, WK
 
   /// 代理不可用/变更后，当前 WebView 必须**立即停止出站**。
   ///
-  /// 只弹提示不算阻断：这里同时停掉正在进行的加载、销毁 OAuth 弹窗，
-  /// 并在 `decidePolicyFor` 里取消后续所有主框架导航。想继续用，只能
-  /// 关掉会话重新打开（那时会按新配置重建 WebView）。
+  /// 只弹提示不算阻断；只 `stopLoading` + 隐藏也不够：已建立的 XHR /
+  /// WebSocket / EventSource 会继续跑，JS 定时器还会接着发请求。这里按
+  /// 「能撤的撤、撤不掉的重建」处理：
+  /// 1. 停加载、销毁 OAuth 弹窗；
+  /// 2. 注入 `window.stop()` 并尽力关闭页内可枚举的连接；
+  /// 3. **销毁 WebView 本身**：从视图层级移除、断开代理引用后内容进程随之
+  ///    终止，其上的连接（含 WS）全部断开；
+  /// 4. 网络层的兜底由调用方先行 `AccountProxyQuarantine.engage(uuid:)`
+  ///    （不可达代理 + allowFailover=false）保证：即使仍有残留进程发起新
+  ///    连接，也连不出去。
+  ///
+  /// 想继续用，只能关掉会话重新打开（那时按新配置重建 WebView）。
   func blockEgress(reason: String) {
     egressBlockedReason = reason
     mainLoadFailed = true
-    mainWebView?.stopLoading()
-    popupWebView?.stopLoading()
-    destroyPopupWebView()
     mainInputEnabled = false
-    headerTitleLabel.text = reason
     loadingIndicator.stopAnimating()
+    destroyPopupWebView()
+
+    if !egressTornDown {
+      egressTornDown = true
+      progressObservation?.invalidate()
+      progressObservation = nil
+      stopIdentityProbeLoop()
+      if let view = mainWebView {
+        // 尽力让页面自己停下（同步执行，不等待回调）。
+        view.evaluateJavaScript(
+          "try{window.stop()}catch(e){};" +
+            "try{for(const k of Object.keys(window)){const v=window[k];" +
+            "if(v&&v.constructor&&/WebSocket|EventSource/.test(v.constructor.name)){" +
+            "try{v.close()}catch(e){}}}}catch(e){}",
+          completionHandler: nil)
+        view.stopLoading()
+        view.navigationDelegate = nil
+        view.uiDelegate = nil
+        // 去掉注入脚本，避免重建前的残留页面继续跑我们的钩子。
+        view.configuration.userContentController.removeAllUserScripts()
+        view.removeFromSuperview()
+      }
+      // 释放引用 = 销毁：WKWebView 的内容进程随最后一个引用消失而终止。
+      mainWebView = nil
+    }
+
+    headerTitleLabel.text = reason
     let label = egressBlockLabel ?? {
       let l = UILabel()
       l.numberOfLines = 0
@@ -409,14 +443,13 @@ final class AccountWebViewController: UIViewController, WKNavigationDelegate, WK
     }()
     label.text = "\(reason)\n\n请返回账号列表，重新打开该账号。"
     label.isHidden = false
-    mainWebView?.isHidden = true
   }
 
-  /// 新会话/新页面建立时清除阻断态。
+  /// 新会话/新页面建立时清除阻断态（WebView 会重新创建）。
   private func clearEgressBlock() {
     egressBlockedReason = nil
+    egressTornDown = false
     egressBlockLabel?.isHidden = true
-    mainWebView?.isHidden = false
   }
 
   func bindSessionSpec(_ spec: IosAccountSessionSpec) {
@@ -435,12 +468,16 @@ final class AccountWebViewController: UIViewController, WKNavigationDelegate, WK
     // No MULTI_PROFILE capability check on iOS: WKWebsiteDataStore identifiers
     // are available on every supported device (iOS 17+).
     //
-    // #11/#16（补 W）：本地代理配置损坏时无法判断该账号该走什么出口，
-    // 宁可阻断整个会话，也不能当成「没有代理」放行直连。
-    if case .corrupt = AccountProxyStore.load() {
-      blockEgress(reason: "本地代理配置损坏，无法确认出口（fail-closed）")
+    // #11/#16（补 W）：出口必须由统一解析器给出。
+    // 配置损坏、或还没收到该账号的条目（下发失败 / 两端未同步）都算未知，
+    // 一律阻断；**不能**因为「没读到配置」就按直连放行。
+    if let reason = AccountProxyResolver.resolve(uuid: spec.uuid).blockReason {
+      blockEgress(reason: reason)
       return
     }
+    // 缓存页可以直接复用：任何出口变更（set / quarantine）都会先
+    // discardProfile 把这个账号的缓存页销毁，所以能拿到缓存就说明
+    // 它的代理配置与当前解析结果一致。
     let cached = RecentAccountPages.take(spec: spec)
     let webView: WKWebView
     if let cached {
@@ -460,13 +497,10 @@ final class AccountWebViewController: UIViewController, WKNavigationDelegate, WK
       config.websiteDataStore = store
       DataStoreRegistry.markCreated(spec.uuid)
       // #11/#16：每账号独立代理。应用失败（不支持 / 缺口令 / 配置损坏）一律
-      // fail-closed：整个会话阻断，绝不回退直连。
-      if let proxy = AccountProxyStore.config(for: spec.uuid), proxy.enabled {
-        let result = AccountProxyApplier.apply(cfg: proxy, uuid: spec.uuid, to: store)
-        if let reason = result.blockReason {
-          blockEgress(reason: reason)
-          return
-        }
+      // fail-closed：整个会话阻断，绝不回退直连。同一入口也负责清除残留隔离。
+      if let reason = AccountProxyResolver.apply(uuid: spec.uuid, to: store) {
+        blockEgress(reason: reason)
+        return
       }
       config.defaultWebpagePreferences.allowsContentJavaScript = true
       config.preferences.javaScriptCanOpenWindowsAutomatically = false
@@ -573,8 +607,8 @@ final class AccountWebViewController: UIViewController, WKNavigationDelegate, WK
     }
     // 出站已被阻断：任何主框架导航（含 OAuth 回调）都不放行，
     // 否则会绕过代理直接用系统网络发请求。
-    if let reason = egressBlockedReason {
-      blockEgress(reason: reason)
+    if egressBlockedReason != nil {
+      // 已经在 blockEgress 里销毁过视图；这里只拦下导航，不再重入销毁逻辑。
       decisionHandler(.cancel)
       return
     }

@@ -217,6 +217,7 @@ impl AccountGateway {
 
   /// 发一条聊天消息并等 ack（直连与代理共用同一协议实现）。
   /// 返回值区分「请求是否已写到线上」——台账据此决定 UNKNOWN 还是未开始。
+  #[allow(dead_code)] // 取消路径走 `send_message_cancellable`
   pub async fn send_message(
     self,
     text: &str,
@@ -224,14 +225,33 @@ impl AccountGateway {
     session_id: Option<&str>,
     timeout: Duration,
   ) -> SendAttemptResult {
+    self
+      .send_message_cancellable(text, node_id, session_id, timeout, None)
+      .await
+  }
+
+  /// 与 [`Self::send_message`] 相同，但写入阶段与等 ack 阶段都可被取消。
+  /// 取消**不会**让调用方拿到「没发出去」的结论：`wrote_frames` 才是依据。
+  pub async fn send_message_cancellable(
+    self,
+    text: &str,
+    node_id: &str,
+    session_id: Option<&str>,
+    timeout: Duration,
+    cancel: Option<&mut tokio::sync::watch::Receiver<bool>>,
+  ) -> SendAttemptResult {
     match self {
       AccountGateway::Direct(g) => {
-        muse_native_client::chat_send::send_message_tracked(g, text, node_id, session_id, timeout)
-          .await
+        muse_native_client::chat_send::send_message_tracked(
+          g, text, node_id, session_id, timeout, cancel,
+        )
+        .await
       }
       AccountGateway::Proxied(g) => {
-        muse_native_client::chat_send::send_message_tracked(g, text, node_id, session_id, timeout)
-          .await
+        muse_native_client::chat_send::send_message_tracked(
+          g, text, node_id, session_id, timeout, cancel,
+        )
+        .await
       }
     }
   }
