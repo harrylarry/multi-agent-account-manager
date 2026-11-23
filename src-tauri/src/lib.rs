@@ -171,18 +171,42 @@ async fn muse_native_approvals_probe(
   muse_native::approvals_probe(&app, &provider_id, &uuid).await
 }
 
-/// B3：只读拉一次额度（Server Action 优先，REST 兜底）。
+/// B3：只读拉一次额度（Server Action 优先，REST 兜底），失败时带每步诊断。
+#[derive(serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct QuotaProbe {
+  pub ok: bool,
+  pub quota: Option<quota::QuotaSnapshot>,
+  pub diag: Vec<String>,
+  pub error: Option<String>,
+}
+
 #[tauri::command]
 async fn muse_native_quota_probe(
   app: AppHandle,
   provider_id: String,
   uuid: String,
-) -> Result<quota::QuotaSnapshot, String> {
+) -> Result<QuotaProbe, String> {
   if provider_id != "muse" {
     return Err("额度探针只支持 Muse 账号".to_string());
   }
-  let cookie = muse_native::cookie_header_for(&app, &uuid).await?;
-  quota::fetch_quota(&cookie, None).await
+  let cookie = match muse_native::cookie_header_for(&app, &uuid).await {
+    Ok(c) => c,
+    Err(e) => {
+      return Ok(QuotaProbe { ok: false, quota: None, diag: vec![], error: Some(e) })
+    }
+  };
+  let (quota, diag) = quota::fetch_quota(&cookie, None).await;
+  Ok(QuotaProbe {
+    ok: quota.is_some(),
+    error: if quota.is_some() {
+      None
+    } else {
+      Some("额度获取失败（见下方每步诊断）".to_string())
+    },
+    quota,
+    diag,
+  })
 }
 
 /// B4：发送一条消息到隔离测试会话（单发锁 + 台账在 muse_native::send_probe）。

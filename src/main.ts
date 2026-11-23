@@ -92,7 +92,10 @@ let spikeApprovalsError: string | null = null;
 interface SpikeQuota {
   tier: string; percentUsed: number; state: string; resetsAtMs: number; source: string;
 }
-let spikeQuota: SpikeQuota | null = null;
+interface SpikeQuotaProbe {
+  ok: boolean; quota: SpikeQuota | null; diag: string[]; error: string | null;
+}
+let spikeQuotaProbe: SpikeQuotaProbe | null = null;
 let spikeQuotaRunning = false;
 let spikeQuotaError: string | null = null;
 interface SpikeSendResult {
@@ -786,12 +789,22 @@ function spikeDiagInnerHtml(): string {
     sendHtml = `<div class="spike-diag-result fail">错误：${escapeHtml(spikeSendError)}</div>`;
   }
   let quotaHtml = "";
+  const spikeQuota = spikeQuotaProbe?.quota ?? null;
   if (spikeQuota) {
     const q = spikeQuota;
     quotaHtml = `
       <div class="spike-diag-result ok">
         <div>✓ 额度：${escapeHtml(q.tier || "—")}　已用 ${q.percentUsed}%　状态 ${escapeHtml(q.state || "—")}</div>
         <div>重置：${q.resetsAtMs ? new Date(q.resetsAtMs).toLocaleString() : "—"}　来源：${escapeHtml(q.source)}</div>
+      </div>`;
+  } else if (spikeQuotaProbe) {
+    quotaHtml = `
+      <div class="spike-diag-result fail">
+        <div>✗ 额度获取失败</div>
+        ${(spikeQuotaProbe.diag ?? [])
+          .map((d) => `<div>· ${escapeHtml(d)}</div>`)
+          .join("")}
+        ${spikeQuotaProbe.error ? `<div>${escapeHtml(spikeQuotaProbe.error)}</div>` : ""}
       </div>`;
   } else if (spikeQuotaError) {
     quotaHtml = `<div class="spike-diag-result fail">错误：${escapeHtml(spikeQuotaError)}</div>`;
@@ -909,7 +922,7 @@ async function runSpikeQuota(): Promise<void> {
   if (!snapshot || spikeQuotaRunning) return;
   const acc = pickWatchAccount();
   if (!acc) {
-    spikeQuota = null;
+    spikeQuotaProbe = null;
     spikeQuotaError = "没有已登录的 Muse 账号。";
     syncSpikeDiag();
     return;
@@ -918,14 +931,14 @@ async function runSpikeQuota(): Promise<void> {
   spikeQuotaError = null;
   syncSpikeDiag();
   try {
-    spikeQuota = await Promise.race([
-      invoke<SpikeQuota>("muse_native_quota_probe", { providerId: "muse", uuid: acc.uuid }),
-      new Promise<SpikeQuota>((_, reject) =>
+    spikeQuotaProbe = await Promise.race([
+      invoke<SpikeQuotaProbe>("muse_native_quota_probe", { providerId: "muse", uuid: acc.uuid }),
+      new Promise<SpikeQuotaProbe>((_, reject) =>
         setTimeout(() => reject(new Error("额度探针超时（60 秒）")), 60_000)
       ),
     ]);
   } catch (e) {
-    spikeQuota = null;
+    spikeQuotaProbe = null;
     spikeQuotaError = String(e);
   }
   spikeQuotaRunning = false;

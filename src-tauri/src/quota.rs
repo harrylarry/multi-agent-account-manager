@@ -143,11 +143,19 @@ pub fn find_action_id(text: &str) -> Option<String> {
   None
 }
 
+/// 响应诊断：状态码、Content-Type、正文前缀（截断，不含凭据）。
+fn preview(text: &str, n: usize) -> String {
+  let flat: String = text.split_whitespace().collect::<Vec<_>>().join(" ");
+  flat.chars().take(n).collect()
+}
+
 async fn post_action(
   client: &reqwest::Client,
   cookie: &str,
   id: &str,
+  diag: &mut Vec<String>,
 ) -> Result<Option<QuotaSnapshot>, String> {
+  let tag = &id[..8.min(id.len())];
   let resp = client
     .post(format!("{ORIGIN}/"))
     .header("Accept", "text/x-component")
@@ -162,7 +170,17 @@ async fn post_action(
     .await
     .map_err(|e| e.to_string())?;
   let status = resp.status().as_u16();
+  let ctype = resp
+    .headers()
+    .get("content-type")
+    .and_then(|v| v.to_str().ok())
+    .unwrap_or("?")
+    .to_string();
   let text = resp.text().await.map_err(|e| e.to_string())?;
+  diag.push(format!(
+    "action {tag}: {status} {ctype} «{}»",
+    preview(&text, 90)
+  ));
   if status >= 400 {
     return Ok(None);
   }
@@ -174,6 +192,7 @@ async fn get_text(
   cookie: &str,
   url: &str,
   accept: &str,
+  diag: &mut Vec<String>,
 ) -> Result<String, String> {
   let resp = client
     .get(url)
@@ -186,10 +205,21 @@ async fn get_text(
     .send()
     .await
     .map_err(|e| e.to_string())?;
-  if !resp.status().is_success() {
-    return Err(format!("HTTP {}", resp.status().as_u16()));
+  let status = resp.status().as_u16();
+  let ctype = resp
+    .headers()
+    .get("content-type")
+    .and_then(|v| v.to_str().ok())
+    .unwrap_or("?")
+    .to_string();
+  let text = resp.text().await.map_err(|e| e.to_string())?;
+  let short = url.trim_start_matches(ORIGIN);
+  if !(200..300).contains(&status) {
+    diag.push(format!("GET {short}: {status} {ctype} «{}»", preview(&text, 90)));
+    return Err(format!("HTTP {status}"));
   }
-  resp.text().await.map_err(|e| e.to_string())
+  diag.push(format!("GET {short}: {status} {ctype} {}B", text.len()));
+  Ok(text)
 }
 
 fn script_urls(html: &str) -> Vec<String> {
@@ -222,10 +252,14 @@ fn script_urls(html: &str) -> Vec<String> {
   out
 }
 
-async fn discover_action_id(client: &reqwest::Client, cookie: &str) -> Option<String> {
+async fn discover_action_id(
+  client: &reqwest::Client,
+  cookie: &str,
+  diag: &mut Vec<String>,
+) -> Option<String> {
   let mut scripts: Vec<String> = Vec::new();
   for path in ["/", "/chat", "/settings"] {
-    if let Ok(html) = get_text(client, cookie, &format!("{ORIGIN}{path}"), "text/html").await {
+    if let Ok(html) = get_text(client, cookie, &format!("{ORIGIN}{path}"), "text/html", diag).await {
       if let Some(id) = find_action_id(&html) {
         return Some(id);
       }
@@ -233,7 +267,7 @@ async fn discover_action_id(client: &reqwest::Client, cookie: &str) -> Option<St
     }
   }
   for url in scripts.into_iter().take(24) {
-    if let Ok(js) = get_text(client, cookie, &url, "*/*").await {
+    if let Ok(js) = get_text(client, cookie, &url, "*/*", diag).await {
       if let Some(id) = find_action_id(&js) {
         return Some(id);
       }
@@ -242,13 +276,23 @@ async fn discover_action_id(client: &reqwest::Client, cookie: &str) -> Option<St
   None
 }
 
-/// 取一次额度：先试缓存/发现的 Server Action，再试 REST 兜底。
-pub async fn fetch_quota(cookie: &str, cached_action: Option<&str>) -> Result<QuotaSnapshot, String> {
-  let client = reqwest::Client::builder()
+/// 取一次额度：先试已知/缓存的 action id，再试发现，再试 REST 兜底。
+/// 返回 (成功快照, 诊断行)；失败时快照为 None，诊断行说明每一步的状态码与响应前缀。
+pub async fn fetch_quota(
+  cookie: &str,
+  cached_action: Option<&str>,
+) -> (Option<QuotaSnapshot>, Vec<String>) {
+  let mut diag: Vec<String> = Vec::new();
+  let client = match reqwest::Client::builder()
     .timeout(Duration::from_secs(20))
     .build()
-    .map_err(|e| e.to_string())?;
-  let mut tried: Vec<String> = Vec::new();
+  {
+    Ok(c) => c,
+    Err(e) => {
+      diag.push(format!("client: {e}"));
+      return (None, diag);
+    }
+  };
 
   let mut candidates: Vec<String> = Vec::new();
   if let Some(id) = cached_action {
@@ -257,44 +301,43 @@ pub async fn fetch_quota(cookie: &str, cached_action: Option<&str>) -> Result<Qu
   candidates.push(FALLBACK_ACTION_ID.to_string());
 
   for id in &candidates {
-    match post_action(&client, cookie, id).await {
-      Ok(Some(q)) => return Ok(q),
-      Ok(None) => tried.push(format!("action {}:no-json", &id[..8.min(id.len())])),
-      Err(e) => tried.push(format!("action {}:{}", &id[..8.min(id.len())], e)),
+    match post_action(&client, cookie, id, &mut diag).await {
+      Ok(Some(q)) => return (Some(q), diag),
+      Ok(None) => {}
+      Err(e) => diag.push(format!("action err: {e}")),
     }
   }
 
-  match discover_action_id(&client, cookie).await {
+  match discover_action_id(&client, cookie, &mut diag).await {
     Some(id) => {
       if !candidates.contains(&id) {
-        match post_action(&client, cookie, &id).await {
-          Ok(Some(q)) => return Ok(q),
-          Ok(None) => tried.push("discovered:no-json".to_string()),
-          Err(e) => tried.push(format!("discovered:{e}")),
+        match post_action(&client, cookie, &id, &mut diag).await {
+          Ok(Some(q)) => return (Some(q), diag),
+          Ok(None) => {}
+          Err(e) => diag.push(format!("discovered err: {e}")),
         }
       }
     }
-    None => tried.push("discover:none".to_string()),
+    None => diag.push("discover: 未找到 action id".to_string()),
   }
 
   for ep in ["/api/subscription", "/api/hatch/subscription", "/api/billing/subscription"] {
-    match get_text(&client, cookie, &format!("{ORIGIN}{ep}"), "application/json").await {
+    match get_text(&client, cookie, &format!("{ORIGIN}{ep}"), "application/json", &mut diag).await {
       Ok(body) => {
         if let Ok(v) = serde_json::from_str::<Value>(&body) {
           if let Some(mut q) = parse_subscription(&v) {
             q.source = "rest".to_string();
-            return Ok(q);
+            return (Some(q), diag);
           }
-          tried.push(format!("rest {ep}:no-quota"));
+          diag.push(format!("rest {ep}: JSON 无额度字段"));
         } else {
-          tried.push(format!("rest {ep}:not-json"));
+          diag.push(format!("rest {ep}: 非 JSON「{}」", preview(&body, 60)));
         }
       }
-      Err(e) => tried.push(format!("rest {ep}:{e}")),
+      Err(_) => {}
     }
   }
-
-  Err(format!("quota unavailable（{}）", tried.join("；")))
+  (None, diag)
 }
 
 #[cfg(test)]
