@@ -43,6 +43,7 @@ pub struct ProxySetting {
 impl ProxySetting {
   /// 强制 fail-closed：无论存储里写什么，代理启用时都不允许直连回退。
   /// 这里不提供关闭它的字段——这是结构性的，不是配置开关。
+  #[allow(dead_code)] // 语义常量：本类型永远 fail-closed
   pub fn fail_closed(&self) -> bool {
     true
   }
@@ -368,6 +369,7 @@ fn migrate_from_value(root: Value) -> Result<(AccountsStoreFile, bool), String> 
         quota_detail,
         auth_state,
         has_unread_reply: false,
+        proxy: None,
       });
     }
   }

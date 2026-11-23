@@ -208,14 +208,30 @@ final class AccountSessionCoordinator {
   /// 让下次打开按新配置重建 WebView（WKWebsiteDataStore 的
   /// proxyConfigurations 只在 WebView 创建时读取一次，改已有的 store 不保证生效）。
   ///
-  /// 返回 (是否已应用, 该账号会话是否正开着)。
-  /// 会话开着时**不**强行重载当前页面：换代理等于换出口，用户可能正在
-  /// 输入；这里只回报 sessionOpen，由 Rust/前端提示用户重开会话。
+  /// **正在打开的会话会被立即阻断出站**：换出口时旧 WebView 仍在按旧配置
+  /// （可能是直连）发请求，只用提示代替阻断就等于绕过代理。用户需要返回
+  /// 账号列表重新打开，届时按新配置重建。
+  ///
+  /// 返回 (是否已落配置, 该账号会话是否曾被阻断)。
   func setAccountProxy(uuid: String, config: AccountProxyConfig?) -> (applied: Bool, sessionOpen: Bool) {
     AccountProxyStore.set(uuid: uuid, config: config)
     RecentAccountPages.discardProfile(uuid)
     TaskWatcher.shared.forget(uuid: uuid)
-    let sessionOpen = lock.withLock { activeSpec?.uuid == uuid }
+
+    var liveVC: AccountWebViewController?
+    var sessionOpen = false
+    lock.withLock {
+      if activeSpec?.uuid == uuid {
+        sessionOpen = true
+        liveVC = viewControllerRef
+      }
+    }
+    if let liveVC {
+      let reason = config?.enabled == true
+        ? "代理已变更，当前会话已停止出站（请重新打开该账号）"
+        : "该账号代理已切换为直连，当前会话已停止出站（请重新打开该账号）"
+      liveVC.blockEgress(reason: reason)
+    }
     return (true, sessionOpen)
   }
 

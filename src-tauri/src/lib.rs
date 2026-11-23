@@ -1,6 +1,7 @@
 mod muse_native;
 mod platform;
 mod probe_cancel;
+mod webview_proxy;
 mod providers;
 mod quota;
 mod secrets;
@@ -358,18 +359,26 @@ async fn muse_native_fingerprint_probe(
   .await)
 }
 
-/// #11/#16：用指定代理验证控制面 + WSS 隧道 + Noise + ping（fail-closed）。
+/// #11/#16：用**该账号已保存的代理**验证控制面 + WSS 隧道 + Noise + ping（fail-closed）。
+///
+/// 不再接受前端传入的 proxy URI：诊断必须与真实发送同源（ProxySetting +
+/// Keychain），否则会出现「诊断 OK、发送走另一个出口」的误判，也会让代理口令
+/// 经 IPC 进入前端。支持后端取消（取消后立即停止后续阶段）。
 #[tauri::command]
 async fn muse_native_proxy_probe(
   app: AppHandle,
   provider_id: String,
   uuid: String,
-  proxy_uri: String,
+  mgr: State<'_, Arc<SessionManager>>,
+  cancel: State<'_, Arc<probe_cancel::ProbeCancel>>,
 ) -> Result<muse_native::ProxyProbe, String> {
   if provider_id != "muse" {
     return Err("代理探针只支持 Muse 账号".to_string());
   }
-  Ok(muse_native::proxy_probe(&app, &uuid, &proxy_uri).await)
+  let setting = account_proxy_setting(&mgr, &provider_id, &uuid).await;
+  let dir = app.path().app_data_dir().map_err(|e| e.to_string())?;
+  let secrets = secrets::Secrets::new(&dir);
+  Ok(muse_native::proxy_probe(&app, &uuid, setting.as_ref(), &secrets, &cancel).await)
 }
 
 /// 平台原生 WebView 侧的代理应用结果。
@@ -394,71 +403,22 @@ pub struct ProxySettingView {
 }
 
 /// #11/#16（补 W）：把账号代理下发给 iOS 侧的 WKWebView。
-///
-/// WKWebView 的出站不受 Rust reqwest / 网关隧道影响，iOS 17+ 只能通过
-/// `WKWebsiteDataStore.proxyConfigurations` 设置，所以必须单独下发一次。
-/// 口令不下发：Swift 按 `proxy-<uuid>` 从同一个 Keychain service 读取。
-#[cfg(target_os = "ios")]
+/// 平台没有这一层时返回 `None`（桌面 / Android），有但未生效时返回
+/// `applied = false` + 原因——前端据此提示，而**阻断由 Swift 侧真正执行**。
 async fn apply_webview_proxy(
   app: &AppHandle,
   uuid: &str,
   setting: Option<&storage::ProxySetting>,
 ) -> Option<WebviewProxyView> {
-  use platform::ios::{SetAccountProxyPayload, set_account_proxy};
-
-  let payload = match setting {
-    Some(s) if s.enabled => match muse_native_client::proxy::ProxyConfig::parse_endpoint(&s.uri) {
-      Ok(ep) => SetAccountProxyPayload {
-        uuid: uuid.to_string(),
-        scheme: ep.scheme.to_string(),
-        host: ep.host,
-        port: ep.port,
-        // 端点里的用户名优先；单独填的 username 字段兜底（uri 不带 userinfo 的情形）。
-        username: ep.username.or_else(|| s.effective_username()),
-        enabled: true,
-      },
-      Err(e) => {
-        return Some(WebviewProxyView {
-          applied: false,
-          session_open: false,
-          reason: Some(format!("代理端点无法下发给 WebView: {e}")),
-        })
-      }
-    },
-    // 未配置 / 未启用：清除 WebView 侧配置。
-    _ => SetAccountProxyPayload {
-      uuid: uuid.to_string(),
-      scheme: "http".to_string(),
-      host: String::new(),
-      port: 0,
-      username: None,
-      enabled: false,
-    },
-  };
-
-  Some(match set_account_proxy(app, payload).await {
-    Ok(r) => WebviewProxyView {
-      applied: r.applied,
-      session_open: r.session_open,
-      reason: r.reason,
-    },
-    Err(e) => WebviewProxyView {
-      applied: false,
-      session_open: false,
-      reason: Some(format!("下发 WebView 代理失败: {e}")),
-    },
+  let outcome = webview_proxy::push(app, uuid, setting).await;
+  if !outcome.applicable {
+    return None;
+  }
+  Some(WebviewProxyView {
+    applied: outcome.applied,
+    session_open: outcome.session_open,
+    reason: outcome.reason,
   })
-}
-
-#[cfg(not(target_os = "ios"))]
-async fn apply_webview_proxy(
-  _app: &AppHandle,
-  _uuid: &str,
-  _setting: Option<&storage::ProxySetting>,
-) -> Option<WebviewProxyView> {
-  // 桌面 / Android 没有“每账号 WebView 代理”这一层（桌面 WKWebView/WebView2
-  // 走系统代理）。明确返回 None，不伪装成已生效。
-  None
 }
 
 fn uri_userinfo(uri: &str) -> Option<&str> {
@@ -535,19 +495,25 @@ async fn muse_native_set_account_proxy(
 }
 
 /// #11/#16：读取账号代理的脱敏视图。
+///
+/// 读取时顺带把配置重新下发一次：Rust 是权威源，App 重启 / Swift 本地配置
+/// 损坏或过期都在这里被纠正，面板显示的状态也就等于 WebView 真正拿到的状态。
 #[tauri::command]
 async fn muse_native_get_account_proxy(
+  app: AppHandle,
   provider_id: String,
   uuid: String,
   mgr: State<'_, Arc<SessionManager>>,
 ) -> Result<Option<ProxySettingView>, String> {
   let pid = providers::ProviderId::parse(&provider_id)
     .ok_or_else(|| format!("未知 provider: {provider_id}"))?;
-  Ok(mgr.proxy_setting(pid, &uuid).await.map(|s| ProxySettingView {
+  let setting = mgr.proxy_setting(pid, &uuid).await;
+  let webview = apply_webview_proxy(&app, &uuid, setting.as_ref()).await;
+  Ok(setting.map(|s| ProxySettingView {
     enabled: s.enabled,
     display: s.display_safe(),
     has_credentials: s.credential_ref.is_some(),
-    webview: None,
+    webview,
   }))
 }
 
@@ -575,21 +541,26 @@ async fn muse_native_clear_account_proxy(
   Ok(())
 }
 
-/// #11/#16：请求取消该账号正在运行的长任务（指纹/发送/订阅等）。
+/// #11/#16：请求取消该账号正在运行的长任务（指纹/发送/代理探针等）。
 /// 只停止发起新请求；已发出的发送按 UNKNOWN 记账，不重发。
+/// 返回命中的任务数（同账号可能有多个任务在跑，例如指纹 + 代理探针）。
 #[tauri::command]
 fn muse_native_cancel_probe(
   provider_id: String,
   uuid: String,
   cancel: State<'_, Arc<probe_cancel::ProbeCancel>>,
-) -> Result<bool, String> {
+) -> Result<usize, String> {
   if provider_id != "muse" {
     return Err("取消探针只支持 Muse 账号".to_string());
   }
-  Ok(cancel.cancel(&uuid))
+  Ok(cancel.cancel_account(&uuid))
 }
 
 /// #10：开始一次存活探针（长连接 + 订阅，记录到断开为止）。
+///
+/// 返回 `Result`：async 命令若返回非 `Result`，Tauri 会把引用参数当成不可满足的
+/// 约束（`AsyncCommandMustReturnResult`）；这里本就要读账号代理设置（需要 await），
+/// 所以统一返回 `Result`，错误直接抛给前端。
 #[tauri::command]
 async fn muse_native_liveness_start(
   app: AppHandle,
@@ -597,10 +568,10 @@ async fn muse_native_liveness_start(
   seconds: u64,
   state: tauri::State<'_, std::sync::Arc<muse_native::LivenessState>>,
   mgr: State<'_, Arc<SessionManager>>,
-) -> muse_native::Liveness {
+) -> Result<muse_native::Liveness, String> {
   let setting = account_proxy_setting(&mgr, "muse", &uuid).await;
   muse_native::liveness_start(&app, &state, &uuid, seconds, setting);
-  state.snapshot()
+  Ok(state.snapshot())
 }
 
 /// #10：读取存活探针当前状态/结果。

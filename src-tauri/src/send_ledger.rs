@@ -50,14 +50,23 @@ pub struct SendAttempt {
   pub mission_id: Option<String>,
 }
 
+/// 台账的全部可变状态放在**同一把锁**里。
+///
+/// 之前 attempts / in_flight / missions 各一把锁，`mission()` 与 `begin()` 会
+/// 各自「先查后插」，两步之间可以插进对方的检查，导致检测任务与手动发送
+/// 同时通过互斥（真实竞态）。单一 Mutex 让「查 + 插」成为一次原子操作。
+#[derive(Default)]
+struct LedgerState {
+  attempts: Vec<SendAttempt>,
+  /// 每个账号当前的 IN_FLIGHT send_id；有则拒绝新发送。
+  in_flight: HashMap<String, String>,
+  /// 每个账号当前进行中的检测任务 mission_id；有则拒绝任何新发送。
+  missions: HashMap<String, String>,
+}
+
 #[derive(Default)]
 pub struct SendLedger {
-  attempts: Mutex<Vec<SendAttempt>>,
-  /// 每个账号当前是否有 IN_FLIGHT；有则拒绝新发送。
-  in_flight: Mutex<HashMap<String, String>>,
-  /// 每个账号当前是否有进行中的检测任务（mission）；有则拒绝任何新发送，
-  /// 避免「指纹评估期间插进一条手动消息」。任务内的探针不走这层拒绝。
-  missions: Mutex<HashMap<String, String>>,
+  state: Mutex<LedgerState>,
 }
 
 fn now_ms() -> u128 {
@@ -87,26 +96,34 @@ impl SendLedger {
   }
 
   /// 申请发送权并落 PREPARED。返回 send_id；已有 IN_FLIGHT 或检测任务时返回 Busy。
-  pub fn begin(&self, account_uuid: &str, conversation_id: &str, text: &str) -> Result<String, SendError> {
-    if let Some(mission) = self.missions.lock().unwrap().get(account_uuid) {
+  pub fn begin(
+    &self,
+    account_uuid: &str,
+    conversation_id: &str,
+    text: &str,
+  ) -> Result<String, SendError> {
+    let mut st = self.state.lock().unwrap();
+    // 单锁内「查 mission + 查 in_flight + 插入」，与 mission() 互斥。
+    if let Some(mission) = st.missions.get(account_uuid) {
       return Err(SendError::Busy(mission.clone()));
     }
-    self.start_attempt(account_uuid, conversation_id, text, SendKind::Message, None)
+    Self::start_attempt_locked(&mut st, account_uuid, conversation_id, text, SendKind::Message, None)
   }
 
   /// 开启一次检测任务（mission）。mission 期间该账号拒绝所有手动发送；
   /// 返回的 guard 在 drop 时自动释放 mission，保证异常路径不锁死账号。
   pub fn mission(&self, account_uuid: &str) -> Result<MissionGuard<'_>, SendError> {
-    let mut missions = self.missions.lock().unwrap();
-    if let Some(existing) = missions.get(account_uuid) {
+    let mut st = self.state.lock().unwrap();
+    if let Some(existing) = st.missions.get(account_uuid) {
       return Err(SendError::Busy(existing.clone()));
     }
-    if let Some(flight) = self.in_flight.lock().unwrap().get(account_uuid) {
+    if let Some(flight) = st.in_flight.get(account_uuid) {
       return Err(SendError::Busy(flight.clone()));
     }
     let mission_id = uuid::Uuid::new_v4().to_string();
-    missions.insert(account_uuid.to_string(), mission_id.clone());
-    drop(missions);
+    st.missions
+      .insert(account_uuid.to_string(), mission_id.clone());
+    drop(st);
     Ok(MissionGuard {
       ledger: self,
       account_uuid: account_uuid.to_string(),
@@ -122,17 +139,17 @@ impl SendLedger {
     conversation_id: &str,
     text: &str,
   ) -> Result<String, SendError> {
-    let belongs = self
+    let mut st = self.state.lock().unwrap();
+    let belongs = st
       .missions
-      .lock()
-      .unwrap()
       .get(account_uuid)
       .map(|m| m == mission_id)
       .unwrap_or(false);
     if !belongs {
       return Err(SendError::Unknown("检测任务已结束或不匹配".to_string()));
     }
-    self.start_attempt(
+    Self::start_attempt_locked(
+      &mut st,
       account_uuid,
       conversation_id,
       text,
@@ -141,23 +158,22 @@ impl SendLedger {
     )
   }
 
-  fn start_attempt(
-    &self,
+  /// 调用方必须持有 state 锁：查 in_flight 与写入是同一个临界区。
+  fn start_attempt_locked(
+    st: &mut LedgerState,
     account_uuid: &str,
     conversation_id: &str,
     text: &str,
     kind: SendKind,
     mission_id: Option<String>,
   ) -> Result<String, SendError> {
-    let mut flight = self.in_flight.lock().unwrap();
-    if let Some(existing) = flight.get(account_uuid) {
+    if let Some(existing) = st.in_flight.get(account_uuid) {
       return Err(SendError::Busy(existing.clone()));
     }
     let send_id = uuid::Uuid::new_v4().to_string();
-    flight.insert(account_uuid.to_string(), send_id.clone());
-    drop(flight);
-
-    let attempt = SendAttempt {
+    st.in_flight
+      .insert(account_uuid.to_string(), send_id.clone());
+    st.attempts.push(SendAttempt {
       send_id: send_id.clone(),
       account_uuid: account_uuid.to_string(),
       conversation_id: conversation_id.to_string(),
@@ -167,19 +183,18 @@ impl SendLedger {
       error: None,
       kind,
       mission_id,
-    };
-    self.attempts.lock().unwrap().push(attempt);
+    });
     Ok(send_id)
   }
 
   fn finish_mission(&self, mission_id: &str) {
-    let mut missions = self.missions.lock().unwrap();
-    missions.retain(|_, v| v != mission_id);
+    let mut st = self.state.lock().unwrap();
+    st.missions.retain(|_, v| v != mission_id);
   }
 
   fn update(&self, send_id: &str, status: SendStatus, error: Option<String>) {
-    let mut list = self.attempts.lock().unwrap();
-    if let Some(a) = list.iter_mut().find(|a| a.send_id == send_id) {
+    let mut st = self.state.lock().unwrap();
+    if let Some(a) = st.attempts.iter_mut().find(|a| a.send_id == send_id) {
       a.status = status;
       a.error = error;
     }
@@ -209,21 +224,36 @@ impl SendLedger {
   }
 
   fn release(&self, send_id: &str) {
-    let mut flight = self.in_flight.lock().unwrap();
-    flight.retain(|_, v| v != send_id);
+    let mut st = self.state.lock().unwrap();
+    st.in_flight.retain(|_, v| v != send_id);
   }
 
+  #[allow(dead_code)] // 供测试与后续台账 UI
   pub fn attempts(&self) -> Vec<SendAttempt> {
-    self.attempts.lock().unwrap().clone()
+    self.state.lock().unwrap().attempts.clone()
   }
 
+  #[allow(dead_code)] // 供测试/诊断
   pub fn busy_account(&self, account_uuid: &str) -> Option<String> {
-    self.in_flight.lock().unwrap().get(account_uuid).cloned()
+    self
+      .state
+      .lock()
+      .unwrap()
+      .in_flight
+      .get(account_uuid)
+      .cloned()
   }
 
   /// 该账号当前是否有进行中的检测任务。
+  #[allow(dead_code)] // 供测试/诊断
   pub fn active_mission(&self, account_uuid: &str) -> Option<String> {
-    self.missions.lock().unwrap().get(account_uuid).cloned()
+    self
+      .state
+      .lock()
+      .unwrap()
+      .missions
+      .get(account_uuid)
+      .cloned()
   }
 }
 
@@ -238,6 +268,7 @@ pub struct MissionGuard<'a> {
 }
 
 impl<'a> MissionGuard<'a> {
+  #[allow(dead_code)] // 调用方目前只用 begin_probe，保留 id 读取供诊断
   pub fn mission_id(&self) -> &str {
     &self.mission_id
   }
@@ -358,6 +389,39 @@ mod tests {
       list.iter().filter(|x| x.status == SendStatus::Confirmed).count(),
       1
     );
+  }
+
+  /// 互斥回归：mission 在**另一个线程**持有期间，手动发送必须被拒。
+  ///
+  /// 旧实现里 missions / in_flight 各一把锁，「先查后插」之间可以互相插入，
+  /// 检测任务与手动发送会同时放行。现在两类状态在同一把锁里检查并写入，
+  /// 这条约束不再依赖调用顺序。用 channel 同步而不是 sleep 竞速，避免测试
+  /// 在高负载 CI 上抖动。
+  #[test]
+  fn mission_held_from_another_thread_blocks_manual_send() {
+    use std::sync::mpsc;
+    use std::sync::Arc;
+    use std::time::Duration;
+
+    let ledger = Arc::new(SendLedger::new());
+    let (acquired_tx, acquired_rx) = mpsc::channel();
+    let held = Arc::clone(&ledger);
+    let handle = std::thread::spawn(move || {
+      let guard = held.mission("u1").expect("mission 应成功");
+      acquired_tx.send(()).unwrap();
+      std::thread::sleep(Duration::from_millis(20));
+      drop(guard);
+    });
+
+    acquired_rx.recv().unwrap();
+    // 此刻 mission 确实被另一个线程持有：手动发送必须被拒。
+    match ledger.begin("u1", "c1", "hi") {
+      Err(SendError::Busy(id)) => assert!(!id.is_empty()),
+      other => panic!("mission 持有期间必须拒绝手动发送，实际: {other:?}"),
+    }
+    handle.join().unwrap();
+    // mission 释放后恢复可发送（说明 guard 的 Drop 没有把账号锁死）。
+    assert!(ledger.begin("u1", "c1", "hi").is_ok());
   }
 
   #[test]

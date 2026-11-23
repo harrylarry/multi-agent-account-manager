@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-muse-native-set-account-proxy"
+description = "Enables the muse_native_set_account_proxy command without any pre-configured scope."
+commands.allow = ["muse_native_set_account_proxy"]
+
+[[permission]]
+identifier = "deny-muse-native-set-account-proxy"
+description = "Denies the muse_native_set_account_proxy command without any pre-configured scope."
+commands.deny = ["muse_native_set_account_proxy"]

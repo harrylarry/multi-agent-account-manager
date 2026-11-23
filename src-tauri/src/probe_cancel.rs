@@ -1,9 +1,17 @@
-//! 后端取消（#11/#16）。
+//! 后端取消（#11/#16/#18）。
 //!
 //! 前端 `Promise.race` 只能让 UI 停止等待，**不会**停止 Rust 侧的任务：
 //! 超时之后探针仍可能在发请求、发消息。这里提供进程内的取消令牌，
 //! 由命令 `muse_native_cancel_probe(uuid)` 触发，长任务在关键步骤上
 //! `select!` 监听它，停止后不再发起新的发送。
+//!
+//! 归属与并发：
+//! - 每个任务注册时带 `kind`（message / fingerprint / proxy / watch…），
+//!   **同一账号可以同时存在多个不同任务**（例如边跑指纹边开代理探针），
+//!   早期版本按账号单槽存放，后来的任务会顶掉前面的登记，导致「按了停止，
+//!   旧任务还在跑」；
+//! - 取消按账号广播到该账号的全部任务，返回真正命中的数量；
+//! - guard 带唯一 id，只注销自己那一条，不会误删后来者。
 //!
 //! 语义是「尽快停止发起新请求」：已经发出的字节无法撤回，对应的发送台账
 //! 仍按 UNKNOWN 记录，绝不重发。
@@ -13,9 +21,15 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Mutex;
 use tokio::sync::watch;
 
+struct TaskEntry {
+  id: u64,
+  kind: &'static str,
+  tx: watch::Sender<bool>,
+}
+
 #[derive(Default)]
 pub struct ProbeCancel {
-  entries: Mutex<HashMap<String, (u64, watch::Sender<bool>)>>,
+  entries: Mutex<HashMap<String, Vec<TaskEntry>>>,
   seq: AtomicU64,
 }
 
@@ -32,6 +46,7 @@ impl CancelToken {
     let _ = self.rx.changed().await;
   }
 
+  #[allow(dead_code)] // 只给测试与诊断用
   pub fn is_cancelled(&self) -> bool {
     *self.rx.borrow()
   }
@@ -48,18 +63,21 @@ impl CancelToken {
   }
 }
 
-/// 任务结束时注销的 RAII guard。带唯一 id，避免误删后来注册的同 key 任务。
+/// 任务结束时注销的 RAII guard。带唯一 id，避免误删同账号下的其它任务。
 pub struct CancelGuard<'a> {
   registry: &'a ProbeCancel,
-  key: String,
+  account: String,
   id: u64,
 }
 
 impl Drop for CancelGuard<'_> {
   fn drop(&mut self) {
     let mut entries = self.registry.entries.lock().unwrap();
-    if entries.get(&self.key).map(|(id, _)| *id) == Some(self.id) {
-      entries.remove(&self.key);
+    if let Some(list) = entries.get_mut(&self.account) {
+      list.retain(|e| e.id != self.id);
+      if list.is_empty() {
+        entries.remove(&self.account);
+      }
     }
   }
 }
@@ -69,35 +87,57 @@ impl ProbeCancel {
     Self::default()
   }
 
-  /// 为某账号注册当前任务，返回取消令牌与自动注销 guard。
-  pub fn register(&self, key: &str) -> (CancelToken, CancelGuard<'_>) {
+  /// 为某账号的某个任务注册取消令牌，返回令牌与自动注销 guard。
+  /// 同账号可注册多个不同 `kind` 的任务。
+  pub fn register(&self, account: &str, kind: &'static str) -> (CancelToken, CancelGuard<'_>) {
     let (tx, rx) = watch::channel(false);
     let id = self.seq.fetch_add(1, Ordering::Relaxed) + 1;
-    self
-      .entries
-      .lock()
-      .unwrap()
-      .insert(key.to_string(), (id, tx));
+    let mut entries = self.entries.lock().unwrap();
+    let list = entries.entry(account.to_string()).or_default();
+    // 同 kind 的旧任务（理论上不该重叠）先置为取消，避免两个同名任务并存。
+    for old in list.iter_mut().filter(|e| e.kind == kind) {
+      let _ = old.tx.send(true);
+    }
+    list.push(TaskEntry { id, kind, tx });
+    drop(entries);
     (
       CancelToken { rx },
       CancelGuard {
         registry: self,
-        key: key.to_string(),
+        account: account.to_string(),
         id,
       },
     )
   }
 
-  /// 请求取消某账号的当前任务。返回是否命中一个正在运行的任务。
-  pub fn cancel(&self, key: &str) -> bool {
+  /// 取消该账号**所有**正在运行的任务，返回命中的任务数。
+  pub fn cancel_account(&self, account: &str) -> usize {
     let entries = self.entries.lock().unwrap();
-    match entries.get(key) {
-      Some((_, tx)) => {
-        let _ = tx.send(true);
-        true
+    match entries.get(account) {
+      Some(list) => {
+        for e in list {
+          let _ = e.tx.send(true);
+        }
+        list.len()
       }
-      None => false,
+      None => 0,
     }
+  }
+
+  /// 该账号当前在跑的任务种类（诊断/日志用，不含任何内容）。
+  #[allow(dead_code)] // 诊断/日志用，暂未接 UI
+  pub fn active(&self, account: &str) -> Vec<&'static str> {
+    let entries = self.entries.lock().unwrap();
+    entries
+      .get(account)
+      .map(|l| l.iter().map(|e| e.kind).collect())
+      .unwrap_or_default()
+  }
+
+  /// 是否有任何任务在跑（用于前端提示）。
+  #[allow(dead_code)] // 诊断用
+  pub fn any_active(&self) -> bool {
+    !self.entries.lock().unwrap().is_empty()
   }
 }
 
@@ -108,14 +148,14 @@ mod tests {
   #[tokio::test]
   async fn cancel_wakes_waiter() {
     let reg = ProbeCancel::new();
-    let (mut token, _guard) = reg.register("u1");
+    let (mut token, _guard) = reg.register("u1", "message");
     assert!(!token.is_cancelled());
     let handle = tokio::spawn(async move {
       token.cancelled().await;
       token.is_cancelled()
     });
     tokio::task::yield_now().await;
-    assert!(reg.cancel("u1"));
+    assert_eq!(reg.cancel_account("u1"), 1);
     assert!(handle.await.unwrap());
   }
 
@@ -123,25 +163,55 @@ mod tests {
   async fn guard_drop_removes_entry() {
     let reg = ProbeCancel::new();
     {
-      let (_token, _guard) = reg.register("u1");
-      assert!(reg.cancel("u1"));
+      let (_token, _guard) = reg.register("u1", "message");
+      assert_eq!(reg.cancel_account("u1"), 1);
     }
-    assert!(!reg.cancel("u1"), "guard drop 后不应命中");
+    assert_eq!(reg.cancel_account("u1"), 0, "guard drop 后不应命中");
+    assert!(!reg.any_active());
   }
 
   #[tokio::test]
-  async fn cancel_unknown_key_is_false() {
+  async fn cancel_unknown_key_is_zero() {
     let reg = ProbeCancel::new();
-    assert!(!reg.cancel("nobody"));
+    assert_eq!(reg.cancel_account("nobody"), 0);
   }
 
   #[tokio::test]
   async fn waiter_wakes_when_sender_dropped() {
     let reg = ProbeCancel::new();
-    let (mut token, guard) = reg.register("u1");
+    let (mut token, guard) = reg.register("u1", "message");
     let handle = tokio::spawn(async move { token.cancelled().await });
     tokio::task::yield_now().await;
     drop(guard);
     handle.await.unwrap();
+  }
+
+  /// 同账号的两个不同任务必须都能被取消——这是早期单槽实现丢的语义。
+  #[tokio::test]
+  async fn concurrent_tasks_on_same_account_are_all_cancelled() {
+    let reg = ProbeCancel::new();
+    let (mut fp, _g1) = reg.register("u1", "fingerprint");
+    let (mut px, _g2) = reg.register("u1", "proxy");
+    let (mut other, _g3) = reg.register("u2", "message");
+    assert_eq!(reg.cancel_account("u1"), 2);
+    assert_eq!(reg.cancel_account("u2"), 1);
+    tokio::task::yield_now().await;
+    assert!(fp.check());
+    assert!(px.check());
+    assert!(other.check());
+    let mut kinds = reg.active("u1");
+    kinds.sort();
+    assert_eq!(kinds, vec!["fingerprint", "proxy"]);
+  }
+
+  /// 同 kind 重复注册：旧任务立即被取消，不并存两个同名任务。
+  #[tokio::test]
+  async fn duplicate_kind_supersedes_previous() {
+    let reg = ProbeCancel::new();
+    let (mut first, _g1) = reg.register("u1", "message");
+    let (_second, _g2) = reg.register("u1", "message");
+    tokio::task::yield_now().await;
+    assert!(first.check(), "同 kind 的旧任务必须收到取消");
+    assert_eq!(reg.cancel_account("u1"), 2);
   }
 }

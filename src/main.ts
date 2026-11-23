@@ -1061,7 +1061,7 @@ function spikeDiagInnerHtml(): string {
       <button id="spike-live-btn" class="mini-btn" type="button" ${spikeLive?.running ? "disabled" : ""}>${spikeLive?.running ? "存活中…" : "存活探针 5min"}</button>
       <button id="spike-lease-btn" class="mini-btn" type="button" ${spikeLeaseRunning ? "disabled" : ""}>${spikeLeaseRunning ? "观测中…" : "租约探针"}</button>
       <button id="spike-fingerprint-btn" class="mini-btn" type="button" ${spikeFingerprintRunning ? "disabled" : ""}>${spikeFingerprintRunning ? "检测中…" : "指纹探针 3 条"}</button>
-      <button id="spike-proxy-btn" class="mini-btn" type="button" ${spikeProxyRunning ? "disabled" : ""}>${spikeProxyRunning ? "验证中…" : "代理探针"}</button>
+      <button id="spike-proxy-btn" class="mini-btn" type="button" ${spikeProxyRunning ? "disabled" : ""}>${spikeProxyRunning ? "验证中…" : "代理探针（用已保存配置）"}</button>
       <button id="spike-stop-btn" class="mini-btn" type="button">停止</button>
       <button id="spike-copy-btn" class="mini-btn" type="button">复制结果</button>
     </div>
@@ -1314,8 +1314,9 @@ function redactProxyUri(uri: string): string {
   return `${scheme}${user ? `${user}@` : ""}${host}`;
 }
 
-// #11/#16 代理探针：用指定测试代理验证控制面 + WSS 隧道。仅对非主力测试账号；
-// 代理口令会进入测试代理但不写入日志。失败 fail-closed，不回退直连。
+// #11/#16 代理探针：用**该账号已保存的代理**（ProxySetting + Keychain）验证
+// 控制面 + WSS 隧道，与真实发送同源；前端不再把 URI/口令送进后端。
+// 失败 fail-closed，不回退直连。
 async function runSpikeProxy(): Promise<void> {
   if (!snapshot || spikeProxyRunning) return;
   const acc = pickWatchAccount();
@@ -1325,14 +1326,16 @@ async function runSpikeProxy(): Promise<void> {
     syncSpikeDiag();
     return;
   }
-  if (!spikeProxyUri.trim()) {
+  // 诊断只认该账号已保存的代理（ProxySetting + Keychain），
+  // 不再把输入框里的 URI / 口令送进后端，避免「诊断与实际发送不同源」。
+  if (!spikeProxySettingView || !spikeProxySettingView.enabled) {
     spikeProxy = null;
-    spikeProxyError = "请先填写测试代理 URI。";
+    spikeProxyError = "该账号还没有启用代理：请先「保存为账号代理」再跑代理探针。";
     syncSpikeDiag();
     return;
   }
   const confirmed = window.confirm(
-    `将对测试账号「${acc.alias}」用代理 ${redactProxyUri(spikeProxyUri)} 跑一次隧道验证（控制面 + WSS + ping）。` +
+    `将对测试账号「${acc.alias}」用已保存的代理 ${spikeProxySettingView.display} 跑一次隧道验证（控制面 + WSS + ping）。` +
       "确认这是你自己的测试代理、该账号是非主力测试账号后继续。"
   );
   if (!confirmed) return;
@@ -1344,7 +1347,6 @@ async function runSpikeProxy(): Promise<void> {
       invoke<SpikeProxyProbe>("muse_native_proxy_probe", {
         providerId: "muse",
         uuid: acc.uuid,
-        proxyUri: spikeProxyUri.trim(),
       }),
       new Promise<SpikeProxyProbe>((_, reject) =>
         setTimeout(() => reject(new Error("代理探针超时（90 秒）")), 90_000)
@@ -1437,12 +1439,14 @@ async function cancelSpikeProbe(): Promise<void> {
   const acc = pickWatchAccount();
   if (!acc) return;
   try {
-    const hit = await invoke<boolean>("muse_native_cancel_probe", {
+    // 返回命中的任务数：同账号可能同时跑多个任务（指纹 + 代理探针等），
+    // 后端按账号广播取消，这里如实显示命中了几个。
+    const hit = await invoke<number>("muse_native_cancel_probe", {
       providerId: "muse",
       uuid: acc.uuid,
     });
-    spikeProxySaveMsg = hit
-      ? "已请求停止：不再发起新的请求/发送"
+    spikeProxySaveMsg = hit > 0
+      ? `已请求停止 ${hit} 个任务：不再发起新的请求/发送`
       : "没有正在运行的长任务";
   } catch (e) {
     spikeProxySaveMsg = `停止失败：${String(e)}`;

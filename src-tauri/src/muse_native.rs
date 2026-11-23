@@ -8,17 +8,16 @@
 //
 // 协议实现在 muse-native crate；这里只有平台接线，不含协议逻辑。
 
-use muse_native_client::control_plane::ControlPlaneFetch;
-use muse_native_client::cookie::{SessionCookie, SessionCookies};
+use muse_native_client::cookie::SessionCookies;
 use muse_native_client::approvals::{parse_pending, ApprovalItem};
 use muse_native_client::fingerprint::{self, FingerprintError, FingerprintResult, Sample};
-use muse_native_client::gateway::{GatewayError, MuseGateway};
+use muse_native_client::gateway::GatewayError;
 use muse_native_client::transport::{HttpRequest, Service};
 use muse_native_client::watch::{WatchSummary, WatchTracker};
 use serde::Serialize;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
-use tauri::{AppHandle, Manager};
+use tauri::AppHandle;
 use zeroize::Zeroize;
 
 use crate::providers::ProviderId;
@@ -62,10 +61,7 @@ impl SpikeDiagnose {
   }
 }
 
-#[cfg(not(target_os = "android"))]
-use crate::egress::ReqwestFetch;
 use crate::probe_cancel::ProbeCancel;
-use crate::providers::ProviderId;
 use crate::secrets::Secrets;
 use crate::storage::ProxySetting;
 
@@ -166,6 +162,12 @@ async fn diagnose_inner(
     };
     let mut connected = match egress.connect(&cookies).await {
       Ok(c) => c,
+      // GatewayError 里带语义（signed_out / cvm_required），不能压成一行字符串：
+      // 这两类失败才是用户真正需要看到的「去重新登录 / 去网页过验证」。
+      Err(crate::egress::EgressError::Gateway(e)) => {
+        cookies.zeroize();
+        return Ok(report_connect_error(e));
+      }
       Err(e) => {
         cookies.zeroize();
         return Ok(SpikeDiagnose::fail("connect", e.to_string()));
@@ -309,7 +311,7 @@ pub async fn send_probe(
     }
 
     // 后端取消：用户停止后不再发出这条消息。
-    let (mut cancel_token, _cancel_guard) = cancel.register(uuid);
+    let (mut cancel_token, _cancel_guard) = cancel.register(uuid, "message");
     if cancel_token.check() {
       cookies.zeroize();
       ledger.fail(&send_id, "用户取消".to_string());
@@ -363,25 +365,43 @@ pub async fn send_probe(
           error: Some("发送阶段被用户取消（结果不明，未重发）".to_string()),
         }
       }
-      Some(Ok((ack, sid))) => {
-        ledger.confirm(&send_id);
-        SendOutcome {
-          ok: true,
-          status: "CONFIRMED".to_string(),
-          send_id,
-          ack: Some(ack),
-          session_id: sid,
-          error: None,
+      Some(tracked) => match tracked.outcome {
+        Ok((ack, sid)) => {
+          ledger.confirm(&send_id);
+          SendOutcome {
+            ok: true,
+            status: "CONFIRMED".to_string(),
+            send_id,
+            ack: Some(ack),
+            session_id: sid,
+            error: None,
+          }
         }
-      }
-      Some(Err(e)) => {
-        ledger.mark_unknown(&send_id, e.to_string());
-        SendOutcome {
-          ok: false, status: "UNKNOWN".to_string(), send_id,
-          ack: None, session_id: session_id.map(str::to_string),
-          error: Some(e.to_string()),
+        Err(e) => {
+          // 请求已写到线上而拿不到 ack → 上游可能已收到，只能 UNKNOWN。
+          // 请求根本没写出去 → 这次发送没有开始，可以明确失败。
+          let detail = if tracked.on_wire {
+            format!("请求已发出但未拿到 ack（结果不明，未重发）: {e}")
+          } else {
+            format!("请求未能发出: {e}")
+          };
+          if tracked.on_wire {
+            ledger.mark_unknown(&send_id, detail.clone());
+            SendOutcome {
+              ok: false, status: "UNKNOWN".to_string(), send_id,
+              ack: None, session_id: session_id.map(str::to_string),
+              error: Some(detail),
+            }
+          } else {
+            ledger.fail(&send_id, detail.clone());
+            SendOutcome {
+              ok: false, status: "DEFINITIVELY_FAILED".to_string(), send_id,
+              ack: None, session_id: session_id.map(str::to_string),
+              error: Some(detail),
+            }
+          }
         }
-      }
+      },
     }
   }
 }
@@ -474,7 +494,7 @@ pub async fn fingerprint_probe(
       Err(e) => return FingerprintProbe::fail("egress", "indeterminate", e.to_string()),
     };
     // 后端取消：前端停止/超时后不会再发起新的探针发送。
-    let (mut cancel_token, _cancel_guard) = cancel.register(uuid);
+    let (mut cancel_token, _cancel_guard) = cancel.register(uuid, "fingerprint");
 
     // 一次指纹评估 = 一个检测任务（mission）：独占该账号发送权，期间拒绝手动发送。
     // 任务内每条探针各自落一条 SendAttempt，有独立状态；任务级结果只做汇总。
@@ -548,7 +568,7 @@ pub async fn fingerprint_probe(
       }
       // 先订：订阅连接必须在发送之前建立，避免漏掉正文增量头。
       // 连接走账号级出站策略：启用代理时经隧道，失败即记 NOT_SENT，不直连。
-      let mut sub = match egress.connect(&cookies).await {
+      let sub = match egress.connect(&cookies).await {
         Ok(gw) => match gw.subscribe().await {
           Ok(s) => s,
           Err(e) => {
@@ -635,84 +655,101 @@ pub async fn fingerprint_probe(
           });
           break;
         }
-        Some(Ok((ack, sid))) => {
-          probes_sent += 1;
-          if session_id.is_none() {
-            session_id = sid.clone();
-          }
-          let msg_id = ack.get("message_id").and_then(|v| v.as_str()).map(str::to_string);
-          let collected = tokio::select! {
-            c = sub.collect(
-              msg_id.as_deref(),
-              Duration::from_secs(90),
-              Duration::from_secs(10),
-            ) => Some(c),
-            _ = cancel_token.cancelled() => None,
-          };
-          let Some(collected) = collected else {
-            let msg = format!("探针 {} 在采集阶段被取消，不重发", probe.id);
-            first_error.get_or_insert(msg.clone());
-            ledger.mark_unknown(&send_id, msg.clone());
-            sends.push(FingerprintSendRecord {
-              probe_id: probe.id.clone(),
-              send_status: "UNKNOWN".to_string(),
-              text_done: false,
-              sample_used: false,
-              error: Some(msg),
-            });
-            break;
-          };
-          // 有效样本必须「真的收完」：以 message_done 为完成信号，不能只看非空。
-          if collected.done {
-            probes_confirmed += 1;
-            ledger.confirm(&send_id);
-            let usable = !collected.text.trim().is_empty();
-            if usable {
-              samples.push(Sample {
-                text: collected.text,
-                expected_count: probe.expected_count,
+        Some(tracked) => match tracked.outcome {
+          Ok((ack, sid)) => {
+            probes_sent += 1;
+            if session_id.is_none() {
+              session_id = sid.clone();
+            }
+            let msg_id = ack.get("message_id").and_then(|v| v.as_str()).map(str::to_string);
+            let collected = tokio::select! {
+              c = sub.collect(
+                msg_id.as_deref(),
+                Duration::from_secs(90),
+                Duration::from_secs(10),
+              ) => Some(c),
+              _ = cancel_token.cancelled() => None,
+            };
+            let Some(collected) = collected else {
+              let msg = format!("探针 {} 在采集阶段被取消，不重发", probe.id);
+              first_error.get_or_insert(msg.clone());
+              ledger.mark_unknown(&send_id, msg.clone());
+              sends.push(FingerprintSendRecord {
+                probe_id: probe.id.clone(),
+                send_status: "UNKNOWN".to_string(),
+                text_done: false,
+                sample_used: false,
+                error: Some(msg),
+              });
+              break;
+            };
+            // 有效样本必须「真的收完」：以 message_done 为完成信号，不能只看非空。
+            if collected.done {
+              probes_confirmed += 1;
+              ledger.confirm(&send_id);
+              let usable = !collected.text.trim().is_empty();
+              if usable {
+                samples.push(Sample {
+                  text: collected.text,
+                  expected_count: probe.expected_count,
+                });
+              } else {
+                first_error.get_or_insert(format!("探针 {} 已回复但正文为空", probe.id));
+              }
+              sends.push(FingerprintSendRecord {
+                probe_id: probe.id.clone(),
+                send_status: "CONFIRMED".to_string(),
+                text_done: true,
+                sample_used: usable,
+                error: if usable {
+                  None
+                } else {
+                  Some("已回复但正文为空".to_string())
+                },
               });
             } else {
-              first_error.get_or_insert(format!("探针 {} 已回复但正文为空", probe.id));
+              // 发出去了但没收到 message_done（超时 / 断流）：结果不明，绝不重发。
+              let msg = format!("探针 {} 采集未完成（{}），不重发", probe.id, collected.ended_by);
+              first_error.get_or_insert(msg.clone());
+              ledger.mark_unknown(&send_id, msg.clone());
+              sends.push(FingerprintSendRecord {
+                probe_id: probe.id.clone(),
+                send_status: "UNKNOWN".to_string(),
+                text_done: false,
+                sample_used: false,
+                error: Some(msg),
+              });
             }
-            sends.push(FingerprintSendRecord {
-              probe_id: probe.id.clone(),
-              send_status: "CONFIRMED".to_string(),
-              text_done: true,
-              sample_used: usable,
-              error: if usable {
-                None
-              } else {
-                Some("已回复但正文为空".to_string())
-              },
-            });
+        },
+        Err(e) => {
+          // 拿不到 ack：只有「请求确实没写出去」才算这次发送没有开始；
+          // 已经写到线上的一律 UNKNOWN（上游可能已收到），都不重发。
+          let (status, msg) = if tracked.on_wire {
+            (
+              "UNKNOWN",
+              format!("探针 {} 已发出但未拿到 ack（结果不明，不重发）: {e}", probe.id),
+            )
           } else {
-            // 发出去了但没收到 message_done（超时 / 断流）：结果不明，绝不重发。
-            let msg = format!("探针 {} 采集未完成（{}），不重发", probe.id, collected.ended_by);
-            first_error.get_or_insert(msg.clone());
-            ledger.mark_unknown(&send_id, msg.clone());
-            sends.push(FingerprintSendRecord {
-              probe_id: probe.id.clone(),
-              send_status: "UNKNOWN".to_string(),
-              text_done: false,
-              sample_used: false,
-              error: Some(msg),
-            });
-          }
-        }
-        Some(Err(e)) => {
-          // 明确 ack 没拿到：不重发，记一条失败，继续下一条探针。
-          let msg = format!("发送探针 {} 失败: {e}", probe.id);
+            (
+              "DEFINITIVELY_FAILED",
+              format!("探针 {} 请求未发出: {e}", probe.id),
+            )
+          };
           first_error.get_or_insert(msg.clone());
-          ledger.fail(&send_id, msg.clone());
+          if tracked.on_wire {
+            ledger.mark_unknown(&send_id, msg.clone());
+          } else {
+            ledger.fail(&send_id, msg.clone());
+          }
           sends.push(FingerprintSendRecord {
             probe_id: probe.id.clone(),
-            send_status: "DEFINITIVELY_FAILED".to_string(),
+            send_status: status.to_string(),
             text_done: false,
             sample_used: false,
             error: Some(msg),
           });
         }
+      },
       }
     }
 
@@ -1412,23 +1449,42 @@ impl ProxyProbe {
   }
 }
 
-/// #11/#16：用指定代理跑一次控制面 + WSS + Noise + ping，验证隧道可行。
-/// `proxy_uri` 形如 http[s]://[user:pass@]host[:port] 或 socks5://[...]。
+/// #11/#16：用**该账号自己保存的代理**跑一次控制面 + WSS + Noise + ping。
+///
+/// 诊断必须与真实账号配置同源：代理 URI 与用户名取自 `ProxySetting`，
+/// 口令取自 Keychain（`credential_ref`），和发送/指纹走同一条
+/// [`crate::egress::AccountEgress::resolve`]。**不接受**前端传入的 URI，
+/// 否则会出现「诊断用 A 代理、实际发送用 B 代理」的误判，也会把口令带进 IPC。
+///
 /// 任何失败都 fail-closed（阻断并报错），不会改用直连。
 #[cfg(not(target_os = "android"))]
-pub async fn proxy_probe(app: &AppHandle, uuid: &str, proxy_uri: &str) -> ProxyProbe {
-  // 先解析代理 URI：非法则直接失败（不建任何连接）。
-  let cfg = match muse_native_client::proxy::ProxyConfig::parse(proxy_uri) {
-    Ok(c) => c,
-    Err(e) => return ProxyProbe::fail("proxy_uri", None, None, format!("代理配置无效: {e}")),
+pub async fn proxy_probe(
+  app: &AppHandle,
+  uuid: &str,
+  setting: Option<&ProxySetting>,
+  secrets: &Secrets,
+  cancel: &ProbeCancel,
+) -> ProxyProbe {
+  let (mut cancel_token, _cancel_guard) = cancel.register(uuid, "proxy");
+
+  let egress = match crate::egress::AccountEgress::resolve(setting, secrets) {
+    Ok(e) => e,
+    Err(e) => return ProxyProbe::fail("egress", None, None, format!("账号代理不可用: {e}")),
   };
-  let tunnel_via = cfg.display_safe();
-  let scheme = match cfg.scheme() {
-    muse_native_client::proxy::ProxyScheme::Http => "http",
-    muse_native_client::proxy::ProxyScheme::Https => "https",
-    muse_native_client::proxy::ProxyScheme::Socks5 => "socks5",
+  if !egress.is_proxy() {
+    // 未启用代理就没有「代理探针」可测：明确说明，而不是悄悄测直连。
+    return ProxyProbe::fail(
+      "egress",
+      None,
+      None,
+      "该账号未启用代理：代理探针需要先保存并启用账号代理",
+    );
   }
-  .to_string();
+  let tunnel_via = Some(egress.display.clone());
+  let scheme = match &egress.kind {
+    crate::egress::EgressKind::Proxy(cfg) => Some(cfg.scheme_name().to_string()),
+    crate::egress::EgressKind::Direct => None,
+  };
 
   let app_owned = app.clone();
   let uuid_owned = uuid.to_string();
@@ -1438,46 +1494,70 @@ pub async fn proxy_probe(app: &AppHandle, uuid: &str, proxy_uri: &str) -> ProxyP
     res = cookie_handle => match res {
       Ok(r) => match r {
         Ok(c) => c,
-        Err(e) => return ProxyProbe::fail("cookies", Some(tunnel_via), Some(scheme), e),
+        Err(e) => return ProxyProbe::fail("cookies", tunnel_via.clone(), scheme.clone(), e),
       },
-      Err(e) => return ProxyProbe::fail("cookies", Some(tunnel_via), Some(scheme), format!("取 cookie 任务异常: {e}")),
+      Err(e) => return ProxyProbe::fail("cookies", tunnel_via.clone(), scheme.clone(), format!("取 cookie 任务异常: {e}")),
     },
     _ = tokio::time::sleep(COOKIE_TIMEOUT) => {
-      return ProxyProbe::fail("cookies", Some(tunnel_via), Some(scheme), "取会话 cookie 超时（15 秒）");
+      return ProxyProbe::fail("cookies", tunnel_via.clone(), scheme.clone(), "取会话 cookie 超时（15 秒）");
+    }
+    _ = cancel_token.cancelled() => {
+      return ProxyProbe::fail("cancelled", tunnel_via.clone(), scheme.clone(), "用户取消（取 cookie 阶段）");
     }
   };
   if cookies.is_empty() {
     return ProxyProbe::fail(
       "cookies",
-      Some(tunnel_via),
-      Some(scheme),
+      tunnel_via,
+      scheme,
       "该账号未登录 muse.ai：请先在 Spike App 里登录 Muse 测试账号。",
     );
   }
 
-  // 控制面 HTTP 走同一代理（HTTP 侧），WSS 走代理隧道（WS 侧）。
-  let fetch = match ReqwestFetch::new_with_proxy(Some(proxy_uri)) {
-    Ok(f) => f,
-    Err(e) => return ProxyProbe::fail("proxy_http", Some(tunnel_via), Some(scheme), e),
+  // 控制面 HTTP 与 WSS 都经同一个 egress：与发送路径完全一致的出站。
+  if cancel_token.check() {
+    cookies.zeroize();
+    return ProxyProbe::fail("cancelled", tunnel_via, scheme, "用户取消（建立隧道前）");
+  }
+  let connected = tokio::select! {
+    r = egress.connect(&cookies) => Some(r),
+    _ = cancel_token.cancelled() => None,
+    _ = tokio::time::sleep(Duration::from_secs(30)) => Some(Err(crate::egress::EgressError::Http(
+      "代理隧道建立超时（30 秒）".to_string(),
+    ))),
   };
-  let gateway = MuseGateway::new(fetch);
-  let mut connected = match gateway.connect_via_proxy(&cookies, &cfg).await {
-    Ok(c) => c,
-    Err(e) => {
+  let mut connected = match connected {
+    None => {
       cookies.zeroize();
-      return ProxyProbe::fail("tunnel", Some(tunnel_via), Some(scheme), e.to_string());
+      return ProxyProbe::fail("cancelled", tunnel_via, scheme, "用户取消（建立隧道阶段）")
+    }
+    Some(Ok(c)) => c,
+    Some(Err(e)) => {
+      cookies.zeroize();
+      return ProxyProbe::fail("tunnel", tunnel_via, scheme, e.to_string());
     }
   };
   cookies.zeroize();
 
-  match connected.ping().await {
-    Ok(status) => {
+  let ping = tokio::select! {
+    r = connected.ping() => Some(r),
+    _ = cancel_token.cancelled() => None,
+    _ = tokio::time::sleep(Duration::from_secs(15)) => Some(Err(GatewayError::Closed(
+      "ping 超时（15 秒）".to_string(),
+    ))),
+  };
+  match ping {
+    None => {
+      connected.close().await;
+      ProxyProbe::fail("cancelled", tunnel_via, scheme, "用户取消（ping 阶段）")
+    }
+    Some(Ok(status)) => {
       connected.close().await;
       ProxyProbe {
         ok: status < 400,
         phase: "ready".to_string(),
-        tunnel_via: Some(tunnel_via),
-        proxy_scheme: Some(scheme),
+        tunnel_via,
+        proxy_scheme: scheme,
         handshake_completed: true,
         ping_status: Some(status),
         fail_closed: true,
@@ -1488,9 +1568,9 @@ pub async fn proxy_probe(app: &AppHandle, uuid: &str, proxy_uri: &str) -> ProxyP
         },
       }
     }
-    Err(e) => {
+    Some(Err(e)) => {
       connected.close().await;
-      ProxyProbe::fail("ping", Some(tunnel_via), Some(scheme), e.to_string())
+      ProxyProbe::fail("ping", tunnel_via, scheme, e.to_string())
     }
   }
 }
@@ -1521,6 +1601,7 @@ fn report_connect_error(e: GatewayError) -> SpikeDiagnose {
 
 #[cfg(target_os = "ios")]
 async fn fetch_session_cookies(app: &AppHandle, uuid: &str) -> Result<SessionCookies, String> {
+  use muse_native_client::cookie::SessionCookie;
   let entries = crate::platform::ios::get_session_cookies(app, uuid).await?;
   Ok(SessionCookies {
     cookies: entries
@@ -1540,6 +1621,7 @@ async fn fetch_session_cookies(_app: &AppHandle, _uuid: &str) -> Result<SessionC
 
 /// Spike 版启动自检：bundle id 不是日常版时，对第一个已登录的 Muse 账号
 /// 跑一次握手诊断，结果只打到诊断日志（不含密钥）。日常版直接返回。
+#[allow(dead_code)]
 pub async fn maybe_auto_diagnose(app: &AppHandle, mgr: &Arc<SessionManager>) {
   if app.config().identifier == DAILY_IDENTIFIER {
     return;
@@ -1556,7 +1638,8 @@ pub async fn maybe_auto_diagnose(app: &AppHandle, mgr: &Arc<SessionManager>) {
     return;
   };
   let uuid = acc.uuid.clone();
-  match diagnose(app, ProviderId::Muse.as_str(), &uuid).await {
+  let setting = mgr.proxy_setting(ProviderId::Muse, &uuid).await;
+  match diagnose(app, ProviderId::Muse.as_str(), &uuid, setting).await {
     Ok(r) => eprintln!(
       "[muse-native] spike auto-diagnose: ok={} phase={} handshake={} ping={:?} cvm={} error={:?}",
       r.ok, r.phase, r.handshake_completed, r.ping_status, r.cvm_detected, r.error

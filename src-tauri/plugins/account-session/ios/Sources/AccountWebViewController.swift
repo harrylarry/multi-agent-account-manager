@@ -51,6 +51,10 @@ final class AccountWebViewController: UIViewController, WKNavigationDelegate, WK
   private var committedAuthority: String?
   private var mainLoadFailed = false
   private var popupWebView: WKWebView?
+  /// #11/#16（补 W）：非 nil 时该会话已被阻断（代理由启用变为不可用、代理变更、
+  /// 本地配置损坏等），所有主框架导航一律取消，不放行任何直连请求。
+  private var egressBlockedReason: String?
+  private var egressBlockLabel: UILabel?
   // 0.1.11 (generalized in 0.1.18): set when the popup navigates to a
   // non-allowlisted host — the popup is doing external auth. The popup
   // auto-closes (and the session reloads) once it lands back on an
@@ -374,6 +378,47 @@ final class AccountWebViewController: UIViewController, WKNavigationDelegate, WK
 
   // MARK: - Session binding
 
+  /// 代理不可用/变更后，当前 WebView 必须**立即停止出站**。
+  ///
+  /// 只弹提示不算阻断：这里同时停掉正在进行的加载、销毁 OAuth 弹窗，
+  /// 并在 `decidePolicyFor` 里取消后续所有主框架导航。想继续用，只能
+  /// 关掉会话重新打开（那时会按新配置重建 WebView）。
+  func blockEgress(reason: String) {
+    egressBlockedReason = reason
+    mainLoadFailed = true
+    mainWebView?.stopLoading()
+    popupWebView?.stopLoading()
+    destroyPopupWebView()
+    mainInputEnabled = false
+    headerTitleLabel.text = reason
+    loadingIndicator.stopAnimating()
+    let label = egressBlockLabel ?? {
+      let l = UILabel()
+      l.numberOfLines = 0
+      l.textAlignment = .center
+      l.font = .systemFont(ofSize: 15, weight: .medium)
+      l.translatesAutoresizingMaskIntoConstraints = false
+      mainWebContainer.addSubview(l)
+      NSLayoutConstraint.activate([
+        l.leadingAnchor.constraint(equalTo: mainWebContainer.leadingAnchor, constant: 24),
+        l.trailingAnchor.constraint(equalTo: mainWebContainer.trailingAnchor, constant: -24),
+        l.centerYAnchor.constraint(equalTo: mainWebContainer.centerYAnchor),
+      ])
+      egressBlockLabel = l
+      return l
+    }()
+    label.text = "\(reason)\n\n请返回账号列表，重新打开该账号。"
+    label.isHidden = false
+    mainWebView?.isHidden = true
+  }
+
+  /// 新会话/新页面建立时清除阻断态。
+  private func clearEgressBlock() {
+    egressBlockedReason = nil
+    egressBlockLabel?.isHidden = true
+    mainWebView?.isHidden = false
+  }
+
   func bindSessionSpec(_ spec: IosAccountSessionSpec) {
     // The plugin binds a fresh controller before presenting it; force the
     // view to load so the outlets below are initialized.
@@ -383,11 +428,19 @@ final class AccountWebViewController: UIViewController, WKNavigationDelegate, WK
     currentSpec = spec
     mainInputEnabled = false
     mainLoadFailed = false
+    clearEgressBlock()
     headerTitleLabel.text = "正在核验会话…"
     loadingIndicator.startAnimating()
 
     // No MULTI_PROFILE capability check on iOS: WKWebsiteDataStore identifiers
     // are available on every supported device (iOS 17+).
+    //
+    // #11/#16（补 W）：本地代理配置损坏时无法判断该账号该走什么出口，
+    // 宁可阻断整个会话，也不能当成「没有代理」放行直连。
+    if case .corrupt = AccountProxyStore.load() {
+      blockEgress(reason: "本地代理配置损坏，无法确认出口（fail-closed）")
+      return
+    }
     let cached = RecentAccountPages.take(spec: spec)
     let webView: WKWebView
     if let cached {
@@ -406,12 +459,12 @@ final class AccountWebViewController: UIViewController, WKNavigationDelegate, WK
       let store = WKWebsiteDataStore(forIdentifier: identifier)
       config.websiteDataStore = store
       DataStoreRegistry.markCreated(spec.uuid)
-      // #11/#16：每账号独立代理。代理不可用时 fail-closed（不回退直连）。
+      // #11/#16：每账号独立代理。应用失败（不支持 / 缺口令 / 配置损坏）一律
+      // fail-closed：整个会话阻断，绝不回退直连。
       if let proxy = AccountProxyStore.config(for: spec.uuid), proxy.enabled {
-        if !AccountProxyApplier.apply(cfg: proxy, uuid: spec.uuid, to: store) {
-          mainLoadFailed = true
-          headerTitleLabel.text = "该设备不支持 WebView 代理（需要 iOS 17+）"
-          loadingIndicator.stopAnimating()
+        let result = AccountProxyApplier.apply(cfg: proxy, uuid: spec.uuid, to: store)
+        if let reason = result.blockReason {
+          blockEgress(reason: reason)
           return
         }
       }
@@ -516,6 +569,13 @@ final class AccountWebViewController: UIViewController, WKNavigationDelegate, WK
       navigationAction.targetFrame?.isMainFrame == true
     else {
       decisionHandler(.allow)
+      return
+    }
+    // 出站已被阻断：任何主框架导航（含 OAuth 回调）都不放行，
+    // 否则会绕过代理直接用系统网络发请求。
+    if let reason = egressBlockedReason {
+      blockEgress(reason: reason)
+      decisionHandler(.cancel)
       return
     }
     let url = navigationAction.request.url

@@ -40,6 +40,7 @@
     "allow-muse-native-cancel-probe",
     "allow-muse-native-liveness-start",
     "allow-muse-native-liveness-status",
-    "allow-muse-native-lease-probe"
+    "allow-muse-native-lease-probe",
+    "allow-is-spike-build"
   ]
 }

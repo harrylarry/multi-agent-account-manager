@@ -74,7 +74,8 @@ private struct FetchTextArgs: Decodable {
 }
 
 // Batch-1: background quota sync targets (Rust filters out the active
-// account — the foreground probe already covers it).private struct SyncAccountTarget: Decodable {
+// account — the foreground probe already covers it).
+private struct SyncAccountTarget: Decodable {
   let providerId: String
   let uuid: String
   let entryUrl: String
@@ -284,26 +285,27 @@ class AccountSessionPlugin: Plugin {
         enabled: true
       )
 
-      var reason: String?
       guard let identifier = UUID(uuidString: args.uuid) else {
         invoke.reject("无效的会话标识")
         return
       }
-      // 用一个临时 store 试装一次，确认这份配置在本机能真正生效
+      // 先用临时 store 试装一次，确认这份配置在本机能真正生效
       //（iOS 17+ 才有 proxyConfigurations）。不 markCreated——它只用于验证。
       let probeStore = WKWebsiteDataStore(forIdentifier: identifier)
-      let applied = AccountProxyApplier.apply(cfg: cfg, uuid: args.uuid, to: probeStore)
-      if !applied {
-        reason = "该设备不支持 WebView 代理（需要 iOS 17+）；该账号的 WebView 将按 fail-closed 阻断，不会回退直连"
-      }
+      let result = AccountProxyApplier.apply(cfg: cfg, uuid: args.uuid, to: probeStore)
+      let applied = result.isApplied
 
-      let result = AccountSessionCoordinator.shared.setAccountProxy(uuid: args.uuid, config: cfg)
+      // 试装结果不理想也照常落配置：落下去之后，该账号的 WebView 在创建时会
+      // 再走一次同样的检查，失败即阻断（fail-closed），不会静默走直连。
+      // 若本地配置此前损坏，这次写入同时把它覆盖修复。
+      let stored = AccountSessionCoordinator.shared.setAccountProxy(
+        uuid: args.uuid, config: cfg)
 
       var payload: [String: Any] = [
-        "applied": applied && result.applied,
-        "sessionOpen": result.sessionOpen,
+        "applied": applied,
+        "sessionOpen": stored.sessionOpen,
       ]
-      if let reason { payload["reason"] = reason }
+      if let reason = result.blockReason { payload["reason"] = reason }
       invoke.resolve(payload)
     }
   }

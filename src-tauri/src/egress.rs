@@ -23,6 +23,7 @@
 
 use crate::secrets::Secrets;
 use crate::storage::ProxySetting;
+use muse_native_client::chat_send::SendAttemptResult;
 use muse_native_client::collect::{collect_text, subscription_request, Collected};
 use muse_native_client::control_plane::ControlPlaneFetch;
 use muse_native_client::cookie::SessionCookies;
@@ -188,6 +189,7 @@ pub enum AccountGateway {
 }
 
 impl AccountGateway {
+  #[allow(dead_code)] // 供日志/断言使用
   pub fn is_proxied(&self) -> bool {
     matches!(self, AccountGateway::Proxied(_))
   }
@@ -214,19 +216,22 @@ impl AccountGateway {
   }
 
   /// 发一条聊天消息并等 ack（直连与代理共用同一协议实现）。
+  /// 返回值区分「请求是否已写到线上」——台账据此决定 UNKNOWN 还是未开始。
   pub async fn send_message(
     self,
     text: &str,
     node_id: &str,
     session_id: Option<&str>,
     timeout: Duration,
-  ) -> Result<(serde_json::Value, Option<String>), GatewayError> {
+  ) -> SendAttemptResult {
     match self {
       AccountGateway::Direct(g) => {
-        muse_native_client::chat_send::send_message(g, text, node_id, session_id, timeout).await
+        muse_native_client::chat_send::send_message_tracked(g, text, node_id, session_id, timeout)
+          .await
       }
       AccountGateway::Proxied(g) => {
-        muse_native_client::chat_send::send_message(g, text, node_id, session_id, timeout).await
+        muse_native_client::chat_send::send_message_tracked(g, text, node_id, session_id, timeout)
+          .await
       }
     }
   }
@@ -288,6 +293,7 @@ impl ReqwestFetch {
     Self::build(None)
   }
 
+  #[allow(dead_code)] // 保留给「进程内一次性代理客户端」的调用方
   pub fn new_with_proxy(proxy_uri: Option<&str>) -> Result<Self, String> {
     Self::build(proxy_uri)
   }

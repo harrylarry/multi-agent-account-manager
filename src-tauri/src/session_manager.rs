@@ -1514,6 +1514,7 @@ impl SessionManager {
         quota_detail: None,
         auth_state: AuthState::LoggedOut,
         has_unread_reply: false,
+        proxy: None,
       });
       save_store_atomic(&locked.store_path, &locked.store)?;
       locked.selected_provider_id = provider_id;
@@ -3135,6 +3136,20 @@ impl SessionManager {
     }
 
     let spec = get_provider(account.provider_id);
+    // #11/#16（补 W）：打开会话前把账号代理重新下发一次。
+    // Rust 是权威源——App 重启、Swift 本地配置损坏/过期都在这里纠正；
+    // 下发失败就拒绝打开，绝不把可能直连的 WebView 放出去。
+    let proxy_setting = self.proxy_setting(account.provider_id, &account.uuid).await;
+    let pushed = crate::webview_proxy::push(app, &account.uuid, proxy_setting.as_ref()).await;
+    if let Some(reason) = pushed.blocked() {
+      let mut locked = self.inner.lock().await;
+      if self.current_seq.load(Ordering::SeqCst) == expected_seq {
+        locked.active_slot = None;
+        locked.notice = Some(format!("账号代理不可用，已阻止打开会话：{reason}"));
+      }
+      return Ok(Self::snapshot_from_locked(&locked));
+    }
+
     let payload = crate::platform::ios::OpenIosAccountPayload {
       provider_id: account.provider_id.as_str().to_string(),
       provider_name: spec.info.short_name.to_string(),

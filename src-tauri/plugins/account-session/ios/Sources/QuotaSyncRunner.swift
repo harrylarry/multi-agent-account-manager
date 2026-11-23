@@ -179,9 +179,11 @@ enum QuotaSyncRunner {
       let store = WKWebsiteDataStore(forIdentifier: identifier)
       config.websiteDataStore = store
       // #11/#16：后台额度同步也是账号出站流量——启用代理的账号必须走代理；
-      // 代理不可用则直接放弃本次探测（fail-closed，不回退直连）。
+      // 代理不可用（不支持 / 缺口令 / 配置损坏）则放弃本次探测，
+      // 绝不回退直连拿一份「看起来正常」的额度。
       if let proxy = AccountProxyStore.config(for: target.uuid), proxy.enabled {
-        if !AccountProxyApplier.apply(cfg: proxy, uuid: target.uuid, to: store) {
+        let result = AccountProxyApplier.apply(cfg: proxy, uuid: target.uuid, to: store)
+        if result.blockReason != nil {
           finish(nil)
           return
         }

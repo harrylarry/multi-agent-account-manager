@@ -6,7 +6,9 @@
 // - 口令不进 UserDefaults：只从系统 Keychain 读取（Rust 侧写入同一
 //   service/account），Swift 侧只处理“是否启用 + 主机端口 + 用户名”；
 // - allowFailover = false：代理不可用时不得回退直连（fail-closed）；
-// - 配置变更后丢弃该账号缓存的 WebView，下次打开按新配置重建。
+// - 配置变更后丢弃该账号缓存的 WebView，下次打开按新配置重建；
+// - **本地配置损坏**（无法解码）视为「所有账号都不可放行」，而不是当作
+//   「没有配置」——后者会静默走直连，属于绕过代理。
 //
 // 真机验收前状态：UNVERIFIED。iOS 编译与真实代理连通性需在 Xcode / 设备上验证。
 
@@ -28,20 +30,44 @@ struct AccountProxyConfig: Codable, Equatable {
     let s = scheme.lowercased()
     return s == "socks5" || s == "socks5h"
   }
+
+  /// 是否是「到代理的 TLS 连接」。WebKit 的 httpCONNECTProxy 是**明文** CONNECT，
+  /// 不能拿来当 https 代理用，否则等于把预期加密的代理链路降级成明文。
+  var isHttpsProxy: Bool {
+    scheme.lowercased() == "https"
+  }
+}
+
+/// 本地配置的加载结果。区分「没有」和「坏了」：
+/// 后者必须阻断，不能当成「没有代理」直接走直连。
+enum AccountProxyLoadState {
+  case missing
+  case ok([String: AccountProxyConfig])
+  case corrupt
 }
 
 enum AccountProxyStore {
   private static let key = "maam.accountProxyConfigs"
 
+  static func load() -> AccountProxyLoadState {
+    guard let data = UserDefaults.standard.data(forKey: key) else { return .missing }
+    guard let map = try? JSONDecoder().decode([String: AccountProxyConfig].self, from: data) else {
+      return .corrupt
+    }
+    return .ok(map)
+  }
+
   static func all() -> [String: AccountProxyConfig] {
-    guard let data = UserDefaults.standard.data(forKey: key) else { return [:] }
-    return (try? JSONDecoder().decode([String: AccountProxyConfig].self, from: data)) ?? [:]
+    if case .ok(let map) = load() { return map }
+    return [:]
   }
 
   static func config(for uuid: String) -> AccountProxyConfig? {
     all()[uuid]
   }
 
+  /// 写入/删除某账号配置。store 已损坏时用本次写入覆盖它（Rust 是权威源，
+  /// 下发即修复），不会保留坏数据。
   static func set(uuid: String, config: AccountProxyConfig?) {
     var map = all()
     if let config {
@@ -49,9 +75,8 @@ enum AccountProxyStore {
     } else {
       map.removeValue(forKey: uuid)
     }
-    if let data = try? JSONEncoder().encode(map) {
-      UserDefaults.standard.set(data, forKey: key)
-    }
+    guard let data = try? JSONEncoder().encode(map) else { return }
+    UserDefaults.standard.set(data, forKey: key)
   }
 }
 
@@ -74,28 +99,76 @@ enum AccountProxyKeychain {
   }
 }
 
+/// 应用结果。**不用 Bool**：调用方需要知道「为什么没生效」才能给出正确阻断，
+/// 也不能把「需要认证但没有口令」当成「不需要认证」放行。
+enum AccountProxyApplyResult {
+  case applied
+  /// 该账号没有配置：按未启用代理处理（正常走系统网络）。
+  case notConfigured
+  /// iOS < 17 或端口非法：无法应用。
+  case unsupported
+  /// 配了用户名但 Keychain 里没有口令：不能发起「无认证」连接。
+  case missingCredential
+  /// 本地配置存储损坏：无法判断该账号该走什么出口。
+  case corrupt
+
+  var isApplied: Bool {
+    if case .applied = self { return true }
+    return false
+  }
+
+  /// 给用户看的阻断原因（不含任何口令/主机细节之外的信息）。
+  var blockReason: String? {
+    switch self {
+    case .applied, .notConfigured:
+      return nil
+    case .unsupported:
+      return "该设备不支持 WebView 代理（需要 iOS 17+），已按 fail-closed 阻断"
+    case .missingCredential:
+      return "代理认证缺少口令（Keychain 中找不到），已按 fail-closed 阻断"
+    case .corrupt:
+      return "本地代理配置损坏，无法确认出口，已按 fail-closed 阻断；请在管理端重新保存代理"
+    }
+  }
+}
+
 enum AccountProxyApplier {
-  /// 把账号代理应用到指定 DataStore。返回是否成功应用（无配置视为成功）。
-  /// iOS < 17 没有 proxyConfigurations，返回 false 由调用方决定是否阻断。
-  @discardableResult
-  static func apply(cfg: AccountProxyConfig, uuid: String, to store: WKWebsiteDataStore) -> Bool {
-    guard cfg.enabled else { return true }
-    guard #available(iOS 17.0, *) else { return false }
-    guard let port = NWEndpoint.Port(rawValue: cfg.port) else { return false }
+  /// 把账号代理应用到指定 DataStore。
+  /// `allowFailover = false`：代理不可用时 URLSession/WebKit 不会回退直连。
+  static func apply(cfg: AccountProxyConfig, uuid: String, to store: WKWebsiteDataStore)
+    -> AccountProxyApplyResult
+  {
+    guard cfg.enabled else { return .notConfigured }
+    guard #available(iOS 17.0, *) else { return .unsupported }
+    guard let port = NWEndpoint.Port(rawValue: cfg.port) else { return .unsupported }
     let endpoint = NWEndpoint.hostPort(host: NWEndpoint.Host(cfg.host), port: port)
+
     let proxy: ProxyConfiguration
     if cfg.isSocks {
-      proxy = ProxyConfiguration(socksProxy: endpoint)
+      // Network.framework 的 SOCKS 初始化器叫 `socksv5Proxy`（不是 socksProxy）。
+      // SOCKS5 的域名地址类型本身就是远端解析，socks5h 不需要单独映射。
+      proxy = ProxyConfiguration(socksv5Proxy: endpoint)
+    } else if cfg.isHttpsProxy {
+      // `https://` 代理 = 到代理先建 TLS，再在 TLS 里做 HTTP CONNECT。
+      // 这就是 `httpCONNECTProxy` + `tlsOptions` 的组合；**不能**当成
+      // 明文 CONNECT（tlsOptions: nil）处理，否则等于把代理链路降级成明文。
+      proxy = ProxyConfiguration(
+        httpCONNECTProxy: endpoint, tlsOptions: NWProtocolTLS.Options())
     } else {
-      proxy = ProxyConfiguration(httpCONNECTProxy: endpoint)
+      proxy = ProxyConfiguration(httpCONNECTProxy: endpoint, tlsOptions: nil)
     }
     // fail-closed：代理不可用时绝不回退直连。
     proxy.allowFailover = false
-    if let user = cfg.username, !user.isEmpty,
-       let pass = AccountProxyKeychain.read(account: "proxy-\(uuid)") {
+
+    if let user = cfg.username, !user.isEmpty {
+      // 有用户名就必须有口令：拿不到口令时不能以「无认证」方式连代理，
+      // 那会被代理以 407 拒绝或（更糟）被当成匿名放行，都不是我们要的语义。
+      guard let pass = AccountProxyKeychain.read(account: "proxy-\(uuid)") else {
+        return .missingCredential
+      }
       proxy.applyCredential(username: user, password: pass)
     }
     store.proxyConfigurations = [proxy]
-    return true
+    return .applied
   }
 }

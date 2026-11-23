@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-is-spike-build"
+description = "Enables the is_spike_build command without any pre-configured scope."
+commands.allow = ["is_spike_build"]
+
+[[permission]]
+identifier = "deny-is-spike-build"
+description = "Denies the is_spike_build command without any pre-configured scope."
+commands.deny = ["is_spike_build"]

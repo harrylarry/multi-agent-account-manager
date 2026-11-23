@@ -8,6 +8,7 @@
 //! 不等同于 Keychain 的安全保证；正式发布前必须在目标平台接入系统凭据库。
 
 /// Keychain 条目的 service 命名空间。
+#[allow(dead_code)] // 仅 Apple 平台分支使用
 pub const SERVICE: &str = "com.harrylarry.multi-agent-account-manager.proxy";
 
 pub struct Secrets {

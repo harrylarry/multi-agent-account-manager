@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-muse-native-fingerprint-probe"
+description = "Enables the muse_native_fingerprint_probe command without any pre-configured scope."
+commands.allow = ["muse_native_fingerprint_probe"]
+
+[[permission]]
+identifier = "deny-muse-native-fingerprint-probe"
+description = "Denies the muse_native_fingerprint_probe command without any pre-configured scope."
+commands.deny = ["muse_native_fingerprint_probe"]
