@@ -14,6 +14,7 @@ use crate::gateway::{ConnectedGateway, GatewayError};
 use crate::transport::{HttpRequest, Service};
 use serde_json::{json, Value};
 use std::time::Duration;
+use tokio::io::{AsyncRead, AsyncWrite};
 
 /// 网页端广告的能力，`delta_stream` 决定服务端是否推文本增量。
 pub const CHAT_CAPABILITIES: &[&str] = &[
@@ -39,13 +40,17 @@ pub fn build_params(text: &str, node_id: &str, session_id: Option<&str>) -> Valu
 }
 
 /// 发送一次并等待 ack（首个非 event 行）。返回 (ack JSON, session_id)。
-pub async fn send_message(
-  gw: ConnectedGateway,
+/// 泛型于底层 WS 流：直连与代理连接都可复用同一发送逻辑。
+pub async fn send_message<S>(
+  gw: ConnectedGateway<S>,
   text: &str,
   node_id: &str,
   session_id: Option<&str>,
   timeout: Duration,
-) -> Result<(Value, Option<String>), GatewayError> {
+) -> Result<(Value, Option<String>), GatewayError>
+where
+  S: AsyncRead + AsyncWrite + Unpin,
+{
   let params = build_params(text, node_id, session_id);
   let req = HttpRequest {
     service: Service::Daemon,

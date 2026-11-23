@@ -9,6 +9,7 @@
 //! 本模块只做「收集」，不做评分、不做判定：拿不到就报拿不到，绝不猜文本。
 
 use std::time::Duration;
+use tokio::io::{AsyncRead, AsyncWrite};
 
 use crate::gateway::{ConnectedGateway, GatewayError, Subscription};
 use crate::transport::{HttpRequest, Service};
@@ -45,7 +46,10 @@ pub struct Collected {
 }
 
 /// 建立 `chat.subscribe` 长连接。返回的 `Subscription` 必须在本轮发送**之前**创建。
-pub async fn open_subscription(gw: ConnectedGateway) -> Result<Subscription, GatewayError> {
+pub async fn open_subscription<S>(gw: ConnectedGateway<S>) -> Result<Subscription<S>, GatewayError>
+where
+  S: AsyncRead + AsyncWrite + Unpin,
+{
   let body = serde_json::json!({ "capabilities": SUBSCRIBE_CAPABILITIES })
     .to_string()
     .into_bytes();
@@ -68,12 +72,15 @@ pub async fn open_subscription(gw: ConnectedGateway) -> Result<Subscription, Gat
 ///
 /// `total` 是整轮预算；`per_line` 是单行等待上限（避免一次 read 卡死整轮）。
 /// `message_id` 若给定，只累积该消息的增量；否则累积第一份到达的正文。
-pub async fn collect_text(
-  sub: &mut Subscription,
+pub async fn collect_text<S>(
+  sub: &mut Subscription<S>,
   message_id: Option<&str>,
   total: Duration,
   per_line: Duration,
-) -> Collected {
+) -> Collected
+where
+  S: AsyncRead + AsyncWrite + Unpin,
+{
   let deadline = tokio::time::Instant::now() + total;
   let mut out = Collected::default();
   let mut target = message_id.map(str::to_string);

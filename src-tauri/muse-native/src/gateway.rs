@@ -14,16 +14,22 @@ use crate::control_plane::{
 use crate::cookie::SessionCookies;
 use crate::methods;
 use crate::noise::{NoiseError, NoiseXXInitiator};
+use crate::proxy::{ProxyConfig, ProxyError, TunnelStream};
 use crate::protobuf::{pb_decode, pb_get, PbWriter};
 use crate::transport::{HttpRequest, InboundFrame, NoiseTransport, TransportError};
 use futures_util::{SinkExt, StreamExt};
 use std::fmt;
 use std::time::Duration;
+use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::net::TcpStream;
+use tokio_tungstenite::client_async;
 use tokio_tungstenite::tungstenite::handshake::client::generate_key;
 use tokio_tungstenite::tungstenite::protocol::Message;
 use tokio_tungstenite::{connect_async, MaybeTlsStream, WebSocketStream};
 use zeroize::Zeroize;
+
+/// 经代理隧道、再包一层到目标站点 TLS 的字节流。
+pub type ProxyTlsStream = tokio_rustls::client::TlsStream<TunnelStream>;
 
 pub const NOISE_URL: &str = "wss://hatch.metaaivm.com/v1/noise";
 pub const APP_ID: &str = "hatch-web";
@@ -43,6 +49,8 @@ pub enum GatewayError {
   Ws(String),
   Http(u16),
   Reset(u32, String),
+  /// #11/#16：代理隧道建立失败。fail-closed——绝不回退直连。
+  Proxy(ProxyError),
 }
 
 impl fmt::Display for GatewayError {
@@ -61,6 +69,7 @@ impl fmt::Display for GatewayError {
       GatewayError::Ws(m) => write!(f, "websocket error: {m}"),
       GatewayError::Http(s) => write!(f, "HTTP {s}"),
       GatewayError::Reset(code, reason) => write!(f, "stream reset ({code}{reason})"),
+      GatewayError::Proxy(e) => write!(f, "proxy tunnel failed (no direct fallback): {e}"),
     }
   }
 }
@@ -92,6 +101,12 @@ impl From<NoiseError> for GatewayError {
 impl From<tokio_tungstenite::tungstenite::Error> for GatewayError {
   fn from(e: tokio_tungstenite::tungstenite::Error) -> Self {
     GatewayError::Ws(e.to_string())
+  }
+}
+
+impl From<ProxyError> for GatewayError {
+  fn from(e: ProxyError) -> Self {
+    GatewayError::Proxy(e)
   }
 }
 
@@ -136,6 +151,22 @@ fn ensure_crypto_provider() {
   INIT.call_once(|| {
     let _ = rustls::crypto::ring::default_provider().install_default();
   });
+}
+
+/// 在代理隧道之上与目标站点做 TLS，得到可交给 client_async 的 TLS 流。
+async fn tls_over_tunnel(tunnel: TunnelStream, host: &str) -> Result<ProxyTlsStream, GatewayError> {
+  let mut roots = rustls::RootCertStore::empty();
+  roots.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
+  let config = rustls::ClientConfig::builder()
+    .with_root_certificates(roots)
+    .with_no_client_auth();
+  let connector = tokio_rustls::TlsConnector::from(std::sync::Arc::new(config));
+  let server_name = rustls::pki_types::ServerName::try_from(host.to_string())
+    .map_err(|e| GatewayError::Proxy(ProxyError::Tls(format!("非法目标主机名: {e}"))))?;
+  connector
+    .connect(server_name, tunnel)
+    .await
+    .map_err(|e| GatewayError::Proxy(ProxyError::Tls(e.to_string())))
 }
 
 impl<F: ControlPlaneFetch> MuseGateway<F> {
@@ -200,9 +231,78 @@ impl<F: ControlPlaneFetch> MuseGateway<F> {
     Ok(ConnectedGateway { ws, transport })
   }
 
-  async fn handshake(
-    ws: &mut WebSocketStream<MaybeTlsStream<TcpStream>>,
-  ) -> Result<NoiseTransport, GatewayError> {
+  /// #11/#16：经逐客户端代理建立 WSS + Noise 连接。
+  ///
+  /// fail-closed：代理隧道建立失败立即返回 `GatewayError::Proxy`，本函数内
+  /// 没有任何「改用直连」的分支；调用方配置的策略即最终策略。
+  ///
+  /// 链路：控制面取凭证（HTTP 侧代理由注入的 `F: ControlPlaneFetch` 负责）
+  /// → 代理 CONNECT/SOCKS5 隧道 → 隧道上与目标站点做 TLS → WS 握手 → Noise。
+  pub async fn connect_via_proxy(
+    self,
+    cookies: &SessionCookies,
+    proxy: &ProxyConfig,
+  ) -> Result<ConnectedGateway<ProxyTlsStream>, GatewayError> {
+    ensure_crypto_provider();
+    let mut cp = MuseControlPlane::new(self.fetch, cookies.clone());
+    let mut creds = cp.credentials(false).await?;
+    drop(cp);
+
+    let mut url = format!(
+      "{NOISE_URL}?vm_id={}&auth_token={}",
+      percent_encode(&creds.vm_id),
+      percent_encode(&creds.auth_token)
+    );
+    if let Some(notary) = &creds.notary_token {
+      url.push_str(&format!("&notary_token={}", percent_encode(notary)));
+    }
+    url.push_str(&format!(
+      "&app_id={APP_ID}&request_id={}",
+      uuid::Uuid::new_v4()
+    ));
+    creds.zeroize();
+    drop(creds);
+
+    // 与直连同样的 WS 握手头（connect_async 补不齐，手动带 5 个强制头）。
+    let request = http::Request::builder()
+      .uri(url)
+      .header("Host", "hatch.metaaivm.com")
+      .header("Connection", "Upgrade")
+      .header("Upgrade", "websocket")
+      .header("Sec-WebSocket-Version", "13")
+      .header("Sec-WebSocket-Key", generate_key())
+      .header("Origin", "https://muse.ai")
+      .header("User-Agent", GATEWAY_UA)
+      .body(())
+      .map_err(|e| GatewayError::HandshakeFailed(format!("bad noise url: {e}")))?;
+
+    // 1) 代理隧道到目标 host:443；任何失败直接返回，绝不回退直连。
+    let tunnel = proxy.connect("hatch.metaaivm.com", 443).await?;
+    // 2) 隧道上与目标站点做 TLS（wss:// 的 TLS 层）。
+    let tls = tls_over_tunnel(tunnel, "hatch.metaaivm.com").await?;
+    // 3) 在 TLS 流上做 WebSocket 握手（client_async 不再自行 TLS）。
+    let (mut ws, _) = tokio::time::timeout(HANDSHAKE_TIMEOUT, client_async(request, tls))
+      .await
+      .map_err(|_| GatewayError::Timeout("websocket open (proxy)"))?
+      .map_err(|e| match e {
+        tokio_tungstenite::tungstenite::Error::Http(r) => {
+          let status = r.status().as_u16();
+          if status == 401 || status == 403 {
+            GatewayError::SignedOut
+          } else {
+            GatewayError::HandshakeFailed(format!("websocket rejected: HTTP {status}"))
+          }
+        }
+        other => GatewayError::Ws(other.to_string()),
+      })?;
+    let transport = Self::handshake(&mut ws).await?;
+    Ok(ConnectedGateway { ws, transport })
+  }
+
+  async fn handshake<S>(ws: &mut WebSocketStream<S>) -> Result<NoiseTransport, GatewayError>
+  where
+    S: AsyncRead + AsyncWrite + Unpin,
+  {
     let mut hs = NoiseXXInitiator::new();
     // hatch_vm：field1 = 32 字节 freshness nonce。
     let mut nonce = [0u8; 32];
@@ -239,12 +339,17 @@ impl<F: ControlPlaneFetch> MuseGateway<F> {
   }
 }
 
-pub struct ConnectedGateway {
-  ws: WebSocketStream<MaybeTlsStream<TcpStream>>,
+/// 已连接的网关。默认类型参数保持直连（MaybeTlsStream<TcpStream>），因此
+/// 直连 `connect()` 与既有调用点零改动；代理路径实例化为 `<ProxyTlsStream>`。
+pub struct ConnectedGateway<S = MaybeTlsStream<TcpStream>> {
+  ws: WebSocketStream<S>,
   transport: NoiseTransport,
 }
 
-impl ConnectedGateway {
+impl<S> ConnectedGateway<S>
+where
+  S: AsyncRead + AsyncWrite + Unpin,
+{
   /// 通用 unary 请求：发送后按帧收齐响应体，返回 (HTTP 状态, body)。
   pub async fn request(&mut self, req: HttpRequest) -> Result<(u16, Vec<u8>), GatewayError> {
     let (stream_id, frames) = self.transport.encrypt_request(&req)?;
@@ -285,7 +390,7 @@ impl ConnectedGateway {
   }
 
   /// 发起长连接订阅（一次连接一个订阅），把连接移交给 `Subscription` 按行读取。
-  pub async fn subscribe(mut self, req: HttpRequest) -> Result<Subscription, GatewayError> {
+  pub async fn subscribe(mut self, req: HttpRequest) -> Result<Subscription<S>, GatewayError> {
     let (stream_id, frames) = self.transport.encrypt_request(&req)?;
     for frame in frames {
       self.ws.send(Message::Binary(frame.into())).await?;
@@ -303,8 +408,8 @@ impl ConnectedGateway {
 
 /// 一条进行中的订阅流。事件是 NDJSON，可能被拆到多个正文块，所以按缓冲区
 /// 拼行；`end_body` 之后把剩余内容作为最后一行返回，再返回 `None`。
-pub struct Subscription {
-  ws: WebSocketStream<MaybeTlsStream<TcpStream>>,
+pub struct Subscription<S = MaybeTlsStream<TcpStream>> {
+  ws: WebSocketStream<S>,
   transport: NoiseTransport,
   stream_id: u64,
   status: Option<u16>,
@@ -312,7 +417,10 @@ pub struct Subscription {
   ended: bool,
 }
 
-impl Subscription {
+impl<S> Subscription<S>
+where
+  S: AsyncRead + AsyncWrite + Unpin,
+{
   pub fn stream_id(&self) -> u64 {
     self.stream_id
   }
@@ -375,7 +483,10 @@ impl Subscription {
   }
 }
 
-impl ConnectedGateway {
+impl<S> ConnectedGateway<S>
+where
+  S: AsyncRead + AsyncWrite + Unpin,
+{
   /// 握手探针：connection.ping（POST /api/ping），返回 HTTP 状态码。
   pub async fn ping(&mut self) -> Result<u16, GatewayError> {
     let spec = methods::connection_ping();
@@ -495,5 +606,120 @@ mod tests {
   fn percent_encoding() {
     assert_eq!(percent_encode("abc-._~123"), "abc-._~123");
     assert_eq!(percent_encode("s0:abc/def?x=1"), "s0%3Aabc%2Fdef%3Fx%3D1");
+  }
+
+  // ---- #11/#16 代理接线测试 ----
+
+  use crate::control_plane::ControlPlaneFetch;
+  use std::collections::VecDeque;
+  use std::sync::Mutex;
+  use tokio::io::{AsyncReadExt, AsyncWriteExt};
+  use tokio::net::TcpListener;
+
+  struct MockFetch {
+    responses: Mutex<VecDeque<(u16, String)>>,
+  }
+
+  impl MockFetch {
+    fn new(responses: Vec<(u16, &str)>) -> Self {
+      Self {
+        responses: Mutex::new(
+          responses
+            .into_iter()
+            .map(|(s, b)| (s, b.to_string()))
+            .collect(),
+        ),
+      }
+    }
+  }
+
+  impl ControlPlaneFetch for MockFetch {
+    async fn post(
+      &self,
+      _url: &str,
+      _headers: &[(&str, &str)],
+      _body: &[u8],
+    ) -> Result<(u16, Vec<u8>), String> {
+      let (s, b) = self
+        .responses
+        .lock()
+        .unwrap()
+        .pop_front()
+        .unwrap_or((500, "{}".to_string()));
+      Ok((s, b.into_bytes()))
+    }
+  }
+
+  fn test_cookies() -> SessionCookies {
+    SessionCookies {
+      cookies: vec![crate::cookie::SessionCookie {
+        name: "hatch_sess".to_string(),
+        value: "test".to_string(),
+      }],
+    }
+  }
+
+  fn creds_responses() -> Vec<(u16, &'static str)> {
+    vec![
+      (200, "{}"), // wake
+      (
+        200,
+        r#"{"status":"assigned","vmId":"vm-9","gatewayUrl":"wss://vm-9.metaaivm.com/","vmName":"vm-9"}"#,
+      ), // lease
+      (200, r#"{"token":"s0:testtoken"}"#), // token（带 notary_token 避免额外请求）
+    ]
+  }
+
+  /// 代理拒绝 CONNECT 时，connect_via_proxy 必须返回 Proxy 错误，
+  /// 不得静默回退直连（否则会去连真实 hatch.metaaivm.com 得到别的错误/超时）。
+  #[tokio::test]
+  async fn proxy_connect_fail_closed_on_407() {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let proxy_port = listener.local_addr().unwrap().port();
+    let proxy_task = tokio::spawn(async move {
+      let (mut s, _) = listener.accept().await.unwrap();
+      // 逐字节读 CONNECT 请求头直到 \r\n\r\n，然后回 407。
+      let mut head: Vec<u8> = Vec::new();
+      let mut buf = [0u8; 1];
+      while head.len() < 8192 {
+        if s.read(&mut buf).await.unwrap_or(0) == 0 {
+          break;
+        }
+        head.push(buf[0]);
+        if head.ends_with(b"\r\n\r\n") {
+          break;
+        }
+      }
+      let _ = s
+        .write_all(b"HTTP/1.1 407 Proxy Authentication Required\r\n\r\n")
+        .await;
+    });
+
+    let cfg = ProxyConfig::parse(&format!("http://127.0.0.1:{proxy_port}")).unwrap();
+    let gateway = MuseGateway::new(MockFetch::new(creds_responses()));
+    let result = gateway.connect_via_proxy(&test_cookies(), &cfg).await;
+    // 无论 mock 读取细节如何，结果必须是 Proxy 变体，绝不能是直连路径的 Ws/Timeout。
+    assert!(
+      matches!(&result, Err(GatewayError::Proxy(_))),
+      "代理失败必须传播为 GatewayError::Proxy"
+    );
+    proxy_task.abort();
+  }
+
+  /// 代理不可达（连接被拒）时同样是 Proxy 错误，而非直连。
+  #[tokio::test]
+  async fn proxy_connect_fail_closed_when_unreachable() {
+    // 绑定后立即释放，得到一个几乎肯定无人监听的端口。
+    let tmp = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = tmp.local_addr().unwrap().port();
+    drop(tmp);
+
+    let cfg = ProxyConfig::parse(&format!("http://127.0.0.1:{port}")).unwrap();
+    let gateway = MuseGateway::new(MockFetch::new(creds_responses()));
+    let result = gateway.connect_via_proxy(&test_cookies(), &cfg).await;
+    assert!(
+      matches!(&result, Err(GatewayError::Proxy(_))),
+      "代理不可达必须传播为 GatewayError::Proxy"
+    );
   }
 }
