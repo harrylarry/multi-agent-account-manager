@@ -624,10 +624,16 @@ pub fn renewal_verdict(first: Option<i64>, second: Option<i64>) -> &'static str 
   match (first, second) {
     // 两次都拿不到到期字段：无法判断，不能报「无变化」。
     (None, None) => "unobservable",
-    // 一次有、一次没有：连字段稳定性都不成立。
-    (a, b) if a.is_some() != b.is_some() => "unobservable",
-    (Some(a), Some(b)) if a == b => "unchanged",
-    (Some(_), Some(_)) => "changed",
+    // 一次有、一次没有：连字段稳定性都不成立，同样算不可观测。
+    (Some(_), None) | (None, Some(_)) => "unobservable",
+    (Some(a), Some(b)) => {
+      if a == b {
+        "unchanged"
+      } else {
+        // 仅「到期字段变化」；是否属于自动续租需长期观测，一次探针不能断言。
+        "changed"
+      }
+    }
   }
 }
 
@@ -639,8 +645,12 @@ pub async fn lease_probe(app: &AppHandle, uuid: &str, twice: bool) -> Result<Lea
   let cookies = muse_native_client::cookie::SessionCookies::from_header(&cookie);
   let fetch = ReqwestFetch::new()?;
   let mut cp = muse_native_client::control_plane::MuseControlPlane::new(fetch, cookies);
-  let note = "探针不调用 wake()；每次 lease_vm 依次尝试 standard 与 hatch_vm（最多 2 次 POST /api/hatch/lease-vm）。\该接口在服务端是否触发 VM 分配/唤醒未经证实，因此不要把本探针当作「无副作用」。"
-    .to_string();
+  let note = concat!(
+    "探针不调用 wake()；每次 lease_vm 依次尝试 standard 与 hatch_vm",
+    "（最多 2 次 POST /api/hatch/lease-vm）。该接口在服务端是否触发 VM",
+    "分配/唤醒未经证实，因此不要把本探针当作「无副作用」。"
+  )
+  .to_string();
 
   let lease = match cp.lease_vm().await {
     Ok(l) => l,
@@ -1086,16 +1096,22 @@ pub async fn maybe_auto_diagnose(app: &AppHandle, mgr: &Arc<SessionManager>) {
     Err(e) => eprintln!("[muse-native] spike auto-diagnose failed: {e}"),
   }
 
+}
+
+#[cfg(test)]
+mod tests {
+  use super::*;
+
   #[test]
   fn renewal_verdict_cases() {
     // 都缺失 → 不可观测（关键回归：不能当成「无变化」）
     assert_eq!(renewal_verdict(None, None), "unobservable");
-    // 相等 → 未变化
+    // 相等 → 字段未变化
     assert_eq!(
       renewal_verdict(Some(1_762_100_300_000), Some(1_762_100_300_000)),
       "unchanged"
     );
-    // 不等 → 字段变化，但语义上≠自动续租（转换在 UI 文案里强调）
+    // 不等 → 仅字段变化；UI 文案把「≠ 自动续租」讲清楚
     assert_eq!(
       renewal_verdict(Some(1_762_100_300_000), Some(1_762_100_400_000)),
       "changed"
@@ -1103,5 +1119,20 @@ pub async fn maybe_auto_diagnose(app: &AppHandle, mgr: &Arc<SessionManager>) {
     // 一有一缺 → 不可观测
     assert_eq!(renewal_verdict(Some(1), None), "unobservable");
     assert_eq!(renewal_verdict(None, Some(1)), "unobservable");
+    // 反向也要一致（对称性回归）
+    assert_eq!(
+      renewal_verdict(Some(1_762_100_400_000), Some(1_762_100_300_000)),
+      "changed"
+    );
+  }
+
+  #[test]
+  fn renewal_never_claims_confirmation() {
+    // 单次探针不可能确认自动续租：以上四种结论里没有「renewed」。
+    for (a, b) in [(None, None), (Some(1), None), (Some(1), Some(1)), (Some(1), Some(2))] {
+      let v = renewal_verdict(a, b);
+      assert_ne!(v, "renewed", "续租必须由长期观测确认，不能由一次探针得出");
+      assert_ne!(v, "extended");
+    }
   }
 }
