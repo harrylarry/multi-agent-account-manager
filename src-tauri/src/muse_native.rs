@@ -10,6 +10,7 @@
 
 use muse_native_client::control_plane::ControlPlaneFetch;
 use muse_native_client::cookie::{SessionCookie, SessionCookies};
+use muse_native_client::approvals::{parse_pending, ApprovalItem};
 use muse_native_client::gateway::{GatewayError, MuseGateway};
 use muse_native_client::transport::{HttpRequest, Service};
 use muse_native_client::watch::{WatchSummary, WatchTracker};
@@ -397,6 +398,108 @@ pub async fn watch_probe(
       parse_errors,
       type_counts,
       error,
+    })
+  }
+}
+
+/// B2：只读拉取一次 `egress.approvals`，返回待审批数量与最新一条的脱敏摘要。
+/// 不做任何 approve/deny，也不返回审批正文。
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ApprovalsProbe {
+  pub ok: bool,
+  pub phase: String,
+  pub status: Option<u16>,
+  pub count: usize,
+  pub first: Option<ApprovalItem>,
+  pub error: Option<String>,
+}
+
+pub async fn approvals_probe(
+  app: &AppHandle,
+  provider_id: &str,
+  uuid: &str,
+) -> Result<ApprovalsProbe, String> {
+  if provider_id != ProviderId::Muse.as_str() {
+    return Err("审批探针只支持 Muse 账号".to_string());
+  }
+  #[cfg(target_os = "android")]
+  {
+    let _ = (app, uuid);
+    return Err("审批探针在 Android 上不可用".to_string());
+  }
+  #[cfg(not(target_os = "android"))]
+  {
+    let app_owned = app.clone();
+    let uuid_owned = uuid.to_string();
+    let cookie_handle =
+      tokio::spawn(async move { fetch_session_cookies(&app_owned, &uuid_owned).await });
+    let mut cookies = tokio::select! {
+      res = cookie_handle => match res {
+        Ok(r) => r?,
+        Err(e) => return Err(format!("取 cookie 任务异常结束: {e}")),
+      },
+      _ = tokio::time::sleep(COOKIE_TIMEOUT) => {
+        return Err("取 muse.ai 会话 cookie 超时（15 秒）".to_string());
+      }
+    };
+    if cookies.is_empty() {
+      return Ok(ApprovalsProbe {
+        ok: false, phase: "no_cookies".to_string(), status: None, count: 0,
+        first: None, error: Some("该账号还没有 muse.ai 登录态".to_string()),
+      });
+    }
+    let fetch = ReqwestFetch::new()?;
+    let gateway = MuseGateway::new(fetch);
+    let mut connected = match gateway.connect(&cookies).await {
+      Ok(c) => c,
+      Err(e) => {
+        cookies.zeroize();
+        return Ok(ApprovalsProbe {
+          ok: false, phase: "connect".to_string(), status: None, count: 0,
+          first: None, error: Some(e.to_string()),
+        });
+      }
+    };
+    cookies.zeroize();
+
+    let req = HttpRequest {
+      service: Service::Sentinel,
+      verb: "GET".to_string(),
+      path: "/approvals".to_string(),
+      headers: vec![
+        ("x-request-id".to_string(), uuid::Uuid::new_v4().to_string()),
+        ("x-app-id".to_string(), "hatch-web".to_string()),
+        ("Accept-Language".to_string(), "en-US".to_string()),
+      ],
+      body: Vec::new(),
+    };
+    let (status, body) = match connected.request(req).await {
+      Ok(r) => r,
+      Err(e) => {
+        return Ok(ApprovalsProbe {
+          ok: false, phase: "request".to_string(), status: None, count: 0,
+          first: None, error: Some(e.to_string()),
+        });
+      }
+    };
+    let json: serde_json::Value = match serde_json::from_slice(&body) {
+      Ok(v) => v,
+      Err(e) => {
+        return Ok(ApprovalsProbe {
+          ok: false, phase: "parse".to_string(), status: Some(status), count: 0,
+          first: None, error: Some(format!("响应不是 JSON: {e}")),
+        });
+      }
+    };
+    let list = parse_pending(&json);
+    Ok(ApprovalsProbe {
+      ok: status < 400,
+      phase: "ready".to_string(),
+      status: Some(status),
+      count: list.len(),
+      first: list.into_iter().next(),
+      error: if status < 400 { None } else { Some(format!("egress.approvals HTTP {status}")) },
     })
   }
 }

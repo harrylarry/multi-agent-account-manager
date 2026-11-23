@@ -159,6 +159,16 @@ async fn muse_native_watch_probe(
   muse_native::watch_probe(&app, &provider_id, &uuid, seconds).await
 }
 
+/// B2：只读拉取 `egress.approvals`。
+#[tauri::command]
+async fn muse_native_approvals_probe(
+  app: AppHandle,
+  provider_id: String,
+  uuid: String,
+) -> Result<muse_native::ApprovalsProbe, String> {
+  muse_native::approvals_probe(&app, &provider_id, &uuid).await
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
   let builder = tauri::Builder::default();
@@ -267,6 +277,7 @@ pub fn run() {
       open_external_url,
       muse_native_diagnose,
       muse_native_watch_probe,
+      muse_native_approvals_probe,
       muse_native::is_spike_build,
     ])
     .run(tauri::generate_context!())

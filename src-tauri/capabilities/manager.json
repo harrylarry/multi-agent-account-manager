@@ -28,6 +28,7 @@
     "allow-download-and-install-update",
     "allow-open-external-url",
     "allow-muse-native-diagnose",
-    "allow-muse-native-watch-probe"
+    "allow-muse-native-watch-probe",
+    "allow-muse-native-approvals-probe"
   ]
 }

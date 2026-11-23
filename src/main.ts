@@ -78,6 +78,17 @@ let spikeWatch: SpikeWatchResult | null = null;
 let spikeWatchRunning = false;
 let spikeWatchError: string | null = null;
 let spikeWatchAccount: string | null = null;
+interface SpikeApprovalItem {
+  id: string; kind: string; displayName: string;
+  requestedAtMs: number; expiresAtMs: number; status: string;
+}
+interface SpikeApprovalsResult {
+  ok: boolean; phase: string; status: number | null;
+  count: number; first: SpikeApprovalItem | null; error: string | null;
+}
+let spikeApprovals: SpikeApprovalsResult | null = null;
+let spikeApprovalsRunning = false;
+let spikeApprovalsError: string | null = null;
 let spikeDiagnoseError: string | null = null;
 // 是否 Spike 版（bundle id 门控）：只决定顶栏徽章显不显示；诊断区不门控。
 let isSpikeBuild = false;
@@ -744,6 +755,19 @@ function spikeDiagInnerHtml(): string {
   } else if (spikeDiagnoseError) {
     resultHtml = `<div class="spike-diag-result fail">错误：${escapeHtml(spikeDiagnoseError)}</div>`;
   }
+  let approvalsHtml = "";
+  if (spikeApprovals) {
+    const a = spikeApprovals;
+    const f = a.first;
+    approvalsHtml = `
+      <div class="spike-diag-result ${a.ok ? "ok" : "fail"}">
+        <div>${a.ok ? "✓ 审批只读查询成功" : "✗ 审批查询失败"}（HTTP ${a.status ?? "—"}，待审批 ${a.count} 条）</div>
+        ${f ? `<div>最新：${escapeHtml(f.displayName || "—")} / ${escapeHtml(f.kind || "—")} / ${escapeHtml(f.status)}${f.expiresAtMs ? ` / 到期 ${new Date(f.expiresAtMs).toLocaleTimeString()}` : ""}</div>` : ""}
+        ${a.error ? `<div>错误：${escapeHtml(a.error)}</div>` : ""}
+      </div>`;
+  } else if (spikeApprovalsError) {
+    approvalsHtml = `<div class="spike-diag-result fail">错误：${escapeHtml(spikeApprovalsError)}</div>`;
+  }
   let watchHtml = "";
   if (spikeWatch) {
     const s = spikeWatch.summary;
@@ -775,10 +799,12 @@ function spikeDiagInnerHtml(): string {
       <span class="spike-diag-title">原生诊断（Spike）</span>
       <button id="spike-diagnose-btn" class="mini-btn" type="button" ${spikeDiagnoseRunning ? "disabled" : ""}>${btnLabel}</button>
       <button id="spike-watch-btn" class="mini-btn" type="button" ${spikeWatchRunning ? "disabled" : ""}>${spikeWatchRunning ? "订阅中…" : "订阅探针 15s"}</button>
+      <button id="spike-approvals-btn" class="mini-btn" type="button" ${spikeApprovalsRunning ? "disabled" : ""}>${spikeApprovalsRunning ? "查询中…" : "审批探针"}</button>
       <button id="spike-copy-btn" class="mini-btn" type="button">复制结果</button>
     </div>
     ${resultHtml}
-    ${watchHtml}`;
+    ${watchHtml}
+    ${approvalsHtml}`;
 }
 
 function syncSpikeDiag(): void {
@@ -797,6 +823,36 @@ function pickWatchAccount(): AccountRecord | undefined {
   return snapshot.accounts.find(
     (a) => a.providerId === "muse" && a.authState === "authenticated"
   );
+}
+
+async function runSpikeApprovals(): Promise<void> {
+  if (!snapshot || spikeApprovalsRunning) return;
+  const acc = pickWatchAccount();
+  if (!acc) {
+    spikeApprovals = null;
+    spikeApprovalsError = "没有已登录的 Muse 账号。";
+    syncSpikeDiag();
+    return;
+  }
+  spikeApprovalsRunning = true;
+  spikeApprovalsError = null;
+  syncSpikeDiag();
+  try {
+    spikeApprovals = await Promise.race([
+      invoke<SpikeApprovalsResult>("muse_native_approvals_probe", {
+        providerId: "muse",
+        uuid: acc.uuid,
+      }),
+      new Promise<SpikeApprovalsResult>((_, reject) =>
+        setTimeout(() => reject(new Error("审批探针超时（45 秒）")), 45_000)
+      ),
+    ]);
+  } catch (e) {
+    spikeApprovals = null;
+    spikeApprovalsError = String(e);
+  }
+  spikeApprovalsRunning = false;
+  syncSpikeDiag();
 }
 
 async function runSpikeWatch(): Promise<void> {
@@ -1783,6 +1839,11 @@ function bindDelegatedEvents(): void {
     const watchBtn = target.closest<HTMLElement>("#spike-watch-btn");
     if (watchBtn) {
       await runSpikeWatch();
+      return;
+    }
+    const approvalsBtn = target.closest<HTMLElement>("#spike-approvals-btn");
+    if (approvalsBtn) {
+      await runSpikeApprovals();
       return;
     }
     const copyBtn = target.closest<HTMLElement>("#spike-copy-btn");

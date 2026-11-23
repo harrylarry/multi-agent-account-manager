@@ -245,6 +245,45 @@ pub struct ConnectedGateway {
 }
 
 impl ConnectedGateway {
+  /// 通用 unary 请求：发送后按帧收齐响应体，返回 (HTTP 状态, body)。
+  pub async fn request(&mut self, req: HttpRequest) -> Result<(u16, Vec<u8>), GatewayError> {
+    let (stream_id, frames) = self.transport.encrypt_request(&req)?;
+    for f in frames {
+      self.ws.send(Message::Binary(f.into())).await?;
+    }
+    let mut status: Option<u16> = None;
+    let mut body: Vec<u8> = Vec::new();
+    tokio::time::timeout(Duration::from_secs(20), async {
+      loop {
+        let msg = self
+          .ws
+          .next()
+          .await
+          .ok_or_else(|| GatewayError::Closed("closed during request".to_string()))??;
+        let Message::Binary(data) = msg else { continue };
+        let Some(frame) = self.transport.decrypt(&data)? else { continue };
+        match frame {
+          InboundFrame::Response { stream_id: sid, status: st, body: b, end_body, .. } if sid == stream_id => {
+            status = Some(st);
+            if !b.is_empty() { body.extend_from_slice(&b); }
+            if end_body { return Ok(()); }
+          }
+          InboundFrame::BodyChunk { stream_id: sid, data, end_body } if sid == stream_id => {
+            body.extend_from_slice(&data);
+            if end_body { return Ok(()); }
+          }
+          InboundFrame::Reset { stream_id: sid, code, reason } if sid == stream_id => {
+            return Err(GatewayError::Reset(code, reason));
+          }
+          _ => {}
+        }
+      }
+    })
+    .await
+    .map_err(|_| GatewayError::Timeout("unary request"))??;
+    Ok((status.unwrap_or(0), body))
+  }
+
   /// 发起长连接订阅（一次连接一个订阅），把连接移交给 `Subscription` 按行读取。
   pub async fn subscribe(mut self, req: HttpRequest) -> Result<Subscription, GatewayError> {
     let (stream_id, frames) = self.transport.encrypt_request(&req)?;
