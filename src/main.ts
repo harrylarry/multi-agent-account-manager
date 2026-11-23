@@ -99,7 +99,7 @@ let spikeQuotaProbe: SpikeQuotaProbe | null = null;
 let spikeQuotaRunning = false;
 let spikeQuotaError: string | null = null;
 interface SpikeLiveness {
-  running: boolean; startedMs: number; connectedMs: number | null;
+  running: boolean; phase: string; startedMs: number; connectedMs: number | null;
   lastEventMs: number | null; endedMs: number | null; events: number; error: string | null;
 }
 let spikeLive: SpikeLiveness | null = null;
@@ -785,7 +785,7 @@ function spikeDiagInnerHtml(): string {
       : (l.endedMs && l.connectedMs ? Math.round((l.endedMs - l.connectedMs) / 1000) : 0);
     liveHtml = `
       <div class="spike-diag-result ${l.error ? "fail" : "ok"}">
-        <div>${l.running ? "● 存活中" : "■ 已结束"}：连接存活 ${alive}s，事件 ${l.events}</div>
+        <div>${l.running ? "● 存活中" : "■ 已结束"}（阶段 ${escapeHtml(l.phase || "—")}）：连接存活 ${alive}s，事件 ${l.events}</div>
         <div>建立 ${l.connectedMs ? fmt(l.connectedMs) : "—"}　最后事件 ${l.lastEventMs ? fmt(l.lastEventMs) : "—"}　结束 ${l.endedMs ? fmt(l.endedMs) : "—"}</div>
         ${l.error ? `<div>结束原因：${escapeHtml(l.error)}</div>` : ""}
       </div>`;
@@ -913,6 +913,26 @@ async function refreshSpikeLive(): Promise<void> {
   syncSpikeDiag();
 }
 
+let spikeLiveTimer: ReturnType<typeof setInterval> | null = null;
+
+function stopLiveTimer(): void {
+  if (spikeLiveTimer) {
+    clearInterval(spikeLiveTimer);
+    spikeLiveTimer = null;
+  }
+}
+
+function startLiveTimer(): void {
+  stopLiveTimer();
+  spikeLiveTimer = setInterval(() => {
+    if (!spikeLive?.running) {
+      stopLiveTimer();
+      return;
+    }
+    void refreshSpikeLive();
+  }, 3000);
+}
+
 async function startSpikeLive(): Promise<void> {
   if (!snapshot) return;
   const acc = pickWatchAccount();
@@ -922,6 +942,7 @@ async function startSpikeLive(): Promise<void> {
       uuid: acc.uuid,
       seconds: 300,
     });
+    startLiveTimer();
   } catch (e) {
     spikeLive = null;
   }

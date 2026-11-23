@@ -390,6 +390,8 @@ pub async fn send_probe(
 #[serde(rename_all = "camelCase")]
 pub struct Liveness {
   pub running: bool,
+  /// 当前阶段：cookies / connect / subscribe / reading / done
+  pub phase: String,
   pub started_ms: u128,
   pub connected_ms: Option<u128>,
   pub last_event_ms: Option<u128>,
@@ -434,6 +436,7 @@ pub fn liveness_start(
   state.set(|l| {
     *l = Liveness {
       running: true,
+      phase: "cookies".to_string(),
       started_ms: now_ms_u128(),
       ..Default::default()
     }
@@ -456,20 +459,37 @@ pub fn liveness_start(
     }
     #[cfg(not(target_os = "android"))]
     {
-      let cookies = match fetch_session_cookies(&app_owned, &uuid_owned).await {
-        Ok(c) => c,
-        Err(e) => {
+      let cookies = match tokio::time::timeout(
+        COOKIE_TIMEOUT,
+        fetch_session_cookies(&app_owned, &uuid_owned),
+      )
+      .await
+      {
+        Err(_) => {
           state_owned.set(|l| {
             l.running = false;
+            l.phase = "cookies-timeout".to_string();
+            l.ended_ms = Some(now_ms_u128());
+            l.error = Some("取 cookie 超时（15 秒）".to_string());
+          });
+          return;
+        }
+        Ok(Ok(c)) => c,
+        Ok(Err(e)) => {
+          state_owned.set(|l| {
+            l.running = false;
+            l.phase = "cookies-error".to_string();
             l.ended_ms = Some(now_ms_u128());
             l.error = Some(e);
           });
           return;
         }
       };
+      state_owned.set(|l| l.phase = "connect".to_string());
       if cookies.is_empty() {
         state_owned.set(|l| {
           l.running = false;
+          l.phase = "no-cookies".to_string();
           l.ended_ms = Some(now_ms_u128());
           l.error = Some("无登录态".to_string());
         });
@@ -488,12 +508,23 @@ pub fn liveness_start(
       };
       let gateway = MuseGateway::new(fetch);
       let mut cookies = cookies;
-      let connected = match gateway.connect(&cookies).await {
-        Ok(c) => c,
-        Err(e) => {
+      let connected = match tokio::time::timeout(Duration::from_secs(60), gateway.connect(&cookies)).await {
+        Err(_) => {
           cookies.zeroize();
           state_owned.set(|l| {
             l.running = false;
+            l.phase = "connect-timeout".to_string();
+            l.ended_ms = Some(now_ms_u128());
+            l.error = Some("建连超时（60 秒）".to_string());
+          });
+          return;
+        }
+        Ok(Ok(c)) => c,
+        Ok(Err(e)) => {
+          cookies.zeroize();
+          state_owned.set(|l| {
+            l.running = false;
+            l.phase = "connect-error".to_string();
             l.ended_ms = Some(now_ms_u128());
             l.error = Some(e.to_string());
           });
@@ -501,7 +532,10 @@ pub fn liveness_start(
         }
       };
       cookies.zeroize();
-      state_owned.set(|l| l.connected_ms = Some(now_ms_u128()));
+      state_owned.set(|l| {
+        l.connected_ms = Some(now_ms_u128());
+        l.phase = "subscribe".to_string();
+      });
 
       let body = br#"{"capabilities":["hotel_results","chat_cancel","delta_stream","custom_reactions","custom_reactions_facebook_thumbs_up_v1"]}"#.to_vec();
       let req = HttpRequest {
@@ -526,6 +560,7 @@ pub fn liveness_start(
           return;
         }
       };
+      state_owned.set(|l| l.phase = "reading".to_string());
       let deadline = Instant::now() + Duration::from_secs(seconds);
       let mut error = None;
       loop {
@@ -553,6 +588,7 @@ pub fn liveness_start(
       }
       state_owned.set(|l| {
         l.running = false;
+        l.phase = "done".to_string();
         l.ended_ms = Some(now_ms_u128());
         l.error = error;
       });
