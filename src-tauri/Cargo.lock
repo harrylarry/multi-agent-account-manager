@@ -2162,7 +2162,7 @@ dependencies = [
 
 [[package]]
 name = "multi-agent-account-manager"
-version = "0.1.23"
+version = "0.1.24"
 dependencies = [
  "block2",
  "muse-native",
