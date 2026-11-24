@@ -521,6 +521,7 @@ pub struct FingerprintProbe {
   pub samples_collected: usize,
   /// 任务汇总：每条探针的独立发送/采集状态。
   pub sends: Vec<FingerprintSendRecord>,
+  pub wire_trace: Vec<String>,
   /// 隔离会话 id（非敏感，便于人工核对探针落在测试会话里）。
   pub session_id: Option<String>,
   pub error: Option<String>,
@@ -538,6 +539,7 @@ impl FingerprintProbe {
       probes_confirmed: 0,
       samples_collected: 0,
       sends: Vec::new(),
+      wire_trace: Vec::new(),
       session_id: None,
       error: Some(error.into()),
     }
@@ -619,14 +621,21 @@ pub async fn fingerprint_probe(
       },
       _ = cancel_token.cancelled() => return FingerprintProbe::fail("cancelled", "indeterminate", "用户取消"),
     };
+    subscription.enable_chat_wire_trace();
     progress("subscribe", 0, 0, 0);
     tokio::select! {
       res = subscription.wait_ready(Duration::from_secs(25)) => {
         if let Err(error) = res {
-          return FingerprintProbe::fail("subscribe", "indeterminate", safe_gateway_status(&error));
+          let mut failure = FingerprintProbe::fail("subscribe", "indeterminate", safe_gateway_status(&error));
+          failure.wire_trace = subscription.take_chat_wire_trace();
+          return failure;
         }
       }
-      _ = cancel_token.cancelled() => return FingerprintProbe::fail("cancelled", "indeterminate", "用户取消"),
+      _ = cancel_token.cancelled() => {
+        let mut failure = FingerprintProbe::fail("cancelled", "indeterminate", "用户取消");
+        failure.wire_trace = subscription.take_chat_wire_trace();
+        return failure;
+      }
     }
 
     let mut samples = Vec::new();
@@ -634,6 +643,7 @@ pub async fn fingerprint_probe(
     let mut probes_sent = 0;
     let mut probes_confirmed = 0;
     let mut sends = Vec::new();
+    let mut wire_trace = Vec::new();
     let mut first_error = None;
     for (index, probe) in probes.iter().enumerate() {
       if cancel_token.check() {
@@ -748,6 +758,7 @@ pub async fn fingerprint_probe(
           record.error = Some(reason);
         }
       }
+      wire_trace.extend(subscription.take_chat_wire_trace());
       let proceed = record.sample_used;
       first_error = record.error.clone();
       sends.push(record);
@@ -756,6 +767,7 @@ pub async fn fingerprint_probe(
       }
     }
 
+    wire_trace.extend(subscription.take_chat_wire_trace());
     let samples_collected = samples.len();
     progress("scoring", 0, probes_confirmed, samples_collected);
     let result = if samples.is_empty() {
@@ -789,6 +801,7 @@ pub async fn fingerprint_probe(
       probes_confirmed,
       samples_collected,
       sends,
+      wire_trace,
       session_id: Some(session_id),
       error: first_error,
     }

@@ -44,3 +44,5 @@ pub mod protobuf;
 pub mod proxy;
 pub mod transport;
 pub mod watch;
+#[cfg(not(target_os = "android"))]
+mod wire_trace;

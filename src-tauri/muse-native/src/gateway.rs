@@ -464,6 +464,7 @@ where
         early_send_events: std::collections::VecDeque::new(),
         last_line_from_send: false,
         socket_closed: false,
+        wire_trace: None,
       }),
     }
   }
@@ -497,6 +498,7 @@ pub struct Subscription<S = MaybeTlsStream<TcpStream>> {
   early_send_events: std::collections::VecDeque<String>,
   last_line_from_send: bool,
   socket_closed: bool,
+  wire_trace: Option<crate::wire_trace::WireTrace>,
 }
 
 #[derive(Default)]
@@ -613,6 +615,16 @@ impl<S: AsyncRead + AsyncWrite + Unpin> ParallelResponse<'_, S> {
 }
 
 impl<S: AsyncRead + AsyncWrite + Unpin> Subscription<S> {
+  pub fn enable_chat_wire_trace(&mut self) {
+    let mut trace = crate::wire_trace::WireTrace::default();
+    trace.request(self.stream_id, "chat.subscribe");
+    self.wire_trace = Some(trace);
+  }
+
+  pub fn take_chat_wire_trace(&mut self) -> Vec<String> {
+    self.wire_trace.as_mut().map_or_else(Vec::new, |trace| trace.take())
+  }
+
   pub fn stream_id(&self) -> u64 {
     self.stream_id
   }
@@ -668,6 +680,10 @@ impl<S: AsyncRead + AsyncWrite + Unpin> Subscription<S> {
       Ok(v) => v,
       Err(e) => return (false, 0, Err(e.into())),
     };
+    if let Some(trace) = &mut self.wire_trace {
+      let method = if req.path == "/chat/stream" { "chat.stream" } else { "unknown" };
+      trace.request(id, method);
+    }
     let wrote = write_frames(&mut WsSink { ws: &mut self.ws }, frames, cancel).await;
     let response = match wrote.error {
       Some(e) => Err(e),
@@ -729,6 +745,18 @@ impl<S: AsyncRead + AsyncWrite + Unpin> Subscription<S> {
             | InboundFrame::BodyChunk { stream_id, .. }
             | InboundFrame::Reset { stream_id, .. } => *stream_id,
           };
+          if let Some(trace) = &mut self.wire_trace {
+            let route = if id == self.stream_id {
+              "subscription"
+            } else if parallel.as_ref().is_some_and(|(aux, _)| *aux == id)
+              || self.send_response.as_ref().is_some_and(|(aux, _)| *aux == id)
+            {
+              "send"
+            } else {
+              "unknown"
+            };
+            trace.frame(id, &frame, route);
+          }
           if id == self.stream_id {
             self.response.accept(frame)?;
           } else if let Some((_, response)) = parallel.filter(|(aux, _)| *aux == id) {
@@ -976,7 +1004,7 @@ mod tests {
         .send(response(
           &mut cipher,
           99,
-          b"{\"message_id\":\"wrong\"}",
+          b"{\"type\":\"event\",\"event\":\"delta.message_done\",\"message_id\":\"wrong\"}",
           true,
         ))
         .await
@@ -1005,6 +1033,7 @@ mod tests {
     });
 
     let mut sub = client.subscribe(subscription_request()).await.unwrap();
+    sub.enable_chat_wire_trace();
     let wait = Duration::from_secs(1);
     sub.wait_ready(wait).await.unwrap();
     let (_tx, mut rx) = watch::channel(false);
@@ -1019,6 +1048,11 @@ mod tests {
     assert!(sub.next_line(wait).await.unwrap().unwrap().contains("delta.text_append"));
     assert!(sub.last_line_from_send());
     assert!(!sub.stream_ended());
+    let trace = sub.take_chat_wire_trace().join("\n");
+    assert!(trace.contains("chat.subscribe 1 response subscription"));
+    assert!(trace.contains("chat.stream 2 response send"));
+    assert!(trace.contains("unknown 99 response unknown 0 true 200 delta.message_done"));
+    assert!(!trace.contains("wrong"));
     peer.await.unwrap();
   }
 

@@ -267,6 +267,20 @@ pub enum AccountSubscription {
 }
 
 impl AccountSubscription {
+  pub fn enable_chat_wire_trace(&mut self) {
+    match self {
+      Self::Direct(s) => s.enable_chat_wire_trace(),
+      Self::Proxied(s) => s.enable_chat_wire_trace(),
+    }
+  }
+
+  pub fn take_chat_wire_trace(&mut self) -> Vec<String> {
+    match self {
+      Self::Direct(s) => s.take_chat_wire_trace(),
+      Self::Proxied(s) => s.take_chat_wire_trace(),
+    }
+  }
+
   pub async fn wait_ready(&mut self, timeout: Duration) -> Result<(), GatewayError> {
     match self {
       Self::Direct(s) => s.wait_ready(timeout).await,

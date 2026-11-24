@@ -179,6 +179,7 @@ interface SpikeFingerprintProbe {
   result: SpikeFingerprintResult | null;
   probesSent: number; probesConfirmed: number; samplesCollected: number;
   sends: SpikeFingerprintSendRecord[];
+  wireTrace?: string[];
   sessionId: string | null;
   error: string | null;
 }
@@ -1246,11 +1247,13 @@ function spikeDiagInnerHtml(accountUuid: string | undefined = pickWatchAccount()
           .join("")
       : "";
     const cls = f.verdict === "scored" ? "ok" : f.verdict === "partial" ? "" : "fail";
+    const wireTrace = f.wireTrace?.join("\n") ?? "";
     fingerprintHtml = `
       <div class="spike-diag-result ${cls}">
         <div>${f.ok ? "✓" : "■"} 指纹探针：${escapeHtml(verdictLabel[f.verdict] ?? f.verdict)}（阶段 ${escapeHtml(f.phase)}）</div>
         <div>进入网络写入 ${f.probesSent}/3　发送确认 ${f.probesConfirmed ?? 0}　采到样本 ${f.samplesCollected}　参与评分 ${r?.usedSamples ?? 0}/${r?.requiredSamples ?? 3}</div>
         ${sendsHtml ? `<div class="hint">${sendsHtml}</div>` : ""}
+        ${wireTrace ? `<details><summary>解密后流诊断</summary><button id="spike-wire-copy-btn" class="mini-btn" type="button">复制脱敏流诊断</button><pre id="spike-wire-trace" style="white-space: pre-wrap; overflow-wrap: anywhere">${escapeHtml(wireTrace)}</pre></details>` : ""}
         ${r && r.prediction ? `<div>候选首位：${escapeHtml(r.predictionName || r.prediction)}　家族 ${escapeHtml(r.familyPredictionName || r.familyPrediction)}</div>` : ""}
         ${r?.calibrated && r.probability != null ? `<div>校准置信度：${(r.probability * 100).toFixed(1)}%（${escapeHtml(r.probabilityStatus)}，闭集参考）</div>` : ""}
         ${candHtml ? `<div>${candHtml}</div>` : ""}
@@ -3008,14 +3011,15 @@ function bindDelegatedEvents(): void {
       await runSpikeApprovals();
       return;
     }
-    const copyBtn = target.closest<HTMLElement>("#spike-copy-btn");
+    const copyBtn = target.closest<HTMLElement>("#spike-copy-btn, #spike-wire-copy-btn");
     if (copyBtn) {
       // 只复制诊断内容：克隆后剔除按钮，避免把「运行诊断/额度探针…」写进剪贴板。
       const el = document.querySelector<HTMLElement>(".spike-diag");
-      let text = "";
-      if (el) {
+      const wireOnly = copyBtn.id === "spike-wire-copy-btn";
+      let text = el?.querySelector("#spike-wire-trace")?.textContent ?? "";
+      if (el && !wireOnly) {
         const clone = el.cloneNode(true) as HTMLElement;
-        clone.querySelectorAll("button").forEach((b) => b.remove());
+        clone.querySelectorAll("button, #spike-wire-trace").forEach((b) => b.remove());
         text = (clone.innerText || "")
           .split("\n")
           .map((l) => l.trim())
@@ -3034,7 +3038,7 @@ function bindDelegatedEvents(): void {
       }
       copyBtn.textContent = "已复制";
       setTimeout(() => {
-        copyBtn.textContent = "复制结果";
+        copyBtn.textContent = wireOnly ? "复制脱敏流诊断" : "复制结果";
       }, 1200);
       return;
     }

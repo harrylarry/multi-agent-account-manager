@@ -20,7 +20,9 @@
 
 实时流式专项包 `8f50c91` 的 CI 与 Xcode 打包通过。本次 iPhone 专项实测中，实时增量与流内结束验收均未通过。三条均为零关联文本增量，最终由历史恢复完成。下一轮按发送流和订阅流分别记录匹配前的事件类型计数，以区分未观测到文本事件与关联失败。[下载与步骤](../acceptance/iphone-acceptance.md#实时增量专项复测)
 
-诊断构建 `d983d52` 的 CI 与 Xcode 打包均通过，等待真机按流回传事件计数。[构建](https://github.com/harrylarry/multi-agent-account-manager/actions/runs/45431942405)
+诊断构建 `d983d52` 的 CI 与 Xcode 打包均通过。iPhone 回报三条均经 `history_completed` 入样，发送流和订阅流均未报告文本增量或结束事件。BotArk 桌面端 02:03 的手测可见文字逐步出现，当时的日志过滤未保留足够帧证据，尚无法确认两端收到的事件差异。[构建](https://github.com/harrylarry/multi-agent-account-manager/actions/runs/45431942405)
+
+下一轮取证使用同一账号、同一代理和各自新建的隔离会话。两端在解密并识别传输帧后、分流前记录 `MUSE_WIRE_TRACE`。字段依次是本地时间戳（Unix 毫秒）、连接序号、记录序号、RPC 方法、连接内流 ID、帧类型、分流匹配、正文长度、正文是否封尾、HTTP 状态或 reset 码、白名单事件名。未知事件只显示 `other`，超过采集上限有明确标记。先收 BotArk 日志，叠号待诊断 IPA 后在「原生诊断 → 解密后流诊断」复制脱敏结果。收到两端记录前，实时流式回复和根因均为 `UNVERIFIED`。
 
 0.1.25 的 Muse 真机指纹采集记录为 `FAIL`。两次各确认发送 1 条，网页可见回复，采集均超时且样本为 0。两次均停止后续发送。
 
