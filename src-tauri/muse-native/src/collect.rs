@@ -112,11 +112,128 @@ fn final_text(payload: &Value, root: &Value, assistant_id: &str) -> Option<Strin
       return Some(text.join("\n\n"));
     }
   }
+  if let Some(parts) = payload["content"]
+    .as_array()
+    .or_else(|| root["content"].as_array())
+  {
+    let text: Vec<_> = parts
+      .iter()
+      .filter(|part| {
+        part["type"]
+          .as_str()
+          .is_none_or(|kind| matches!(kind, "text" | "markdown"))
+      })
+      .filter_map(|part| text_field(&[part], &["text", "markdown"]))
+      .collect();
+    if !text.is_empty() {
+      return Some(text.join("\n\n"));
+    }
+  }
   text_field(
     &[payload, &payload["message"], root],
     &["display_text", "text", "content"],
   )
   .map(str::to_string)
+}
+
+/// Recover a persisted, completed reply from a session-scoped history response.
+/// Only the latest user turn is eligible, and its ID must match the send ACK.
+pub fn completed_history_reply(body: &[u8], session_id: &str, user_id: &str) -> Option<String> {
+  let raw: Value = serde_json::from_slice(body).ok()?;
+  if raw["ok"] == false || !raw["error"].is_null() || raw["has_more"] == true {
+    return None;
+  }
+  let result = raw.get("result").unwrap_or(&raw);
+  if result["has_more"] == true
+    || result["session_id"]
+      .as_str()
+      .is_some_and(|id| id != session_id)
+  {
+    return None;
+  }
+  let rows = ["events", "chat_events", "messages"]
+    .iter()
+    .find_map(|key| result[*key].as_array())
+    .or_else(|| result.as_array())?;
+  let mut ordered: Vec<_> = rows.iter().collect();
+  let sequenced = ordered.iter().all(|row| row["seq"].is_u64());
+  if sequenced {
+    ordered.sort_by_key(|row| row["seq"].as_u64());
+  }
+  let mut current = false;
+  let mut foreign_user = false;
+  let mut unlinked = false;
+  let mut pending = HashSet::new();
+  let mut completed = HashMap::new();
+  for row in ordered {
+    let payload = &row["payload"];
+    let fields = [payload, row, &payload["chat_context"]];
+    if text_field(&fields, &["session_id", "thread_id"]).is_some_and(|id| id != session_id) {
+      return None;
+    }
+    let kind = text_field(&[row], &["event_name", "event", "type"]);
+    let role = text_field(&fields, &["role"]);
+    let id = text_field(&fields, &["message_id", "id"]);
+    if role == Some("user") || kind == Some("message.user") {
+      if !current || id != Some(user_id) {
+        pending.clear();
+        completed.clear();
+        unlinked = false;
+      }
+      current = id == Some(user_id);
+      foreign_user |= !current;
+      continue;
+    }
+    if !current
+      || !(role == Some("assistant")
+        || matches!(
+          kind,
+          Some(
+            "message.assistant"
+              | "delta.message_done"
+              | "delta.message_start"
+              | "delta.text_append"
+          )
+        ))
+    {
+      continue;
+    }
+    let parent = text_field(
+      &fields,
+      &[
+        "user_message_id",
+        "parent_message_id",
+        "reply_to_message_id",
+      ],
+    );
+    if parent.is_some_and(|id| id != user_id) {
+      return None;
+    }
+    unlinked |= parent.is_none();
+    let id = id.filter(|id| *id != user_id)?;
+    let terminal = matches!(
+      text_field(&fields, &["status"]),
+      Some("complete" | "completed" | "done" | "finished")
+    );
+    if terminal {
+      let text = final_text(payload, row, id)
+        .or_else(|| final_text(row, row, id))
+        .filter(|text| !text.trim().is_empty())?;
+      pending.remove(id);
+      completed.insert(id, text);
+    } else if !completed.contains_key(id) {
+      pending.insert(id);
+    }
+  }
+  if current
+    && pending.is_empty()
+    && completed.len() == 1
+    && (sequenced || !foreign_user || !unlinked)
+  {
+    completed.into_values().next()
+  } else {
+    None
+  }
 }
 
 /// Gathering a bubble and establishing the end of a turn are independent.
@@ -314,6 +431,41 @@ pub async fn collect_text<L: LineSource>(
 #[cfg(test)]
 mod tests {
   use super::*;
+
+  #[test]
+  fn history_requires_completed_reply_for_latest_acknowledged_turn() {
+    let user = serde_json::json!({"role":"user","id":"u","seq":1});
+    let reply = serde_json::json!({"role":"assistant","id":"a","seq":2,
+      "status":"completed","content":[{"type":"text","text":"verified reply"}]});
+    let read = |rows: Vec<Value>| {
+      completed_history_reply(
+        serde_json::json!({"ok":true,"result":{
+          "session_id":"s","messages":rows
+        }})
+        .to_string()
+        .as_bytes(),
+        "s",
+        "u",
+      )
+    };
+    assert_eq!(
+      read(vec![reply.clone(), user.clone()]).as_deref(),
+      Some("verified reply")
+    );
+    assert!(read(vec![reply.clone()]).is_none());
+    assert!(read(vec![
+      user.clone(),
+      reply.clone(),
+      serde_json::json!({"role":"user","id":"other","seq":3})
+    ])
+    .is_none());
+    let mut partial = reply.clone();
+    partial["status"] = serde_json::json!("running");
+    assert!(read(vec![user.clone(), partial]).is_none());
+    let mut unrelated = reply;
+    unrelated["parent_message_id"] = serde_json::json!("other");
+    assert!(read(vec![user, unrelated]).is_none());
+  }
   use std::collections::VecDeque;
 
   struct Scripted(VecDeque<Result<Option<String>, GatewayError>>);

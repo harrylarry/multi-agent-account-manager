@@ -616,7 +616,6 @@ pub async fn fingerprint_probe(
       },
       _ = cancel_token.cancelled() => return FingerprintProbe::fail("cancelled", "indeterminate", "用户取消"),
     };
-    drop(cookies);
     progress("subscribe", 0, 0, 0);
     tokio::select! {
       res = subscription.wait_ready(Duration::from_secs(25)) => {
@@ -685,7 +684,25 @@ pub async fn fingerprint_probe(
               _ = cancel_token.cancelled() => None,
             };
             match collected {
-              Some(c) => {
+              Some(mut c) => {
+                if !c.done && c.ended_by == "timeout" {
+                  let recovery = read_fingerprint_history(&egress, &cookies, &session_id, &ack.message_id);
+                  tokio::select! {
+                    result = tokio::time::timeout(Duration::from_secs(18), recovery) => {
+                      match result {
+                        Ok(Ok(Some(text))) => {
+                          c.text = text;
+                          c.done = true;
+                          c.ended_by = "history_completed".to_string();
+                        }
+                        Ok(Ok(None)) => c.ended_by = "history_unverified".to_string(),
+                        Ok(Err(reason)) => c.ended_by = reason,
+                        Err(_) => c.ended_by = "history_timeout".to_string(),
+                      }
+                    }
+                    _ = cancel_token.cancelled() => c.ended_by = "cancelled".to_string(),
+                  }
+                }
                 record.text_done = c.done;
                 record.diagnostics = Some(FingerprintCollectionDiagnostics {
                   ended_by: c.ended_by.clone(),
@@ -804,6 +821,35 @@ async fn allocate_isolated_session(
     return Err("Muse 会话列表没有确认新会话，已停止".to_string());
   }
   Ok(created)
+}
+
+#[cfg(not(target_os = "android"))]
+async fn read_fingerprint_history(
+  egress: &crate::egress::AccountEgress,
+  cookies: &SessionCookies,
+  session_id: &str,
+  user_id: &str,
+) -> Result<Option<String>, String> {
+  let query = url::form_urlencoded::Serializer::new(String::new())
+    .append_pair("session_id", session_id)
+    .append_pair("limit", "50")
+    .finish();
+  let mut gateway = egress.connect(cookies).await.map_err(|_| "history_connect_error".to_string())?;
+  let (status, body) = gateway.request(HttpRequest {
+    service: Service::Daemon,
+    verb: "GET".to_string(),
+    path: format!("/chat/history?{query}"),
+    headers: vec![
+      ("x-app-id".to_string(), "hatch-web".to_string()),
+      ("x-request-id".to_string(), uuid::Uuid::new_v4().to_string()),
+      ("Accept-Language".to_string(), "en-US".to_string()),
+    ],
+    body: Vec::new(),
+  }).await.map_err(|error| format!("history_{}", safe_gateway_status(&error)))?;
+  if !(200..300).contains(&status) {
+    return Err(format!("history_http_{status}"));
+  }
+  Ok(muse_native_client::collect::completed_history_reply(&body, session_id, user_id))
 }
 
 #[cfg(not(target_os = "android"))]
