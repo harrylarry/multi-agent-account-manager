@@ -1,5 +1,6 @@
 mod muse_native;
 mod platform;
+mod hark_native;
 mod probe_cancel;
 mod webview_proxy;
 mod providers;
@@ -363,6 +364,36 @@ async fn muse_native_fingerprint_probe(
     )
     .await,
   )
+}
+
+#[tauri::command]
+#[cfg_attr(not(target_os = "ios"), allow(unused_variables))]
+async fn hark_native_watch_probe(
+  app: AppHandle,
+  uuid: String,
+  timezone: String,
+  mgr: State<'_, Arc<SessionManager>>,
+) -> Result<hark_native::HarkProbe, String> {
+  #[cfg(not(target_os = "ios"))]
+  {
+    Err("Hark 原生诊断需要 iOS 测试包".to_string())
+  }
+  #[cfg(target_os = "ios")]
+  {
+    if !muse_native::is_spike_build(app.clone()) {
+      return Err("Hark 原生诊断仅在 Spike 包开放".to_string());
+    }
+    if timezone.is_empty() || timezone.len() > 96
+      || !timezone.bytes().all(|b| b.is_ascii_alphanumeric() || b"/_+-".contains(&b))
+    {
+      return Err("时区格式无效".to_string());
+    }
+    let account = mgr.get_snapshot().await.accounts.into_iter()
+      .find(|account| account.provider_id == providers::ProviderId::Hark && account.uuid == uuid
+        && account.auth_state == storage::AuthState::Authenticated)
+      .ok_or_else(|| "没有匹配的 Hark 测试账号".to_string())?;
+    Ok(hark_native::diagnose(&app, &uuid, account.proxy.as_ref(), &timezone).await)
+  }
 }
 
 /// #11/#16：用**该账号已保存的代理**验证控制面 + WSS 隧道 + Noise + ping（fail-closed）。
@@ -795,6 +826,7 @@ pub fn run() {
       open_external_url,
       muse_native_diagnose,
       muse_native_watch_probe,
+      hark_native_watch_probe,
       muse_native_approvals_probe,
       muse_native_quota_probe,
       muse_native_send_probe,

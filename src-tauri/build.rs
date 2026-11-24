@@ -21,6 +21,7 @@ const APP_COMMANDS: &[&str] = &[
   // Spike 原生探针（#8/#10/#18、#11/#16）
   "muse_native_diagnose",
   "muse_native_watch_probe",
+  "hark_native_watch_probe",
   "muse_native_approvals_probe",
   "muse_native_quota_probe",
   "muse_native_send_probe",

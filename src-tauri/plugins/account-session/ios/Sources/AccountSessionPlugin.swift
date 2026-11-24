@@ -57,6 +57,7 @@ private struct DeleteProfileArgs: Decodable {
 
 private struct GetSessionCookiesArgs: Decodable {
   let uuid: String
+  let provider: String?
 }
 
 private struct SetUnreadBadgeArgs: Decodable {
@@ -230,7 +231,21 @@ class AccountSessionPlugin: Plugin {
       }
       let store = WKWebsiteDataStore(forIdentifier: identifier)
       store.httpCookieStore.getAllCookies { cookies in
-        let mine = cookies.filter { $0.domain == "muse.ai" || $0.domain.hasSuffix(".muse.ai") }
+        let mine: [HTTPCookie]
+        switch args.provider {
+        case nil, "muse":
+          mine = cookies.filter { $0.domain == "muse.ai" || $0.domain.hasSuffix(".muse.ai") }
+        case "hark":
+          mine = cookies.filter { cookie in
+            let domain = cookie.domain.lowercased()
+            let validDomain = domain == "app.hark.com" || domain == ".app.hark.com" || domain == ".hark.com"
+            let validPath = cookie.path == "/" || cookie.path == "/api" || cookie.path == "/api/"
+            return validDomain && validPath && (cookie.expiresDate.map { $0 > Date() } ?? true)
+          }
+        default:
+          invoke.reject("不支持的登录态服务")
+          return
+        }
         invoke.resolve(["cookies": mine.map { ["name": $0.name, "value": $0.value] }])
       }
     }

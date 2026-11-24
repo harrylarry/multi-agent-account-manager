@@ -172,6 +172,65 @@ interface SpikeFingerprintProbe {
   sessionId: string | null;
   error: string | null;
 }
+interface SpikeHarkProbe {
+  restStatus: number | null; sseStatus: number | null; sseEnd: string | null;
+  sseFrames: number; pollStatus: number | null; pollFrames: number;
+  summary: { malformedFrames: number; knownMessages: number; running: number; completed: number; failed: number; duplicateStates: number };
+  error: string | null;
+}
+const harkProbeByAccount = new Map<string, { running: boolean; result: SpikeHarkProbe | null; error: string | null }>();
+
+function harkTestAccount(): AccountRecord | undefined {
+  const accounts = snapshot?.accounts.filter((account) =>
+    account.providerId === "hark" && account.authState === "authenticated") ?? [];
+  const active = snapshot?.activeAccount;
+  return accounts.find((account) => active && isSameKey(active, account)) ?? accounts[0];
+}
+
+function harkProbeHtml(): string {
+  const account = harkTestAccount();
+  const state = account && harkProbeByAccount.get(account.uuid);
+  const result = state?.result;
+  const diagnosis = result
+    ? `<div class="spike-diag-result">
+        <div>REST ${result.restStatus ?? "未观测"} · SSE ${result.sseStatus ?? "未观测"} · Poll ${result.pollStatus ?? "未观测"}</div>
+        <div>SSE ${result.sseFrames} 帧 · Poll ${result.pollFrames} 帧 · ${escapeHtml(result.sseEnd ?? "未观测")}</div>
+        <div>已关联助手消息 ${result.summary.knownMessages} · 观测期间开始 ${result.summary.running} · 完成 ${result.summary.completed} · 失败 ${result.summary.failed}</div>
+        <div>去重 ${result.summary.duplicateStates} · 坏帧 ${result.summary.malformedFrames}</div>
+        ${result.error ? `<div>${escapeHtml(result.error)}</div>` : ""}
+      </div>`
+    : state?.error ? `<div class="spike-diag-result fail">${escapeHtml(state.error)}</div>` : "";
+  return `<div class="spike-diag">
+    <button id="spike-hark-watch-btn" class="mini-btn" type="button" ${!account || state?.running ? "disabled" : ""}>${state?.running ? "正在观测…" : "Hark 原生检测"}</button>
+    ${diagnosis}
+  </div>`;
+}
+
+async function runHarkWatch(): Promise<void> {
+  const account = harkTestAccount();
+  if (!account || harkProbeByAccount.get(account.uuid)?.running) return;
+  const confirmed = await askConfirm({
+    title: "检测 Hark 会话",
+    desc: `对非主力测试账号「${account.alias}」进行一次只读检测，记录同步通道和状态变化。`,
+    confirmLabel: "开始检测",
+  });
+  if (!confirmed || harkProbeByAccount.get(account.uuid)?.running) return;
+  const state = { running: true, result: null as SpikeHarkProbe | null, error: null as string | null };
+  harkProbeByAccount.set(account.uuid, state);
+  render();
+  try {
+    state.result = await invoke<SpikeHarkProbe>("hark_native_watch_probe", {
+      uuid: account.uuid,
+      timezone: Intl.DateTimeFormat().resolvedOptions().timeZone || "UTC",
+    });
+  } catch (e) {
+    state.error = String(e);
+  } finally {
+    state.running = false;
+    render();
+  }
+}
+
 let spikeFingerprint: SpikeFingerprintProbe | null = null;
 interface SpikeFingerprintTask {
   accountUuid: string; taskId: string;
@@ -2246,7 +2305,7 @@ function renderMiddleContent(state: ManagerSnapshot, provider: ProviderInfo): st
   const spikeDiagHtml =
     provider.id === "muse"
       ? `<div class="spike-diag" data-account-uuid="${escapeHtml(diagAccountUuid ?? "")}">${spikeDiagInnerHtml(diagAccountUuid)}</div>`
-      : "";
+      : provider.id === "hark" && isSpikeBuild ? harkProbeHtml() : "";
 
   // Spike 顶栏标识（0.1.22）：只在 Spike 版显示（bundle id 门控）。
   const spikeBadgeHtml =
@@ -2903,6 +2962,10 @@ function bindDelegatedEvents(): void {
     const fingerprintBtn = target.closest<HTMLElement>("#spike-fingerprint-btn");
     if (fingerprintBtn) {
       await runSpikeFingerprint();
+      return;
+    }
+    if (target.closest("#spike-hark-watch-btn")) {
+      await runHarkWatch();
       return;
     }
     const proxyBtn = target.closest<HTMLElement>("#spike-proxy-btn, #spike-proxy-connectivity-btn");

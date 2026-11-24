@@ -527,6 +527,17 @@ pub async fn get_session_cookies(app: &AppHandle, uuid: &str) -> Result<Vec<IosS
   Ok(res.cookies)
 }
 
+#[cfg(target_os = "ios")]
+pub async fn get_hark_api_cookies(app: &AppHandle, uuid: &str) -> Result<Vec<IosSessionCookie>, String> {
+  let bridge = app.state::<IosSessionBridge<tauri::Wry>>();
+  let res: SessionCookiesResponse = bridge
+    .0
+    .run_mobile_plugin_async("getSessionCookies", serde_json::json!({ "uuid": uuid, "provider": "hark" }))
+    .await
+    .map_err(|_| "读取 Hark 登录态失败".to_string())?;
+  Ok(res.cookies)
+}
+
 /// 0.1.16: pushes the aggregate unread state (any account with an
 /// unread reply) to the native session view, which shows/hides the
 /// dot on the "← 账号" button.
