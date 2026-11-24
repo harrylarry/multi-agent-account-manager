@@ -4,7 +4,7 @@
 
 ## Phase 0 技术 Spike
 
-开发分支为 `spike/native-methods`，本快照覆盖的功能提交为 `8eed8ff15d76b07384b6c8752804fc8f94dece5e`。0.1.25 Spike IPA 由 `b8ffb6b8219205a2d98b6e933c1e210a01e1b5e7` 构建，安装与校验见 [iPhone 真机验收](../acceptance/iphone-acceptance.md)。
+开发分支为 `spike/native-methods`，本快照覆盖的功能提交为 `034415b41250c36bbb5b72a721a2735c07367659`。当前 0.1.26 Spike IPA 由 `034415b41250c36bbb5b72a721a2735c07367659` 构建，安装与校验见 [iPhone 真机验收](../acceptance/iphone-acceptance.md)。
 
 | 切片 | 已核对证据 | 待验收 |
 | --- | --- | --- |
@@ -18,6 +18,6 @@
 
 ## 下一步
 
-0.1.25 的 Muse 真机指纹采集记录为 `FAIL`。两次各确认发送 1 条，用户可在网页看到回复，采集均超时且样本为 0。两次均停止后续发送。0.1.26 增加对已确认隔离会话的只读历史恢复，真机复验仍为 `UNVERIFIED`。
+0.1.25 的 Muse 真机指纹采集记录为 `FAIL`。两次各确认发送 1 条，用户可在网页看到回复，采集均超时且样本为 0。两次均停止后续发送。0.1.26 增加对已确认隔离会话的只读历史恢复，[Quick checks](https://github.com/harrylarry/multi-agent-account-manager/actions/runs/45394615640)与 [Xcode 打包](https://github.com/harrylarry/multi-agent-account-manager/actions/runs/45394618651)通过，真机复验仍为 `UNVERIFIED`。
 
-使用下一候选包复验 Muse 三样本指纹，继续验证三协议代理和重启后的故障阻断。回填脱敏结果后逐项更新 #13/#14，再安排 Hark 的真机观测以及 VM 租约和后台 WSS 复测。Phase 0 的 Go/No-Go 以验收记录为准。
+使用 0.1.26 复验 Muse 三样本指纹，继续验证三协议代理和重启后的故障阻断。回填脱敏结果后逐项更新 #13/#14，再安排 Hark 的真机观测以及 VM 租约和后台 WSS 复测。Phase 0 的 Go/No-Go 以验收记录为准。
