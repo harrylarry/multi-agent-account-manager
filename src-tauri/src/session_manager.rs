@@ -1014,16 +1014,20 @@ impl SessionManager {
   ) -> Result<(), String> {
     let mut inner = self.inner.lock().await;
     let store_path = inner.store_path.clone();
-    let Some(target) = inner
+    let Some(index) = inner
       .store
       .accounts
-      .iter_mut()
-      .find(|a| a.provider_id == provider && a.uuid == uuid)
+      .iter()
+      .position(|a| a.provider_id == provider && a.uuid == uuid)
     else {
       return Err("账号不存在".to_string());
     };
-    target.proxy = proxy;
-    save_store_atomic(&store_path, &inner.store)
+    let previous = std::mem::replace(&mut inner.store.accounts[index].proxy, proxy);
+    if let Err(error) = save_store_atomic(&store_path, &inner.store) {
+      inner.store.accounts[index].proxy = previous;
+      return Err(error);
+    }
+    Ok(())
   }
 
   fn snapshot_from_locked(locked: &InnerState) -> ManagerSnapshot {
@@ -4339,4 +4343,30 @@ struct DesktopProbeResult {
   quota_pct: Option<u8>,
   quota_detail: Option<QuotaDetail>,
   pending_hotkey: Option<u8>,
+}
+
+#[cfg(test)]
+mod proxy_tests {
+  use super::*;
+
+  #[tokio::test]
+  async fn failed_proxy_store_write_preserves_the_previous_account_route() {
+    let dir = std::env::temp_dir().join(format!("proxy-write-{}", uuid::Uuid::new_v4()));
+    std::fs::create_dir_all(dir.join("blocked")).unwrap();
+    let account_uuid = uuid::Uuid::new_v4().to_string();
+    let before: ProxySetting = serde_json::from_value(serde_json::json!({
+      "uri": "socks5://proxy.example:1080", "enabled": true
+    })).unwrap();
+    let mut store = AccountsStoreFile::default();
+    store.accounts.push(serde_json::from_value(serde_json::json!({
+      "providerId": "muse", "uuid": account_uuid, "alias": "fixture",
+      "createdAtMs": 1, "proxy": before,
+    })).unwrap());
+    save_store_atomic(&dir.join("accounts.json"), &store).unwrap();
+    let manager = SessionManager::new(dir.clone());
+    manager.inner.lock().await.store_path = dir.join("blocked");
+    assert!(manager.set_account_proxy(ProviderId::Muse, &account_uuid, None).await.is_err());
+    assert_eq!(manager.proxy_setting(ProviderId::Muse, &account_uuid).await, Some(before));
+    std::fs::remove_dir_all(dir).unwrap();
+  }
 }

@@ -60,14 +60,9 @@ impl ProxySetting {
 
   /// 生效的用户名（`uri` 中的 user@ 优先，其次 `username` 字段）。
   pub fn effective_username(&self) -> Option<String> {
-    if let Some((ui, _)) = self
-      .uri
-      .split_once("://")
-      .map(|(_, r)| r.split('/').next().unwrap_or(r))
-      .and_then(|authority| authority.rsplit_once('@'))
-    {
-      if !ui.is_empty() {
-        return Some(ui.to_string());
+    if let Ok(endpoint) = muse_native_client::proxy::ProxyConfig::parse_endpoint(&self.uri) {
+      if endpoint.username.is_some() {
+        return endpoint.username;
       }
     }
     self.username.as_deref().filter(|u| !u.is_empty()).map(str::to_string)
@@ -113,14 +108,16 @@ impl ProxySetting {
 
   /// 脱敏展示串：去掉 userinfo 与 query，绝不含口令。
   pub fn display_safe(&self) -> String {
-    let rest = self
-      .uri
-      .split_once("://")
-      .map(|(_, r)| r)
-      .unwrap_or(&self.uri);
-    let authority = rest.split('/').next().unwrap_or(rest);
-    let host_part = authority.rsplit_once('@').map(|(_, h)| h).unwrap_or(authority);
-    host_part.to_string()
+    let Ok(url) = url::Url::parse(&self.uri) else {
+      return "代理配置损坏".to_string();
+    };
+    let Some(host) = url.host_str() else {
+      return "代理配置损坏".to_string();
+    };
+    match url.port() {
+      Some(port) => format!("{host}:{port}"),
+      None => host.to_string(),
+    }
   }
 }
 
@@ -357,6 +354,22 @@ fn migrate_from_value(root: Value) -> Result<(AccountsStoreFile, bool), String> 
         quota_percent = None;
       }
 
+      let proxy = item_obj.get("proxy").filter(|value| !value.is_null()).map(|value| {
+        // An existing but unreadable proxy must remain blocked. A missing
+        // field or explicit null still represents legacy/system networking.
+        if value.get("enabled").and_then(Value::as_bool).is_some() {
+          if let Ok(setting) = serde_json::from_value::<ProxySetting>(value.clone()) {
+            return setting;
+          }
+        }
+        ProxySetting {
+          uri: String::new(),
+          username: None,
+          credential_ref: None,
+          enabled: true,
+        }
+      });
+
       accounts.push(AccountRecord {
         provider_id,
         uuid,
@@ -369,7 +382,7 @@ fn migrate_from_value(root: Value) -> Result<(AccountsStoreFile, bool), String> 
         quota_detail,
         auth_state,
         has_unread_reply: false,
-        proxy: None,
+        proxy,
       });
     }
   }
@@ -599,12 +612,46 @@ mod proxy_tests {
   #[test]
   fn effective_username_prefers_uri_user() {
     let p = ProxySetting {
-      uri: "http://alice@p.example:8080".to_string(),
+      uri: "http://alice%40corp@p.example:8080".to_string(),
       username: Some("bob".to_string()),
       credential_ref: Some("ref".to_string()),
       enabled: true,
     };
-    assert_eq!(p.effective_username().as_deref(), Some("alice"));
+    assert_eq!(p.effective_username().as_deref(), Some("alice@corp"));
+  }
+
+  #[test]
+  fn migration_retains_proxy_settings_and_blocks_damaged_proxy_entries() {
+    let account = |proxy: Option<Value>| {
+      let mut account = serde_json::json!({
+        "providerId": "muse", "uuid": Uuid::new_v4().to_string(), "alias": "fixture",
+      });
+      if let Some(proxy) = proxy {
+        account["proxy"] = proxy;
+      }
+      account
+    };
+    let valid = serde_json::json!({
+      "uri": "socks5://proxy.example:1080", "username": "user",
+      "credentialRef": "proxy-credential-reference", "enabled": true,
+    });
+    let (store, _) = migrate_from_value(serde_json::json!({
+      "version": STORE_VERSION, "accounts": [
+        account(Some(valid.clone())),
+        account(Some(serde_json::json!({"enabled": true}))),
+        account(Some(serde_json::json!({"uri": "socks5://proxy.example:1080"}))),
+        account(Some(Value::Null)),
+        account(None),
+      ],
+    })).unwrap();
+    assert_eq!(serde_json::to_value(&store.accounts[0].proxy).unwrap(), valid);
+    let secrets = crate::secrets::Secrets::new(&std::env::temp_dir());
+    for record in &store.accounts[1..3] {
+      let setting = record.proxy.as_ref().unwrap();
+      assert!(setting.enabled);
+      assert!(crate::egress::AccountEgress::resolve(Some(setting), &secrets).is_err());
+    }
+    assert!(store.accounts[3..].iter().all(|record| record.proxy.is_none()));
   }
 
   #[test]

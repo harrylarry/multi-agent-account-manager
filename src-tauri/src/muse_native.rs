@@ -1490,11 +1490,9 @@ pub async fn proxy_probe(
   uuid: &str,
   setting: Option<&ProxySetting>,
   secrets: &Secrets,
-  cancel: &ProbeCancel,
+  mut cancel_token: crate::probe_cancel::CancelToken,
   connectivity_only: bool,
 ) -> ProxyProbe {
-  let (mut cancel_token, _cancel_guard) = cancel.register(uuid, "proxy");
-
   let egress = match crate::egress::AccountEgress::resolve(setting, secrets) {
     Ok(e) => e,
     Err(e) => return ProxyProbe::fail("egress", None, None, format!("账号代理不可用: {e}")),

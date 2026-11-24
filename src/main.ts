@@ -190,10 +190,8 @@ interface SpikeProxyProbe {
   connectivityStatus: number | null;
   error: string | null;
 }
-let spikeProxy: SpikeProxyProbe | null = null;
 let spikeProxyRunning = false;
-let spikeProxyError: string | null = null;
-let spikeProxyUri = "";
+let spikeProxyTask: SpikeFingerprintTask | null = null;
 // #11/#16 账号级代理配置（脱敏视图；口令只进 Keychain）。
 interface SpikeWebviewProxyView {
   applied: boolean; sessionOpen: boolean; reason: string | null;
@@ -202,15 +200,37 @@ interface SpikeWebviewProxyView {
 }
 interface SpikeProxySettingView {
   enabled: boolean; display: string; hasCredentials: boolean;
-  /** iOS：账号 WebView 侧的代理下发结果；null 表示该平台没有这一层。 */
+  credentialAvailable: boolean | null;
+  /** 当前操作观察到的 WebView 下发结果。 */
   webview?: SpikeWebviewProxyView | null;
 }
-let spikeProxySettingView: SpikeProxySettingView | null = null;
-// 视图是按账号读的：记住它属于哪个 uuid，切换账号后必须重新读，
-// 否则会把 A 的代理显示在 B 的诊断区、甚至用错账号跑探针。
-let spikeProxyLoadedFor: string | null = null;
-let spikeProxySaveLines: string[] = [];
-let spikeProxySaveOk: boolean | null = null;
+interface SpikeProxyAccountState {
+  uri: string;
+  username: string;
+  view: SpikeProxySettingView | null;
+  result: SpikeProxyProbe | null;
+  error: string | null;
+  read: Promise<SpikeProxySettingView | null> | null;
+  loaded: boolean;
+  saveLines: string[];
+  saveOk: boolean | null;
+  clearPassword: boolean;
+}
+
+const spikeProxyAccounts = new Map<string, SpikeProxyAccountState>();
+const emptyProxyAccount: SpikeProxyAccountState = {
+  uri: "", username: "", view: null, result: null, error: null, read: null, loaded: false,
+  saveLines: [], saveOk: null, clearPassword: false,
+};
+
+function spikeProxyAccount(uuid: string): SpikeProxyAccountState {
+  const existing = spikeProxyAccounts.get(uuid);
+  if (existing) return existing;
+  const created = { ...emptyProxyAccount };
+  spikeProxyAccounts.set(uuid, created);
+  return created;
+}
+
 let spikeProxyBusy = false;
 // 最近一次操作的阶段记录（脱敏）：真机出问题时，先看「点击→确认→IPC→返回」
 // 停在哪一步，不用猜。只保留最近 10 条，不写入磁盘。
@@ -935,7 +955,8 @@ function syncSpikeTrace(): void {
   el.hidden = html === "";
 }
 
-function spikeDiagInnerHtml(): string {
+function spikeDiagInnerHtml(accountUuid: string | undefined = pickWatchAccount()?.uuid): string {
+  const proxyAccount = accountUuid ? spikeProxyAccount(accountUuid) : emptyProxyAccount;
   const btnLabel = spikeDiagnoseRunning ? "诊断中…" : "运行诊断";
   let resultHtml = "";
   if (spikeDiagnose) {
@@ -1076,9 +1097,11 @@ function spikeDiagInnerHtml(): string {
     watchHtml = `<div class="spike-diag-result fail">错误：${escapeHtml(spikeWatchError)}</div>`;
   }
   let proxyHtml = "";
-  if (spikeProxySettingView) {
-    const v = spikeProxySettingView;
-    proxyHtml += `<div class="hint">账号代理：${v.enabled ? "已启用" : "未启用"}　${escapeHtml(v.display)}${v.hasCredentials ? "（口令在 Keychain）" : ""}</div>`;
+  if (proxyAccount.view) {
+    const v = proxyAccount.view;
+    proxyHtml += `<div class="hint">账号代理：${v.enabled ? "已启用" : "未启用"}　${escapeHtml(v.display)}</div>`;
+    const credential = v.hasCredentials ? (v.credentialAvailable ? "可读" : "不可用") : "无需认证";
+    proxyHtml += `<div class="hint">Keychain 凭据：${credential}</div>`;
     const wv = v.webview;
     if (wv) {
       const desc = wv.applied
@@ -1087,17 +1110,19 @@ function spikeDiagInnerHtml(): string {
           : "已写入"
         : `未生效：${wv.reason ?? "该设备不支持 WebView 代理"}`;
       proxyHtml += `<div class="hint">账号 WebView：${escapeHtml(desc)}</div>`;
+    } else {
+      proxyHtml += `<div class="hint">账号 WebView：等待会话打开或保存时验证下发</div>`;
     }
   }
-  if (spikeProxySaveLines.length) {
+  if (proxyAccount.saveLines.length) {
     const cls =
-      spikeProxySaveOk === null ? "" : spikeProxySaveOk ? "ok" : "fail";
-    proxyHtml += `<div class="spike-diag-result ${cls}">${spikeProxySaveLines
+      proxyAccount.saveOk === null ? "" : proxyAccount.saveOk ? "ok" : "fail";
+    proxyHtml += `<div class="spike-diag-result ${cls}">${proxyAccount.saveLines
       .map((line) => `<div>${escapeHtml(line)}</div>`)
       .join("")}</div>`;
   }
-  if (spikeProxy) {
-    const p = spikeProxy;
+  if (proxyAccount.result) {
+    const p = proxyAccount.result;
     proxyHtml = `
       <div class="spike-diag-result ${p.ok ? "ok" : "fail"}">
         <div>${p.ok ? "✓" : "■"} 代理探针：阶段 ${escapeHtml(p.phase)}　协议 ${escapeHtml(p.proxyScheme ?? "—")}　隧道 ${escapeHtml(p.tunnelVia ?? "—")}</div>
@@ -1106,8 +1131,8 @@ function spikeDiagInnerHtml(): string {
           : `<div>WS 握手 ${p.handshakeCompleted ? "完成" : "未完成"}　ping ${p.pingStatus ?? "—"}　fail-closed ${p.failClosed ? "开启" : "关闭"}</div>`}
         ${p.error ? `<div>错误：${escapeHtml(p.error)}</div>` : ""}
       </div>`;
-  } else if (spikeProxyError) {
-    proxyHtml = `<div class="spike-diag-result fail">代理探针错误：${escapeHtml(spikeProxyError)}</div>`;
+  } else if (proxyAccount.error) {
+    proxyHtml += `<div class="spike-diag-result fail">代理探针错误：${escapeHtml(proxyAccount.error)}</div>`;
   }
   let fingerprintHtml = "";
   if (spikeFingerprintRunning && spikeFingerprintProgress) {
@@ -1188,8 +1213,8 @@ function spikeDiagInnerHtml(): string {
     <div class="spike-trace" id="spike-front-trace" ${spikeTraceEntries.length ? "" : "hidden"}>${spikeTraceLinesHtml()}</div>
     <div class="spike-diag-proxy-row">
       <label>代理 URI（不含密码）：</label>
-      <input id="spike-proxy-uri" type="text" placeholder="socks5://host:1080" value="${escapeHtml(spikeProxyUri)}" />
-      <input id="spike-proxy-user" type="text" placeholder="用户名（可选）" />
+      <input id="spike-proxy-uri" type="text" placeholder="socks5://host:1080" value="${escapeHtml(proxyAccount.uri)}" />
+      <input id="spike-proxy-user" type="text" placeholder="用户名（可选）" value="${escapeHtml(proxyAccount.username)}" />
       <input id="spike-proxy-pass" type="password" placeholder="密码（仅存 Keychain）" />
       <button id="spike-proxy-save-btn" class="mini-btn" type="button" ${spikeProxyBusy ? "disabled" : ""}>保存为账号代理</button>
       <button id="spike-proxy-clear-btn" class="mini-btn" type="button" ${spikeProxyBusy ? "disabled" : ""}>清除</button>
@@ -1210,53 +1235,44 @@ function spikeDiagInnerHtml(): string {
 function syncSpikeDiag(): void {
   const el = document.querySelector<HTMLElement>(".spike-diag");
   if (!el) return;
-  // 重写 innerHTML 会丢掉正在输入的代理 URI / 用户名 / 口令；状态更新很频繁，
-  // 不能因此让用户重输。值只在 DOM 与本函数局部变量里流转，不落到模块状态
-  // （口令不保留在 JS 里）。
-  const prevUri = document.querySelector<HTMLInputElement>("#spike-proxy-uri")?.value ?? "";
-  const prevUser = document.querySelector<HTMLInputElement>("#spike-proxy-user")?.value ?? "";
-  const prevPass = document.querySelector<HTMLInputElement>("#spike-proxy-pass")?.value ?? "";
-  el.innerHTML = spikeDiagInnerHtml();
-  const uriEl = document.querySelector<HTMLInputElement>("#spike-proxy-uri");
-  const userEl = document.querySelector<HTMLInputElement>("#spike-proxy-user");
-  const passEl = document.querySelector<HTMLInputElement>("#spike-proxy-pass");
-  if (uriEl && prevUri) {
-    uriEl.value = prevUri;
-    spikeProxyUri = prevUri;
-  }
-  if (userEl && prevUser) userEl.value = prevUser;
-  // 保存成功后口令已经进 Keychain，不再回填。
-  if (passEl && prevPass && !spikeProxyPassSaved) passEl.value = prevPass;
-  spikeProxyPassSaved = false;
-  void syncDiagProxyView();
+  const accountUuid = pickWatchAccount()?.uuid;
+  const state = accountUuid ? spikeProxyAccount(accountUuid) : null;
+  const staysOnAccount = state && el.dataset.accountUuid === accountUuid;
+  const previousPassword = staysOnAccount && !state.clearPassword
+    ? el.querySelector<HTMLInputElement>("#spike-proxy-pass")?.value
+    : null;
+  el.dataset.accountUuid = accountUuid ?? "";
+  el.innerHTML = spikeDiagInnerHtml(accountUuid);
+  const password = el.querySelector<HTMLInputElement>("#spike-proxy-pass");
+  if (password && previousPassword) password.value = previousPassword;
+  if (state) state.clearPassword = false;
+  syncDiagProxyView();
 }
 
-// 代理视图按账号缓存：切换账号后必须重新读，避免把 A 的配置显示在 B 上，
-// 也避免代理探针用了 A 的视图却跑 B 的账号。
-let spikeProxyPassSaved = false;
-async function ensureProxyView(acc: AccountRecord): Promise<SpikeProxySettingView | null> {
-  if (spikeProxyLoadedFor === acc.uuid) return spikeProxySettingView;
-  try {
-    spikeProxySettingView = await invoke<SpikeProxySettingView | null>(
-      "muse_native_get_account_proxy",
-      { providerId: "muse", uuid: acc.uuid }
-    );
-  } catch (e) {
-    spikeProxySettingView = null;
-    spikeTrace("账号代理", "读取失败", String(e));
-  }
-  spikeProxyLoadedFor = acc.uuid;
-  return spikeProxySettingView;
+function ensureProxyView(acc: AccountRecord, refresh = false): Promise<SpikeProxySettingView | null> {
+  const account = spikeProxyAccount(acc.uuid);
+  if (account.read) return account.read;
+  if (account.loaded && !refresh) return Promise.resolve(account.view);
+  const pending = invoke<SpikeProxySettingView | null>("muse_native_get_account_proxy", {
+    providerId: "muse",
+    uuid: acc.uuid,
+  }).catch(() => null).then((view) => {
+    // A completed save or clear invalidates a refresh already in flight.
+    if (account.read === pending) {
+      account.view = view;
+      account.read = null;
+      account.loaded = true;
+    }
+    if (pickWatchAccount()?.uuid === acc.uuid) syncSpikeDiag();
+    return account.view;
+  });
+  account.read = pending;
+  return pending;
 }
 
 function syncDiagProxyView(): void {
-  if (!snapshot) return;
   const acc = pickWatchAccount();
-  if (!acc || spikeProxyLoadedFor === acc.uuid) return;
-  void ensureProxyView(acc).then(() => {
-    // 账号代理信息到手后补一次渲染（syncSpikeDiag 会保留正在输入的代理字段）。
-    if (snapshot) syncSpikeDiag();
-  });
+  if (acc) void ensureProxyView(acc);
 }
 
 function pickWatchAccount(): AccountRecord | undefined {
@@ -1484,7 +1500,7 @@ function proxySaveSummary(view: SpikeProxySettingView | null): string[] {
   const lines = [
     `Rust 配置：已保存（${view.enabled ? "已启用" : "未启用"}）${view.display}`,
     view.hasCredentials
-      ? "Keychain：口令引用已建立（accounts.json 只保留引用，无明文）"
+      ? (view.credentialAvailable ? "Keychain：口令可读" : "Keychain：保存了凭据引用，口令暂不可读")
       : "Keychain：未使用认证凭据",
   ];
   const webview = view.webview;
@@ -1508,17 +1524,17 @@ function proxySaveSummary(view: SpikeProxySettingView | null): string[] {
   return lines;
 }
 
-// 代理 URI 脱敏：确认弹窗、日志、错误里只允许出现 scheme://[user@]host:port。
+// 代理 URI 脱敏：确认弹窗和诊断只显示 scheme://host:port。
 function redactProxyUri(uri: string): string {
-  const trimmed = uri.trim();
-  const schemeEnd = trimmed.indexOf("://");
-  if (schemeEnd < 0) return "（代理 URI 格式无效）";
-  const scheme = trimmed.slice(0, schemeEnd + 3);
-  const rest = trimmed.slice(schemeEnd + 3);
-  const authority = rest.split("/")[0] ?? "";
-  const at = authority.lastIndexOf("@");
-  if (at < 0) return `${scheme}${authority}`;
-  return `${scheme}${authority.slice(at + 1)}`;
+  try {
+    const url = new URL(uri);
+    if (url.hostname && ["http:", "https:", "socks5:", "socks5h:"].includes(url.protocol)) {
+      return `${url.protocol}//${url.host}`;
+    }
+  } catch {
+    // 保留统一的校验提示，避免把无法解析的输入写入诊断。
+  }
+  return "（代理 URI 格式无效）";
 }
 
 // #11/#16 代理探针：用**该账号已保存的代理**（ProxySetting + Keychain）验证
@@ -1534,18 +1550,18 @@ async function runSpikeProxy(connectivityOnly = false): Promise<void> {
   spikeNotice = null;
   const acc = pickWatchAccount();
   if (!acc) {
-    spikeProxy = null;
-    spikeProxyError = "没有已登录的 Muse 账号。";
+    spikeNotice = "没有已登录的 Muse 账号。";
     spikeTrace("代理探针", "中止：没有可用的 Muse 账号");
     syncSpikeDiag();
     return;
   }
   // 诊断只认该账号已保存的代理（ProxySetting + Keychain），
   // 不再把输入框里的 URI / 口令送进后端，避免「诊断与实际发送不同源」。
-  const view = await ensureProxyView(acc);
+  const account = spikeProxyAccount(acc.uuid);
+  const view = await ensureProxyView(acc, true);
   if (!view || !view.enabled) {
-    spikeProxy = null;
-    spikeProxyError = "该账号还没有启用代理：请先「保存为账号代理」再跑代理探针。";
+    account.result = null;
+    account.error = "该账号还没有启用代理：请先「保存为账号代理」再跑代理探针。";
     spikeTrace("代理探针", "中止：账号未启用代理", `账号 ${acc.alias}`);
     syncSpikeDiag();
     return;
@@ -1565,30 +1581,35 @@ async function runSpikeProxy(connectivityOnly = false): Promise<void> {
     syncSpikeDiag();
     return;
   }
+  const task = { accountUuid: acc.uuid, taskId: createSpikeTaskId() };
+  spikeProxyTask = task;
   spikeProxyRunning = true;
-  spikeProxyError = null;
+  account.result = null;
+  account.error = null;
   spikeTrace("代理探针", "调用后端", "muse_native_proxy_probe");
   syncSpikeDiag();
   try {
-    spikeProxy = await Promise.race([
+    account.result = await Promise.race([
       invoke<SpikeProxyProbe>("muse_native_proxy_probe", {
         providerId: "muse",
         uuid: acc.uuid,
         connectivityOnly,
+        taskId: task.taskId,
       }),
       new Promise<SpikeProxyProbe>((_, reject) =>
         setTimeout(() => reject(new Error("代理探针超时（90 秒）")), 90_000)
       ),
     ]);
-    spikeTrace("代理探针", "后端已返回", `阶段 ${spikeProxy.phase}`);
+    spikeTrace("代理探针", "后端已返回", `阶段 ${account.result.phase}`);
   } catch (e) {
-    spikeProxy = null;
-    spikeProxyError = String(e);
+    account.result = null;
+    account.error = String(e);
     spikeTrace("代理探针", "后端失败/超时", String(e));
     // 前端超时/异常不能代替后端取消：显式请求后端停止，避免继续发请求。
-    void cancelSpikeProbe(null, acc.uuid);
+    void cancelSpikeProbe(task);
   }
   spikeProxyRunning = false;
+  spikeProxyTask = null;
   syncSpikeDiag();
 }
 
@@ -1603,19 +1624,20 @@ async function saveSpikeProxy(): Promise<void> {
   spikeNotice = null;
   const acc = pickWatchAccount();
   if (!acc) {
-    spikeProxySaveLines = ["保存中止：没有已登录的 Muse 账号。"];
-    spikeProxySaveOk = false;
+    spikeNotice = "保存中止：没有已登录的 Muse 账号。";
     spikeTrace("保存代理", "中止：没有可用的 Muse 账号");
     syncSpikeDiag();
     return;
   }
+  const proxyAccount = spikeProxyAccount(acc.uuid);
   const uri = (document.querySelector<HTMLInputElement>("#spike-proxy-uri")?.value ?? "").trim();
   const username = (document.querySelector<HTMLInputElement>("#spike-proxy-user")?.value ?? "").trim();
   const password = document.querySelector<HTMLInputElement>("#spike-proxy-pass")?.value ?? "";
-  spikeProxyUri = uri;
+  proxyAccount.uri = uri;
+  proxyAccount.username = username;
   if (!uri) {
-    spikeProxySaveLines = ["请填写代理 URI（例如 socks5://host:1080）。"];
-    spikeProxySaveOk = false;
+    proxyAccount.saveLines = ["请填写代理 URI（例如 socks5://host:1080）。"];
+    proxyAccount.saveOk = false;
     spikeTrace("保存代理", "校验失败：URI 为空");
     syncSpikeDiag();
     return;
@@ -1636,12 +1658,12 @@ async function saveSpikeProxy(): Promise<void> {
     return;
   }
   spikeProxyBusy = true;
-  spikeProxySaveLines = ["保存中…"];
-  spikeProxySaveOk = null;
+  proxyAccount.saveLines = ["保存中…"];
+  proxyAccount.saveOk = null;
   spikeTrace("保存代理", "调用后端", "muse_native_set_account_proxy");
   syncSpikeDiag();
   try {
-    spikeProxySettingView = await invoke<SpikeProxySettingView>(
+    proxyAccount.view = await invoke<SpikeProxySettingView>(
       "muse_native_set_account_proxy",
       {
         providerId: "muse",
@@ -1652,19 +1674,22 @@ async function saveSpikeProxy(): Promise<void> {
         enabled: true,
       }
     );
-    spikeProxyLoadedFor = acc.uuid;
-    spikeProxySaveLines = proxySaveSummary(spikeProxySettingView);
-    spikeProxySaveOk = true;
+    proxyAccount.loaded = true;
+    proxyAccount.read = null;
+    proxyAccount.result = null;
+    proxyAccount.error = null;
+    proxyAccount.saveLines = proxySaveSummary(proxyAccount.view);
+    proxyAccount.saveOk = true;
     // 口令已进 Keychain：从界面上清掉，避免留在输入框里。
-    spikeProxyPassSaved = true;
+    proxyAccount.clearPassword = true;
     spikeTrace("保存代理", "后端已返回", "Rust 配置已保存");
   } catch (e) {
-    spikeProxySaveLines = [
+    proxyAccount.saveLines = [
       `保存失败：${String(e)}`,
       "Rust 配置可能未落盘（失败可能发生在校验 / 隔离 / 写入任一阶段）；" +
         "按 fail-closed 设计，WebView 出口不会回退直连。",
     ];
-    spikeProxySaveOk = false;
+    proxyAccount.saveOk = false;
     spikeTrace("保存代理", "后端失败", String(e));
   }
   spikeProxyBusy = false;
@@ -1681,12 +1706,12 @@ async function clearSpikeProxy(): Promise<void> {
   spikeNotice = null;
   const acc = pickWatchAccount();
   if (!acc) {
-    spikeProxySaveLines = ["清除中止：没有已登录的 Muse 账号。"];
-    spikeProxySaveOk = false;
+    spikeNotice = "清除中止：没有已登录的 Muse 账号。";
     spikeTrace("清除代理", "中止：没有可用的 Muse 账号");
     syncSpikeDiag();
     return;
   }
+  const proxyAccount = spikeProxyAccount(acc.uuid);
   spikeTrace("清除代理", "已点击", `账号 ${acc.alias}`);
   const confirmed = await askConfirm({
     title: "清除账号代理",
@@ -1703,27 +1728,33 @@ async function clearSpikeProxy(): Promise<void> {
     return;
   }
   spikeProxyBusy = true;
-  spikeProxySaveLines = ["清除中…"];
-  spikeProxySaveOk = null;
+  proxyAccount.saveLines = ["清除中…"];
+  proxyAccount.saveOk = null;
   spikeTrace("清除代理", "调用后端", "muse_native_clear_account_proxy");
   syncSpikeDiag();
   try {
-    await invoke("muse_native_clear_account_proxy", {
+    const webview = await invoke<SpikeWebviewProxyView | null>("muse_native_clear_account_proxy", {
       providerId: "muse",
       uuid: acc.uuid,
     });
-    spikeProxySettingView = null;
-    spikeProxyLoadedFor = acc.uuid;
-    spikeProxySaveLines = [
+    proxyAccount.view = null;
+    proxyAccount.loaded = true;
+    proxyAccount.read = null;
+    proxyAccount.result = null;
+    proxyAccount.error = null;
+    proxyAccount.clearPassword = true;
+    proxyAccount.saveLines = [
       "Rust 配置：已清除（该账号恢复走系统网络）",
       "Keychain：口令已删除（包括旧的 proxy-<uuid> 引用）",
-      "WebView：已同步清除并解除出口隔离",
+      webview?.applied
+        ? "WebView：已清除，重新打开账号后验证"
+        : `WebView：${webview?.reason ?? "未获得下发结果"}`,
     ];
-    spikeProxySaveOk = true;
+    proxyAccount.saveOk = webview?.applied ?? null;
     spikeTrace("清除代理", "后端已返回");
   } catch (e) {
-    spikeProxySaveLines = [`清除失败：${String(e)}`];
-    spikeProxySaveOk = false;
+    proxyAccount.saveLines = [`清除失败：${String(e)}`];
+    proxyAccount.saveOk = false;
     spikeTrace("清除代理", "后端失败", String(e));
   }
   spikeProxyBusy = false;
@@ -1739,8 +1770,8 @@ function createSpikeTaskId(): string {
   return `${hex.slice(0, 8)}-${hex.slice(8, 12)}-${hex.slice(12, 16)}-${hex.slice(16, 20)}-${hex.slice(20)}`;
 }
 
-async function cancelSpikeProbe(task = spikeFingerprintTask, accountUuid?: string): Promise<void> {
-  const uuid = task?.accountUuid ?? accountUuid ?? pickWatchAccount()?.uuid;
+async function cancelSpikeProbe(task = spikeFingerprintTask ?? spikeProxyTask): Promise<void> {
+  const uuid = task?.accountUuid ?? pickWatchAccount()?.uuid;
   if (!uuid) {
     spikeNotice = "停止失败：没有已登录的 Muse 账号。";
     syncSpikeDiag();
@@ -2211,9 +2242,10 @@ function renderMiddleContent(state: ManagerSnapshot, provider: ProviderInfo): st
   }
 
   // Spike 原生诊断区：Muse 页显示（本分支即 Spike 分支）。
+  const diagAccountUuid = pickWatchAccount()?.uuid;
   const spikeDiagHtml =
     provider.id === "muse"
-      ? `<div class="spike-diag">${spikeDiagInnerHtml()}</div>`
+      ? `<div class="spike-diag" data-account-uuid="${escapeHtml(diagAccountUuid ?? "")}">${spikeDiagInnerHtml(diagAccountUuid)}</div>`
       : "";
 
   // Spike 顶栏标识（0.1.22）：只在 Spike 版显示（bundle id 门控）。
@@ -2875,8 +2907,6 @@ function bindDelegatedEvents(): void {
     }
     const proxyBtn = target.closest<HTMLElement>("#spike-proxy-btn, #spike-proxy-connectivity-btn");
     if (proxyBtn) {
-      const input = document.querySelector<HTMLInputElement>("#spike-proxy-uri");
-      spikeProxyUri = input?.value ?? spikeProxyUri;
       await runSpikeProxy(proxyBtn.id === "spike-proxy-connectivity-btn");
       return;
     }
@@ -3127,9 +3157,13 @@ function bindDelegatedEvents(): void {
 
   root.addEventListener("input", (ev) => {
     const input = ev.target as HTMLInputElement;
-    if (input.id === "spike-proxy-uri") {
-      // 诊断区会被状态更新重写，先记住正在输入的 URI，避免被旧值覆盖。
-      spikeProxyUri = input.value;
+    if (input.id === "spike-proxy-uri" || input.id === "spike-proxy-user") {
+      const accountUuid = input.closest<HTMLElement>(".spike-diag")?.dataset.accountUuid;
+      if (accountUuid) {
+        const account = spikeProxyAccount(accountUuid);
+        if (input.id === "spike-proxy-uri") account.uri = input.value;
+        else account.username = input.value;
+      }
       return;
     }
     if (input.id !== "modal-alias-input") return;

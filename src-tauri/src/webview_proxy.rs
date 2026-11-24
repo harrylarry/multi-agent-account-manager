@@ -123,7 +123,9 @@ pub async fn push(
   use crate::platform::ios::{SetAccountProxyPayload, set_account_proxy};
 
   let payload = match setting {
-    Some(s) if s.enabled => match muse_native_client::proxy::ProxyConfig::parse_endpoint(&s.uri) {
+    Some(s) if s.enabled => match s.validate().and_then(|_| {
+      muse_native_client::proxy::ProxyConfig::parse_endpoint(&s.uri).map_err(|e| e.to_string())
+    }) {
       Ok(ep) => SetAccountProxyPayload {
         uuid: uuid.to_string(),
         scheme: ep.scheme.to_string(),
@@ -134,12 +136,14 @@ pub async fn push(
         enabled: true,
       },
       Err(e) => {
+        let reason = format!("代理端点无法下发给 WebView: {e}");
+        let isolation = quarantine(app, uuid, Some(reason.clone())).await;
         return PushOutcome {
           applicable: true,
           applied: false,
-          session_open: false,
-          quarantined: true,
-          reason: Some(format!("代理端点无法下发给 WebView: {e}")),
+          session_open: isolation.session_open,
+          quarantined: isolation.engaged,
+          reason: Some(reason),
         }
       }
     },

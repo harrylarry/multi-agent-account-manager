@@ -376,16 +376,31 @@ async fn muse_native_proxy_probe(
   provider_id: String,
   uuid: String,
   connectivity_only: Option<bool>,
+  task_id: Option<String>,
   mgr: State<'_, Arc<SessionManager>>,
   cancel: State<'_, Arc<probe_cancel::ProbeCancel>>,
 ) -> Result<muse_native::ProxyProbe, String> {
   if provider_id != "muse" {
     return Err("代理探针只支持 Muse 账号".to_string());
   }
+  let (token, _guard) = match task_id {
+    Some(task_id) => {
+      let id = uuid::Uuid::parse_str(&task_id).map_err(|_| "代理任务标识无效".to_string())?;
+      cancel.register_task(&uuid, "proxy", id)
+    }
+    None => cancel.register(&uuid, "proxy"),
+  };
   let setting = account_proxy_setting(&mgr, &provider_id, &uuid).await;
   let dir = app.path().app_data_dir().map_err(|e| e.to_string())?;
   let secrets = secrets::Secrets::new(&dir);
-  Ok(muse_native::proxy_probe(&app, &uuid, setting.as_ref(), &secrets, &cancel, connectivity_only.unwrap_or(false)).await)
+  Ok(muse_native::proxy_probe(
+    &app,
+    &uuid,
+    setting.as_ref(),
+    &secrets,
+    token,
+    connectivity_only.unwrap_or(false),
+  ).await)
 }
 
 /// 平台原生 WebView 侧的代理应用结果。
@@ -406,9 +421,16 @@ pub struct ProxySettingView {
   pub enabled: bool,
   pub display: String,
   pub has_credentials: bool,
+  pub credential_available: Option<bool>,
   /// iOS：账号 WebView（WKWebView）侧的代理应用结果；其它平台为 `None`（不适用，
   /// 桌面 WebView 走系统代理）。`None` 不代表“已生效”，只代表“无此层”。
   pub webview: Option<WebviewProxyView>,
+}
+
+fn proxy_credential_available(setting: &storage::ProxySetting, secrets: &secrets::Secrets) -> Option<bool> {
+  setting.credential_ref.as_deref().map(|reference| {
+    matches!(secrets.get(reference), Ok(Some(secret)) if !secret.is_empty())
+  })
 }
 
 /// #11/#16（补 W）：把账号代理下发给 iOS 侧的 WKWebView。
@@ -447,6 +469,7 @@ async fn muse_native_set_account_proxy(
   password: Option<String>,
   enabled: bool,
   mgr: State<'_, Arc<SessionManager>>,
+  cancel: State<'_, Arc<probe_cancel::ProbeCancel>>,
 ) -> Result<ProxySettingView, String> {
   let pid = providers::ProviderId::parse(&provider_id)
     .ok_or_else(|| format!("未知 provider: {provider_id}"))?;
@@ -465,7 +488,7 @@ async fn muse_native_set_account_proxy(
     .map(|u| u.trim().to_string())
     .filter(|u| !u.is_empty());
   let has_user = username.is_some() || uri_userinfo(&uri).map(|u| !u.is_empty()).unwrap_or(false);
-  let password = password.filter(|p| !p.is_empty());
+  let password = password.filter(|p| !p.is_empty()).map(zeroize::Zeroizing::new);
 
   let dir = app.path().app_data_dir().map_err(|e| e.to_string())?;
   let secrets = secrets::Secrets::new(&dir);
@@ -498,29 +521,46 @@ async fn muse_native_set_account_proxy(
     return Err(format!("无法隔离当前 WebView 出站，已拒绝保存代理：{reason}"));
   }
 
-  if has_user {
-    secrets.set(&reference, password.as_deref().unwrap_or(""))?;
+  cancel.cancel_account(&uuid);
+  let previous_password = if has_user {
+    let existing = secrets.get(&reference)?;
+    secrets.set(&reference, password.as_deref().map(String::as_str).unwrap_or(""))?;
+    existing
   } else {
-    // 切回无认证：清掉旧口令，避免残留。
-    let _ = secrets.delete(&reference);
+    None
+  };
+  if let Err(error) = mgr.set_account_proxy(pid, &uuid, Some(setting.clone())).await {
+    if has_user {
+      let restore = match previous_password {
+        Some(secret) => secrets.set(&reference, &secret),
+        None => secrets.delete(&reference),
+      };
+      if restore.is_err() {
+        return Err("代理配置写入失败，旧凭据无法恢复，账号出口保持隔离".to_string());
+      }
+    }
+    return Err(error);
   }
-  mgr.set_account_proxy(pid, &uuid, Some(setting.clone())).await?;
 
   // 再下发新配置：成功即替换隔离；enabled=false 时 helper 会清除 WebView 配置。
   let webview = apply_webview_proxy(&app, &uuid, Some(&setting)).await;
+  if !has_user {
+    secrets.delete(&reference)?;
+  }
 
   Ok(ProxySettingView {
     enabled: setting.enabled,
     display: setting.display_safe(),
     has_credentials: setting.credential_ref.is_some(),
+    credential_available: proxy_credential_available(&setting, &secrets),
     webview,
   })
 }
 
 /// #11/#16：读取账号代理的脱敏视图。
 ///
-/// 读取时顺带把配置重新下发一次：Rust 是权威源，App 重启 / Swift 本地配置
-/// 损坏或过期都在这里被纠正，面板显示的状态也就等于 WebView 真正拿到的状态。
+/// 读取配置和凭据可用性。WebView 下发发生在保存、打开会话与后台同步前；
+/// 读面板不会销毁正在使用的 WebView。
 #[tauri::command]
 async fn muse_native_get_account_proxy(
   app: AppHandle,
@@ -531,12 +571,14 @@ async fn muse_native_get_account_proxy(
   let pid = providers::ProviderId::parse(&provider_id)
     .ok_or_else(|| format!("未知 provider: {provider_id}"))?;
   let setting = mgr.proxy_setting(pid, &uuid).await;
-  let webview = apply_webview_proxy(&app, &uuid, setting.as_ref()).await;
+  let dir = app.path().app_data_dir().map_err(|e| e.to_string())?;
+  let secrets = secrets::Secrets::new(&dir);
   Ok(setting.map(|s| ProxySettingView {
     enabled: s.enabled,
     display: s.display_safe(),
     has_credentials: s.credential_ref.is_some(),
-    webview,
+    credential_available: proxy_credential_available(&s, &secrets),
+    webview: None,
   }))
 }
 
@@ -547,17 +589,13 @@ async fn muse_native_clear_account_proxy(
   provider_id: String,
   uuid: String,
   mgr: State<'_, Arc<SessionManager>>,
-) -> Result<(), String> {
+  cancel: State<'_, Arc<probe_cancel::ProbeCancel>>,
+) -> Result<Option<WebviewProxyView>, String> {
   let pid = providers::ProviderId::parse(&provider_id)
     .ok_or_else(|| format!("未知 provider: {provider_id}"))?;
   let dir = app.path().app_data_dir().map_err(|e| e.to_string())?;
   let secrets = secrets::Secrets::new(&dir);
-  if let Some(existing) = mgr.proxy_setting(pid, &uuid).await {
-    if let Some(reference) = existing.credential_ref {
-      let _ = secrets.delete(&reference);
-    }
-  }
-  let _ = secrets.delete(&format!("proxy-{uuid}"));
+  let reference = mgr.proxy_setting(pid, &uuid).await.and_then(|setting| setting.credential_ref);
   // 同样先隔离：清凭据到下发之间，已打开的 WebView 不能还按旧代理跑。
   let quarantined = webview_proxy::quarantine(
     &app,
@@ -568,11 +606,15 @@ async fn muse_native_clear_account_proxy(
   if let Some(reason) = quarantined.failed() {
     return Err(format!("无法隔离当前 WebView 出站，已拒绝清除代理：{reason}"));
   }
+  cancel.cancel_account(&uuid);
   mgr.set_account_proxy(pid, &uuid, None).await?;
-  // WebView 侧同步清除并解除隔离；失败不回滚 Rust 侧（清除本身是安全方向），
-  // 隔离态会让该账号继续发不出去，属于 fail-closed。
-  let _ = apply_webview_proxy(&app, &uuid, None).await;
-  Ok(())
+  let webview = apply_webview_proxy(&app, &uuid, None).await;
+  let default_reference = format!("proxy-{uuid}");
+  secrets.delete(&default_reference)?;
+  if let Some(reference) = reference.filter(|reference| reference != &default_reference) {
+    secrets.delete(&reference)?;
+  }
+  Ok(webview)
 }
 
 /// #11/#16：请求取消该账号正在运行的长任务（指纹/发送/代理探针等）。
