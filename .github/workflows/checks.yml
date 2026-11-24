@@ -55,7 +55,7 @@ jobs:
             all_checks "git diff 失败"
           fi
           echo "changed files:"; echo "$files"
-          if echo "$files" | grep -qE '^(src/|index\.html|package(-lock)?\.json|tsconfig\.json|vite\.config\.ts|scripts/)'; then
+          if echo "$files" | grep -qE '^(src/|index\.html|package(-lock)?\.json|tsconfig\.json|vite\.config\.ts|scripts/|tests/)'; then
             web=true
           else
             web=false
@@ -92,6 +92,26 @@ jobs:
           cache: npm
       - run: npm ci
       - run: npm run build
+
+  # 内嵌 JavaScript：Xcode / Kotlin 编译通过，不代表注入的字符串能被解析。
+  # 2d39149 的 Scripts.swift 少了一行 `const origFetch = window.fetch`，括号
+  # 因此不平衡，整个 quota hook 从未安装，而所有构建都是绿的。
+  embedded-js:
+    name: Embedded JS (node --check + runtime)
+    needs: changes
+    if: needs.changes.outputs.rust == 'true' || needs.changes.outputs.web == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@v6
+        with:
+          node-version: 22
+      # 只依赖 Node 内置模块，不跑 npm ci。
+      - run: npm run check:embedded-js
+      - run: npm test
 
   actionlint:
     name: actionlint

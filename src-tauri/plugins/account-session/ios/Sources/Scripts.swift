@@ -1,16 +1,20 @@
 // Scripts.swift — JavaScript injected into account web views.
 //
-// The two scripts below are byte-identical (modulo leading/trailing blank
-// lines, which are insignificant in JS) to the Kotlin constants
-// QUOTA_HOOK_INIT_SCRIPT and the probe part of IDENTITY_PROBE_SCRIPT in
-// AccountWebActivity.kt. They were extracted mechanically from the Kotlin
-// source; do not hand-edit them here — change the Kotlin originals and
-// re-extract, so Android and iOS never drift apart.
+// GENERATED FILE — do not edit by hand.
+//
+// Source of truth: AccountWebActivity.kt (QUOTA_HOOK_INIT_SCRIPT and
+// IDENTITY_PROBE_SCRIPT). The two platforms must inject byte-identical
+// JavaScript; hand-editing this file is what previously broke it (a
+// dropped `const origFetch = window.fetch` left an unbalanced brace, so
+// the whole script failed to parse and the hook never installed).
+//
+// Regenerate:  node scripts/sync-embedded-js.mjs --write
+// Verify:      node scripts/sync-embedded-js.mjs --check   (also in CI)
 
 enum Scripts {
-  /// fetch/XHR/WebSocket hooks that capture quota-related responses and
-  /// stash them on window.__maamQuota. Injected once per web view at
-  /// document start via WKUserScript.
+  /// fetch/WebSocket hooks that capture quota-related responses and stash
+  /// them on window.__maamQuota. Injected once per web view at document
+  /// start via WKUserScript.
   static let quotaHookInitScript = #"""
             (() => {
               try {
@@ -303,96 +307,11 @@ enum Scripts {
                   }
                 };
                 if (isPrimaryHost) {
-                  // --- Server Action 采集（广收集、窄使用）---
-                  // 目的：把所有出现过的 Next-Action id 记下来，供诊断与后续复用；
-                  // 只有当请求体与本项目已知的额度探测体完全一致时，才允许自动重放，
-                  // 避免误触发有副作用的 action（删除/提交类）。
-                  const HARVEST_KEY = '__maam_actions_v1';
-                  const QUOTA_BODY = '[{"includeAgreement":false}]';
-                  const harvest = (() => {
-                    let list = [];
-                    try { list = JSON.parse(localStorage.getItem(HARVEST_KEY) || '[]') || []; } catch (_) { list = []; }
-                    const seen = new Set(list.map((x) => x.a + '|' + x.u + '|' + (x.b || '')));
-                    const save = () => { try { localStorage.setItem(HARVEST_KEY, JSON.stringify(list)); } catch (_) {} };
-                    return {
-                      record(url, action, method, body) {
-                        if (!action) return;
-                        const b = (body || '').slice(0, 160);
-                        const k = action + '|' + url + '|' + b;
-                        if (seen.has(k)) return;
-                        seen.add(k);
-                        list.push({ a: action, u: String(url || '').slice(0, 200), m: method || 'GET', b, t: Date.now() });
-                        if (list.length > 400) list = list.slice(-400);
-                        save();
-                      },
-                      all() { return list; },
-                      quotaBodies() {
-                        return list.filter((x) => x.b === QUOTA_BODY).map((x) => x.a);
-                      }
-                    };
-                  })();
-                  window.__maamHarvest = harvest;
-                  const pickHeader = (headers, name) => {
-                    try {
-                      if (!headers) return '';
-                      if (typeof headers.get === 'function') return headers.get(name) || '';
-                      if (Array.isArray(headers)) {
-                        for (const kv of headers) {
-                          if (kv && String(kv[0]).toLowerCase() === name) return String(kv[1]);
-                        }
-                        return '';
-                      }
-                      for (const k of Object.keys(headers)) {
-                        if (k.toLowerCase() === name) return String(headers[k]);
-                      }
-                    } catch (_) {}
-                    return '';
-                  };
-                  // 用采集到的 id 重放一次额度请求；只在响应确实含 subscription 时采纳。
-                  window.__maamTryQuotaAction = async () => {
-                    const ids = harvest.quotaBodies().slice(-4).reverse();
-                    if (!ids.length) return false;
-                    const fetchFn = window.__maamOrigFetch || window.fetch;
-                    for (const id of ids) {
-                      try {
-                        const res = await fetchFn.call(window, '/', {
-                          method: 'POST',
-                          credentials: 'include',
-                          headers: {
-                            Accept: 'text/x-component',
-                            'Content-Type': 'text/plain;charset=UTF-8',
-                            'Next-Action': id
-                          },
-                          body: QUOTA_BODY
-                        });
-                        if (!res || !res.ok) continue;
-                        const text = await res.text();
-                        if (!/"subscription"\s*:/.test(text)) continue;
-                        const lines = text.split(/\r?\n/);
-                        for (const line of lines) {
-                          const t = line.trim();
-                          if (!t) continue;
-                          const seg = /^\d+:/.test(t) ? t.slice(t.indexOf(':') + 1) : t;
-                          try {
-                            const obj = JSON.parse(seg);
-                            const m = mapSub(obj);
-                            if (m) { saveDetail(m); return true; }
-                          } catch (_) {}
-                        }
-                      } catch (_) {}
-                    }
-                    return false;
-                  };
-
+                  const origFetch = window.fetch;
+                  if (typeof origFetch === 'function') {
+                    window.__maamOrigFetch = origFetch;
                     window.fetch = function(...args) {
                       const reqUrl = typeof args[0] === 'string' ? args[0] : (args[0] && args[0].url) || '';
-                      try {
-                        const init = args[1] || {};
-                        const act = pickHeader(init.headers, 'next-action');
-                        if (act) {
-                          harvest.record(reqUrl, act, init.method || 'GET', typeof init.body === 'string' ? init.body : '');
-                        }
-                      } catch (_) {}
                       const p = origFetch.apply(this, args);
                       p.then((res) => {
                         try {
@@ -413,31 +332,6 @@ enum Scripts {
                       return p;
                     };
                   }
-                  // XHR 通道也采集（有些调用不走 fetch）。
-                  try {
-                    const XHR = window.XMLHttpRequest;
-                    if (XHR && XHR.prototype && !XHR.prototype.__maamHooked) {
-                      const oOpen = XHR.prototype.open;
-                      const oSet = XHR.prototype.setRequestHeader;
-                      const oSend = XHR.prototype.send;
-                      XHR.prototype.open = function(method, url) {
-                        this.__maamM = method; this.__maamU = url; return oOpen.apply(this, arguments);
-                      };
-                      XHR.prototype.setRequestHeader = function(k, v) {
-                        try { if (String(k).toLowerCase() === 'next-action') this.__maamA = String(v); } catch (_) {}
-                        return oSet.apply(this, arguments);
-                      };
-                      XHR.prototype.send = function(body) {
-                        try {
-                          if (this.__maamA) {
-                            harvest.record(this.__maamU, this.__maamA, this.__maamM, typeof body === 'string' ? body : '');
-                          }
-                        } catch (_) {}
-                        return oSend.apply(this, arguments);
-                      };
-                      XHR.prototype.__maamHooked = true;
-                    }
-                  } catch (_) {}
                   const OrigWS = window.WebSocket;
                   if (typeof OrigWS === 'function') {
                     const WrappedWS = function(...args) {

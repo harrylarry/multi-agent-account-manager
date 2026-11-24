@@ -1618,6 +1618,27 @@ body,
   color: var(--danger);
 }
 
+/* Spike 前端阶段记录：真机复测时定位「点击 → 确认 → IPC → 返回」停在哪一步。 */
+.spike-trace {
+  margin-top: 8px;
+  font-size: 11px;
+  line-height: 1.65;
+  color: var(--text-muted);
+  word-break: break-word;
+}
+.spike-trace[hidden] {
+  display: none;
+}
+.spike-notice {
+  margin-top: 8px;
+  padding: 6px 8px;
+  border-radius: 6px;
+  background: var(--primary-soft);
+  color: var(--text-sub);
+  font-size: 12px;
+  line-height: 1.6;
+}
+
 /* Spike 诊断区允许选中与复制（全局 user-select: none 会挡住）。 */
 .spike-diag,
 .spike-diag * {

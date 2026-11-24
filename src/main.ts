@@ -18,7 +18,17 @@ type ModalMode =
   | { kind: "add"; providerId: ProviderId; draft: string }
   | { kind: "rename"; account: AccountRecord; draft: string }
   | { kind: "remove"; account: AccountRecord }
-  | { kind: "update" };
+  | { kind: "update" }
+  // 应用内确认框（替代 window.confirm）。WKWebView 的 UIDelegate 没有
+  // 实现 runJavaScriptConfirmPanel，iOS 上 confirm() 直接返回 false，
+  // 所以不能依赖浏览器原生弹窗。
+  | {
+      kind: "confirm";
+      title: string;
+      desc: string;
+      confirmLabel: string;
+      danger: boolean;
+    };
 
 const PROVIDER_LOGOS: Record<ProviderId, { src: string; fullBleed: boolean }> = {
   muse: { src: "/logos/muse.png", fullBleed: true },
@@ -35,6 +45,8 @@ const ICON_DRAG = `<svg width="16" height="16" viewBox="0 0 24 24" fill="current
 
 let snapshot: ManagerSnapshot | null = null;
 let modal: ModalMode = { kind: "none" };
+// 应用内确认框的 resolver：由 askConfirm 设置，确认/取消/被顶掉时结算。
+let confirmResolver: ((ok: boolean) => void) | null = null;
 let optimisticSwitching: AccountKey | null = null;
 // Spike 原生诊断（0.1.22）：Muse 页底部显示诊断区。
 // 诊断结果不进 structuralSignature，改动后只同步诊断区 DOM，不重建列表。
@@ -180,8 +192,23 @@ interface SpikeProxySettingView {
   webview?: SpikeWebviewProxyView | null;
 }
 let spikeProxySettingView: SpikeProxySettingView | null = null;
-let spikeProxySaveMsg: string | null = null;
+// 视图是按账号读的：记住它属于哪个 uuid，切换账号后必须重新读，
+// 否则会把 A 的代理显示在 B 的诊断区、甚至用错账号跑探针。
+let spikeProxyLoadedFor: string | null = null;
+let spikeProxySaveLines: string[] = [];
+let spikeProxySaveOk: boolean | null = null;
 let spikeProxyBusy = false;
+// 最近一次操作的阶段记录（脱敏）：真机出问题时，先看「点击→确认→IPC→返回」
+// 停在哪一步，不用猜。只保留最近 10 条，不写入磁盘。
+interface SpikeTraceEntry {
+  at: number;
+  label: string;
+  stage: string;
+  detail: string | null;
+}
+const spikeTraceEntries: SpikeTraceEntry[] = [];
+// 中性提示（用户取消、已在运行等），与红色错误区分。
+let spikeNotice: string | null = null;
 let spikeDiagnoseError: string | null = null;
 // 是否 Spike 版（bundle id 门控）：只决定顶栏徽章显不显示；诊断区不门控。
 let isSpikeBuild = false;
@@ -745,6 +772,13 @@ async function runDownloadAndInstall(): Promise<void> {
 }
 
 async function setModal(next: ModalMode): Promise<void> {
+  // 离开确认框的所有路径（取消按钮、Esc、切换账号等）都按「取消」结算，
+  // 调用方的 await 永远不会悬挂。
+  if (modal.kind === "confirm" && next.kind !== "confirm") {
+    const resolve = confirmResolver;
+    confirmResolver = null;
+    resolve?.(false);
+  }
   const wasActive = modal.kind !== "none";
   const isActive = next.kind !== "none";
   modal = next;
@@ -766,9 +800,35 @@ async function setModal(next: ModalMode): Promise<void> {
       input.focus();
       input.select();
     }
-  } else if (next.kind === "remove") {
+  } else if (next.kind === "remove" || next.kind === "confirm") {
     document.querySelector<HTMLButtonElement>("#modal-confirm-btn")?.focus();
   }
+}
+
+// 应用内异步确认。返回 true 仅表示用户点了确认按钮；任何其他关闭方式
+// （取消 / Esc / 被新的弹窗顶掉）都返回 false。
+async function askConfirm(options: {
+  title: string;
+  desc: string;
+  confirmLabel?: string;
+  danger?: boolean;
+}): Promise<boolean> {
+  if (confirmResolver) {
+    const previous = confirmResolver;
+    confirmResolver = null;
+    previous(false);
+  }
+  const answer = new Promise<boolean>((resolve) => {
+    confirmResolver = resolve;
+  });
+  await setModal({
+    kind: "confirm",
+    title: options.title,
+    desc: options.desc,
+    confirmLabel: options.confirmLabel ?? "继续",
+    danger: options.danger ?? false,
+  });
+  return answer;
 }
 
 async function callCommand(
@@ -832,6 +892,35 @@ function triggerAutoSync(): void {
 
 // Spike 原生诊断（0.1.22）：诊断区只在 Spike 版的 Muse 页显示。
 // 结果只同步诊断区 DOM（syncSpikeDiag），不走 render()，不重建列表。
+
+// 阶段记录：点击后先记「已点击」，确认后记「已确认/已取消」，再记
+// 「已调用后端」与返回结果。真机复测时这一段就是最直接的证据链。
+function spikeTrace(label: string, stage: string, detail?: string): void {
+  spikeTraceEntries.push({ at: Date.now(), label, stage, detail: detail ?? null });
+  while (spikeTraceEntries.length > 10) spikeTraceEntries.shift();
+  syncSpikeTrace();
+}
+
+function spikeTraceLinesHtml(): string {
+  return spikeTraceEntries
+    .slice(-6)
+    .map((entry) => {
+      const time = new Date(entry.at).toLocaleTimeString();
+      const detail = entry.detail ? `（${entry.detail}）` : "";
+      return `<div>${escapeHtml(time)}　${escapeHtml(entry.label)} · ${escapeHtml(entry.stage)}${escapeHtml(detail)}</div>`;
+    })
+    .join("");
+}
+
+// 只重写阶段记录容器：不重建整个诊断区，输入框（代理口令）不会被清空。
+function syncSpikeTrace(): void {
+  const el = document.querySelector<HTMLElement>("#spike-front-trace");
+  if (!el) return;
+  const html = spikeTraceLinesHtml();
+  el.innerHTML = html;
+  el.hidden = html === "";
+}
+
 function spikeDiagInnerHtml(): string {
   const btnLabel = spikeDiagnoseRunning ? "诊断中…" : "运行诊断";
   let resultHtml = "";
@@ -986,8 +1075,12 @@ function spikeDiagInnerHtml(): string {
       proxyHtml += `<div class="hint">账号 WebView：${escapeHtml(desc)}</div>`;
     }
   }
-  if (spikeProxySaveMsg) {
-    proxyHtml += `<div class="hint">${escapeHtml(spikeProxySaveMsg)}</div>`;
+  if (spikeProxySaveLines.length) {
+    const cls =
+      spikeProxySaveOk === null ? "" : spikeProxySaveOk ? "ok" : "fail";
+    proxyHtml += `<div class="spike-diag-result ${cls}">${spikeProxySaveLines
+      .map((line) => `<div>${escapeHtml(line)}</div>`)
+      .join("")}</div>`;
   }
   if (spikeProxy) {
     const p = spikeProxy;
@@ -1067,6 +1160,7 @@ function spikeDiagInnerHtml(): string {
       <button id="spike-stop-btn" class="mini-btn" type="button">停止</button>
       <button id="spike-copy-btn" class="mini-btn" type="button">复制结果</button>
     </div>
+    <div class="spike-trace" id="spike-front-trace" ${spikeTraceEntries.length ? "" : "hidden"}>${spikeTraceLinesHtml()}</div>
     <div class="spike-diag-proxy-row">
       <label>代理 URI（不含密码）：</label>
       <input id="spike-proxy-uri" type="text" placeholder="socks5://host:1080" value="${escapeHtml(spikeProxyUri)}" />
@@ -1076,6 +1170,7 @@ function spikeDiagInnerHtml(): string {
       <button id="spike-proxy-clear-btn" class="mini-btn" type="button" ${spikeProxyBusy ? "disabled" : ""}>清除</button>
       <span class="hint">口令只写入系统 Keychain；失败即阻断，不回退直连。</span>
     </div>
+    ${spikeNotice ? `<div class="spike-notice">${escapeHtml(spikeNotice)}</div>` : ""}
     ${resultHtml}
     ${watchHtml}
     ${approvalsHtml}
@@ -1090,27 +1185,53 @@ function spikeDiagInnerHtml(): string {
 function syncSpikeDiag(): void {
   const el = document.querySelector<HTMLElement>(".spike-diag");
   if (!el) return;
+  // 重写 innerHTML 会丢掉正在输入的代理 URI / 用户名 / 口令；状态更新很频繁，
+  // 不能因此让用户重输。值只在 DOM 与本函数局部变量里流转，不落到模块状态
+  // （口令不保留在 JS 里）。
+  const prevUri = document.querySelector<HTMLInputElement>("#spike-proxy-uri")?.value ?? "";
+  const prevUser = document.querySelector<HTMLInputElement>("#spike-proxy-user")?.value ?? "";
+  const prevPass = document.querySelector<HTMLInputElement>("#spike-proxy-pass")?.value ?? "";
   el.innerHTML = spikeDiagInnerHtml();
-  void loadSpikeProxy();
+  const uriEl = document.querySelector<HTMLInputElement>("#spike-proxy-uri");
+  const userEl = document.querySelector<HTMLInputElement>("#spike-proxy-user");
+  const passEl = document.querySelector<HTMLInputElement>("#spike-proxy-pass");
+  if (uriEl && prevUri) {
+    uriEl.value = prevUri;
+    spikeProxyUri = prevUri;
+  }
+  if (userEl && prevUser) userEl.value = prevUser;
+  // 保存成功后口令已经进 Keychain，不再回填。
+  if (passEl && prevPass && !spikeProxyPassSaved) passEl.value = prevPass;
+  spikeProxyPassSaved = false;
+  void syncDiagProxyView();
 }
 
-// 首次打开诊断面板时读取账号当前代理配置（脱敏视图）。
-let spikeProxyLoaded = false;
-async function loadSpikeProxy(): Promise<void> {
-  if (spikeProxyLoaded || !snapshot) return;
-  const acc = pickWatchAccount();
-  if (!acc) return;
-  spikeProxyLoaded = true;
+// 代理视图按账号缓存：切换账号后必须重新读，避免把 A 的配置显示在 B 上，
+// 也避免代理探针用了 A 的视图却跑 B 的账号。
+let spikeProxyPassSaved = false;
+async function ensureProxyView(acc: AccountRecord): Promise<SpikeProxySettingView | null> {
+  if (spikeProxyLoadedFor === acc.uuid) return spikeProxySettingView;
   try {
     spikeProxySettingView = await invoke<SpikeProxySettingView | null>(
       "muse_native_get_account_proxy",
       { providerId: "muse", uuid: acc.uuid }
     );
-  } catch {
+  } catch (e) {
     spikeProxySettingView = null;
+    spikeTrace("账号代理", "读取失败", String(e));
   }
-  const el = document.querySelector<HTMLElement>(".spike-diag");
-  if (el) el.innerHTML = spikeDiagInnerHtml();
+  spikeProxyLoadedFor = acc.uuid;
+  return spikeProxySettingView;
+}
+
+function syncDiagProxyView(): void {
+  if (!snapshot) return;
+  const acc = pickWatchAccount();
+  if (!acc || spikeProxyLoadedFor === acc.uuid) return;
+  void ensureProxyView(acc).then(() => {
+    // 账号代理信息到手后补一次渲染（syncSpikeDiag 会保留正在输入的代理字段）。
+    if (snapshot) syncSpikeDiag();
+  });
 }
 
 function pickWatchAccount(): AccountRecord | undefined {
@@ -1163,7 +1284,14 @@ function startLiveTimer(): void {
 async function startSpikeLive(): Promise<void> {
   if (!snapshot) return;
   const acc = pickWatchAccount();
-  if (!acc) return;
+  if (!acc) {
+    spikeLiveError = "没有已登录的 Muse 账号，无法开始存活探针。";
+    spikeTrace("存活探针", "中止：没有可用的 Muse 账号");
+    syncSpikeDiag();
+    return;
+  }
+  spikeNotice = null;
+  spikeTrace("存活探针", "调用后端", "muse_native_liveness_start");
   try {
     spikeLive = await invoke<SpikeLiveness>("muse_native_liveness_start", {
       uuid: acc.uuid,
@@ -1178,7 +1306,13 @@ async function startSpikeLive(): Promise<void> {
 }
 
 async function runSpikeLease(): Promise<void> {
-  if (!snapshot || spikeLeaseRunning) return;
+  if (!snapshot) return;
+  if (spikeLeaseRunning) {
+    spikeNotice = "租约探针正在运行，请等待结果。";
+    syncSpikeDiag();
+    return;
+  }
+  spikeNotice = null;
   const acc = pickWatchAccount();
   if (!acc) {
     spikeLease = null;
@@ -1209,7 +1343,13 @@ async function runSpikeLease(): Promise<void> {
 }
 
 async function runSpikeSend(): Promise<void> {
-  if (!snapshot || spikeSendRunning) return;
+  if (!snapshot) return;
+  if (spikeSendRunning) {
+    spikeNotice = "发送探针正在运行，请等待结果。";
+    syncSpikeDiag();
+    return;
+  }
+  spikeNotice = null;
   const acc = pickWatchAccount();
   if (!acc) {
     spikeSend = null;
@@ -1246,21 +1386,39 @@ async function runSpikeSend(): Promise<void> {
 // #18 模型指纹：只应对已授权的**非主力测试账号**手动触发。探针内容是
 // 无语义整数计数（不含隐私），发往隔离会话；3 条样本不足则显示不可判定。
 async function runSpikeFingerprint(): Promise<void> {
-  if (!snapshot || spikeFingerprintRunning) return;
+  if (!snapshot) return;
+  if (spikeFingerprintRunning) {
+    spikeNotice = "指纹探针正在运行，请等待结果或点「停止」。";
+    syncSpikeDiag();
+    return;
+  }
+  spikeNotice = null;
   const acc = pickWatchAccount();
   if (!acc) {
     spikeFingerprint = null;
     spikeFingerprintError = "没有已登录的 Muse 账号。";
+    spikeTrace("指纹探针", "中止：没有可用的 Muse 账号");
     syncSpikeDiag();
     return;
   }
-  const confirmed = window.confirm(
-    `将对测试账号「${acc.alias}」的隔离会话发送 3 条无语义计数探针（不是聊天内容），` +
-      "采到回答后在本地评分，不会上传第三方。确认该账号是非主力测试账号后继续。"
-  );
-  if (!confirmed) return;
+  spikeTrace("指纹探针", "已点击", `账号 ${acc.alias}`);
+  const confirmed = await askConfirm({
+    title: "运行指纹探针（3 条）",
+    desc:
+      `将对测试账号「${acc.alias}」的隔离会话发送 3 条无语义计数探针（不是聊天内容），` +
+      "采到回答后在本地评分，不会上传第三方。\n" +
+      "请确认该账号是非主力测试账号。",
+    confirmLabel: "开始探针",
+  });
+  spikeTrace("指纹探针", confirmed ? "确认框返回 true" : "确认框返回 false（取消）");
+  if (!confirmed) {
+    spikeNotice = "已取消指纹探针：没有发送任何请求。";
+    syncSpikeDiag();
+    return;
+  }
   spikeFingerprintRunning = true;
   spikeFingerprintError = null;
+  spikeTrace("指纹探针", "调用后端", "muse_native_fingerprint_probe");
   syncSpikeDiag();
   try {
     spikeFingerprint = await Promise.race([
@@ -1272,9 +1430,11 @@ async function runSpikeFingerprint(): Promise<void> {
         setTimeout(() => reject(new Error("指纹探针超时（5 分钟）")), 300_000)
       ),
     ]);
+    spikeTrace("指纹探针", "后端已返回", `阶段 ${spikeFingerprint.phase}`);
   } catch (e) {
     spikeFingerprint = null;
     spikeFingerprintError = String(e);
+    spikeTrace("指纹探针", "后端失败/超时", String(e));
     // 前端超时不能代替后端取消：显式请求后端停止，避免继续发探针。
     void cancelSpikeProbe();
   }
@@ -1282,25 +1442,40 @@ async function runSpikeFingerprint(): Promise<void> {
   syncSpikeDiag();
 }
 
-// 保存代理后的结果摘要：把 iOS WebView 侧的下发结果如实说明，
-// 不让“Rust 侧已保存”被误读成“整个账号已生效”。
-function proxySaveSummary(
-  view: SpikeProxySettingView | null,
-  base: string,
-): string {
-  const webview = view?.webview;
-  if (!webview) return base;
-  if (webview.applied) {
-    if (webview.sessionOpen) {
-      return `${base}；WebView 代理已写入，当前会话需重新打开后生效`;
-    }
-    return `${base}；WebView 代理已写入`;
+// 保存代理后的结果摘要：把三层状态分开写，不让“Rust 侧已保存”被误读成
+// “整个账号已生效”。三行分别是 Rust 配置 / Keychain 凭据 / WebView 下发。
+function proxySaveSummary(view: SpikeProxySettingView | null): string[] {
+  if (!view) {
+    return [
+      "保存请求已返回，但没有拿到代理配置视图。",
+      "Rust 配置 / Keychain / WebView 三层状态均未知，请刷新后重新确认。",
+    ];
   }
-  const reason = webview.reason ?? "该设备不支持 WebView 代理";
-  if (webview.quarantined) {
-    return `${base}；但 WebView 侧未生效，出口已被隔离（不会直连）：${reason}`;
+  const lines = [
+    `Rust 配置：已保存（${view.enabled ? "已启用" : "未启用"}）${view.display}`,
+    view.hasCredentials
+      ? "Keychain：口令引用已建立（accounts.json 只保留引用，无明文）"
+      : "Keychain：未使用认证凭据",
+  ];
+  const webview = view.webview;
+  if (!webview) {
+    lines.push("WebView：该平台没有这一层（桌面走系统代理；Android 未接入）");
+  } else if (webview.applied) {
+    lines.push(
+      webview.sessionOpen
+        ? "WebView：已写入，当前会话需重新打开后生效"
+        : "WebView：已写入"
+    );
+  } else if (webview.quarantined) {
+    lines.push(
+      `WebView：未生效，出口已隔离（不会直连）：${webview.reason ?? "原因未返回"}`
+    );
+  } else {
+    lines.push(
+      `WebView：未生效：${webview.reason ?? "该设备不支持 WebView 代理"}`
+    );
   }
-  return `${base}；但 WebView 侧未生效：${reason}`;
+  return lines;
 }
 
 // 代理 URI 脱敏：确认弹窗、日志、错误里只允许出现 scheme://[user@]host:port。
@@ -1323,29 +1498,49 @@ function redactProxyUri(uri: string): string {
 // 控制面 + WSS 隧道，与真实发送同源；前端不再把 URI/口令送进后端。
 // 失败 fail-closed，不回退直连。
 async function runSpikeProxy(): Promise<void> {
-  if (!snapshot || spikeProxyRunning) return;
+  if (!snapshot) return;
+  if (spikeProxyRunning) {
+    spikeNotice = "代理探针正在运行，请等待结果或点「停止」。";
+    syncSpikeDiag();
+    return;
+  }
+  spikeNotice = null;
   const acc = pickWatchAccount();
   if (!acc) {
     spikeProxy = null;
     spikeProxyError = "没有已登录的 Muse 账号。";
+    spikeTrace("代理探针", "中止：没有可用的 Muse 账号");
     syncSpikeDiag();
     return;
   }
   // 诊断只认该账号已保存的代理（ProxySetting + Keychain），
   // 不再把输入框里的 URI / 口令送进后端，避免「诊断与实际发送不同源」。
-  if (!spikeProxySettingView || !spikeProxySettingView.enabled) {
+  const view = await ensureProxyView(acc);
+  if (!view || !view.enabled) {
     spikeProxy = null;
     spikeProxyError = "该账号还没有启用代理：请先「保存为账号代理」再跑代理探针。";
+    spikeTrace("代理探针", "中止：账号未启用代理", `账号 ${acc.alias}`);
     syncSpikeDiag();
     return;
   }
-  const confirmed = window.confirm(
-    `将对测试账号「${acc.alias}」用已保存的代理 ${spikeProxySettingView.display} 跑一次隧道验证（控制面 + WSS + ping）。` +
-      "确认这是你自己的测试代理、该账号是非主力测试账号后继续。"
-  );
-  if (!confirmed) return;
+  spikeTrace("代理探针", "已点击", `账号 ${acc.alias}，代理 ${view.display}`);
+  const confirmed = await askConfirm({
+    title: "运行代理探针",
+    desc:
+      `将对测试账号「${acc.alias}」用已保存的代理 ${view.display} 跑一次隧道验证` +
+      "（控制面 + WSS + ping）。\n" +
+      "请确认这是你自己的测试代理、该账号是非主力测试账号。",
+    confirmLabel: "开始验证",
+  });
+  spikeTrace("代理探针", confirmed ? "确认框返回 true" : "确认框返回 false（取消）");
+  if (!confirmed) {
+    spikeNotice = "已取消代理探针：没有发起任何连接。";
+    syncSpikeDiag();
+    return;
+  }
   spikeProxyRunning = true;
   spikeProxyError = null;
+  spikeTrace("代理探针", "调用后端", "muse_native_proxy_probe");
   syncSpikeDiag();
   try {
     spikeProxy = await Promise.race([
@@ -1357,9 +1552,11 @@ async function runSpikeProxy(): Promise<void> {
         setTimeout(() => reject(new Error("代理探针超时（90 秒）")), 90_000)
       ),
     ]);
+    spikeTrace("代理探针", "后端已返回", `阶段 ${spikeProxy.phase}`);
   } catch (e) {
     spikeProxy = null;
     spikeProxyError = String(e);
+    spikeTrace("代理探针", "后端失败/超时", String(e));
     // 前端超时/异常不能代替后端取消：显式请求后端停止，避免继续发请求。
     void cancelSpikeProbe();
   }
@@ -1369,10 +1566,18 @@ async function runSpikeProxy(): Promise<void> {
 
 // 保存账号级代理：口令只进 Keychain，前端与 accounts.json 都不保留明文。
 async function saveSpikeProxy(): Promise<void> {
-  if (!snapshot || spikeProxyBusy) return;
+  if (!snapshot) return;
+  if (spikeProxyBusy) {
+    spikeNotice = "上一次代理操作还在进行，请稍候。";
+    syncSpikeDiag();
+    return;
+  }
+  spikeNotice = null;
   const acc = pickWatchAccount();
   if (!acc) {
-    spikeProxySaveMsg = "没有已登录的 Muse 账号";
+    spikeProxySaveLines = ["保存中止：没有已登录的 Muse 账号。"];
+    spikeProxySaveOk = false;
+    spikeTrace("保存代理", "中止：没有可用的 Muse 账号");
     syncSpikeDiag();
     return;
   }
@@ -1381,16 +1586,31 @@ async function saveSpikeProxy(): Promise<void> {
   const password = document.querySelector<HTMLInputElement>("#spike-proxy-pass")?.value ?? "";
   spikeProxyUri = uri;
   if (!uri) {
-    spikeProxySaveMsg = "请填写代理 URI";
+    spikeProxySaveLines = ["请填写代理 URI（例如 socks5://host:1080）。"];
+    spikeProxySaveOk = false;
+    spikeTrace("保存代理", "校验失败：URI 为空");
     syncSpikeDiag();
     return;
   }
-  const ok = window.confirm(
-    `把代理 ${redactProxyUri(uri)} 保存为账号「${acc.alias}」的专用代理？口令只写入系统 Keychain。`
-  );
-  if (!ok) return;
+  const redacted = redactProxyUri(uri);
+  spikeTrace("保存代理", "已点击", `账号 ${acc.alias}，代理 ${redacted}`);
+  const confirmed = await askConfirm({
+    title: "保存账号代理",
+    desc:
+      `把代理 ${redacted} 保存为账号「${acc.alias}」的专用代理？\n` +
+      "口令只写入系统 Keychain，不写入 accounts.json。",
+    confirmLabel: "保存",
+  });
+  spikeTrace("保存代理", confirmed ? "确认框返回 true" : "确认框返回 false（取消）");
+  if (!confirmed) {
+    spikeNotice = "已取消保存：代理配置未改动。";
+    syncSpikeDiag();
+    return;
+  }
   spikeProxyBusy = true;
-  spikeProxySaveMsg = "保存中…";
+  spikeProxySaveLines = ["保存中…"];
+  spikeProxySaveOk = null;
+  spikeTrace("保存代理", "调用后端", "muse_native_set_account_proxy");
   syncSpikeDiag();
   try {
     spikeProxySettingView = await invoke<SpikeProxySettingView>(
@@ -1404,25 +1624,60 @@ async function saveSpikeProxy(): Promise<void> {
         enabled: true,
       }
     );
-    spikeProxySaveMsg = proxySaveSummary(spikeProxySettingView, "已保存：口令写入 Keychain，accounts.json 只保留引用");
+    spikeProxyLoadedFor = acc.uuid;
+    spikeProxySaveLines = proxySaveSummary(spikeProxySettingView);
+    spikeProxySaveOk = true;
+    // 口令已进 Keychain：从界面上清掉，避免留在输入框里。
+    spikeProxyPassSaved = true;
+    spikeTrace("保存代理", "后端已返回", "Rust 配置已保存");
   } catch (e) {
-    spikeProxySaveMsg = `保存失败：${String(e)}`;
+    spikeProxySaveLines = [
+      `保存失败：${String(e)}`,
+      "Rust 配置可能未落盘（失败可能发生在校验 / 隔离 / 写入任一阶段）；" +
+        "按 fail-closed 设计，WebView 出口不会回退直连。",
+    ];
+    spikeProxySaveOk = false;
+    spikeTrace("保存代理", "后端失败", String(e));
   }
   spikeProxyBusy = false;
   syncSpikeDiag();
 }
 
 async function clearSpikeProxy(): Promise<void> {
-  if (!snapshot || spikeProxyBusy) return;
-  const acc = pickWatchAccount();
-  if (!acc) {
-    spikeProxySaveMsg = "没有已登录的 Muse 账号";
+  if (!snapshot) return;
+  if (spikeProxyBusy) {
+    spikeNotice = "上一次代理操作还在进行，请稍候。";
     syncSpikeDiag();
     return;
   }
-  if (!window.confirm(`清除账号「${acc.alias}」的代理配置？清除后将走系统网络。`)) return;
+  spikeNotice = null;
+  const acc = pickWatchAccount();
+  if (!acc) {
+    spikeProxySaveLines = ["清除中止：没有已登录的 Muse 账号。"];
+    spikeProxySaveOk = false;
+    spikeTrace("清除代理", "中止：没有可用的 Muse 账号");
+    syncSpikeDiag();
+    return;
+  }
+  spikeTrace("清除代理", "已点击", `账号 ${acc.alias}`);
+  const confirmed = await askConfirm({
+    title: "清除账号代理",
+    desc:
+      `清除账号「${acc.alias}」的代理配置？\n` +
+      "清除后该账号走系统网络；Keychain 中的口令一并删除。",
+    confirmLabel: "清除",
+    danger: true,
+  });
+  spikeTrace("清除代理", confirmed ? "确认框返回 true" : "确认框返回 false（取消）");
+  if (!confirmed) {
+    spikeNotice = "已取消清除：代理配置未改动。";
+    syncSpikeDiag();
+    return;
+  }
   spikeProxyBusy = true;
-  spikeProxySaveMsg = "清除中…";
+  spikeProxySaveLines = ["清除中…"];
+  spikeProxySaveOk = null;
+  spikeTrace("清除代理", "调用后端", "muse_native_clear_account_proxy");
   syncSpikeDiag();
   try {
     await invoke("muse_native_clear_account_proxy", {
@@ -1430,9 +1685,18 @@ async function clearSpikeProxy(): Promise<void> {
       uuid: acc.uuid,
     });
     spikeProxySettingView = null;
-    spikeProxySaveMsg = "已清除账号代理（含 Keychain 口令）";
+    spikeProxyLoadedFor = acc.uuid;
+    spikeProxySaveLines = [
+      "Rust 配置：已清除（该账号恢复走系统网络）",
+      "Keychain：口令已删除（包括旧的 proxy-<uuid> 引用）",
+      "WebView：已同步清除并解除出口隔离",
+    ];
+    spikeProxySaveOk = true;
+    spikeTrace("清除代理", "后端已返回");
   } catch (e) {
-    spikeProxySaveMsg = `清除失败：${String(e)}`;
+    spikeProxySaveLines = [`清除失败：${String(e)}`];
+    spikeProxySaveOk = false;
+    spikeTrace("清除代理", "后端失败", String(e));
   }
   spikeProxyBusy = false;
   syncSpikeDiag();
@@ -1442,7 +1706,11 @@ async function clearSpikeProxy(): Promise<void> {
 async function cancelSpikeProbe(): Promise<void> {
   if (!snapshot) return;
   const acc = pickWatchAccount();
-  if (!acc) return;
+  if (!acc) {
+    spikeNotice = "停止失败：没有已登录的 Muse 账号。";
+    syncSpikeDiag();
+    return;
+  }
   try {
     // 返回命中的任务数：同账号可能同时跑多个任务（指纹 + 代理探针等），
     // 后端按账号广播取消，这里如实显示命中了几个。
@@ -1450,17 +1718,26 @@ async function cancelSpikeProbe(): Promise<void> {
       providerId: "muse",
       uuid: acc.uuid,
     });
-    spikeProxySaveMsg = hit > 0
-      ? `已请求停止 ${hit} 个任务：不再发起新的请求/发送`
-      : "没有正在运行的长任务";
+    spikeNotice =
+      hit > 0
+        ? `已请求停止 ${hit} 个任务：不再发起新的请求/发送`
+        : "没有正在运行的长任务";
+    spikeTrace("停止", "已请求后端取消", `命中 ${hit} 个任务`);
   } catch (e) {
-    spikeProxySaveMsg = `停止失败：${String(e)}`;
+    spikeNotice = `停止失败：${String(e)}`;
+    spikeTrace("停止", "后端失败", String(e));
   }
   syncSpikeDiag();
 }
 
 async function runSpikeQuota(): Promise<void> {
-  if (!snapshot || spikeQuotaRunning) return;
+  if (!snapshot) return;
+  if (spikeQuotaRunning) {
+    spikeNotice = "额度探针正在运行，请等待结果。";
+    syncSpikeDiag();
+    return;
+  }
+  spikeNotice = null;
   const acc = pickWatchAccount();
   if (!acc) {
     spikeQuotaProbe = null;
@@ -1487,7 +1764,13 @@ async function runSpikeQuota(): Promise<void> {
 }
 
 async function runSpikeApprovals(): Promise<void> {
-  if (!snapshot || spikeApprovalsRunning) return;
+  if (!snapshot) return;
+  if (spikeApprovalsRunning) {
+    spikeNotice = "审批探针正在运行，请等待结果。";
+    syncSpikeDiag();
+    return;
+  }
+  spikeNotice = null;
   const acc = pickWatchAccount();
   if (!acc) {
     spikeApprovals = null;
@@ -1517,7 +1800,13 @@ async function runSpikeApprovals(): Promise<void> {
 }
 
 async function runSpikeWatch(): Promise<void> {
-  if (!snapshot || spikeWatchRunning) return;
+  if (!snapshot) return;
+  if (spikeWatchRunning) {
+    spikeNotice = "订阅探针正在运行，请等待结果。";
+    syncSpikeDiag();
+    return;
+  }
+  spikeNotice = null;
   const acc = pickWatchAccount();
   spikeWatchAccount = acc?.alias ?? null;
   if (!acc) {
@@ -1549,7 +1838,13 @@ async function runSpikeWatch(): Promise<void> {
 }
 
 async function runSpikeDiagnose(): Promise<void> {
-  if (!snapshot || spikeDiagnoseRunning) return;
+  if (!snapshot) return;
+  if (spikeDiagnoseRunning) {
+    spikeNotice = "诊断正在运行，请等待结果。";
+    syncSpikeDiag();
+    return;
+  }
+  spikeNotice = null;
   const acc = snapshot.accounts.find(
     (a) => a.providerId === "muse" && a.authState === "authenticated"
   );
@@ -1744,6 +2039,21 @@ function renderModal(provider: ProviderInfo): string {
           <div class="modal-footer">
             <button id="modal-cancel-btn" class="btn" type="button">取消</button>
             <button id="modal-confirm-btn" class="btn primary" type="button">保存</button>
+          </div>
+        </div>
+      </div>
+    `;
+  }
+  if (modal.kind === "confirm") {
+    const desc = escapeHtml(modal.desc).replace(/\n/g, "<br>");
+    return `
+      <div class="inline-modal" role="dialog" aria-modal="true">
+        <div class="modal-card">
+          <div class="modal-title">${escapeHtml(modal.title)}</div>
+          <div class="modal-desc">${desc}</div>
+          <div class="modal-footer">
+            <button id="modal-cancel-btn" class="btn" type="button">取消</button>
+            <button id="modal-confirm-btn" class="btn ${modal.danger ? "danger" : "primary"}" type="button">${escapeHtml(modal.confirmLabel)}</button>
           </div>
         </div>
       </div>
@@ -2045,6 +2355,9 @@ function modalIdentityKey(provider: ProviderInfo): string | null {
       return `rename:${modal.account.uuid}`;
     case "remove":
       return `remove:${modal.account.uuid}:${modal.account.alias}`;
+    case "confirm":
+      // 内容在打开时确定，不会在显示期间变化；标题 + 长度足以区分。
+      return `confirm:${modal.title}:${modal.desc.length}:${modal.confirmLabel}`;
     case "update":
       // Dynamic content (update check / install progress): no stable
       // identity — the caller falls back to the full HTML.
@@ -2680,7 +2993,14 @@ function bindDelegatedEvents(): void {
         break;
       case "modal-confirm-btn": {
         const currentModal = modal;
-        if (currentModal.kind === "add") {
+        if (currentModal.kind === "confirm") {
+          // 先摘掉 resolver，再关弹窗：setModal 的自动结算会看到 null，
+          // 不会把这次确认覆盖成「取消」。
+          const resolve = confirmResolver;
+          confirmResolver = null;
+          await setModal({ kind: "none" });
+          resolve?.(true);
+        } else if (currentModal.kind === "add") {
           const alias = currentModal.draft.trim();
           await setModal({ kind: "none" });
           await callCommand("add_account", {
@@ -2773,6 +3093,11 @@ function bindDelegatedEvents(): void {
 
   root.addEventListener("input", (ev) => {
     const input = ev.target as HTMLInputElement;
+    if (input.id === "spike-proxy-uri") {
+      // 诊断区会被状态更新重写，先记住正在输入的 URI，避免被旧值覆盖。
+      spikeProxyUri = input.value;
+      return;
+    }
     if (input.id !== "modal-alias-input") return;
     if (modal.kind === "add" || modal.kind === "rename") {
       modal.draft = input.value;
@@ -2835,6 +3160,11 @@ async function bootstrap(): Promise<void> {
 
   window.addEventListener("keydown", async (ev) => {
     if (modal.kind !== "none") {
+      if (modal.kind === "confirm" && ev.key === "Enter") {
+        ev.preventDefault();
+        document.querySelector<HTMLButtonElement>("#modal-confirm-btn")?.click();
+        return;
+      }
       if (
         ev.key === "Escape" &&
         modal.kind !== "add" &&

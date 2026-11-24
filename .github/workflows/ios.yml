@@ -46,6 +46,10 @@ jobs:
         with:
           workspaces: ./src-tauri -> target
       - run: npm ci
+      # 注入的 JS 不会经过 Xcode 的语法检查：先提取 + node --check，避免
+      # 打出一个「能装但钩子从未运行」的包（见 2d39149 的 Scripts.swift）。
+      - name: Verify embedded JavaScript
+        run: npm run check:embedded-js
       # init must go through `npm run tauri` (never raw xcodebuild / xcodegen);
       # --skip-targets-install because the target is installed above.
       - run: npm run tauri -- ios init --ci --skip-targets-install
