@@ -23,4 +23,8 @@
 
 ## 回填结果
 
+### 0.1.26 Muse 指纹真机回执
+
+2026-11-24 回执。历史恢复路径为 `DEVICE_VERIFIED`，本轮从确认到返回约 5 分 29 秒。3 条探针均为 `CONFIRMED` 和 `history_completed`，有效样本解析为 330/330、326/326、305/305，3 条全部参与实际 lmfpd 评分。参考库首位候选为 `deepseek-v4-flash-0731`，闭集校准置信度 21.0%。三条流式文本增量均为 0，实时采集仍为 `UNVERIFIED`。机型、iOS 版本及原会话网页侧对照未随本次回执提供。
+
 在 [PR #16 验收记录](https://github.com/harrylarry/multi-agent-account-manager/pull/16#issuecomment-7130670517)关联的 Issue 或 PR 下记录机型、iOS 版本、构建 SHA、场景、结果、预期差异和脱敏诊断。保留各项的 `DEVICE_VERIFIED`、`FAIL`、`UNVERIFIED` 或 `BLOCKED` 状态。回传前移除 Cookie、Token、账号邮箱及代理认证信息。
