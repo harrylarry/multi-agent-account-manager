@@ -1598,10 +1598,12 @@ body,
 }
 .spike-diag-header {
   display: flex;
-  justify-content: space-between;
+  flex-wrap: wrap;
   align-items: center;
+  gap: 6px;
 }
 .spike-diag-title {
+  flex: 1 0 100%;
   font-size: 13px;
   font-weight: 600;
 }
