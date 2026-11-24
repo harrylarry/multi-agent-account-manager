@@ -460,6 +460,8 @@ where
         transport: self.transport,
         stream_id,
         response: ResponseLines::default(),
+        send_response: None,
+        early_send_events: std::collections::VecDeque::new(),
         socket_closed: false,
       }),
     }
@@ -490,6 +492,8 @@ pub struct Subscription<S = MaybeTlsStream<TcpStream>> {
   transport: NoiseTransport,
   stream_id: u64,
   response: ResponseLines,
+  send_response: Option<(u64, ResponseLines)>,
+  early_send_events: std::collections::VecDeque<String>,
   socket_closed: bool,
 }
 
@@ -562,9 +566,16 @@ pub(crate) struct ParallelResponse<'a, S> {
   subscription: &'a mut Subscription<S>,
   id: u64,
   response: ResponseLines,
+  early_events: std::collections::VecDeque<String>,
+  early_event_bytes: usize,
 }
 
 impl<S: AsyncRead + AsyncWrite + Unpin> ParallelResponse<'_, S> {
+  pub(crate) fn retain_for_collection(self) {
+    self.subscription.early_send_events = self.early_events;
+    self.subscription.send_response = Some((self.id, self.response));
+  }
+
   pub(crate) fn status(&self) -> Option<u16> {
     self.response.status
   }
@@ -576,6 +587,16 @@ impl<S: AsyncRead + AsyncWrite + Unpin> ParallelResponse<'_, S> {
     let deadline = tokio::time::Instant::now() + timeout;
     loop {
       if let Some(line) = self.response.line()? {
+        if serde_json::from_str::<serde_json::Value>(&line)
+          .is_ok_and(|value| value["type"] == "event")
+        {
+          self.early_event_bytes += line.len();
+          if self.early_events.len() == 128 || self.early_event_bytes > 2 * 1024 * 1024 {
+            return Err(GatewayError::Protocol("too many events before send ACK".to_string()));
+          }
+          self.early_events.push_back(line);
+          continue;
+        }
         return Ok(Some(line));
       }
       if self.response.ended || self.subscription.socket_closed {
@@ -652,6 +673,8 @@ impl<S: AsyncRead + AsyncWrite + Unpin> Subscription<S> {
         subscription: self,
         id,
         response: ResponseLines::default(),
+        early_events: Default::default(),
+        early_event_bytes: 0,
       }),
     };
     (wrote.entered_write, wrote.wrote, response)
@@ -660,10 +683,21 @@ impl<S: AsyncRead + AsyncWrite + Unpin> Subscription<S> {
   pub async fn next_line(&mut self, timeout: Duration) -> Result<Option<String>, GatewayError> {
     let deadline = tokio::time::Instant::now() + timeout;
     loop {
+      if let Some(line) = self.early_send_events.pop_front() {
+        return Ok(Some(line));
+      }
       if let Some(line) = self.response.line()? {
         return Ok(Some(line));
       }
-      if self.response.ended || self.socket_closed {
+      if let Some((_, response)) = &mut self.send_response {
+        if let Some(line) = response.line()? {
+          return Ok(Some(line));
+        }
+        if response.ended {
+          self.send_response = None;
+        }
+      }
+      if (self.response.ended && self.send_response.is_none()) || self.socket_closed {
         return Ok(None);
       }
       self.receive(deadline, None).await?;
@@ -689,6 +723,8 @@ impl<S: AsyncRead + AsyncWrite + Unpin> Subscription<S> {
           if id == self.stream_id {
             self.response.accept(frame)?;
           } else if let Some((_, response)) = parallel.filter(|(aux, _)| *aux == id) {
+            response.accept(frame)?;
+          } else if let Some((_, response)) = self.send_response.as_mut().filter(|(aux, _)| *aux == id) {
             response.accept(frame)?;
           }
         }
@@ -949,11 +985,14 @@ mod tests {
         .send(response(
           &mut cipher,
           2,
-          b"{\"message_id\":\"accepted\",\"session_id\":\"new\"}",
-          true,
+          b"{\"type\":\"event\",\"event\":\"delta.message_start\"}\n{\"message_id\":\"accepted\",\"session_id\":\"new\"}\n",
+          false,
         ))
         .await
         .unwrap();
+      server.send(response(
+        &mut cipher, 2, b"{\"type\":\"event\",\"event\":\"delta.text_append\"}\n", true,
+      )).await.unwrap();
     });
 
     let mut sub = client.subscribe(subscription_request()).await.unwrap();
@@ -963,8 +1002,10 @@ mod tests {
     let sent = send_on_subscription(&mut sub, "test", "new", wait, &mut rx).await;
     assert!(sent.on_wire);
     assert_eq!(sent.outcome.unwrap().message_id, "accepted");
+    assert!(sub.next_line(wait).await.unwrap().unwrap().contains("delta.message_start"));
     let event = sub.next_line(wait).await.unwrap().unwrap();
     assert!(event.contains("message.user"));
+    assert!(sub.next_line(wait).await.unwrap().unwrap().contains("delta.text_append"));
     assert!(!sub.stream_ended());
     peer.await.unwrap();
   }

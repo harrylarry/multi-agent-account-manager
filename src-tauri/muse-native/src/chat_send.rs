@@ -375,7 +375,13 @@ pub async fn send_on_subscription<S: AsyncRead + AsyncWrite + Unpin>(
   let req = chat_stream_request(text, "", Some(session_id));
   let (on_wire, wrote_frames, response) = subscription.open_parallel(req, Some(cancel)).await;
   let outcome = match response {
-    Ok(mut source) => read_ack(&mut source, timeout, Some(cancel)).await,
+    Ok(mut source) => {
+      let ack = read_ack(&mut source, timeout, Some(cancel)).await;
+      if ack.is_ok() {
+        source.retain_for_collection();
+      }
+      ack
+    },
     Err(error) => Err(error),
   };
   SendAttemptResult {
