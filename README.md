@@ -146,11 +146,13 @@ npm run tauri -- build
 
 ---
 
-## 开发约定与计划
+## 开发与验收
 
-- [AGENTS.md](AGENTS.md)：开发 Agent 的协作约定（单 Agent 连续开发、以 GitHub 作为项目事实来源、测试与安全门禁）。
-- [开发计划 v2.1](docs/叠号开发计划-严谨执行版-v2.1-2026-11-23.md)：Phase 0–5 的可执行任务、验收矩阵、风险登记与 Go/No-Go 门禁。
-- 任务进度、验收证据与阻断以 GitHub Issue / PR / Actions 为准；`.muse-graph/` 仅作辅助索引，不与 GitHub 记录冲突。
+- [AGENTS.md](AGENTS.md) · 开发协作、测试与安全门禁。
+- [产品设计 v4](<docs/叠号 iOS 借鉴 BotArk 优化设计规划 v4.md>) · 产品需求与设计决策。后续裁决见[开发决策记录](docs/开发决策记录.md)。
+- [开发计划 v2.1](docs/叠号开发计划-严谨执行版-v2.1-2026-11-23.md) · Phase 0–5 的任务、验收矩阵与 Go/No-Go 门禁。
+- [当前进度](docs/development/current-progress.md) · 阶段状态、候选提交、待验收事项与 GitHub 证据。
+- [iPhone 真机验收](docs/acceptance/iphone-acceptance.md) · Spike IPA、校验值、测试步骤与结果回填。
 
 ---
 
