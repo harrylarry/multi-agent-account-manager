@@ -363,18 +363,23 @@ pub async fn send_probe(
       )
       .await;
     if matches!(tracked.outcome, Err(GatewayError::Cancelled)) {
-      // 取消发生在发送阶段：可能已发出，按 UNKNOWN 记账，绝不重发。
-      ledger.mark_unknown(&send_id, "发送阶段被取消".to_string());
+      // 取消发生在发送阶段：只要进入过网络写入就可能已发出，按 UNKNOWN 记账，绝不重发。
+      let detail = if tracked.on_wire {
+        format!(
+          "发送阶段被用户取消（已进入网络写入，完成 {} 帧；结果不明，未重发）",
+          tracked.wrote_frames
+        )
+      } else {
+        "发送阶段被用户取消（尚未进入网络写入，未重发）".to_string()
+      };
+      ledger.mark_unknown(&send_id, detail.clone());
       return SendOutcome {
         ok: false,
         status: "UNKNOWN".to_string(),
         send_id,
         ack: None,
         session_id: session_id.map(str::to_string),
-        error: Some(format!(
-          "发送阶段被用户取消（已写出 {} 帧，结果不明，未重发）",
-          tracked.wrote_frames
-        )),
+        error: Some(detail),
       };
     }
     match tracked.outcome {
@@ -390,12 +395,15 @@ pub async fn send_probe(
         }
       }
       Err(e) => {
-        // 请求已写到线上而拿不到 ack → 上游可能已收到，只能 UNKNOWN。
-        // 一帧都没写出去 → 这次发送确实没有开始，可以明确失败。
+        // 只要进入过网络写入（哪怕一帧都没写完、写了一半就断），上游就可能
+        // 已经收到，只能 UNKNOWN。确认没进入写入阶段的失败才是明确失败。
         let detail = if tracked.on_wire {
-          format!("请求已发出但未拿到 ack（结果不明，未重发）: {e}")
+          format!(
+            "请求已进入网络写入（完成 {} 帧）但未拿到 ack（结果不明，未重发）: {e}",
+            tracked.wrote_frames
+          )
         } else {
-          format!("请求未能发出: {e}")
+          format!("请求在进入网络写入前失败: {e}")
         };
         if tracked.on_wire {
           ledger.mark_unknown(&send_id, detail.clone());
@@ -664,10 +672,14 @@ pub async fn fingerprint_probe(
         )
         .await;
       if matches!(tracked.outcome, Err(GatewayError::Cancelled)) {
-        let msg = format!(
-          "探针 {} 在发送阶段被取消（已写出 {} 帧），不重发",
-          probe.id, tracked.wrote_frames
-        );
+        let msg = if tracked.on_wire {
+          format!(
+            "探针 {} 在发送阶段被取消（已进入网络写入，完成 {} 帧），不重发",
+            probe.id, tracked.wrote_frames
+          )
+        } else {
+          format!("探针 {} 在发送阶段被取消（尚未进入网络写入），不重发", probe.id)
+        };
         first_error.get_or_insert(msg.clone());
         ledger.mark_unknown(&send_id, msg.clone());
         sends.push(FingerprintSendRecord {
@@ -749,20 +761,20 @@ pub async fn fingerprint_probe(
           }
         }
         Err(e) => {
-          // 拿不到 ack：只有「一帧都没写出去」才算这次发送没有开始；
-          // 已经写到线上的一律 UNKNOWN（上游可能已收到），都不重发。
+          // 拿不到 ack：只要进入过网络写入（含首帧写一半就断），上游就可能
+          // 已收到，一律 UNKNOWN。确认没进入写入阶段的失败才算明确失败。
           let (status, msg) = if tracked.on_wire {
             (
               "UNKNOWN",
               format!(
-                "探针 {} 已发出 {} 帧但未拿到 ack（结果不明，不重发）: {e}",
+                "探针 {} 已进入网络写入（完成 {} 帧）但未拿到 ack（结果不明，不重发）: {e}",
                 probe.id, tracked.wrote_frames
               ),
             )
           } else {
             (
               "DEFINITIVELY_FAILED",
-              format!("探针 {} 请求未发出（0 帧）: {e}", probe.id),
+              format!("探针 {} 在进入网络写入前失败: {e}", probe.id),
             )
           };
           first_error.get_or_insert(msg.clone());

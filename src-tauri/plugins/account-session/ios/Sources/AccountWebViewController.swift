@@ -387,11 +387,12 @@ final class AccountWebViewController: UIViewController, WKNavigationDelegate, WK
   /// 「能撤的撤、撤不掉的重建」处理：
   /// 1. 停加载、销毁 OAuth 弹窗；
   /// 2. 注入 `window.stop()` 并尽力关闭页内可枚举的连接；
-  /// 3. **销毁 WebView 本身**：从视图层级移除、断开代理引用后内容进程随之
-  ///    终止，其上的连接（含 WS）全部断开；
-  /// 4. 网络层的兜底由调用方先行 `AccountProxyQuarantine.engage(uuid:)`
-  ///    （不可达代理 + allowFailover=false）保证：即使仍有残留进程发起新
-  ///    连接，也连不出去。
+  /// 3. **销毁 WebView 本身**：从视图层级移除、断开代理引用，交给 WebKit
+  ///    回收内容进程（回收时机由系统决定，须真机验证，不能仅凭推理断言
+  ///    连接已全部断开）；
+  /// 4. 不依赖回收的兜底：调用方先行 `AccountProxyQuarantine.engage(uuid:)`
+  ///    把该 store 的出口换成不可达代理并关掉 failover，此后**新**连接
+  ///    （包括残留进程发起的）无法离开设备。
   ///
   /// 想继续用，只能关掉会话重新打开（那时按新配置重建 WebView）。
   func blockEgress(reason: String) {

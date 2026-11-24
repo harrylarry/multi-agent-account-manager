@@ -626,10 +626,16 @@ pub fn run() {
       app.manage(Arc::clone(&session_mgr));
 
       // 发送台账的状态日志：进程异常退出后，未定论的发送在重启时改判 UNKNOWN，
-      // 不会被当成「没发过」而重发。日志损坏则拒绝发送（fail-closed）。
+      // 不会被当成「没发过」而重发。日志读不了/写不了都拒绝新发送（fail-closed）。
       let (ledger, recovery) = send_ledger::SendLedger::open(app_data_dir.join("send-ledger.json"));
       if recovery.corrupt {
-        eprintln!("[send-ledger] 状态日志损坏：本次运行拒绝一切新发送（fail-closed）");
+        eprintln!(
+          "[send-ledger] 台账不可用（{}）：本次运行拒绝一切新发送（fail-closed）",
+          recovery
+            .load_error
+            .as_deref()
+            .unwrap_or("状态日志损坏或无法持久化")
+        );
       } else if recovery.restored > 0 {
         eprintln!(
           "[send-ledger] 恢复 {} 条记录，其中 {} 条未定论改判 UNKNOWN",

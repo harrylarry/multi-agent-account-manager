@@ -209,10 +209,12 @@ final class AccountSessionCoordinator {
   /// 让下次打开按新配置重建 WebView（WKWebsiteDataStore 的
   /// proxyConfigurations 只在 WebView 创建时读取一次，改已有的 store 不保证生效）。
   ///
-  /// **正在打开的会话会被彻底销毁**：换出口时旧 WebView 仍在按旧配置
+  /// **正在打开的会话会被销毁并隔离**：换出口时旧 WebView 仍在按旧配置
   /// （可能是直连）发请求，只 stopLoading / 隐藏都是不够的——已建立的
   /// XHR/WebSocket 还在跑。这里先由 Rust 侧 quarantine 把 data store 的
-  /// 出口指向不可达端点，再把 WebView 从视图层级移除（内容进程随之终止）。
+  /// 出口指向不可达端点，再把 WebView 从视图层级移除并释放引用，让 WebKit
+  /// 回收其内容进程。**这一链路依赖 WebKit 的回收时机，须真机验证**：
+  /// 网络层兜底（不可达代理 + allowFailover=false）不依赖回收。
   ///
   /// 返回 (是否已落配置, 该账号会话是否曾被阻断)。
   func setAccountProxy(uuid: String, config: AccountProxyConfig?) -> (applied: Bool, sessionOpen: Bool) {

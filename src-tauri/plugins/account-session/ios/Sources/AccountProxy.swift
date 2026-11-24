@@ -262,11 +262,12 @@ enum AccountProxyResolver {
 ///
 /// 为什么需要它：`stopLoading()` / 隐藏 WebView / 取消导航都**不**能证明
 /// 已建立的 XHR、WebSocket、EventSource 停了 —— JS 定时器还会继续发请求。
-/// WebKit 没有「杀掉这个 data store 全部连接」的 API，能保证不再外流的
-/// 只有一件事：把出口换成一个连不通的代理，并关掉 failover。之后该 store
-/// 上任何**新**连接（包括残留进程发起的）都会在 CONNECT 阶段失败。
+/// WebKit 没有「杀掉这个 data store 全部连接」的 API。本机制提供的是
+/// **新连接**层面的约束：把出口换成一个连不通的代理并关掉 failover，之后
+/// 该 store 上任何新连接都会在 CONNECT 阶段失败。
 ///
-/// 已建立的连接由调用方销毁 WebView（内容进程随之终止）来断。
+/// 已建立的连接只能靠销毁 WebView、由系统回收内容进程来断——回收时机不受
+/// 我们控制，因此这条路径的真机效果标记为 UNVERIFIED，不以推理代替证据。
 enum AccountProxyQuarantine {
   /// 本机回环 + 未监听端口：连接立即被拒，不会有任何字节离开设备。
   private static let deadPort: UInt16 = 9

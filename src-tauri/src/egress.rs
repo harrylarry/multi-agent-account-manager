@@ -216,7 +216,7 @@ impl AccountGateway {
   }
 
   /// 发一条聊天消息并等 ack（直连与代理共用同一协议实现）。
-  /// 返回值区分「请求是否已写到线上」——台账据此决定 UNKNOWN 还是未开始。
+  /// 返回值区分「是否已进入网络写入」——台账据此决定 UNKNOWN 还是未开始。
   #[allow(dead_code)] // 取消路径走 `send_message_cancellable`
   pub async fn send_message(
     self,
@@ -231,7 +231,8 @@ impl AccountGateway {
   }
 
   /// 与 [`Self::send_message`] 相同，但写入阶段与等 ack 阶段都可被取消。
-  /// 取消**不会**让调用方拿到「没发出去」的结论：`wrote_frames` 才是依据。
+  /// 取消**不会**让调用方拿到「没发出去」的结论：`on_wire` 才是依据——
+  /// 首帧写入中被取消时帧计数是 0，但字节可能已经写出去了。
   pub async fn send_message_cancellable(
     self,
     text: &str,

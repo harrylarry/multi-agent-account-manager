@@ -1,7 +1,7 @@
 //! B4：原生发送安全层（Issue #13 / i005 #15）。
 //!
 //! 目标不是「能发出去」，而是**发不重、发不清不楚的时候不装明白**：
-//! - 每次发送先落一条 `SendAttempt`（PREPARED），再发请求；
+//! - 每次发送先落一条 `SendAttempt`（PREPARED），**落盘成功才允许发**；
 //! - 同一账号同一时刻只允许一条 IN_FLIGHT（单发锁），再次触发直接拒绝、不排队；
 //! - 请求发出后无论超时还是断线，一律记 `UNKNOWN`，**绝不自动重发**；
 //! - 只有拿到明确 ack 才记 CONFIRMED，明确失败才记 DEFINITIVELY_FAILED。
@@ -13,17 +13,25 @@
 //! 内存台账在进程死掉时全丢，重启后如果当成「什么都没发生」，用户看到的是
 //! 一条「没发过」的记录，而服务端可能已经收到了 —— 这正是最危险的方向。
 //!
-//! 所以每次状态变更都**同步**写一份日志（临时文件 + rename，崩溃时不会读到
-//! 半截文件）。重启时：
+//! 所以每次状态变更都**同步**写一份日志（临时文件 + fsync + rename，崩溃时
+//! 不会读到半截文件）。重启时：
 //! - `PREPARED` / `IN_FLIGHT` → 一律恢复成 `UNKNOWN`（结果不明，不重发）；
 //! - `CONFIRMED` / `DEFINITIVELY_FAILED` / `UNKNOWN` → 原样保留；
 //! - 锁状态**不恢复**：崩溃时的 in_flight 已经没有对应任务，保留会让账号
-//!   永久发不出去；
-//! - 日志本身损坏（不是崩溃能产生的形态）→ 拒绝发送（fail-closed），
-//!   不能假装「没有未完成的发送」。
+//!   永久发不出去。
+//!
+//! ## 日志本身不可用时一律 fail-closed
+//!
+//! - 读取：只有 `NotFound` 能当「首次创建」；权限、IO 错误、路径是目录、
+//!   空文件、解析失败、版本不认识 → 台账不可用，拒绝一切新发送；
+//! - 写入：新发送的 PREPARED 必须**先成功落盘**才返回发送权；落盘失败
+//!   回滚内存并拒绝发送。发送结果（CONFIRMED/FAILED/UNKNOWN）落盘失败时
+//!   保留内存结果（消息已经出去了，事实不能丢），但台账转入不可用态，
+//!   之后不再放行新发送。
 
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
+use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -70,13 +78,16 @@ pub struct SendAttempt {
 /// 之前 attempts / in_flight / missions 各一把锁，`mission()` 与 `begin()` 会
 /// 各自「先查后插」，两步之间可以插进对方的检查，导致检测任务与手动发送
 /// 同时通过互斥（真实竞态）。单一 Mutex 让「查 + 插」成为一次原子操作。
-#[derive(Default)]
+#[derive(Default, Clone)]
 struct LedgerState {
   attempts: Vec<SendAttempt>,
   /// 每个账号当前的 IN_FLIGHT send_id；有则拒绝新发送。
   in_flight: HashMap<String, String>,
   /// 每个账号当前进行中的检测任务 mission_id；有则拒绝任何新发送。
   missions: HashMap<String, String>,
+  /// 台账不可用的原因（日志读不了 / 写不进去 / 格式损坏）。
+  /// `Some` 时拒绝一切**新**发送；已有发送的结果仍可正常记账。
+  unusable: Option<String>,
 }
 
 /// 恢复结果，用于启动日志与诊断（不含任何正文）。
@@ -86,16 +97,16 @@ pub struct RecoveryReport {
   pub restored: usize,
   /// 其中被改判为 UNKNOWN 的条数（崩溃时还没定论）。
   pub marked_unknown: usize,
-  /// 日志损坏：台账进入 fail-closed，拒绝一切新发送。
+  /// 台账不可用（日志读不了 / 格式损坏 / 恢复结果写不回去），已进入 fail-closed。
   pub corrupt: bool,
+  /// 进入 fail-closed 的具体原因。
+  pub load_error: Option<String>,
 }
 
 pub struct SendLedger {
   state: Mutex<LedgerState>,
   /// 状态日志路径；None 表示纯内存（测试/桌面无持久化场景）。
   journal: Option<PathBuf>,
-  /// 日志损坏：宁可发不出去，也不能在不知道有没有未完成发送的情况下继续发。
-  poisoned: bool,
 }
 
 const JOURNAL_VERSION: u32 = 1;
@@ -171,7 +182,7 @@ pub fn digest_of(text: &str) -> String {
 pub enum SendError {
   /// 该账号已有发送在进行中（不排队）。
   Busy(String),
-  /// 台账自身不可用（日志损坏）。
+  /// 台账自身不可用（日志损坏 / 读写失败）。
   Unknown(String),
 }
 
@@ -182,17 +193,25 @@ impl SendLedger {
     Self {
       state: Mutex::new(LedgerState::default()),
       journal: None,
-      poisoned: false,
     }
   }
 
   /// 带状态日志的台账。启动时读回上一次运行的记录：
   /// 未定论的发送改判 UNKNOWN，锁不恢复。
   pub fn open(path: PathBuf) -> (Self, RecoveryReport) {
-    let (mut attempts, corrupt) = load_journal(&path);
-    let mut report = RecoveryReport {
-      restored: attempts.len(),
-      ..Default::default()
+    let mut report = RecoveryReport::default();
+    let (mut attempts, initial_unusable) = match load_journal(&path) {
+      JournalLoad::NotFound => (Vec::new(), None),
+      JournalLoad::Loaded(v) => {
+        report.restored = v.len();
+        (v, None)
+      }
+      JournalLoad::Unreadable(why) => {
+        report.corrupt = true;
+        report.load_error = Some(why.clone());
+        // 读不出来就不能假装「没有未定论的发送」：保留空表 + 不可用标记。
+        (Vec::new(), Some(why))
+      }
     };
     for a in attempts.iter_mut() {
       if matches!(a.status, SendStatus::Prepared | SendStatus::InFlight) {
@@ -203,49 +222,92 @@ impl SendLedger {
         report.marked_unknown += 1;
       }
     }
-    report.corrupt = corrupt;
     let ledger = Self {
       state: Mutex::new(LedgerState {
         attempts,
         // 锁与 mission 不恢复：它们的持有者已经随进程消失。
         in_flight: HashMap::new(),
         missions: HashMap::new(),
+        unusable: initial_unusable,
       }),
       journal: Some(path),
-      poisoned: corrupt,
     };
     // 恢复后的状态（含改判）立刻落盘，避免下次启动重复改判。
-    ledger.with_state(|_| ());
+    // 这一步写不进去同样要 fail-closed：下一次崩溃就无法识别未定论发送。
+    ledger.flush_recovery(&mut report);
     (ledger, report)
   }
 
-  /// 台账是否因日志损坏而拒绝发送。
+  fn flush_recovery(&self, report: &mut RecoveryReport) {
+    let mut st = self.state.lock().unwrap_or_else(|e| e.into_inner());
+    if st.unusable.is_some() {
+      return;
+    }
+    if let Some(path) = &self.journal {
+      if let Err(e) = persist_journal(path, &st) {
+        let reason = persist_failure(&e);
+        report.corrupt = true;
+        report.load_error = Some(reason.clone());
+        st.unusable = Some(reason);
+      }
+    }
+  }
+
+  /// 台账是否已进入 fail-closed（拒绝新发送）。
   #[cfg_attr(not(test), allow(dead_code))]
   pub fn is_poisoned(&self) -> bool {
-    self.poisoned
+    self
+      .state
+      .lock()
+      .unwrap_or_else(|e| e.into_inner())
+      .unusable
+      .is_some()
   }
 
-  /// 所有状态变更的唯一入口：持锁执行 + 落盘。
+  /// 申请发送权的唯一入口：持锁完成「查状态 + 查重 + 插入 + 落盘」。
   ///
-  /// 落盘放在临界区内，保证日志顺序与内存状态一致；写失败只打日志，
-  /// 不能让「日志写不下去」变成「消息发不出去」——那是另一种危险。
-  fn with_state<R>(&self, f: impl FnOnce(&mut LedgerState) -> R) -> R {
+  /// 落盘失败时回滚内存并拒绝发送——没有落成 PREPARED 的发送不允许开始，
+  /// 否则崩溃后没人知道它曾经存在过。任何一个环节都不能拆成两步。
+  fn commit<R>(
+    &self,
+    f: impl FnOnce(&mut LedgerState) -> Result<R, SendError>,
+  ) -> Result<R, SendError> {
     let mut st = self.state.lock().unwrap_or_else(|e| e.into_inner());
-    let out = f(&mut st);
-    if let Some(path) = &self.journal {
-      persist_journal(path, &st);
+    if let Some(reason) = st.unusable.clone() {
+      return Err(SendError::Unknown(reason));
     }
-    out
+    let before = st.clone();
+    let out = match f(&mut st) {
+      Ok(v) => v,
+      Err(e) => {
+        // 失败路径不应留下半截修改（例如已插入 mission 但返回 Busy）。
+        *st = before;
+        return Err(e);
+      }
+    };
+    if let Some(path) = &self.journal {
+      if let Err(e) = persist_journal(path, &st) {
+        // 回滚：这条发送根本没有「开始」的持久化凭据。
+        *st = before;
+        let reason = persist_failure(&e);
+        st.unusable = Some(reason.clone());
+        return Err(SendError::Unknown(reason));
+      }
+    }
+    Ok(out)
   }
 
-  fn check_poisoned(&self) -> Result<(), SendError> {
-    if self.poisoned {
-      return Err(SendError::Unknown(
-        "发送台账日志损坏：无法确认是否存在未完成的发送，已拒绝新发送（fail-closed）"
-          .to_string(),
-      ));
+  /// 发送结果类变更：消息已经发出去了，结果必须保留在内存里（不能因为
+  /// 写盘失败就说「没发过」）；但日志写不进去意味着崩溃后无法识别未定论
+  /// 发送，所以台账从此刻起不再放行新发送。
+  fn persist_locked(&self, st: &mut LedgerState) {
+    if st.unusable.is_some() {
+      return;
     }
-    Ok(())
+    let Some(path) = &self.journal else { return };
+    if let Err(e) = persist_journal(path, st) {
+      st.unusable = Some(persist_failure(&e));
+    }
   }
 
   /// 申请发送权并落 PREPARED。返回 send_id；已有 IN_FLIGHT 或检测任务时返回 Busy。
@@ -255,8 +317,7 @@ impl SendLedger {
     conversation_id: &str,
     text: &str,
   ) -> Result<String, SendError> {
-    self.check_poisoned()?;
-    self.with_state(|st| {
+    self.commit(|st| {
       // 单锁内「查 mission + 查 in_flight + 插入」，与 mission() 互斥。
       if let Some(mission) = st.missions.get(account_uuid) {
         return Err(SendError::Busy(mission.clone()));
@@ -275,8 +336,7 @@ impl SendLedger {
   /// 开启一次检测任务（mission）。mission 期间该账号拒绝所有手动发送；
   /// 返回的 guard 在 drop 时自动释放 mission，保证异常路径不锁死账号。
   pub fn mission(&self, account_uuid: &str) -> Result<MissionGuard<'_>, SendError> {
-    self.check_poisoned()?;
-    let mission_id = self.with_state(|st| {
+    let mission_id = self.commit(|st| {
       if let Some(existing) = st.missions.get(account_uuid) {
         return Err(SendError::Busy(existing.clone()));
       }
@@ -303,8 +363,7 @@ impl SendLedger {
     conversation_id: &str,
     text: &str,
   ) -> Result<String, SendError> {
-    self.check_poisoned()?;
-    self.with_state(|st| {
+    self.commit(|st| {
       let belongs = st
         .missions
         .get(account_uuid)
@@ -354,18 +413,18 @@ impl SendLedger {
   }
 
   fn finish_mission(&self, mission_id: &str) {
-    self.with_state(|st| {
-      st.missions.retain(|_, v| v != mission_id);
-    });
+    let mut st = self.state.lock().unwrap_or_else(|e| e.into_inner());
+    st.missions.retain(|_, v| v != mission_id);
+    self.persist_locked(&mut st);
   }
 
   fn update(&self, send_id: &str, status: SendStatus, error: Option<String>) {
-    self.with_state(|st| {
-      if let Some(a) = st.attempts.iter_mut().find(|a| a.send_id == send_id) {
-        a.status = status;
-        a.error = error;
-      }
-    });
+    let mut st = self.state.lock().unwrap_or_else(|e| e.into_inner());
+    if let Some(a) = st.attempts.iter_mut().find(|a| a.send_id == send_id) {
+      a.status = status;
+      a.error = error;
+    }
+    self.persist_locked(&mut st);
   }
 
   pub fn mark_in_flight(&self, send_id: &str) {
@@ -378,7 +437,7 @@ impl SendLedger {
     self.release(send_id);
   }
 
-  /// 明确失败（服务端拒绝）：释放锁并记 DEFINITIVELY_FAILED。
+  /// 明确失败（确认请求没进入网络写入）：释放锁并记 DEFINITIVELY_FAILED。
   pub fn fail(&self, send_id: &str, err: String) {
     self.update(send_id, SendStatus::DefinitivelyFailed, Some(err));
     self.release(send_id);
@@ -392,9 +451,9 @@ impl SendLedger {
   }
 
   fn release(&self, send_id: &str) {
-    self.with_state(|st| {
-      st.in_flight.retain(|_, v| v != send_id);
-    });
+    let mut st = self.state.lock().unwrap_or_else(|e| e.into_inner());
+    st.in_flight.retain(|_, v| v != send_id);
+    self.persist_locked(&mut st);
   }
 
   #[allow(dead_code)] // 供测试与后续台账 UI
@@ -431,32 +490,56 @@ impl SendLedger {
   }
 }
 
-/// 读取日志。返回 (条目, 是否损坏)。
+enum JournalLoad {
+  /// 文件不存在：首次创建，唯一允许当作「空台账」的情形。
+  NotFound,
+  Loaded(Vec<SendAttempt>),
+  /// 读不了 / 解不开 / 为空：一律 fail-closed。
+  Unreadable(String),
+}
+
+/// 读取日志。
 ///
-/// 空文件/不存在 → 正常空台账（首次启动、或崩溃恰好发生在第一次写入前）。
-/// 解不出来 → 损坏，调用方必须进入 fail-closed。
-fn load_journal(path: &Path) -> (Vec<SendAttempt>, bool) {
-  let Ok(bytes) = std::fs::read(path) else {
-    return (Vec::new(), false);
+/// **只有 `NotFound` 可以当首次创建**。权限不足、IO 错误、路径是目录、
+/// 空文件、解析失败、版本不认识——都不能当成空台账，否则会在「不知道
+/// 有没有未完成发送」的情况下继续发。
+fn load_journal(path: &Path) -> JournalLoad {
+  let bytes = match std::fs::read(path) {
+    Ok(b) => b,
+    Err(e) if e.kind() == std::io::ErrorKind::NotFound => return JournalLoad::NotFound,
+    Err(e) => return JournalLoad::Unreadable(format!("读取状态日志失败: {e}")),
   };
   if bytes.iter().all(|b| b.is_ascii_whitespace()) {
-    return (Vec::new(), false);
+    // 原子 rename 不可能产出空文件：这是被截断或被别的写入者覆盖的痕迹。
+    return JournalLoad::Unreadable(
+      "状态日志为空（可能被截断），无法确认是否存在未定论的发送".to_string(),
+    );
   }
   match serde_json::from_slice::<JournalFile>(&bytes) {
-    Ok(f) if f.version == JOURNAL_VERSION => (
-      f.attempts.into_iter().map(JournalEntry::into_attempt).collect(),
-      false,
+    Ok(f) if f.version == JOURNAL_VERSION => JournalLoad::Loaded(
+      f.attempts
+        .into_iter()
+        .map(JournalEntry::into_attempt)
+        .collect(),
     ),
-    // 版本不认识也按损坏处理：宁可停发，也不要误读别的格式。
-    Ok(_) => (Vec::new(), true),
-    Err(_) => (Vec::new(), true),
+    // 版本不认识也按不可用处理：宁可停发，也不要误读别的格式。
+    Ok(f) => JournalLoad::Unreadable(format!("状态日志版本不认识: {}", f.version)),
+    Err(e) => JournalLoad::Unreadable(format!("状态日志解析失败: {e}")),
   }
 }
 
-/// 原子写：先写临时文件再 rename，崩溃时不会留下半截 JSON。
-fn persist_journal(path: &Path, st: &LedgerState) {
+fn persist_failure(err: &str) -> String {
+  format!(
+    "发送台账无法写入状态日志（{err}）：崩溃后无法识别未定论的发送，已拒绝新发送（fail-closed）"
+  )
+}
+
+/// 原子写：临时文件 → fsync → rename →（尽力）fsync 目录。
+///
+/// 返回错误时调用方必须拒绝发送，不能只打日志。
+fn persist_journal(path: &Path, st: &LedgerState) -> Result<(), String> {
   if let Some(dir) = path.parent() {
-    let _ = std::fs::create_dir_all(dir);
+    std::fs::create_dir_all(dir).map_err(|e| format!("创建台账目录失败: {e}"))?;
   }
   let skip = st.attempts.len().saturating_sub(JOURNAL_MAX_ENTRIES);
   let file = JournalFile {
@@ -466,19 +549,32 @@ fn persist_journal(path: &Path, st: &LedgerState) {
       .map(JournalEntry::from_attempt)
       .collect(),
   };
-  let Ok(json) = serde_json::to_vec(&file) else {
-    eprintln!("[send-ledger] 序列化状态日志失败，跳过本次落盘");
-    return;
-  };
+  let json = serde_json::to_vec(&file).map_err(|e| format!("序列化状态日志失败: {e}"))?;
   let tmp = path.with_extension("json.tmp");
-  if let Err(e) = std::fs::write(&tmp, &json) {
-    eprintln!("[send-ledger] 写状态日志失败: {e}");
-    return;
+  let write_tmp = || -> std::io::Result<()> {
+    let mut f = std::fs::File::create(&tmp)?;
+    f.write_all(&json)?;
+    // 先刷内容再 rename：否则断电后可能「文件名已更新、内容还在页缓存」，
+    // 重开时读到空文件——那正是最危险的状态。
+    f.sync_all()
+  };
+  if let Err(e) = write_tmp() {
+    let _ = std::fs::remove_file(&tmp);
+    return Err(format!("写入临时状态日志失败: {e}"));
   }
   if let Err(e) = std::fs::rename(&tmp, path) {
-    eprintln!("[send-ledger] 替换状态日志失败: {e}");
     let _ = std::fs::remove_file(&tmp);
+    return Err(format!("替换状态日志失败: {e}"));
   }
+  // rename 本身也要落目录项（部分文件系统需要）。失败不影响本次正确性，
+  // 下次写入会再次同步。
+  #[cfg(unix)]
+  if let Some(dir) = path.parent() {
+    if let Ok(d) = std::fs::File::open(dir) {
+      let _ = d.sync_all();
+    }
+  }
+  Ok(())
 }
 
 /// 检测任务的 RAII 租约：`drop` 时释放该账号的 mission 独占。
@@ -519,6 +615,16 @@ mod tests {
     std::env::temp_dir()
       .join(format!("maam-ledger-{}-{tag}", uuid::Uuid::new_v4()))
       .join("send-ledger.json")
+  }
+
+  /// 把日志父目录换成一个同名普通文件：之后所有落盘都会失败（ENOTDIR）。
+  /// 这是在不依赖权限位（root 也照样能写）的前提下模拟磁盘故障。
+  fn break_parent_dir(path: &Path) -> PathBuf {
+    let dir = path.parent().unwrap().to_path_buf();
+    let moved = dir.with_extension("moved");
+    std::fs::rename(&dir, &moved).unwrap();
+    std::fs::write(&dir, b"blocked").unwrap();
+    moved
   }
 
   #[test]
@@ -698,6 +804,22 @@ mod tests {
     let _ = std::fs::remove_dir_all(path.parent().unwrap());
   }
 
+  /// 崩溃发生在 PREPARED 之后、mark_in_flight 之前：同样必须改判 UNKNOWN。
+  #[test]
+  fn prepared_only_crash_becomes_unknown() {
+    let path = tmp_journal("prepared-crash");
+    {
+      let (l, _) = SendLedger::open(path.clone());
+      let _id = l.begin("u1", "c1", "maybe sent").unwrap();
+      // 直接「崩掉」，连 in_flight 都没来得及标。
+    }
+    let (l, report) = SendLedger::open(path.clone());
+    assert_eq!(report.restored, 1);
+    assert_eq!(report.marked_unknown, 1);
+    assert_eq!(l.attempts()[0].status, SendStatus::Unknown);
+    let _ = std::fs::remove_dir_all(path.parent().unwrap());
+  }
+
   #[test]
   fn crash_recovery_keeps_decided_attempts() {
     let path = tmp_journal("keep");
@@ -726,21 +848,38 @@ mod tests {
     std::fs::write(&path, b"{not json").unwrap();
     let (l, report) = SendLedger::open(path.clone());
     assert!(report.corrupt);
+    assert!(report.load_error.is_some());
     assert!(l.is_poisoned());
     assert!(matches!(l.begin("u1", "c1", "x"), Err(SendError::Unknown(_))));
     assert!(matches!(l.mission("u1"), Err(SendError::Unknown(_))));
     let _ = std::fs::remove_dir_all(path.parent().unwrap());
   }
 
+  /// 空文件不是合法状态：原子 rename 不会产出它，只可能是被截断。
+  /// 必须 fail-closed，不能当作「首次启动」。
   #[test]
-  fn empty_journal_is_not_corruption() {
+  fn empty_journal_fails_closed() {
     let path = tmp_journal("empty");
     std::fs::create_dir_all(path.parent().unwrap()).unwrap();
     std::fs::write(&path, b"").unwrap();
     let (l, report) = SendLedger::open(path.clone());
-    assert!(!report.corrupt);
-    assert!(!l.is_poisoned());
-    assert!(l.begin("u1", "c1", "x").is_ok());
+    assert!(report.corrupt, "空日志不能当成空台账");
+    assert!(report.load_error.unwrap().contains("空"));
+    assert!(l.is_poisoned());
+    assert!(l.begin("u1", "c1", "x").is_err());
+    let _ = std::fs::remove_dir_all(path.parent().unwrap());
+  }
+
+  /// 读取失败（这里是 EISDIR）同样不能当首次创建。
+  #[test]
+  fn journal_read_error_fails_closed() {
+    let path = tmp_journal("read-error").with_file_name("as-dir");
+    std::fs::create_dir_all(&path).unwrap();
+    let (l, report) = SendLedger::open(path.clone());
+    assert!(report.corrupt);
+    assert!(report.load_error.is_some());
+    assert!(l.is_poisoned());
+    assert!(l.begin("u1", "c1", "x").is_err());
     let _ = std::fs::remove_dir_all(path.parent().unwrap());
   }
 
@@ -753,5 +892,61 @@ mod tests {
     assert!(path.exists());
     assert!(!path.with_extension("json.tmp").exists(), "临时文件必须被 rename 掉");
     let _ = std::fs::remove_dir_all(path.parent().unwrap());
+  }
+
+  /// BEGIN 返回之前，PREPARED 必须已经在磁盘上。
+  #[test]
+  fn prepared_is_persisted_before_begin_returns() {
+    let path = tmp_journal("prepared-first");
+    let (l, _) = SendLedger::open(path.clone());
+    let id = l.begin("u1", "c1", "hello").unwrap();
+    let raw = std::fs::read_to_string(&path).unwrap();
+    let f: JournalFile = serde_json::from_str(&raw).expect("日志必须是完整 JSON");
+    assert_eq!(f.attempts.len(), 1);
+    assert_eq!(f.attempts[0].send_id, id);
+    assert_eq!(f.attempts[0].status, SendStatus::Prepared);
+    let _ = std::fs::remove_dir_all(path.parent().unwrap());
+  }
+
+  /// 磁盘写不了：拒绝发送，不能只打日志然后照发。
+  #[test]
+  fn begin_refused_when_journal_cannot_be_written() {
+    let path = tmp_journal("write-fail");
+    let (l, report) = SendLedger::open(path.clone());
+    assert!(!report.corrupt, "首次打开不应失败");
+    let moved = break_parent_dir(&path);
+
+    let err = l.begin("u1", "c1", "hello").unwrap_err();
+    assert!(matches!(err, SendError::Unknown(_)), "写不了日志必须拒绝发送");
+    assert!(l.busy_account("u1").is_none(), "失败必须回滚，不能留下锁");
+    assert!(l.attempts().is_empty(), "不能留下 PREPARED 幽灵记录");
+    assert!(l.is_poisoned());
+    // 后续发送同样被拒（不会因为上一次失败就恢复）。
+    assert!(l.begin("u1", "c1", "again").is_err());
+
+    let _ = std::fs::remove_file(path.parent().unwrap());
+    let _ = std::fs::remove_dir_all(&moved);
+  }
+
+  /// 发送已完成后写盘失败：结果保留（事实不能丢）、锁释放、但不再放行新发送。
+  #[test]
+  fn persist_failure_after_send_keeps_result_and_poisons() {
+    let path = tmp_journal("post-fail");
+    let (l, _) = SendLedger::open(path.clone());
+    let id = l.begin("u1", "c1", "hello").unwrap();
+    let moved = break_parent_dir(&path);
+
+    l.confirm(&id);
+    assert_eq!(
+      l.attempts()[0].status,
+      SendStatus::Confirmed,
+      "消息已确认，不能因为写盘失败就丢掉结果"
+    );
+    assert!(l.busy_account("u1").is_none(), "锁必须在内存里释放");
+    assert!(l.is_poisoned(), "日志不可写后必须拒绝新发送");
+    assert!(l.begin("u1", "c1", "next").is_err());
+
+    let _ = std::fs::remove_file(path.parent().unwrap());
+    let _ = std::fs::remove_dir_all(&moved);
   }
 }

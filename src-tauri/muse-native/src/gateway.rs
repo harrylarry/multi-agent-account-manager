@@ -407,25 +407,29 @@ where
     self.subscribe_tracked(req, None).await.result
   }
 
-  /// 与 [`Self::subscribe`] 相同，但报告**已经写到线上的帧数**。
+  /// 与 [`Self::subscribe`] 相同，但报告**是否已经进入网络写阶段**。
   ///
-  /// 一条请求会被 Noise 切成多帧（`encrypt_request`）。`ws.send` 的 `Err`
-  /// 只说明「这一帧没写成功」，前面那些帧可能已经在 TCP 缓冲区里、甚至
-  /// 已被对端读到。因此调用方**不能**把 `Err` 等同于「请求没发出去」，
-  /// 只能看 `wrote_frames`：0 才是确定没开始，>0 一律是结果不明。
+  /// 一条请求会被 Noise 切成多帧（`encrypt_request`）。调用方**不能**把
+  /// `Err` 等同于「请求没发出去」：`ws.send` 的 `Err` 可能发生在写了一半
+  /// 之后，前几帧甚至同一帧的前半段已经在 TCP 缓冲区里。
   ///
-  /// `cancel`：写入过程中允许被中断（每帧之间检查一次）。被中断时同样
-  /// 按 `wrote_frames` 判断——已经写出的帧无法撤回。
+  /// 更关键的是：`wrote_frames == 0` 也**不**代表没写过。首帧的
+  /// `send_frame` 被 `select!` 取消时 Future 被直接丢弃，计数仍是 0，
+  /// 但底层很可能已经写出了字节。所以判定必须看独立的 `entered_write`
+  /// 状态：它在我们**开始调用底层写操作之前**就置位。
+  ///
+  /// `cancel`：写入过程中允许被中断（每帧之间检查一次，写入中也可打断）。
   pub async fn subscribe_tracked(
     mut self,
     req: HttpRequest,
-    mut cancel: Option<&mut watch::Receiver<bool>>,
+    cancel: Option<&mut watch::Receiver<bool>>,
   ) -> SubscribeAttempt<S> {
     let (stream_id, frames) = match self.transport.encrypt_request(&req) {
       Ok(v) => v,
       // 加密/序列化阶段失败：一个字节都没写出去。
       Err(e) => {
         return SubscribeAttempt {
+          entered_write: false,
           wrote_frames: 0,
           result: Err(e.into()),
         }
@@ -433,15 +437,16 @@ where
     };
     let mut sink = WsSink { ws: &mut self.ws };
     let wrote = write_frames(&mut sink, frames, cancel).await;
-    let wrote_frames = wrote.wrote;
     if let Some(err) = wrote.error {
       return SubscribeAttempt {
-        wrote_frames,
+        entered_write: wrote.entered_write,
+        wrote_frames: wrote.wrote,
         result: Err(err),
       };
     }
     SubscribeAttempt {
-      wrote_frames,
+      entered_write: wrote.entered_write,
+      wrote_frames: wrote.wrote,
       result: Ok(Subscription {
         ws: self.ws,
         transport: self.transport,
@@ -454,8 +459,12 @@ where
   }
 }
 
-/// 一次订阅尝试的结果，`wrote_frames` 是**已经写进 WS 的帧数**。
+/// 一次订阅尝试的结果。
+///
+/// `entered_write` 是**权威判定**：一旦为 true，底层写操作已被调用过，
+/// 无法证明没有字节离开本机；`wrote_frames` 只是完整写完的帧数，仅作诊断。
 pub struct SubscribeAttempt<S> {
+  pub entered_write: bool,
   pub wrote_frames: usize,
   pub result: Result<Subscription<S>, GatewayError>,
 }
@@ -463,7 +472,7 @@ pub struct SubscribeAttempt<S> {
 impl<S> SubscribeAttempt<S> {
   /// 请求是否可能已经到达服务端。`true` 时任何失败都只能记 UNKNOWN。
   pub fn possibly_on_wire(&self) -> bool {
-    self.wrote_frames > 0
+    self.entered_write
   }
 }
 
@@ -676,29 +685,42 @@ where
 }
 
 struct WriteOutcome {
+  /// 是否已经调用过底层写操作（`send_frame` 至少被轮询一次）。
+  ///
+  /// 这是 on_wire 的**唯一依据**：一旦进入写操作，即使一帧都没写完、
+  /// 甚至第一次写就返回 Err，也无法排除「半帧已经出去了」。
+  entered_write: bool,
+  /// 完整写完的帧数。只作诊断，**不能**用来判「没发出去」。
   wrote: usize,
   error: Option<GatewayError>,
 }
 
 /// 把请求切成帧逐条写出，并在每帧之间检查取消。
 ///
-/// 返回的 `wrote` 是**已经成功写进 WS 的帧数**，即使随后出错也不会回退：
-/// 已经写出的字节无法撤回。
+/// `entered_write` 在**调用 `send_frame` 之前**置位——被 `select!` 取消时
+/// `send_frame` 的 Future 会被直接丢弃，`wrote` 不会增加，但底层可能已经
+/// 写出了字节。所以「有没有开始写」和「写完了几个完整帧」必须分开记。
 async fn write_frames<K: FrameSink>(
   sink: &mut K,
   frames: Vec<Vec<u8>>,
   mut cancel: Option<&mut watch::Receiver<bool>>,
 ) -> WriteOutcome {
   let mut wrote = 0usize;
+  let mut entered_write = false;
   for frame in frames {
+    // 进写入前的检查：只有这里命中才能确定「一个字节都没写」。
     if let Some(rx) = cancel.as_deref_mut() {
       if *rx.borrow_and_update() {
         return WriteOutcome {
+          entered_write,
           wrote,
           error: Some(GatewayError::Cancelled),
         };
       }
     }
+    // 关键：置位发生在 poll 之前。之后无论成功、失败还是被取消，
+    // 都不能再断言「请求没有开始写」。
+    entered_write = true;
     let sent = match cancel.as_deref_mut() {
       Some(rx) => tokio::select! {
         r = sink.send_frame(frame) => Some(r),
@@ -709,12 +731,14 @@ async fn write_frames<K: FrameSink>(
     match sent {
       None => {
         return WriteOutcome {
+          entered_write,
           wrote,
           error: Some(GatewayError::Cancelled),
         }
       }
       Some(Err(e)) => {
         return WriteOutcome {
+          entered_write,
           wrote,
           error: Some(e),
         }
@@ -722,7 +746,11 @@ async fn write_frames<K: FrameSink>(
       Some(Ok(())) => wrote += 1,
     }
   }
-  WriteOutcome { wrote, error: None }
+  WriteOutcome {
+    entered_write,
+    wrote,
+    error: None,
+  }
 }
 
 #[cfg(test)]
@@ -873,17 +901,42 @@ mod tests {
 
   // ---- 写入阶段的 on_wire 判定（不依赖真实 WSS）----------------------
 
+  /// 假 sink：模拟四种底层写行为。
+  /// - `fail_at(n)`：第 n 帧直接返回 Err（可能已经写了半帧）；
+  /// - `partial_fail_at(n)`：第 n 帧先「写出半帧」再返回 Err——真实 socket
+  ///   的部分写就是这个形态，帧计数不会增加，但字节已经在线上；
+  /// - `stall_at(n)`：第 n 帧永久挂起（用于在写入中被取消）。
   struct MockSink {
     fail_at: Option<usize>,
+    partial_fail_at: Option<usize>,
     stall_at: Option<usize>,
     seen: usize,
+    /// 已经「写进 socket」但没构成完整帧的字节数。
+    partial_bytes: usize,
+  }
+
+  impl MockSink {
+    fn new() -> Self {
+      Self {
+        fail_at: None,
+        partial_fail_at: None,
+        stall_at: None,
+        seen: 0,
+        partial_bytes: 0,
+      }
+    }
   }
 
   impl FrameSink for MockSink {
-    async fn send_frame(&mut self, _frame: Vec<u8>) -> Result<(), GatewayError> {
+    async fn send_frame(&mut self, frame: Vec<u8>) -> Result<(), GatewayError> {
       self.seen += 1;
       if Some(self.seen) == self.stall_at {
         std::future::pending::<()>().await;
+      }
+      if Some(self.seen) == self.partial_fail_at {
+        // 半帧已经交给 socket，然后连接断掉。
+        self.partial_bytes += frame.len() / 2 + 1;
+        return Err(GatewayError::Ws("connection reset mid-frame".to_string()));
       }
       if Some(self.seen) == self.fail_at {
         return Err(GatewayError::Ws("write failed".to_string()));
@@ -898,8 +951,9 @@ mod tests {
 
   #[tokio::test]
   async fn write_frames_all_ok() {
-    let mut sink = MockSink { fail_at: None, stall_at: None, seen: 0 };
+    let mut sink = MockSink::new();
     let out = write_frames(&mut sink, frames(3), None).await;
+    assert!(out.entered_write);
     assert_eq!(out.wrote, 3);
     assert!(out.error.is_none());
   }
@@ -907,22 +961,76 @@ mod tests {
   /// 关键回归：第 2 帧写失败时，第 1 帧已经在线上 → 不能报告「没发出去」。
   #[tokio::test]
   async fn write_frames_failure_after_partial_write_keeps_count() {
-    let mut sink = MockSink { fail_at: Some(2), stall_at: None, seen: 0 };
+    let mut sink = MockSink {
+      fail_at: Some(2),
+      ..MockSink::new()
+    };
     let out = write_frames(&mut sink, frames(3), None).await;
+    assert!(out.entered_write);
     assert_eq!(out.wrote, 1, "第 1 帧已经写出去，必须计入");
     assert!(matches!(out.error, Some(GatewayError::Ws(_))));
   }
 
+  /// 首帧就返回 Err：帧计数是 0，但底层写已经被调用过——不能当「没开始」。
   #[tokio::test]
-  async fn write_frames_failure_on_first_frame_writes_nothing() {
-    let mut sink = MockSink { fail_at: Some(1), stall_at: None, seen: 0 };
+  async fn write_frames_first_frame_error_is_indeterminate() {
+    let mut sink = MockSink {
+      fail_at: Some(1),
+      ..MockSink::new()
+    };
     let out = write_frames(&mut sink, frames(2), None).await;
-    assert_eq!(out.wrote, 0, "首帧失败才是真正的「没开始」");
+    assert_eq!(out.wrote, 0);
+    assert!(
+      out.entered_write,
+      "send_frame 已被轮询，可能已写出字节，必须视为已进入网络写入"
+    );
+    assert!(matches!(out.error, Some(GatewayError::Ws(_))));
+  }
+
+  /// 首帧写了一半后失败：这是本轮复审点名的场景。
+  #[tokio::test]
+  async fn write_frames_first_frame_partial_write_then_error_is_indeterminate() {
+    let mut sink = MockSink {
+      partial_fail_at: Some(1),
+      ..MockSink::new()
+    };
+    let out = write_frames(&mut sink, frames(2), None).await;
+    assert!(sink.partial_bytes > 0, "模拟必须真的写了半帧");
+    assert_eq!(out.wrote, 0);
+    assert!(
+      out.entered_write,
+      "半帧已在线上：绝不能记 DEFINITIVELY_FAILED"
+    );
+  }
+
+  /// 首帧写入中被取消：Future 被丢弃，计数为 0，但字节可能已经写出去了。
+  #[tokio::test]
+  async fn write_frames_cancel_during_first_frame_write_is_indeterminate() {
+    let mut sink = MockSink {
+      stall_at: Some(1),
+      ..MockSink::new()
+    };
+    let (tx, rx) = watch::channel(false);
+    let mut rx = rx;
+    tokio::spawn(async move {
+      tokio::time::sleep(Duration::from_millis(10)).await;
+      let _ = tx.send(true);
+    });
+    let out = write_frames(&mut sink, frames(1), Some(&mut rx)).await;
+    assert_eq!(out.wrote, 0);
+    assert!(
+      out.entered_write,
+      "取消发生在首帧写入中，不能当成「没开始」"
+    );
+    assert!(matches!(out.error, Some(GatewayError::Cancelled)));
   }
 
   #[tokio::test]
   async fn write_frames_cancel_mid_write_keeps_written_count() {
-    let mut sink = MockSink { fail_at: None, stall_at: Some(2), seen: 0 };
+    let mut sink = MockSink {
+      stall_at: Some(2),
+      ..MockSink::new()
+    };
     let (tx, rx) = watch::channel(false);
     let mut rx = rx;
     tokio::spawn(async move {
@@ -930,18 +1038,32 @@ mod tests {
       let _ = tx.send(true);
     });
     let out = write_frames(&mut sink, frames(3), Some(&mut rx)).await;
+    assert!(out.entered_write);
     assert_eq!(out.wrote, 1);
     assert!(matches!(out.error, Some(GatewayError::Cancelled)));
   }
 
+  /// 唯一能确定「没开始」的取消：进写入之前就已经被取消。
   #[tokio::test]
-  async fn write_frames_cancel_before_start_writes_nothing() {
-    let mut sink = MockSink { fail_at: None, stall_at: None, seen: 0 };
+  async fn write_frames_cancel_before_start_is_not_entered() {
+    let mut sink = MockSink::new();
     let (tx, rx) = watch::channel(true);
     let mut rx = rx;
     drop(tx);
     let out = write_frames(&mut sink, frames(2), Some(&mut rx)).await;
+    assert!(!out.entered_write);
     assert_eq!(out.wrote, 0);
     assert!(matches!(out.error, Some(GatewayError::Cancelled)));
+  }
+
+  /// 空请求（无帧）不会碰网络。
+  #[tokio::test]
+  async fn write_frames_empty_request_never_enters_write() {
+    let mut sink = MockSink::new();
+    let out = write_frames(&mut sink, frames(0), None).await;
+    assert!(!out.entered_write);
+    assert_eq!(out.wrote, 0);
+    assert!(out.error.is_none());
+    assert_eq!(sink.seen, 0);
   }
 }

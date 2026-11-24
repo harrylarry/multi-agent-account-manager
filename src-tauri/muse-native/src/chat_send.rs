@@ -14,8 +14,10 @@
 //!
 //! 1. **`Err` 不等于「没发出去」。** 一条请求会被 Noise 切成多帧，`subscribe`
 //!    的写入循环可能在写到第 2 帧时失败，此时第 1 帧已经在 TCP 缓冲区里，
-//!    对端可能已经收到。所以结果里必须带 `wrote_frames`，只有 0 帧才能说
-//!    「这次发送没有开始」；其余一律 UNKNOWN，绝不自动重发。
+//!    对端可能已经收到。更极端的是首帧写一半被取消：帧计数为 0，字节却
+//!    已经出去了。所以结果里带的是独立的 `entered_write`（进入底层写操作
+//!    之前置位），只有它为 false 才能说「这次发送没有开始」；其余一律
+//!    UNKNOWN，绝不自动重发。
 //! 2. **任何非 event JSON 都不算 ack。** 服务端的错误体也是 JSON 对象，
 //!    直接当成功会把「被拒」记成「已送达」。ack 必须通过
 //!    [`validate_ack`]：2xx 状态、无 error 体、有非空 `message_id`。
@@ -248,18 +250,21 @@ pub async fn read_ack<L: LineSource>(
   }
 }
 
-/// 一次发送的结果，**区分「请求有没有真正写到线上」**。
+/// 一次发送的结果，**区分「请求有没有真正开始网络写入」**。
 ///
 /// 这决定台账怎么记账，不能混：
-/// - `on_wire == false`：一帧都没写出去（加密/序列化/首帧前失败），
-///   账号侧可以据此判断「这次发送没有开始」；
-/// - `on_wire == true`：至少一帧已经写进 WS，之后的任何失败（断流、超时、
-///   ack 丢失、写第 2 帧失败）都意味着**上游可能已经收到**，只能记
-///   UNKNOWN，绝不重发。
+/// - `on_wire == false`：确定没进入底层写操作（加密/序列化失败、首帧之前
+///   就被取消），账号侧可以据此判断「这次发送没有开始」；
+/// - `on_wire == true`：底层写已被调用过——哪怕一帧都没写完，甚至首帧
+///   写了一半就断——之后的任何失败（断流、超时、ack 丢失、写入中取消）
+///   都意味着**上游可能已经收到**，只能记 UNKNOWN，绝不重发。
+///
+/// 注意：`wrote_frames == 0` 并不等于 `on_wire == false`。首帧写到一半被
+/// 取消或失败时，帧计数仍是 0，但字节可能已经在线上。判定只能看 `on_wire`。
 #[derive(Debug)]
 pub struct SendAttemptResult {
   pub on_wire: bool,
-  /// 已经写进 WS 的帧数（0 表示确定没开始）。
+  /// 完整写出的帧数，仅作诊断。
   pub wrote_frames: usize,
   pub outcome: Result<Ack, GatewayError>,
 }
@@ -311,12 +316,14 @@ where
     .subscribe_tracked(req, cancel.as_deref_mut())
     .await;
   let wrote_frames = attempt.wrote_frames;
+  // 只有「还没开始调用底层写操作」才能说这次发送没有开始；
+  // 首帧写一半失败/被取消时 wrote_frames 仍是 0，但 on_wire 必须为 true。
+  let on_wire = attempt.entered_write;
   let mut sub = match attempt.result {
     Ok(s) => s,
-    // `wrote_frames == 0` 才是「这次发送没有开始」；写过帧的一律结果不明。
     Err(e) => {
       return SendAttemptResult {
-        on_wire: wrote_frames > 0,
+        on_wire,
         wrote_frames,
         outcome: Err(e),
       }
