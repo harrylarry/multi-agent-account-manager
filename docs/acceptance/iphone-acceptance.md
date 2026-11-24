@@ -10,6 +10,14 @@
 
 ## Muse 指纹与发送
 
+### 实时增量专项复测
+
+使用 [0.1.26 Spike 构建 `8f50c91`](https://github.com/harrylarry/multi-agent-account-manager/actions/runs/45417370699/artifacts/14932589152)。解压后未签名 IPA 的 SHA-256 为 `bcf5aa552c37c31fef7feed864ed5f08a9127917d18a6437081e51d7c31e66e8`。两个验收包显示同一版本号，以下载链接和校验值区分。[Quick checks](https://github.com/harrylarry/multi-agent-account-manager/actions/runs/45407570093)
+
+在前台运行「指纹探针 3 条」，回传每条的 ACK、文本增量数和结束原因。`文本增量 > 0` 表示采集器收到增量，`done` 表示从流判定结束。`history_completed` 表示由历史恢复确认。此包在结束后汇总增量计数，无法用汇总数核对首个增量的到达时间。
+
+### 通用验收
+
 1. 记下测试账号原会话的当前状态。返回管理页，在该账号的原生诊断区运行指纹探针。
 2. 核对探针均出现在新建会话，原会话没有新增探针。验证每条完整回复结束后才发下一条。
 3. 记录网络写入、发送确认、回复完成、有效样本和实际 lmfpd 评分。通过条件是 **3 个 ACK、3 条完整回复、3 个有效样本和实际评分**。
