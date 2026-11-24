@@ -69,7 +69,7 @@ impl Secrets {
 mod imp {
   use super::SERVICE;
   use security_framework::passwords::{
-    delete_generic_password, generic_password, set_generic_password,
+    delete_generic_password, generic_password, set_generic_password, PasswordOptions,
   };
 
   /// `errSecItemNotFound`（Security.framework）。
@@ -81,7 +81,11 @@ mod imp {
   }
 
   pub fn get(account: &str) -> Result<Option<String>, String> {
-    match generic_password(SERVICE, account) {
+    // security-framework 3.x 的 `generic_password` 只接受 `PasswordOptions`：
+    // 早期 2.x 的 `(service, account)` 两参写法已不存在，会在 macOS/iOS
+    // 编译时报 E0061（Linux 桌面走另一个 cfg 分支，本地看不出来）。
+    let options = PasswordOptions::new_generic_password(SERVICE, account);
+    match generic_password(options) {
       Ok(bytes) => String::from_utf8(bytes)
         .map(Some)
         .map_err(|_| "Keychain 返回值不是合法 UTF-8".to_string()),
