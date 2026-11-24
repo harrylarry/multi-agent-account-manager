@@ -167,7 +167,9 @@ enum AccountProxyApplier {
     guard let port = NWEndpoint.Port(rawValue: cfg.port) else { return .unsupported }
     let endpoint = NWEndpoint.hostPort(host: NWEndpoint.Host(cfg.host), port: port)
 
-    let proxy: ProxyConfiguration
+    // `ProxyConfiguration` 是 struct：设置 `allowFailover`、调用
+    // `applyCredential` 都是 mutating，必须用 `var`，否则 Swift 直接编译失败。
+    var proxy: ProxyConfiguration
     if cfg.isSocks {
       // Network.framework 的 SOCKS 初始化器叫 `socksv5Proxy`（不是 socksProxy）。
       // SOCKS5 的域名地址类型本身就是远端解析，socks5h 不需要单独映射。
@@ -280,7 +282,7 @@ enum AccountProxyQuarantine {
     guard let port = NWEndpoint.Port(rawValue: deadPort) else { return false }
     let store = WKWebsiteDataStore(forIdentifier: identifier)
     let endpoint = NWEndpoint.hostPort(host: .ipv4(.loopback), port: port)
-    let proxy = ProxyConfiguration(httpCONNECTProxy: endpoint, tlsOptions: nil)
+    var proxy = ProxyConfiguration(httpCONNECTProxy: endpoint, tlsOptions: nil)
     // 不可达时**不得**回退直连——这是隔离的全部意义。
     proxy.allowFailover = false
     store.proxyConfigurations = [proxy]
