@@ -1,10 +1,19 @@
-# 叠号 iOS 完整更新日志（0.1.5 → 0.1.22）
+# 叠号 iOS 完整更新日志（0.1.5 → 0.1.23）
 
 本 fork 基于上游 v0.1.5 + iOS 移植与优化。版本号 0.1.6–0.1.22 是 fork 自有版本，不包含上游 v0.1.6 的功能（每账号无认证 HTTP CONNECT 代理、一键复制 Cookie，仅 macOS/Windows/Android）。
 
 未签名 IPA（iOS 17.0+），需自行签名后侧载安装（LC sign / AltStore / Sideloadly 等）。
 
 ---
+
+## 0.1.23（2026-11-24）
+
+- **修复 iOS 管理页按钮无响应（0.1.22 真机实测）**：`window.confirm` 在 WKWebView 上恒为 false（wry 的 `WKUIDelegate` 未实现 `runJavaScriptConfirmPanel`），指纹探针 / 代理探针 / 保存代理 / 清除代理四个按钮都在确认处直接返回，既不更新界面也不调用 IPC。改用应用内异步确认框（复用现有 Modal），确认语义不变，没有为了「让按钮响应」跳过确认。
+- **修复内嵌 quota hook 从未安装**：`Scripts.swift` 的 fetch Hook 在手工改动中丢失 `const origFetch = window.fetch` 与对应 `if` 分支，括号不平衡导致整段脚本在解析阶段抛 `SyntaxError`。改为以 Kotlin 为唯一源重新生成，iOS/Android 逐字节一致。
+- **内嵌 JS 纳入 CI**：新增提取/校验脚本与 12 条运行时测试（注入、正常 fetch、不递归、重复注入、额度采集、identity probe）；`node --check` 同时覆盖 `TaskWatcher.taskStateScript`，打包前也会先跑。
+- **操作反馈**：账号缺失、运行中、用户取消、IPC 失败都有可见提示；诊断区新增脱敏的「前端阶段」记录（点击 → 确认框返回 → 调用后端 → 返回/失败）。
+- **代理保存结果分三层**：Rust 配置 / Keychain 凭据 / WebView 下发分别显示；账号代理视图按 uuid 缓存，切换账号会重新读取。
+- 版本 0.1.23；0.1.22 已真机通过的握手、订阅、审批、额度、发送路径未改动。
 
 ## 0.1.22（2026-11-23）
 
