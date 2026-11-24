@@ -174,6 +174,7 @@ let spikeFingerprintError: string | null = null;
 interface SpikeProxyProbe {
   ok: boolean; phase: string; tunnelVia: string | null; proxyScheme: string | null;
   handshakeCompleted: boolean; pingStatus: number | null; failClosed: boolean;
+  connectivityStatus: number | null;
   error: string | null;
 }
 let spikeProxy: SpikeProxyProbe | null = null;
@@ -1087,7 +1088,9 @@ function spikeDiagInnerHtml(): string {
     proxyHtml = `
       <div class="spike-diag-result ${p.ok ? "ok" : "fail"}">
         <div>${p.ok ? "✓" : "■"} 代理探针：阶段 ${escapeHtml(p.phase)}　协议 ${escapeHtml(p.proxyScheme ?? "—")}　隧道 ${escapeHtml(p.tunnelVia ?? "—")}</div>
-        <div>WS 握手 ${p.handshakeCompleted ? "完成" : "未完成"}　ping ${p.pingStatus ?? "—"}　fail-closed ${p.failClosed ? "开启" : "关闭"}</div>
+        ${p.phase === "connectivity"
+          ? `<div>代理 HTTPS 响应 ${p.connectivityStatus ?? "—"}　fail-closed ${p.failClosed ? "开启" : "关闭"}</div>`
+          : `<div>WS 握手 ${p.handshakeCompleted ? "完成" : "未完成"}　ping ${p.pingStatus ?? "—"}　fail-closed ${p.failClosed ? "开启" : "关闭"}</div>`}
         ${p.error ? `<div>错误：${escapeHtml(p.error)}</div>` : ""}
       </div>`;
   } else if (spikeProxyError) {
@@ -1157,6 +1160,7 @@ function spikeDiagInnerHtml(): string {
       <button id="spike-lease-btn" class="mini-btn" type="button" ${spikeLeaseRunning ? "disabled" : ""}>${spikeLeaseRunning ? "观测中…" : "租约探针"}</button>
       <button id="spike-fingerprint-btn" class="mini-btn" type="button" ${spikeFingerprintRunning ? "disabled" : ""}>${spikeFingerprintRunning ? "检测中…" : "指纹探针 3 条"}</button>
       <button id="spike-proxy-btn" class="mini-btn" type="button" ${spikeProxyRunning ? "disabled" : ""}>${spikeProxyRunning ? "验证中…" : "代理探针（用已保存配置）"}</button>
+      <button id="spike-proxy-connectivity-btn" class="mini-btn" type="button" ${spikeProxyRunning ? "disabled" : ""}>检测代理连通性</button>
       <button id="spike-stop-btn" class="mini-btn" type="button">停止</button>
       <button id="spike-copy-btn" class="mini-btn" type="button">复制结果</button>
     </div>
@@ -1488,16 +1492,13 @@ function redactProxyUri(uri: string): string {
   const authority = rest.split("/")[0] ?? "";
   const at = authority.lastIndexOf("@");
   if (at < 0) return `${scheme}${authority}`;
-  const userinfo = authority.slice(0, at);
-  const host = authority.slice(at + 1);
-  const user = userinfo.split(":")[0] ?? "";
-  return `${scheme}${user ? `${user}@` : ""}${host}`;
+  return `${scheme}${authority.slice(at + 1)}`;
 }
 
 // #11/#16 代理探针：用**该账号已保存的代理**（ProxySetting + Keychain）验证
 // 控制面 + WSS 隧道，与真实发送同源；前端不再把 URI/口令送进后端。
 // 失败 fail-closed，不回退直连。
-async function runSpikeProxy(): Promise<void> {
+async function runSpikeProxy(connectivityOnly = false): Promise<void> {
   if (!snapshot) return;
   if (spikeProxyRunning) {
     spikeNotice = "代理探针正在运行，请等待结果或点「停止」。";
@@ -1525,10 +1526,10 @@ async function runSpikeProxy(): Promise<void> {
   }
   spikeTrace("代理探针", "已点击", `账号 ${acc.alias}，代理 ${view.display}`);
   const confirmed = await askConfirm({
-    title: "运行代理探针",
+    title: connectivityOnly ? "检测代理连通性" : "运行代理探针",
     desc:
       `将对测试账号「${acc.alias}」用已保存的代理 ${view.display} 跑一次隧道验证` +
-      "（控制面 + WSS + ping）。\n" +
+      (connectivityOnly ? "（向 muse.ai 发起匿名 HTTPS 请求）。\n" : "（控制面 + WSS + ping）。\n") +
       "请确认这是你自己的测试代理、该账号是非主力测试账号。",
     confirmLabel: "开始验证",
   });
@@ -1547,6 +1548,7 @@ async function runSpikeProxy(): Promise<void> {
       invoke<SpikeProxyProbe>("muse_native_proxy_probe", {
         providerId: "muse",
         uuid: acc.uuid,
+        connectivityOnly,
       }),
       new Promise<SpikeProxyProbe>((_, reject) =>
         setTimeout(() => reject(new Error("代理探针超时（90 秒）")), 90_000)
@@ -2839,11 +2841,11 @@ function bindDelegatedEvents(): void {
       await runSpikeFingerprint();
       return;
     }
-    const proxyBtn = target.closest<HTMLElement>("#spike-proxy-btn");
+    const proxyBtn = target.closest<HTMLElement>("#spike-proxy-btn, #spike-proxy-connectivity-btn");
     if (proxyBtn) {
       const input = document.querySelector<HTMLInputElement>("#spike-proxy-uri");
       spikeProxyUri = input?.value ?? spikeProxyUri;
-      await runSpikeProxy();
+      await runSpikeProxy(proxyBtn.id === "spike-proxy-connectivity-btn");
       return;
     }
     const proxySaveBtn = target.closest<HTMLElement>("#spike-proxy-save-btn");

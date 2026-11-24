@@ -1471,6 +1471,7 @@ pub struct ProxyProbe {
   pub proxy_scheme: Option<String>,
   pub handshake_completed: bool,
   pub ping_status: Option<u16>,
+  pub connectivity_status: Option<u16>,
   pub fail_closed: bool,
   pub error: Option<String>,
 }
@@ -1484,6 +1485,7 @@ impl ProxyProbe {
       proxy_scheme: scheme,
       handshake_completed: false,
       ping_status: None,
+      connectivity_status: None,
       fail_closed: true,
       error: Some(error.into()),
     }
@@ -1505,6 +1507,7 @@ pub async fn proxy_probe(
   setting: Option<&ProxySetting>,
   secrets: &Secrets,
   cancel: &ProbeCancel,
+  connectivity_only: bool,
 ) -> ProxyProbe {
   let (mut cancel_token, _cancel_guard) = cancel.register(uuid, "proxy");
 
@@ -1526,6 +1529,34 @@ pub async fn proxy_probe(
     crate::egress::EgressKind::Proxy(cfg) => Some(cfg.scheme_name().to_string()),
     crate::egress::EgressKind::Direct => None,
   };
+
+  if connectivity_only {
+    // 固定目标、不带 Cookie、不跟随跳转，也不获取 VM 租约。
+    let result = match egress.http_client(Duration::from_secs(15), false) {
+      Ok(client) => tokio::select! {
+        r = client.head("https://muse.ai/").send() => {
+          r.map(|response| response.status().as_u16())
+            .map_err(|e| crate::egress::safe_http_error("代理 HTTPS", &e))
+        },
+        _ = cancel_token.cancelled() => Err("用户取消".to_string()),
+      },
+      Err(e) => Err(e.to_string()),
+    };
+    return match result {
+      Ok(status) => ProxyProbe {
+        ok: true,
+        phase: "connectivity".to_string(),
+        tunnel_via,
+        proxy_scheme: scheme,
+        handshake_completed: false,
+        ping_status: None,
+        connectivity_status: Some(status),
+        fail_closed: true,
+        error: None,
+      },
+      Err(e) => ProxyProbe::fail("connectivity", tunnel_via, scheme, e),
+    };
+  }
 
   let app_owned = app.clone();
   let uuid_owned = uuid.to_string();
@@ -1575,7 +1606,17 @@ pub async fn proxy_probe(
     Some(Ok(c)) => c,
     Some(Err(e)) => {
       cookies.zeroize();
-      return ProxyProbe::fail("tunnel", tunnel_via, scheme, e.to_string());
+      use crate::egress::EgressError;
+      let phase = match &e {
+        EgressError::Http(_) => "http_client",
+        EgressError::Gateway(GatewayError::ControlPlane(_)) => "control_plane",
+        EgressError::Gateway(GatewayError::SignedOut) => "authentication",
+        EgressError::Gateway(GatewayError::Proxy(_)) => "tunnel",
+        EgressError::Gateway(GatewayError::Ws(_) | GatewayError::Timeout("websocket open (proxy)")) => "websocket",
+        EgressError::Gateway(_) => "handshake",
+        _ => "egress",
+      };
+      return ProxyProbe::fail(phase, tunnel_via, scheme, e.to_string());
     }
   };
   cookies.zeroize();
@@ -1601,6 +1642,7 @@ pub async fn proxy_probe(
         proxy_scheme: scheme,
         handshake_completed: true,
         ping_status: Some(status),
+        connectivity_status: None,
         fail_closed: true,
         error: if status < 400 {
           None

@@ -32,6 +32,7 @@ use muse_native_client::gateway::{
 };
 use muse_native_client::proxy::ProxyConfig;
 use muse_native_client::transport::HttpRequest;
+use std::error::Error as _;
 use std::time::Duration;
 use zeroize::Zeroize;
 
@@ -66,7 +67,7 @@ impl std::fmt::Display for EgressError {
 /// 一个账号本次出站使用的策略与脱敏描述。
 pub struct AccountEgress {
   pub kind: EgressKind,
-  /// scheme://[user@]host:port（绝不含口令），可安全用于 UI / 台账。
+  /// scheme://host:port，省略认证信息，可安全用于 UI / 台账。
   pub display: String,
 }
 
@@ -135,18 +136,11 @@ impl AccountEgress {
       builder = builder.redirect(reqwest::redirect::Policy::none());
     }
     if let EgressKind::Proxy(cfg) = &self.kind {
-      // 含凭据的 URI 只在本函数内存在，构造完立即清空。
-      let mut uri = cfg.to_credentialed_uri();
-      let proxy = reqwest::Proxy::all(&uri);
-      uri.zeroize();
-      let proxy = proxy.map_err(|e| {
-        EgressError::Http(format!("代理 URI 无效（不会回退直连）: {e}"))
-      })?;
-      builder = builder.proxy(proxy);
+      builder = builder.proxy(reqwest_proxy(cfg).map_err(EgressError::Http)?);
     }
     builder
       .build()
-      .map_err(|e| EgressError::Http(format!("创建 HTTP 客户端失败: {e}")))
+      .map_err(|e| EgressError::Http(safe_http_error("创建 HTTP 客户端", &e)))
   }
 
   /// 建立到 Muse 网关的连接。Direct 走系统网络；Proxy 走代理隧道，
@@ -314,29 +308,18 @@ impl ReqwestFetch {
     Self::build(None)
   }
 
-  #[allow(dead_code)] // 保留给「进程内一次性代理客户端」的调用方
-  pub fn new_with_proxy(proxy_uri: Option<&str>) -> Result<Self, String> {
-    Self::build(proxy_uri)
-  }
-
   pub fn for_proxy(cfg: &ProxyConfig) -> Result<Self, String> {
-    // 只在进程内传递含凭据的 URI，构造完 client 后立即丢弃字符串。
-    let mut uri = cfg.to_credentialed_uri();
-    let out = Self::build(Some(&uri));
-    uri.zeroize();
-    out
+    Self::build(Some(cfg))
   }
 
-  fn build(proxy_uri: Option<&str>) -> Result<Self, String> {
+  fn build(config: Option<&ProxyConfig>) -> Result<Self, String> {
     let mut builder = reqwest::Client::builder().timeout(Duration::from_secs(20));
-    if let Some(uri) = proxy_uri {
-      let proxy = reqwest::Proxy::all(uri)
-        .map_err(|e| format!("代理 URI 无效（不会回退直连）: {e}"))?;
-      builder = builder.proxy(proxy);
+    if let Some(config) = config {
+      builder = builder.proxy(reqwest_proxy(config)?);
     }
     let client = builder
       .build()
-      .map_err(|e| format!("创建 HTTP 客户端失败: {e}"))?;
+      .map_err(|e| safe_http_error("创建 HTTP 客户端", &e))?;
     Ok(Self { client })
   }
 }
@@ -352,11 +335,47 @@ impl ControlPlaneFetch for ReqwestFetch {
     for (k, v) in headers {
       req = req.header(*k, *v);
     }
-    let resp = req.send().await.map_err(|e| e.to_string())?;
+    let resp = req.send().await.map_err(|e| safe_http_error("控制面 HTTP 请求", &e))?;
     let status = resp.status().as_u16();
-    let bytes = resp.bytes().await.map_err(|e| e.to_string())?;
+    let bytes = resp.bytes().await.map_err(|e| safe_http_error("读取控制面响应", &e))?;
     Ok((status, bytes.to_vec()))
   }
+}
+
+fn reqwest_proxy(config: &ProxyConfig) -> Result<reqwest::Proxy, String> {
+  let mut uri = config.to_reqwest_proxy_uri();
+  let proxy = reqwest::Proxy::all(&uri);
+  uri.zeroize();
+  proxy.map_err(|e| safe_http_error("构造 HTTP 代理", &e))
+}
+
+/// 只输出错误类别和底层 I/O 类型。第三方错误的自由文本可能含 URI 或凭据。
+pub(crate) fn safe_http_error(stage: &str, error: &reqwest::Error) -> String {
+  let category = if error.is_timeout() {
+    "timeout"
+  } else if error.is_connect() {
+    "connect"
+  } else if error.is_builder() {
+    "client_configuration"
+  } else if error.is_body() || error.is_decode() {
+    "response_body"
+  } else if error.is_redirect() {
+    "redirect"
+  } else {
+    "request"
+  };
+  let mut detail = format!("{stage}: {category}");
+  let mut cause = error.source();
+  while let Some(err) = cause {
+    if let Some(io) = err.downcast_ref::<std::io::Error>() {
+      detail.push_str(&format!(" / io:{:?}", io.kind()));
+      if let Some(code) = io.raw_os_error() {
+        detail.push_str(&format!("({code})"));
+      }
+    }
+    cause = err.source();
+  }
+  detail
 }
 
 /// 把 base（scheme://host[:port]）与凭据拼成完整 URI。userinfo 做百分号编码，
@@ -395,13 +414,86 @@ fn pct_encode(s: &str) -> String {
 #[cfg(test)]
 mod tests {
   use super::*;
+  use tokio::io::{AsyncReadExt, AsyncWriteExt};
+  use tokio::net::TcpListener;
+
+  #[tokio::test]
+  async fn control_plane_reqwest_sends_domain_and_credentials_to_socks_proxy() {
+    let proxy = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let config = ProxyConfig::parse(&format!(
+      "socks5://user%40test:pass%3Aword@{}",
+      proxy.local_addr().unwrap()
+    ))
+    .unwrap();
+    let server = tokio::spawn(async move {
+      let (mut stream, _) = proxy.accept().await.unwrap();
+      assert_eq!(stream.read_u8().await.unwrap(), 5);
+      let mut methods = vec![0; stream.read_u8().await.unwrap() as usize];
+      stream.read_exact(&mut methods).await.unwrap();
+      assert!(methods.contains(&2));
+      stream.write_all(&[5, 2]).await.unwrap();
+      assert_eq!(stream.read_u8().await.unwrap(), 1);
+      let mut username = vec![0; stream.read_u8().await.unwrap() as usize];
+      stream.read_exact(&mut username).await.unwrap();
+      assert_eq!(username, b"user@test");
+      let mut password = vec![0; stream.read_u8().await.unwrap() as usize];
+      stream.read_exact(&mut password).await.unwrap();
+      assert_eq!(password, b"pass:word");
+      stream.write_all(&[1, 0]).await.unwrap();
+      let mut header = [0; 4];
+      stream.read_exact(&mut header).await.unwrap();
+      assert_eq!(header, [5, 1, 0, 3]);
+      let mut domain = vec![0; stream.read_u8().await.unwrap() as usize];
+      stream.read_exact(&mut domain).await.unwrap();
+      assert_eq!(domain, b"lease-target.invalid");
+      assert_eq!(stream.read_u16().await.unwrap(), 80);
+      stream.write_all(&[5, 0, 0, 1, 127, 0, 0, 1, 0, 0]).await.unwrap();
+      let mut request = Vec::new();
+      while !request.ends_with(b"\r\n\r\n") {
+        assert!(request.len() < 4096);
+        request.push(stream.read_u8().await.unwrap());
+      }
+      assert!(request.starts_with(b"POST /api/hatch/lease-vm HTTP/1.1\r\n"));
+      stream
+        .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\n{}")
+        .await
+        .unwrap();
+    });
+    let fetch = ReqwestFetch::for_proxy(&config).unwrap();
+    let result = fetch.post("http://lease-target.invalid/api/hatch/lease-vm", &[], b"").await;
+    assert_eq!(result.unwrap(), (200, b"{}".to_vec()));
+    server.await.unwrap();
+  }
+
+  #[tokio::test]
+  async fn control_plane_reqwest_does_not_fall_back_after_socks_rejection() {
+    let target = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let proxy = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let config = ProxyConfig::parse(&format!("socks5://{}", proxy.local_addr().unwrap())).unwrap();
+    let server = tokio::spawn(async move {
+      let (mut stream, _) = proxy.accept().await.unwrap();
+      let mut greeting = [0; 3];
+      stream.read_exact(&mut greeting).await.unwrap();
+      assert_eq!(greeting, [5, 1, 0]);
+      stream.write_all(&[5, 0xff]).await.unwrap();
+    });
+    let fetch = ReqwestFetch::for_proxy(&config).unwrap();
+    let url = format!("http://{}/api/hatch/lease-vm", target.local_addr().unwrap());
+    let error = tokio::select! {
+      result = fetch.post(&url, &[], b"") => result.unwrap_err(),
+      result = target.accept() => panic!("unexpected direct connection: {result:?}"),
+    };
+    assert!(error.contains("connect"), "{error}");
+    assert!(!error.contains(&url), "{error}");
+    server.await.unwrap();
+  }
 
   #[test]
   fn compose_uri_encodes_special_chars() {
     let uri = compose_uri("socks5://host:1080", Some("u@x"), Some("p@ss:w0rd"));
     assert_eq!(uri, "socks5://u%40x:p%40ss%3Aw0rd@host:1080");
     let parsed = ProxyConfig::parse(&uri).unwrap();
-    assert_eq!(parsed.display_safe(), "socks5://u@x@host:1080");
+    assert_eq!(parsed.display_safe(), "socks5://host:1080");
   }
 
   #[test]
@@ -447,8 +539,7 @@ mod tests {
     };
     let egress = AccountEgress::resolve(Some(&setting), &secrets).unwrap();
     assert!(egress.is_proxy());
-    assert!(egress.display.contains("alice@p.example:1080"));
-    assert!(!egress.display.contains("p%40ss"));
+    assert_eq!(egress.display, "socks5://p.example:1080");
     let _ = std::fs::remove_dir_all(&dir);
   }
 }

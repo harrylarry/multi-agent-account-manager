@@ -369,6 +369,7 @@ async fn muse_native_proxy_probe(
   app: AppHandle,
   provider_id: String,
   uuid: String,
+  connectivity_only: Option<bool>,
   mgr: State<'_, Arc<SessionManager>>,
   cancel: State<'_, Arc<probe_cancel::ProbeCancel>>,
 ) -> Result<muse_native::ProxyProbe, String> {
@@ -378,7 +379,7 @@ async fn muse_native_proxy_probe(
   let setting = account_proxy_setting(&mgr, &provider_id, &uuid).await;
   let dir = app.path().app_data_dir().map_err(|e| e.to_string())?;
   let secrets = secrets::Secrets::new(&dir);
-  Ok(muse_native::proxy_probe(&app, &uuid, setting.as_ref(), &secrets, &cancel).await)
+  Ok(muse_native::proxy_probe(&app, &uuid, setting.as_ref(), &secrets, &cancel, connectivity_only.unwrap_or(false)).await)
 }
 
 /// 平台原生 WebView 侧的代理应用结果。

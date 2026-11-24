@@ -51,7 +51,7 @@ impl fmt::Debug for ProxyConfig {
       .field("scheme", &self.scheme)
       .field("host", &self.host)
       .field("port", &self.port)
-      .field("username", &self.username.as_deref().unwrap_or("<none>"))
+      .field("has_credentials", &self.has_credentials())
       .field("password", &"<redacted>")
       .finish()
   }
@@ -265,25 +265,33 @@ impl ProxyConfig {
     scheme_name(self.scheme)
   }
 
-  /// 脱敏串，可安全进日志 / UI：scheme://[user@]host:port，绝不含密码。
+  /// 脱敏串，可安全进日志 / UI，省略全部认证信息。
   pub fn display_safe(&self) -> String {
-    let user = self
-      .username
-      .as_ref()
-      .map(|u| format!("{u}@"))
-      .unwrap_or_default();
-    format!("{}://{}{}:{}", scheme_name(self.scheme), user, self.host, self.port)
+    format!("{}://{}", self.scheme_name(), self.authority())
   }
 
-  /// 组装**含凭据**的完整 URI，仅供进程内 HTTP 客户端（如 reqwest）使用。
+  fn authority(&self) -> String {
+    if self.host.contains(':') {
+      format!("[{}]:{}", self.host, self.port)
+    } else {
+      format!("{}:{}", self.host, self.port)
+    }
+  }
+
+  /// 组装**含凭据**的 reqwest 代理 URI。SOCKS 目标域名始终由代理解析，
+  /// 与原生 WSS 隧道及 WKWebView 的 SOCKS5 策略一致。
   /// 返回值含明文密码：不得写日志、不得进 UI、不得持久化。
-  pub fn to_credentialed_uri(&self) -> String {
+  pub fn to_reqwest_proxy_uri(&self) -> String {
+    let scheme = match self.scheme {
+      ProxyScheme::Socks5 => "socks5h",
+      _ => self.scheme_name(),
+    };
     let user = match (&self.username, &self.password) {
       (Some(u), Some(p)) => format!("{}:{}@", percent_encode(u), percent_encode(p.as_str())),
       (Some(u), None) => format!("{}@", percent_encode(u)),
       _ => String::new(),
     };
-    format!("{}://{}{}:{}", scheme_name(self.scheme), user, self.host, self.port)
+    format!("{scheme}://{user}{}", self.authority())
   }
 
   pub fn has_credentials(&self) -> bool {
@@ -758,15 +766,24 @@ mod tests {
   }
 
   #[test]
-  fn parse_auth_and_display_safe_redacts_password() {
+  fn parse_auth_and_display_safe_redacts_credentials() {
     let cfg = ProxyConfig::parse("http://alice:s3cr3t@p.example:8080").unwrap();
     assert_eq!(cfg.username.as_deref(), Some("alice"));
     assert_eq!(cfg.password.as_deref().map(|p| p.as_str()), Some("s3cr3t"));
     let safe = cfg.display_safe();
-    assert!(safe.contains("alice@"));
-    assert!(!safe.contains("s3cr3t"));
+    assert_eq!(safe, "http://p.example:8080");
     let dbg = format!("{cfg:?}");
+    assert!(!dbg.contains("alice"));
     assert!(!dbg.contains("s3cr3t"));
+  }
+
+  #[test]
+  fn reqwest_proxy_uri_preserves_connect_and_uses_remote_socks_dns() {
+    for scheme in ["http", "https", "socks5", "socks5h"] {
+      let cfg = ProxyConfig::parse(&format!("{scheme}://u%40x:p%3Ass@[::1]:1080")).unwrap();
+      let expected = if scheme == "socks5" { "socks5h" } else { scheme };
+      assert_eq!(cfg.to_reqwest_proxy_uri(), format!("{expected}://u%40x:p%3Ass@[::1]:1080"));
+    }
   }
 
   #[test]
