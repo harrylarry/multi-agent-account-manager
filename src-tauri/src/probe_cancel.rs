@@ -23,6 +23,7 @@ use tokio::sync::watch;
 
 struct TaskEntry {
   id: u64,
+  task: Option<uuid::Uuid>,
   kind: &'static str,
   tx: watch::Sender<bool>,
 }
@@ -97,15 +98,35 @@ impl ProbeCancel {
   /// 为某账号的某个任务注册取消令牌，返回令牌与自动注销 guard。
   /// 同账号可注册多个不同 `kind` 的任务。
   pub fn register(&self, account: &str, kind: &'static str) -> (CancelToken, CancelGuard<'_>) {
+    self.register_inner(account, kind, None)
+  }
+
+  pub fn register_task(
+    &self,
+    account: &str,
+    kind: &'static str,
+    task: uuid::Uuid,
+  ) -> (CancelToken, CancelGuard<'_>) {
+    self.register_inner(account, kind, Some(task))
+  }
+
+  fn register_inner(
+    &self,
+    account: &str,
+    kind: &'static str,
+    task: Option<uuid::Uuid>,
+  ) -> (CancelToken, CancelGuard<'_>) {
     let (tx, rx) = watch::channel(false);
     let id = self.seq.fetch_add(1, Ordering::Relaxed) + 1;
     let mut entries = self.entries.lock().unwrap();
     let list = entries.entry(account.to_string()).or_default();
     // 同 kind 的旧任务（理论上不该重叠）先置为取消，避免两个同名任务并存。
-    for old in list.iter_mut().filter(|e| e.kind == kind) {
-      let _ = old.tx.send(true);
+    if task.is_none() {
+      for old in list.iter().filter(|e| e.kind == kind && e.task.is_none()) {
+        let _ = old.tx.send(true);
+      }
     }
-    list.push(TaskEntry { id, kind, tx });
+    list.push(TaskEntry { id, task, kind, tx });
     drop(entries);
     (
       CancelToken { rx },
@@ -115,6 +136,19 @@ impl ProbeCancel {
         id,
       },
     )
+  }
+
+  pub fn cancel_task(&self, account: &str, task: uuid::Uuid) -> usize {
+    let entries = self.entries.lock().unwrap();
+    if let Some(entry) = entries
+      .get(account)
+      .and_then(|list| list.iter().find(|entry| entry.task == Some(task)))
+    {
+      let _ = entry.tx.send(true);
+      1
+    } else {
+      0
+    }
   }
 
   /// 取消该账号**所有**正在运行的任务，返回命中的任务数。
@@ -151,6 +185,20 @@ impl ProbeCancel {
 #[cfg(test)]
 mod tests {
   use super::*;
+
+  #[test]
+  fn exact_task_cancellation_is_bound_to_the_starting_account() {
+    let reg = ProbeCancel::new();
+    let task = uuid::Uuid::new_v4();
+    let (mut first, _first_guard) = reg.register_task("first", "fingerprint", task);
+    let (mut second, _second_guard) = reg.register_task("second", "fingerprint", task);
+    let (mut proxy, _proxy_guard) = reg.register("first", "proxy");
+    assert_eq!(reg.cancel_task("first", uuid::Uuid::new_v4()), 0);
+    assert_eq!(reg.cancel_task("first", task), 1);
+    assert!(first.check());
+    assert!(!second.check());
+    assert!(!proxy.check());
+  }
 
   #[tokio::test]
   async fn cancel_wakes_waiter() {

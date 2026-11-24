@@ -335,20 +335,51 @@ pub async fn send_probe(
         };
       }
     };
-    let connected = match egress.connect(&cookies).await {
-      Ok(c) => c,
-      Err(e) => {
-        cookies.zeroize();
-        ledger.fail(&send_id, e.to_string());
+    let setup = async {
+      let mut gateway = egress.connect(&cookies).await.map_err(|e| e.to_string())?;
+      let target = match session_id {
+        Some(id) if !id.trim().is_empty() => id.to_string(),
+        _ => allocate_isolated_session(&mut gateway).await?,
+      };
+      Ok::<_, String>((gateway, target))
+    };
+    let ready = tokio::select! {
+      res = tokio::time::timeout(Duration::from_secs(60), setup) => match res {
+        Ok(res) => res,
+        Err(_) => Err("建立发送连接或隔离会话超时".to_string()),
+      },
+      _ = cancel_token.cancelled() => Err("用户取消（尚未发送）".to_string()),
+    };
+    cookies.zeroize();
+    let (connected, target_session) = match ready {
+      Ok(ready) => ready,
+      Err(error) => {
+        ledger.fail(&send_id, error.clone());
         return SendOutcome {
-          ok: false, status: "DEFINITIVELY_FAILED".to_string(), send_id,
-          ack: None, session_id: session_id.map(str::to_string),
-          error: Some(e.to_string()),
+          ok: false,
+          status: "DEFINITIVELY_FAILED".to_string(),
+          send_id,
+          ack: None,
+          session_id: session_id.map(str::to_string),
+          error: Some(error),
         };
       }
     };
-    cookies.zeroize();
-    ledger.mark_in_flight(&send_id);
+    if ledger
+      .mark_in_flight_in(&send_id, Some(&target_session))
+      .is_err()
+    {
+      let detail = "发送台账无法持久化，尚未发送".to_string();
+      ledger.fail(&send_id, detail.clone());
+      return SendOutcome {
+        ok: false,
+        status: "DEFINITIVELY_FAILED".to_string(),
+        send_id,
+        ack: None,
+        session_id: Some(target_session),
+        error: Some(detail),
+      };
+    }
 
     // 发送用一次性连接：mark_in_flight 之后所有权交给 send_message。
     // 取消令牌直接传给发送侧：写入每一帧之间、等 ack 时都能中断，
@@ -357,7 +388,7 @@ pub async fn send_probe(
       .send_message_cancellable(
         text,
         node_id,
-        session_id,
+        Some(&target_session),
         Duration::from_secs(30),
         Some(cancel_token.receiver()),
       )
@@ -372,10 +403,16 @@ pub async fn send_probe(
       } else {
         "发送阶段被用户取消（尚未进入网络写入，未重发）".to_string()
       };
-      ledger.mark_unknown(&send_id, detail.clone());
+      let status = if tracked.on_wire {
+        ledger.mark_unknown(&send_id, detail.clone());
+        "UNKNOWN"
+      } else {
+        ledger.fail(&send_id, detail.clone());
+        "DEFINITIVELY_FAILED"
+      };
       return SendOutcome {
         ok: false,
-        status: "UNKNOWN".to_string(),
+        status: status.to_string(),
         send_id,
         ack: None,
         session_id: session_id.map(str::to_string),
@@ -385,13 +422,14 @@ pub async fn send_probe(
     match tracked.outcome {
       Ok(ack) => {
         ledger.confirm(&send_id);
+        let session_verified = ack.session_id.as_deref() == Some(target_session.as_str());
         SendOutcome {
-          ok: true,
+          ok: session_verified,
           status: "CONFIRMED".to_string(),
           send_id,
           ack: Some(ack.raw),
           session_id: ack.session_id,
-          error: None,
+          error: (!session_verified).then(|| "发送已确认，但 ACK 未确认目标会话".to_string()),
         }
       }
       Err(e) => {
@@ -442,7 +480,22 @@ pub struct FingerprintSendRecord {
   pub send_status: String,
   pub text_done: bool,
   pub sample_used: bool,
+  pub diagnostics: Option<FingerprintCollectionDiagnostics>,
   pub error: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct FingerprintCollectionDiagnostics {
+  ended_by: String,
+  lines: u64,
+  text_deltas: u64,
+  read_timeouts: u64,
+  parse_errors: u64,
+  unmatched_events: u64,
+  saw_user: bool,
+  assistant_messages: usize,
+  saw_idle: bool,
 }
 
 /// #18 模型指纹探针结果。verdict/identification 的语义：
@@ -457,9 +510,9 @@ pub struct FingerprintProbe {
   pub verdict: String,
   pub identification: bool,
   pub result: Option<FingerprintResult>,
-  /// 本次实际发出的探针条数（拿到 ack，不代表采集完成）。
+  /// 进入网络写入的探针条数（可能还没有 ACK）。
   pub probes_sent: usize,
-  /// 发送台账 CONFIRMED 的条数（ack + 收到 message_done）。
+  /// 收到有效 ACK 并记入发送台账的条数。
   pub probes_confirmed: usize,
   /// 本次实际采到并送评分的样本数。
   pub samples_collected: usize,
@@ -488,320 +541,205 @@ impl FingerprintProbe {
   }
 }
 
-/// #18：在隔离会话里发 3 条无语义计数探针，收齐回答后本地评分。
-///
-/// 安全约束：
-/// - 全程占用单发锁（一次指纹评估视为一笔发送事务），期间不再接受其他发送；
-/// - 每条探针"先订后发"，正文只从 chat.subscribe 收，绝不从别处拼；
-/// - 拿到明确 ack 才算发出；超时/断线不重发，样本不足就返回"不可判定"；
-/// - cookie 只内存传递，用完 zeroize；结果不含正文、不含任何凭据。
+/// #18: Allocate a side conversation, then send and collect one verified turn at a time.
+#[cfg_attr(target_os = "android", allow(unused_variables))]
 pub async fn fingerprint_probe(
   app: &AppHandle,
   ledger: &crate::send_ledger::SendLedger,
   uuid: &str,
+  task_id: uuid::Uuid,
   setting: Option<&ProxySetting>,
   secrets: &Secrets,
-  cancel: &ProbeCancel,
+  mut cancel_token: crate::probe_cancel::CancelToken,
 ) -> FingerprintProbe {
   #[cfg(target_os = "android")]
   {
-    let _ = (app, ledger, uuid, setting, secrets, cancel);
-    return FingerprintProbe::fail("android", "indeterminate", "指纹探针在 Android 上不可用");
+    FingerprintProbe::fail("android", "indeterminate", "指纹探针在 Android 上不可用")
   }
 
   #[cfg(not(target_os = "android"))]
   {
-    use crate::send_ledger::SendError;
+    use tauri::Emitter;
+    use zeroize::Zeroizing;
 
-    // 账号级出站策略：启用代理时必须全程走代理，解析失败也不得退回直连。
+    let progress = |phase: &str, probe: usize, confirmed: usize, samples: usize| {
+      let _ = app.emit_to(
+        "manager",
+        "muse-fingerprint-progress",
+        serde_json::json!({
+          "taskId": task_id.to_string(), "accountUuid": uuid, "phase": phase,
+          "probe": probe, "confirmed": confirmed, "samples": samples,
+        }),
+      );
+    };
     let egress = match crate::egress::AccountEgress::resolve(setting, secrets) {
       Ok(e) => e,
-      Err(e) => return FingerprintProbe::fail("egress", "indeterminate", e.to_string()),
+      Err(_) => return FingerprintProbe::fail("egress", "indeterminate", "该账号的出站配置不可用"),
     };
-    // 后端取消：前端停止/超时后不会再发起新的探针发送。
-    let (mut cancel_token, _cancel_guard) = cancel.register(uuid, "fingerprint");
-
-    // 一次指纹评估 = 一个检测任务（mission）：独占该账号发送权，期间拒绝手动发送。
-    // 任务内每条探针各自落一条 SendAttempt，有独立状态；任务级结果只做汇总。
-    // MissionGuard 在任何返回路径上都会释放独占，不会把账号锁死。
     let mission = match ledger.mission(uuid) {
       Ok(m) => m,
-      Err(SendError::Busy(existing)) => {
-        return FingerprintProbe::fail(
-          "busy",
-          "indeterminate",
-          format!("该账号已有发送或检测任务在进行中，请稍后再试：{existing}"),
-        )
-      }
-      Err(SendError::Unknown(e)) => return FingerprintProbe::fail("ledger", "indeterminate", e),
+      Err(e) => return FingerprintProbe::fail("ledger", "indeterminate", format!("{e:?}")),
     };
-
-    // 取 cookie（独立任务 + 竞速，避免同步阻塞打穿运行时）。
-    let app_owned = app.clone();
-    let uuid_owned = uuid.to_string();
-    let cookie_handle =
-      tokio::spawn(async move { fetch_session_cookies(&app_owned, &uuid_owned).await });
-    let mut cookies = tokio::select! {
-      res = cookie_handle => match res {
-        Ok(Ok(c)) => c,
-        Ok(Err(e)) => {
-          return FingerprintProbe::fail("cookies", "indeterminate", e);
-        }
-        Err(e) => {
-          return FingerprintProbe::fail("cookies", "indeterminate", format!("取 cookie 任务异常: {e}"));
-        }
+    progress("cookies", 0, 0, 0);
+    let cookies = tokio::select! {
+      res = tokio::time::timeout(COOKIE_TIMEOUT, fetch_session_cookies(app, uuid)) => match res {
+        Ok(Ok(c)) if !c.is_empty() => Zeroizing::new(c),
+        _ => return FingerprintProbe::fail("cookies", "indeterminate", "无法读取该测试账号的 Muse 登录态"),
       },
-      _ = tokio::time::sleep(COOKIE_TIMEOUT) => {
-        return FingerprintProbe::fail("cookies", "indeterminate", "取 muse.ai 会话 cookie 超时（15 秒）");
-      }
+      _ = cancel_token.cancelled() => return FingerprintProbe::fail("cancelled", "indeterminate", "用户取消"),
     };
-    if cookies.is_empty() {
-      cookies.zeroize();
-      return FingerprintProbe::fail("no_cookies", "indeterminate", "该账号还没有 muse.ai 登录态");
-    }
-
-    // 生成 3 条真实探针题（lmfpd 生成器，计数 292–332，无语义无隐私）。
     let probes = match fingerprint::generate_probes() {
       Ok(p) => p,
-      Err(e) => {
-        cookies.zeroize();
-        return FingerprintProbe::fail("generate", "indeterminate", e.to_string());
-      }
+      Err(_) => return FingerprintProbe::fail("generate", "indeterminate", "无法生成 lmfpd 探针"),
+    };
+    progress("reference_bank", 0, 0, 0);
+    let detector = tokio::select! {
+      result = tokio::task::spawn_blocking(fingerprint::FingerprintDetector::load) => match result {
+        Ok(Ok(d)) => d,
+        _ => return FingerprintProbe::fail("reference_bank", "indeterminate", "无法加载 lmfpd 参考库"),
+      },
+      _ = cancel_token.cancelled() => return FingerprintProbe::fail("cancelled", "indeterminate", "用户取消"),
     };
 
-    // 加载参考库（首次联网下载，之后 SDK 缓存）。失败不伪造候选。
-    let detector = match fingerprint::FingerprintDetector::load() {
-      Ok(d) => d,
-      Err(e) => {
-        cookies.zeroize();
-        return FingerprintProbe::fail("reference_bank", "indeterminate", e.to_string());
-      }
+    progress("session", 0, 0, 0);
+    let setup = async {
+      let mut gateway = egress.connect(&cookies).await.map_err(|e| e.to_string())?;
+      let session_id = allocate_isolated_session(&mut gateway).await?;
+      let sub = gateway.subscribe().await.map_err(|e| e.to_string())?;
+      Ok::<_, String>((sub, session_id))
     };
+    let (mut subscription, session_id) = tokio::select! {
+      res = tokio::time::timeout(Duration::from_secs(60), setup) => match res {
+        Ok(Ok(s)) => s,
+        Ok(Err(e)) => return FingerprintProbe::fail("session", "indeterminate", e),
+        Err(_) => return FingerprintProbe::fail("session", "indeterminate", "建立或验证隔离会话超时"),
+      },
+      _ = cancel_token.cancelled() => return FingerprintProbe::fail("cancelled", "indeterminate", "用户取消"),
+    };
+    drop(cookies);
+    progress("subscribe", 0, 0, 0);
+    tokio::select! {
+      res = subscription.wait_ready(Duration::from_secs(25)) => {
+        if let Err(error) = res {
+          return FingerprintProbe::fail("subscribe", "indeterminate", safe_gateway_status(&error));
+        }
+      }
+      _ = cancel_token.cancelled() => return FingerprintProbe::fail("cancelled", "indeterminate", "用户取消"),
+    }
 
-    let mut samples: Vec<Sample> = Vec::new();
-    let mut session_id: Option<String> = None;
-    let mut probes_sent = 0usize;
-    let mut probes_confirmed = 0usize;
-    let mut sends: Vec<FingerprintSendRecord> = Vec::new();
-    let mut first_error: Option<String> = None;
-
-    for probe in &probes {
-      // 后端取消检查点：用户停止后不再建立新连接、不再发新探针。
+    let mut samples = Vec::new();
+    let mut seen_receipts = std::collections::HashSet::new();
+    let mut probes_sent = 0;
+    let mut probes_confirmed = 0;
+    let mut sends = Vec::new();
+    let mut first_error = None;
+    for (index, probe) in probes.iter().enumerate() {
       if cancel_token.check() {
-        first_error.get_or_insert("用户取消：停止发起新探针".to_string());
+        first_error = Some("用户取消".to_string());
         break;
       }
-      // 先订：订阅连接必须在发送之前建立，避免漏掉正文增量头。
-      // 连接走账号级出站策略：启用代理时经隧道，失败即记 NOT_SENT，不直连。
-      let sub = match egress.connect(&cookies).await {
-        Ok(gw) => match gw.subscribe().await {
-          Ok(s) => s,
-          Err(e) => {
-            let msg = format!("订阅失败: {e}");
-            first_error.get_or_insert(msg.clone());
-            sends.push(FingerprintSendRecord {
-              probe_id: probe.id.clone(),
-              send_status: "NOT_SENT".to_string(),
-              text_done: false,
-              sample_used: false,
-              error: Some(msg),
-            });
-            continue;
-          }
-        },
-        Err(e) => {
-          let msg = format!("订阅连接失败: {e}");
-          first_error.get_or_insert(msg.clone());
-          sends.push(FingerprintSendRecord {
-            probe_id: probe.id.clone(),
-            send_status: "NOT_SENT".to_string(),
-            text_done: false,
-            sample_used: false,
-            error: Some(msg),
-          });
-          continue;
-        }
-      };
-
-      // 后发：订阅已就绪，再取发送权并落一条独立 SendAttempt。
-      let send_id = match mission.begin_probe("fingerprint-isolated", &probe.prompt) {
+      progress("sending", index + 1, probes_confirmed, samples.len());
+      let send_id = match mission.begin_probe(&session_id, &probe.prompt) {
         Ok(id) => id,
-        Err(e) => {
-          let msg = match e {
-            SendError::Busy(x) => format!("探针 {} 单发锁被占用: {x}", probe.id),
-            SendError::Unknown(x) => format!("探针 {} 台账异常: {x}", probe.id),
-          };
-          first_error.get_or_insert(msg.clone());
-          sends.push(FingerprintSendRecord {
-            probe_id: probe.id.clone(),
-            send_status: "NOT_SENT".to_string(),
-            text_done: false,
-            sample_used: false,
-            error: Some(msg),
-          });
-          continue;
+        Err(_) => {
+          first_error = Some("发送台账拒绝开始本轮".to_string());
+          break;
         }
       };
-      ledger.mark_in_flight(&send_id);
-
-      // 同一隔离会话（首条建会话，后续复用其 session_id）。
-      let send_gw = match egress.connect(&cookies).await {
-        Ok(g) => g,
-        Err(e) => {
-          let msg = format!("发送连接失败: {e}");
-          first_error.get_or_insert(msg.clone());
-          ledger.fail(&send_id, msg.clone());
-          sends.push(FingerprintSendRecord {
-            probe_id: probe.id.clone(),
-            send_status: "DEFINITIVELY_FAILED".to_string(),
-            text_done: false,
-            sample_used: false,
-            error: Some(msg),
-          });
-          continue;
-        }
-      };
-      // 发送前/发送中可被后端取消：写入每帧之间与等 ack 时都会中断。
-      let tracked = send_gw
-        .send_message_cancellable(
+      if let Err(e) = ledger.mark_in_flight(&send_id) {
+        ledger.fail(&send_id, "写入发送台账失败，尚未发送".to_string());
+        first_error = Some(format!("{e:?}"));
+        break;
+      }
+      let tracked = subscription
+        .send_on_subscription(
           &probe.prompt,
-          "",
-          session_id.as_deref(),
+          &session_id,
           Duration::from_secs(30),
-          Some(cancel_token.receiver()),
+          cancel_token.receiver(),
         )
         .await;
-      if matches!(tracked.outcome, Err(GatewayError::Cancelled)) {
-        let msg = if tracked.on_wire {
-          format!(
-            "探针 {} 在发送阶段被取消（已进入网络写入，完成 {} 帧），不重发",
-            probe.id, tracked.wrote_frames
-          )
-        } else {
-          format!("探针 {} 在发送阶段被取消（尚未进入网络写入），不重发", probe.id)
-        };
-        first_error.get_or_insert(msg.clone());
-        ledger.mark_unknown(&send_id, msg.clone());
-        sends.push(FingerprintSendRecord {
-          probe_id: probe.id.clone(),
-          send_status: "UNKNOWN".to_string(),
-          text_done: false,
-          sample_used: false,
-          error: Some(msg),
-        });
-        break;
-      }
+      probes_sent += usize::from(tracked.on_wire);
+      let mut record = FingerprintSendRecord {
+        probe_id: probe.id.clone(),
+        send_status: "DEFINITIVELY_FAILED".to_string(),
+        text_done: false,
+        sample_used: false,
+        diagnostics: None,
+        error: None,
+      };
       match tracked.outcome {
         Ok(ack) => {
-          probes_sent += 1;
-          if session_id.is_none() {
-            session_id = ack.session_id.clone();
-          }
-          let msg_id = Some(ack.message_id.clone());
-          let collected = tokio::select! {
-            c = sub.collect(
-              msg_id.as_deref(),
-              Duration::from_secs(90),
-              Duration::from_secs(10),
-            ) => Some(c),
-            _ = cancel_token.cancelled() => None,
-          };
-            let Some(collected) = collected else {
-            let msg = format!("探针 {} 在采集阶段被取消，不重发", probe.id);
-            first_error.get_or_insert(msg.clone());
-            ledger.mark_unknown(&send_id, msg.clone());
-            sends.push(FingerprintSendRecord {
-              probe_id: probe.id.clone(),
-              send_status: "UNKNOWN".to_string(),
-              text_done: false,
-              sample_used: false,
-              error: Some(msg),
-            });
-            break;
-          };
-          // 有效样本必须「真的收完」：以 message_done 为完成信号，不能只看非空。
-          if collected.done {
-            probes_confirmed += 1;
-            ledger.confirm(&send_id);
-            let usable = !collected.text.trim().is_empty();
-            if usable {
-              samples.push(Sample {
-                text: collected.text,
-                expected_count: probe.expected_count,
-              });
-            } else {
-              first_error.get_or_insert(format!("探针 {} 已回复但正文为空", probe.id));
-            }
-            sends.push(FingerprintSendRecord {
-              probe_id: probe.id.clone(),
-              send_status: "CONFIRMED".to_string(),
-              text_done: true,
-              sample_used: usable,
-              error: if usable {
-                None
-              } else {
-                Some("已回复但正文为空".to_string())
-              },
-            });
+          ledger.confirm(&send_id);
+          record.send_status = "CONFIRMED".to_string();
+          probes_confirmed += 1;
+          if ack.session_id.as_deref() != Some(session_id.as_str())
+            || !seen_receipts.insert(ack.message_id.clone())
+          {
+            record.error =
+              Some("发送已确认，但 ACK 无法确认本轮属于新建隔离会话，后续发送已停止".to_string());
           } else {
-            // 发出去了但没收到 message_done（超时 / 断流）：结果不明，绝不重发。
-            let msg = format!(
-              "探针 {} 采集未完成（{}），不重发",
-              probe.id, collected.ended_by
-            );
-            first_error.get_or_insert(msg.clone());
-            ledger.mark_unknown(&send_id, msg.clone());
-            sends.push(FingerprintSendRecord {
-              probe_id: probe.id.clone(),
-              send_status: "UNKNOWN".to_string(),
-              text_done: false,
-              sample_used: false,
-              error: Some(msg),
-            });
+            progress("collecting", index + 1, probes_confirmed, samples.len());
+            let collected = tokio::select! {
+              c = subscription.collect(&ack, &session_id, Duration::from_secs(90), Duration::from_secs(10)) => Some(c),
+              _ = cancel_token.cancelled() => None,
+            };
+            match collected {
+              Some(c) => {
+                record.text_done = c.done;
+                record.diagnostics = Some(FingerprintCollectionDiagnostics {
+                  ended_by: c.ended_by.clone(),
+                  lines: c.lines,
+                  text_deltas: c.text_deltas,
+                  read_timeouts: c.read_timeouts,
+                  parse_errors: c.parse_errors,
+                  unmatched_events: c.unmatched_events,
+                  saw_user: c.saw_user,
+                  assistant_messages: c.assistant_messages,
+                  saw_idle: c.saw_idle,
+                });
+                if c.done && fingerprint::check_sample(&c.text, probe.expected_count).accepted {
+                  record.sample_used = true;
+                  samples.push(Sample {
+                    text: c.text,
+                    expected_count: probe.expected_count,
+                  });
+                } else if c.done {
+                  record.error = Some("回复已结束，但正文未达到 lmfpd 样本要求".to_string());
+                } else {
+                  record.error = Some(format!("回复采集未完成（{}），后续发送已停止", c.ended_by));
+                }
+              }
+              None => record.error = Some("发送已确认，用户取消采集".to_string()),
+            }
           }
         }
         Err(e) => {
-          // 拿不到 ack：只要进入过网络写入（含首帧写一半就断），上游就可能
-          // 已收到，一律 UNKNOWN。确认没进入写入阶段的失败才算明确失败。
-          let (status, msg) = if tracked.on_wire {
-            (
-              "UNKNOWN",
-              format!(
-                "探针 {} 已进入网络写入（完成 {} 帧）但未拿到 ack（结果不明，不重发）: {e}",
-                probe.id, tracked.wrote_frames
-              ),
-            )
-          } else {
-            (
-              "DEFINITIVELY_FAILED",
-              format!("探针 {} 在进入网络写入前失败: {e}", probe.id),
-            )
-          };
-          first_error.get_or_insert(msg.clone());
+          let reason = format!("发送阶段：{}", safe_gateway_status(&e));
           if tracked.on_wire {
-            ledger.mark_unknown(&send_id, msg.clone());
+            record.send_status = "UNKNOWN".to_string();
+            ledger.mark_unknown(&send_id, reason.clone());
           } else {
-            ledger.fail(&send_id, msg.clone());
+            ledger.fail(&send_id, reason.clone());
           }
-          sends.push(FingerprintSendRecord {
-            probe_id: probe.id.clone(),
-            send_status: status.to_string(),
-            text_done: false,
-            sample_used: false,
-            error: Some(msg),
-          });
+          record.error = Some(reason);
         }
+      }
+      let proceed = record.sample_used;
+      first_error = record.error.clone();
+      sends.push(record);
+      if !proceed {
+        break;
       }
     }
 
-    // cookie 不再需要，立即清零。
-    cookies.zeroize();
-
     let samples_collected = samples.len();
+    progress("scoring", 0, probes_confirmed, samples_collected);
     let result = if samples.is_empty() {
       fingerprint::FingerprintResult::indeterminate(
         first_error
-          .unwrap_or_else(|| "三条探针均未采到有效正文".to_string()),
+          .clone()
+          .unwrap_or_else(|| "没有完整有效的探针样本".to_string()),
         detector.built_at().to_string(),
       )
     } else {
@@ -818,9 +756,8 @@ pub async fn fingerprint_probe(
       }
     };
 
-    let ok = result.identification || result.verdict == fingerprint::Verdict::Partial;
     FingerprintProbe {
-      ok,
+      ok: result.identification || result.verdict == fingerprint::Verdict::Partial,
       phase: "done".to_string(),
       verdict: result.verdict.as_str().to_string(),
       identification: result.identification,
@@ -829,9 +766,56 @@ pub async fn fingerprint_probe(
       probes_confirmed,
       samples_collected,
       sends,
-      session_id,
-      error: None,
+      session_id: Some(session_id),
+      error: first_error,
     }
+  }
+}
+
+#[cfg(not(target_os = "android"))]
+async fn allocate_isolated_session(
+  gateway: &mut crate::egress::AccountGateway,
+) -> Result<String, String> {
+  use muse_native_client::chat_send::{
+    listed_session_ids, session_list_request, start_session_request, started_session_id,
+  };
+
+  let (status, body) = gateway
+    .request(session_list_request())
+    .await
+    .map_err(|e| safe_gateway_status(&e))?;
+  let previous = listed_session_ids(status, &body).map_err(|e| e.to_string())?;
+  let (status, body) = gateway
+    .request(start_session_request())
+    .await
+    .map_err(|e| safe_gateway_status(&e))?;
+  let created = started_session_id(status, &body).map_err(|e| e.to_string())?;
+  if previous.contains(&created) {
+    return Err("Muse 返回了已存在的会话，已停止".to_string());
+  }
+  let (status, body) = gateway
+    .request(session_list_request())
+    .await
+    .map_err(|e| safe_gateway_status(&e))?;
+  if !listed_session_ids(status, &body)
+    .map_err(|e| e.to_string())?
+    .contains(&created)
+  {
+    return Err("Muse 会话列表没有确认新会话，已停止".to_string());
+  }
+  Ok(created)
+}
+
+#[cfg(not(target_os = "android"))]
+fn safe_gateway_status(error: &GatewayError) -> String {
+  match error {
+    GatewayError::Http(code) => format!("HTTP {code}"),
+    GatewayError::Closed(_) => "closed".to_string(),
+    GatewayError::Timeout(_) => "timeout".to_string(),
+    GatewayError::Reset(code, _) => format!("reset ({code})"),
+    GatewayError::Cancelled => "cancelled".to_string(),
+    GatewayError::Ws(_) => "websocket_error".to_string(),
+    _ => "protocol_error".to_string(),
   }
 }
 

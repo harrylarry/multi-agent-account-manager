@@ -158,6 +158,11 @@ interface SpikeFingerprintResult {
 interface SpikeFingerprintSendRecord {
   probeId: string; sendStatus: string; textDone: boolean;
   sampleUsed: boolean; error: string | null;
+  diagnostics: {
+    endedBy: string; lines: number; textDeltas: number; readTimeouts: number;
+    parseErrors: number; unmatchedEvents: number; sawUser: boolean;
+    assistantMessages: number; sawIdle: boolean;
+  } | null;
 }
 interface SpikeFingerprintProbe {
   ok: boolean; phase: string; verdict: string; identification: boolean;
@@ -168,7 +173,15 @@ interface SpikeFingerprintProbe {
   error: string | null;
 }
 let spikeFingerprint: SpikeFingerprintProbe | null = null;
+interface SpikeFingerprintTask {
+  accountUuid: string; taskId: string;
+}
+interface SpikeFingerprintProgress extends SpikeFingerprintTask {
+  phase: string; probe: number; confirmed: number; samples: number;
+}
 let spikeFingerprintRunning = false;
+let spikeFingerprintTask: SpikeFingerprintTask | null = null;
+let spikeFingerprintProgress: SpikeFingerprintProgress | null = null;
 let spikeFingerprintError: string | null = null;
 // #11/#16 代理探针：仅展示阶段/状态码/脱敏代理串，不含 cookie/token/口令。
 interface SpikeProxyProbe {
@@ -1097,7 +1110,14 @@ function spikeDiagInnerHtml(): string {
     proxyHtml = `<div class="spike-diag-result fail">代理探针错误：${escapeHtml(spikeProxyError)}</div>`;
   }
   let fingerprintHtml = "";
-  if (spikeFingerprint) {
+  if (spikeFingerprintRunning && spikeFingerprintProgress) {
+    const progress = spikeFingerprintProgress;
+    const phase: Record<string, string> = {
+      cookies: "读取测试账号登录态", reference_bank: "加载参考库", session: "建立并核对隔离会话",
+      subscribe: "等待事件订阅就绪", sending: "发送探针", collecting: "采集完整回复", scoring: "本地评分",
+    };
+    fingerprintHtml = `<div class="spike-diag-result" role="status">${escapeHtml(phase[progress.phase] ?? progress.phase)}${progress.probe ? ` ${progress.probe}/3` : ""}　发送确认 ${progress.confirmed}　有效样本 ${progress.samples}</div>`;
+  } else if (spikeFingerprint) {
     const f = spikeFingerprint;
     const r = f.result;
     const verdictLabel: Record<string, string> = {
@@ -1126,7 +1146,8 @@ function spikeDiagInnerHtml(): string {
       ? f.sends
           .map(
             (s) =>
-              `<div>探针 ${escapeHtml(s.probeId)}：${escapeHtml(s.sendStatus)}${s.textDone ? "（回复完成）" : ""}${s.sampleUsed ? "（入样）" : ""}${s.error ? `｜${escapeHtml(s.error)}` : ""}</div>`
+              `<div>探针 ${escapeHtml(s.probeId)}：${escapeHtml(s.sendStatus)}${s.textDone ? "（回复完成）" : ""}${s.sampleUsed ? "（入样）" : ""}${s.error ? `｜${escapeHtml(s.error)}` : ""}</div>
+              ${s.diagnostics ? `<div class="hint">${escapeHtml(s.diagnostics.endedBy)} · 事件行 ${s.diagnostics.lines} · 文本增量 ${s.diagnostics.textDeltas} · 读取超时 ${s.diagnostics.readTimeouts} · 解析错误 ${s.diagnostics.parseErrors} · 未关联事件 ${s.diagnostics.unmatchedEvents} · 用户事件 ${s.diagnostics.sawUser ? "已关联" : "未观察"} · 助手消息 ${s.diagnostics.assistantMessages} · 空闲 ${s.diagnostics.sawIdle ? "已观察" : "未观察"}</div>` : ""}`
           )
           .join("")
       : "";
@@ -1134,7 +1155,7 @@ function spikeDiagInnerHtml(): string {
     fingerprintHtml = `
       <div class="spike-diag-result ${cls}">
         <div>${f.ok ? "✓" : "■"} 指纹探针：${escapeHtml(verdictLabel[f.verdict] ?? f.verdict)}（阶段 ${escapeHtml(f.phase)}）</div>
-        <div>发出探针 ${f.probesSent}/3　发送确认 ${f.probesConfirmed ?? 0}　采到样本 ${f.samplesCollected}　参与评分 ${r?.usedSamples ?? 0}/${r?.requiredSamples ?? 3}</div>
+        <div>进入网络写入 ${f.probesSent}/3　发送确认 ${f.probesConfirmed ?? 0}　采到样本 ${f.samplesCollected}　参与评分 ${r?.usedSamples ?? 0}/${r?.requiredSamples ?? 3}</div>
         ${sendsHtml ? `<div class="hint">${sendsHtml}</div>` : ""}
         ${r && r.prediction ? `<div>候选首位：${escapeHtml(r.predictionName || r.prediction)}　家族 ${escapeHtml(r.familyPredictionName || r.familyPrediction)}</div>` : ""}
         ${r?.calibrated && r.probability != null ? `<div>校准置信度：${(r.probability * 100).toFixed(1)}%（${escapeHtml(r.probabilityStatus)}，闭集参考）</div>` : ""}
@@ -1142,7 +1163,7 @@ function spikeDiagInnerHtml(): string {
         ${sampleHtml ? `<div class="hint">${escapeHtml(sampleHtml)}</div>` : ""}
         ${r?.evidenceReason ? `<div class="hint">${escapeHtml(r.evidenceLabel)}：${escapeHtml(r.evidenceReason)}</div>` : ""}
         ${r?.referenceBuiltAt ? `<div class="hint">参考库 ${escapeHtml(r.referenceBuiltAt)}　${escapeHtml(r.method)}</div>` : ""}
-        ${f.sessionId ? `<div class="hint">隔离会话 ${escapeHtml(f.sessionId)}</div>` : ""}
+        ${f.sessionId ? `<div class="hint">隔离会话标识末尾 ${escapeHtml(f.sessionId.slice(-8))}</div>` : ""}
         ${f.error ? `<div>错误：${escapeHtml(f.error)}</div>` : ""}
       </div>`;
   } else if (spikeFingerprintError) {
@@ -1420,30 +1441,35 @@ async function runSpikeFingerprint(): Promise<void> {
     syncSpikeDiag();
     return;
   }
+  const task = { accountUuid: acc.uuid, taskId: createSpikeTaskId() };
+  spikeFingerprintTask = task;
+  spikeFingerprintProgress = { ...task, phase: "cookies", probe: 0, confirmed: 0, samples: 0 };
   spikeFingerprintRunning = true;
+  spikeFingerprint = null;
   spikeFingerprintError = null;
   spikeTrace("指纹探针", "调用后端", "muse_native_fingerprint_probe");
   syncSpikeDiag();
+  const watchdog = window.setTimeout(() => {
+    void cancelSpikeProbe(task);
+  }, 510_000);
   try {
-    spikeFingerprint = await Promise.race([
-      invoke<SpikeFingerprintProbe>("muse_native_fingerprint_probe", {
-        providerId: "muse",
-        uuid: acc.uuid,
-      }),
-      new Promise<SpikeFingerprintProbe>((_, reject) =>
-        setTimeout(() => reject(new Error("指纹探针超时（5 分钟）")), 300_000)
-      ),
-    ]);
+    spikeFingerprint = await invoke<SpikeFingerprintProbe>("muse_native_fingerprint_probe", {
+      providerId: "muse",
+      uuid: task.accountUuid,
+      taskId: task.taskId,
+    });
     spikeTrace("指纹探针", "后端已返回", `阶段 ${spikeFingerprint.phase}`);
   } catch (e) {
-    spikeFingerprint = null;
     spikeFingerprintError = String(e);
-    spikeTrace("指纹探针", "后端失败/超时", String(e));
-    // 前端超时不能代替后端取消：显式请求后端停止，避免继续发探针。
-    void cancelSpikeProbe();
+    spikeTrace("指纹探针", "后端失败", String(e));
+    void cancelSpikeProbe(task);
+  } finally {
+    window.clearTimeout(watchdog);
+    spikeFingerprintRunning = false;
+    spikeFingerprintTask = null;
+    spikeFingerprintProgress = null;
+    syncSpikeDiag();
   }
-  spikeFingerprintRunning = false;
-  syncSpikeDiag();
 }
 
 // 保存代理后的结果摘要：把三层状态分开写，不让“Rust 侧已保存”被误读成
@@ -1560,7 +1586,7 @@ async function runSpikeProxy(connectivityOnly = false): Promise<void> {
     spikeProxyError = String(e);
     spikeTrace("代理探针", "后端失败/超时", String(e));
     // 前端超时/异常不能代替后端取消：显式请求后端停止，避免继续发请求。
-    void cancelSpikeProbe();
+    void cancelSpikeProbe(null, acc.uuid);
   }
   spikeProxyRunning = false;
   syncSpikeDiag();
@@ -1705,20 +1731,26 @@ async function clearSpikeProxy(): Promise<void> {
 }
 
 // 后端取消：Promise.race 超时后仍会调用它，确保 Rust 侧停止发起新请求。
-async function cancelSpikeProbe(): Promise<void> {
-  if (!snapshot) return;
-  const acc = pickWatchAccount();
-  if (!acc) {
+function createSpikeTaskId(): string {
+  const bytes = crypto.getRandomValues(new Uint8Array(16));
+  bytes[6] = (bytes[6] & 0x0f) | 0x40;
+  bytes[8] = (bytes[8] & 0x3f) | 0x80;
+  const hex = Array.from(bytes, (byte) => byte.toString(16).padStart(2, "0")).join("");
+  return `${hex.slice(0, 8)}-${hex.slice(8, 12)}-${hex.slice(12, 16)}-${hex.slice(16, 20)}-${hex.slice(20)}`;
+}
+
+async function cancelSpikeProbe(task = spikeFingerprintTask, accountUuid?: string): Promise<void> {
+  const uuid = task?.accountUuid ?? accountUuid ?? pickWatchAccount()?.uuid;
+  if (!uuid) {
     spikeNotice = "停止失败：没有已登录的 Muse 账号。";
     syncSpikeDiag();
     return;
   }
   try {
-    // 返回命中的任务数：同账号可能同时跑多个任务（指纹 + 代理探针等），
-    // 后端按账号广播取消，这里如实显示命中了几个。
     const hit = await invoke<number>("muse_native_cancel_probe", {
       providerId: "muse",
-      uuid: acc.uuid,
+      uuid,
+      taskId: task?.taskId ?? null,
     });
     spikeNotice =
       hit > 0
@@ -3121,6 +3153,12 @@ function bindDelegatedEvents(): void {
 async function bootstrap(): Promise<void> {
   // 0.1.9: event delegation is bound once here, before the first render.
   bindDelegatedEvents();
+
+  await listen<SpikeFingerprintProgress>("muse-fingerprint-progress", ({ payload }) => {
+    if (payload.taskId !== spikeFingerprintTask?.taskId || payload.accountUuid !== spikeFingerprintTask.accountUuid) return;
+    spikeFingerprintProgress = payload;
+    syncSpikeDiag();
+  });
 
   await listen<ManagerSnapshot>("manager-state-changed", (event) => {
     saveScrollPosition();

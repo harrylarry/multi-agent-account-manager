@@ -1,20 +1,13 @@
-//! #18 探针采集：把一条 `chat.stream` 的助手回复完整收下来。
-//!
-//! 为什么需要单独一层：`chat.stream` 是**订阅**，ack 之后正文并不在同一路
-//! 流里继续，而是在 `chat.subscribe` 的长连接上以 `delta.text_append` 事件到达。
-//! 所以一次探针要两条连接：
-//! 1. 订阅连接：先开 `chat.subscribe`，从第一帧起就开始收事件（先订后发，避免漏头）；
-//! 2. 发送连接：`chat.stream` 只负责投递与 ack（复用 `chat_send::send_message`）。
-//!
-//! 本模块只做「收集」，不做评分、不做判定：拿不到就报拿不到，绝不猜文本。
+//! Collect a correlated assistant turn on the same Noise connection as the send.
 
+use std::collections::{HashMap, HashSet};
 use std::time::Duration;
 
-use crate::chat_send::LineSource;
+use crate::chat_send::{Ack, LineSource};
 use crate::gateway::{ConnectedGateway, GatewayError, Subscription};
 use crate::transport::{HttpRequest, Service};
-use crate::watch::{parse_event, WatchKind};
 use serde::Serialize;
+use serde_json::Value;
 use tokio::io::{AsyncRead, AsyncWrite};
 
 /// 网页端广告的能力集合（含 `delta_stream`，否则服务端不推正文增量）。
@@ -43,7 +36,11 @@ pub struct Collected {
   /// 结束原因：`done` / `timeout` / `closed`。
   pub ended_by: String,
   /// 是否出现过智能体忙态（用于判断这轮是否真的开始了）。
-  pub saw_busy: bool,
+  pub read_timeouts: u64,
+  pub unmatched_events: u64,
+  pub saw_user: bool,
+  pub saw_idle: bool,
+  pub assistant_messages: usize,
 }
 
 /// 构造 `chat.subscribe` 请求（供直连与代理两条路径复用）。
@@ -73,186 +70,351 @@ where
   gw.subscribe(subscription_request()).await
 }
 
-/// 从订阅里收文本，直到 `message_done`、超时或断流。
-///
-/// `total` 是整轮预算；`per_line` 是单行等待上限（避免一次 read 卡死整轮）。
-/// `message_id` 若给定，只累积该消息的增量；否则累积第一份到达的正文。
-///
-/// 泛型于 [`LineSource`]：直连/代理的 `Subscription` 与测试用的假数据源
-/// 走同一套解析逻辑，「采集中被取消」的语义才能被单测覆盖。
-pub async fn collect_text<L>(
-  sub: &mut L,
-  message_id: Option<&str>,
-  total: Duration,
-  per_line: Duration,
-) -> Collected
-where
-  L: LineSource,
-{
-  let deadline = tokio::time::Instant::now() + total;
-  let mut out = Collected::default();
-  let mut target = message_id.map(str::to_string);
+#[derive(Default)]
+struct AssistantMessage {
+  text: String,
+  done: bool,
+}
 
-  loop {
-    let left = deadline.saturating_duration_since(tokio::time::Instant::now());
-    if left.is_zero() {
-      out.ended_by = "timeout".to_string();
-      return out;
-    }
-    let wait = left.min(per_line);
-    match sub.next_line(wait).await {
-      Ok(Some(line)) => {
-        out.lines += 1;
-        if parse_event(&line).is_none() {
-          // 非 event 行（ack/心跳）不算错误，但也不计入解析失败。
-          if serde_json::from_str::<serde_json::Value>(line.trim()).is_err() {
-            out.parse_errors += 1;
-          }
-          continue;
-        }
-        let Some(ev) = parse_event(&line) else {
-          continue;
-        };
-        // 只看目标消息：第一条正文出现时把它定为目标。
-        let belongs = match (&target, &ev.message_id) {
-          (None, _) => true,
-          (Some(t), Some(m)) => t == m,
-          (Some(_), None) => true,
-        };
-        match ev.kind {
-          WatchKind::AgentBusy(_) => {
-            out.saw_busy = true;
-          }
-          WatchKind::MessageStarted => {
-            if target.is_none() {
-              target = ev.message_id.clone();
-            }
-          }
-          WatchKind::TextDelta(delta) => {
-            if target.is_none() {
-              target = ev.message_id.clone();
-            }
-            if belongs {
-              out.text.push_str(&delta);
-              out.text_deltas += 1;
-            }
-          }
-          WatchKind::MessageDone { .. } => {
-            if belongs {
-              out.done = true;
-              out.ended_by = "done".to_string();
-              return out;
-            }
-          }
-          WatchKind::TurnStarted | WatchKind::AgentIdle(_) | WatchKind::Other => {}
-        }
-      }
-      Ok(None) => {
-        out.ended_by = "closed".to_string();
-        return out;
-      }
-      Err(_) => {
-        out.ended_by = "closed".to_string();
-        return out;
-      }
+fn text_field<'a>(objects: &[&'a Value], keys: &[&str]) -> Option<&'a str> {
+  objects.iter().find_map(|value| {
+    keys
+      .iter()
+      .find_map(|key| value.get(key)?.as_str().filter(|text| !text.is_empty()))
+  })
+}
+
+fn final_text(payload: &Value, root: &Value, assistant_id: &str) -> Option<String> {
+  if let Some(messages) = payload["transcript"]["messages"].as_array() {
+    let text: Vec<&str> = messages
+      .iter()
+      .filter(|message| message["role"] == "assistant")
+      .filter(|message| {
+        text_field(&[message], &["message_id", "id"]).is_none_or(|id| id == assistant_id)
+      })
+      .flat_map(|message| {
+        let content = &message["content"];
+        content.as_str().into_iter().chain(
+          content
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter(|part| {
+              part["type"]
+                .as_str()
+                .is_none_or(|kind| matches!(kind, "text" | "markdown"))
+            })
+            .filter_map(|part| text_field(&[part], &["text", "markdown"])),
+        )
+      })
+      .collect();
+    if !text.is_empty() {
+      return Some(text.join("\n\n"));
     }
   }
+  text_field(
+    &[payload, &payload["message"], root],
+    &["display_text", "text", "content"],
+  )
+  .map(str::to_string)
+}
+
+/// Gathering a bubble and establishing the end of a turn are independent.
+/// A matching completion must be followed by an observed idle state. A short
+/// settle window allows another bubble to arrive before the turn is released.
+pub async fn collect_text<L: LineSource>(
+  sub: &mut L,
+  ack: &Ack,
+  session_id: &str,
+  total: Duration,
+  per_line: Duration,
+) -> Collected {
+  use tokio::time::{timeout_at, Instant};
+  let deadline = Instant::now() + total;
+  let mut out = Collected::default();
+  let mut messages = HashMap::<String, AssistantMessage>::new();
+  let mut order = Vec::new();
+  let mut seen = HashSet::new();
+  let fields = ack.raw.get("result").unwrap_or(&ack.raw);
+  let mut turn = text_field(&[fields], &["turn_id"]).map(str::to_string);
+  let mut task = text_field(&[fields], &["task_id"]).map(str::to_string);
+  let mut settle_at: Option<Instant> = None;
+
+  out.ended_by = loop {
+    let now = Instant::now();
+    if settle_at.is_some_and(|end| end <= now && end <= deadline) {
+      out.done = true;
+      break "done";
+    }
+    if deadline <= now {
+      break "timeout";
+    }
+    let wake = (now + per_line)
+      .min(deadline)
+      .min(settle_at.unwrap_or(deadline));
+    let line = match timeout_at(wake, sub.next_line(wake - now)).await {
+      Ok(Ok(Some(line))) => line,
+      Ok(Ok(None)) if sub.stream_ended() => break "stream_ended",
+      Ok(Ok(None) | Err(GatewayError::Closed(_))) => break "closed",
+      Ok(Err(GatewayError::Cancelled)) => break "cancelled",
+      Ok(Err(GatewayError::Reset(..))) => break "reset",
+      Ok(Err(GatewayError::Ws(_))) => break "websocket_error",
+      Ok(Err(GatewayError::Timeout(_))) | Err(_) => {
+        if Some(wake) != settle_at && wake < deadline {
+          out.read_timeouts += 1;
+        }
+        continue;
+      }
+      Ok(Err(_)) => break "protocol_error",
+    };
+    out.lines += 1;
+    let Ok(root) = serde_json::from_str::<Value>(&line) else {
+      out.parse_errors += 1;
+      break "protocol_error";
+    };
+    if root["type"] != "event" {
+      continue;
+    }
+    let Some(event) = text_field(&[&root], &["event", "event_name"]) else {
+      out.parse_errors += 1;
+      break "protocol_error";
+    };
+    let payload = &root["payload"];
+    let contexts = [
+      payload,
+      &root,
+      &payload["chat_context"],
+      &root["chat_context"],
+      &payload["message"],
+    ];
+    let session = text_field(
+      &contexts,
+      &["session_id", "sessionId", "thread_id", "threadId"],
+    );
+    let event_turn = text_field(&contexts, &["turn_id"]);
+    let event_task = text_field(&contexts, &["task_id"]);
+    let msg = text_field(&[payload, &root], &["message_id", "assistant_message_id"])
+      .or_else(|| text_field(&[&payload["message"]], &["message_id", "id"]));
+    let parent = text_field(
+      &contexts,
+      &[
+        "user_message_id",
+        "reply_to_message_id",
+        "parent_message_id",
+      ],
+    );
+    if session.is_some_and(|id| id != session_id) {
+      out.unmatched_events += 1;
+      continue;
+    }
+    if event == "message.user" {
+      if msg.or(parent) == Some(ack.message_id.as_str()) {
+        out.saw_user = true;
+        if turn.is_none() {
+          turn = event_turn.map(str::to_string);
+        }
+        if task.is_none() {
+          task = event_task.map(str::to_string);
+        }
+      } else if session == Some(session_id) || (session.is_none() && out.saw_user) {
+        break "competing_turn";
+      }
+      continue;
+    }
+    if event_turn.zip(turn.as_deref()).is_some_and(|(a, b)| a != b)
+      || event_task.zip(task.as_deref()).is_some_and(|(a, b)| a != b)
+      || parent.is_some_and(|id| id != ack.message_id)
+    {
+      out.unmatched_events += 1;
+      continue;
+    }
+    if event == "agent.status" {
+      match text_field(&[payload, &root], &["activity_code"]) {
+        Some("idle" | "online") if !messages.is_empty() && messages.values().all(|m| m.done) => {
+          out.saw_idle = true;
+          settle_at.get_or_insert(Instant::now() + Duration::from_secs(1));
+        }
+        Some("idle" | "online") | None => {}
+        Some(_) => {
+          settle_at = None;
+        }
+      }
+      continue;
+    }
+    if !matches!(
+      event,
+      "delta.message_start" | "delta.text_append" | "delta.message_done" | "message.assistant"
+    ) {
+      continue;
+    }
+    let Some(id) = msg.filter(|id| *id != ack.message_id) else {
+      out.unmatched_events += 1;
+      continue;
+    };
+    let linked = parent == Some(ack.message_id.as_str())
+      || event_turn.zip(turn.as_deref()).is_some_and(|(a, b)| a == b)
+      || event_task.zip(task.as_deref()).is_some_and(|(a, b)| a == b)
+      || (out.saw_user && session == Some(session_id))
+      || messages.contains_key(id);
+    if !linked {
+      out.unmatched_events += 1;
+      continue;
+    }
+    if let Some(seq) = root["seq"].as_u64().filter(|seq| *seq > 0) {
+      if !seen.insert((event.to_string(), id.to_string(), seq)) {
+        continue;
+      }
+    }
+    if !messages.contains_key(id) {
+      order.push(id.to_string());
+    }
+    let message = messages.entry(id.to_string()).or_default();
+    match event {
+      "delta.message_start" => settle_at = None,
+      "delta.text_append" if !message.done => {
+        settle_at = None;
+        if let Some(text) = text_field(&[payload, &root], &["text"]) {
+          message.text.push_str(text);
+          out.text_deltas += 1;
+        }
+      }
+      "delta.message_done" | "message.assistant" => {
+        let status = text_field(&[payload, &root], &["status"]);
+        match status {
+          Some("completed" | "complete" | "done" | "finished" | "ok") | None => {}
+          Some("failed" | "error" | "cancelled" | "canceled" | "interrupted") => {
+            break "remote_failure"
+          }
+          Some(_) => continue,
+        }
+        if let Some(text) = final_text(payload, &root, id) {
+          message.text = text;
+        }
+        if !message.done {
+          settle_at = None;
+          message.done = true;
+        }
+      }
+      _ => {}
+    }
+    if out.lines > 16_384 || message.text.len() > 512 * 1024 || order.len() > 64 {
+      break "response_limit";
+    }
+  }
+  .to_string();
+  out.assistant_messages = messages.len();
+  out.text = order
+    .iter()
+    .map(|id| messages[id].text.as_str())
+    .collect::<Vec<_>>()
+    .join("\n\n");
+  out
 }
 
 #[cfg(test)]
 mod tests {
   use super::*;
   use std::collections::VecDeque;
-  use tokio::sync::watch;
 
-  /// 假数据源：按脚本吐行；`stall` 为真时吐完就永久挂起（模拟「采集中流不动」）。
-  struct Scripted {
-    lines: VecDeque<String>,
-    stall: bool,
-  }
-
-  impl Scripted {
-    fn new(lines: &[&str], stall: bool) -> Self {
-      Self {
-        lines: lines.iter().map(|s| s.to_string()).collect(),
-        stall,
-      }
-    }
-  }
+  struct Scripted(VecDeque<Result<Option<String>, GatewayError>>);
 
   impl LineSource for Scripted {
     fn http_status(&self) -> Option<u16> {
-      None
+      Some(200)
     }
-
     async fn next_line(&mut self, _wait: Duration) -> Result<Option<String>, GatewayError> {
-      if let Some(l) = self.lines.pop_front() {
-        return Ok(Some(l));
+      if let Some(item) = self.0.pop_front() {
+        return item;
       }
-      if self.stall {
-        std::future::pending::<()>().await;
-      }
-      Ok(None)
+      std::future::pending().await
     }
   }
 
-  #[tokio::test]
-  async fn collect_accumulates_matching_deltas_until_done() {
-    let mut src = Scripted::new(
-      &[
-        r#"{"type":"event","event":"delta.message_start","seq":1,"payload":{"message_id":"m1"}}"#,
-        r#"{"type":"event","event":"delta.text_append","seq":2,"payload":{"message_id":"m1","text":"he"}}"#,
-        r#"{"type":"event","event":"delta.text_append","seq":3,"payload":{"message_id":"other","text":"NO"}}"#,
-        r#"{"type":"event","event":"delta.text_append","seq":4,"payload":{"message_id":"m1","text":"llo"}}"#,
-        r#"{"type":"event","event":"delta.message_done","seq":5,"payload":{"message_id":"m1","status":"ok"}}"#,
-      ],
-      false,
-    );
-    let got = collect_text(&mut src, None, Duration::from_secs(2), Duration::from_secs(1)).await;
-    assert!(got.done);
-    assert_eq!(got.ended_by, "done");
-    assert_eq!(got.text, "hello");
-    assert_eq!(got.text_deltas, 2);
+  fn ack() -> Ack {
+    Ack {
+      message_id: "user-1".to_string(),
+      session_id: Some("test-session".to_string()),
+      raw: serde_json::json!({"message_id":"user-1","session_id":"test-session"}),
+    }
+  }
+
+  fn lines(values: &[&str]) -> Scripted {
+    Scripted(
+      values
+        .iter()
+        .map(|line| Ok(Some((*line).to_string())))
+        .collect(),
+    )
   }
 
   #[tokio::test]
-  async fn collect_reports_closed_stream_without_done() {
-    let mut src = Scripted::new(
-      &[r#"{"type":"event","event":"delta.text_append","seq":1,"payload":{"message_id":"m1","text":"hi"}}"#],
-      false,
-    );
-    let got = collect_text(&mut src, None, Duration::from_secs(2), Duration::from_secs(1)).await;
-    assert!(!got.done, "断流不能被当成收完");
-    assert_eq!(got.ended_by, "closed");
-    assert_eq!(got.text, "hi");
+  async fn collects_only_matching_assistant_and_preserves_whitespace_after_read_timeout() {
+    let mut src = lines(&[
+      r#"{"type":"event","event":"message.user","message_id":"user-1","payload":{"session_id":"test-session","turn_id":"turn-1"}}"#,
+      r#"{"type":"event","event":"delta.message_done","message_id":"other","payload":{"status":"complete","text":"wrong"}}"#,
+      r#"{"type":"event","event":"delta.text_append","message_id":"assistant","seq":3,"payload":{"turn_id":"turn-1","text":"one "}}"#,
+      r#"{"type":"event","event":"delta.text_append","message_id":"assistant","seq":3,"payload":{"text":"duplicate"}}"#,
+      r#"{"type":"event","event":"delta.text_append","message_id":"assistant","seq":4,"payload":{"text":"two"}}"#,
+      r#"{"type":"event","event":"delta.message_done","message_id":"assistant","payload":{"status":"complete"}}"#,
+      r#"{"type":"event","event":"agent.status","payload":{"activity_code":"idle"}}"#,
+    ]);
+    src
+      .0
+      .push_front(Err(GatewayError::Timeout("subscription read")));
+    let result = collect_text(
+      &mut src,
+      &ack(),
+      "test-session",
+      Duration::from_secs(2),
+      Duration::from_millis(100),
+    )
+    .await;
+    assert!(result.done);
+    assert_eq!(result.ended_by, "done");
+    assert_eq!(result.text, "one two");
+    assert_eq!(result.text_deltas, 2);
+    assert!(result.read_timeouts > 0);
+    assert_eq!(result.unmatched_events, 1);
   }
 
-  /// 采集中被取消必须在毫秒级生效（不能等 90 秒预算走完）。
   #[tokio::test]
-  async fn collect_can_be_cancelled_mid_stream() {
-    let mut src = Scripted::new(&[], true);
-    let (tx, mut rx) = watch::channel(false);
-    tokio::spawn(async move {
-      tokio::time::sleep(Duration::from_millis(10)).await;
-      let _ = tx.send(true);
-    });
-    let outcome = tokio::select! {
-      _ = collect_text(&mut src, None, Duration::from_secs(90), Duration::from_secs(90)) => "collected",
-      _ = rx.changed() => "cancelled",
-    };
-    assert_eq!(outcome, "cancelled");
+  async fn message_done_without_turn_end_does_not_advance() {
+    let mut src = lines(&[
+      r#"{"type":"event","event":"delta.message_done","message_id":"assistant","payload":{"parent_message_id":"user-1","status":"complete","text":"reply"}}"#,
+    ]);
+    let result = collect_text(
+      &mut src,
+      &ack(),
+      "test-session",
+      Duration::from_millis(20),
+      Duration::from_millis(5),
+    )
+    .await;
+    assert!(!result.done);
+    assert_eq!(result.ended_by, "timeout");
   }
 
-  #[test]
-  fn default_collected_is_empty_and_not_done() {
-    let c = Collected::default();
-    assert_eq!(c.text, "");
-    assert!(!c.done);
-    assert_eq!(c.ended_by, "");
-  }
-
-  #[test]
-  fn capabilities_include_delta_stream() {
-    assert!(SUBSCRIBE_CAPABILITIES.contains(&"delta_stream"));
+  #[tokio::test]
+  async fn distinguishes_cancellation_close_and_protocol_error() {
+    for (event, expected) in [
+      (Ok(None), "closed"),
+      (Err(GatewayError::Cancelled), "cancelled"),
+      (
+        Err(GatewayError::Protocol("invalid frame".to_string())),
+        "protocol_error",
+      ),
+    ] {
+      let mut src = Scripted(VecDeque::from([event]));
+      let result = collect_text(
+        &mut src,
+        &ack(),
+        "test-session",
+        Duration::from_secs(1),
+        Duration::from_secs(1),
+      )
+      .await;
+      assert!(!result.done);
+      assert_eq!(result.ended_by, expected);
+    }
   }
 }

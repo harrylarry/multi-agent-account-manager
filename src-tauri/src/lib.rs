@@ -338,6 +338,7 @@ async fn muse_native_fingerprint_probe(
   app: AppHandle,
   provider_id: String,
   uuid: String,
+  task_id: String,
   ledger: tauri::State<'_, std::sync::Arc<send_ledger::SendLedger>>,
   mgr: State<'_, Arc<SessionManager>>,
   cancel: State<'_, Arc<probe_cancel::ProbeCancel>>,
@@ -345,18 +346,23 @@ async fn muse_native_fingerprint_probe(
   if provider_id != "muse" {
     return Err("指纹探针只支持 Muse 账号".to_string());
   }
+  let task_id = uuid::Uuid::parse_str(&task_id).map_err(|_| "指纹任务标识无效".to_string())?;
+  let (token, _guard) = cancel.register_task(&uuid, "fingerprint", task_id);
   let setting = account_proxy_setting(&mgr, &provider_id, &uuid).await;
   let dir = app.path().app_data_dir().map_err(|e| e.to_string())?;
   let secrets = secrets::Secrets::new(&dir);
-  Ok(muse_native::fingerprint_probe(
-    &app,
-    &ledger,
-    &uuid,
-    setting.as_ref(),
-    &secrets,
-    &cancel,
+  Ok(
+    muse_native::fingerprint_probe(
+      &app,
+      &ledger,
+      &uuid,
+      task_id,
+      setting.as_ref(),
+      &secrets,
+      token,
+    )
+    .await,
   )
-  .await)
 }
 
 /// #11/#16：用**该账号已保存的代理**验证控制面 + WSS 隧道 + Noise + ping（fail-closed）。
@@ -576,12 +582,19 @@ async fn muse_native_clear_account_proxy(
 fn muse_native_cancel_probe(
   provider_id: String,
   uuid: String,
+  task_id: Option<String>,
   cancel: State<'_, Arc<probe_cancel::ProbeCancel>>,
 ) -> Result<usize, String> {
   if provider_id != "muse" {
     return Err("取消探针只支持 Muse 账号".to_string());
   }
-  Ok(cancel.cancel_account(&uuid))
+  Ok(match task_id {
+    Some(task) => cancel.cancel_task(
+      &uuid,
+      uuid::Uuid::parse_str(&task).map_err(|_| "任务标识无效".to_string())?,
+    ),
+    None => cancel.cancel_account(&uuid),
+  })
 }
 
 /// #10：开始一次存活探针（长连接 + 订阅，记录到断开为止）。

@@ -110,7 +110,15 @@ impl From<NoiseError> for GatewayError {
 
 impl From<tokio_tungstenite::tungstenite::Error> for GatewayError {
   fn from(e: tokio_tungstenite::tungstenite::Error) -> Self {
-    GatewayError::Ws(e.to_string())
+    use tokio_tungstenite::tungstenite::Error;
+    match e {
+      Error::ConnectionClosed
+      | Error::AlreadyClosed
+      | Error::Protocol(
+        tokio_tungstenite::tungstenite::error::ProtocolError::ResetWithoutClosingHandshake,
+      ) => GatewayError::Closed("websocket disconnected".to_string()),
+      _ => GatewayError::Ws(e.to_string()),
+    }
   }
 }
 
@@ -451,9 +459,8 @@ where
         ws: self.ws,
         transport: self.transport,
         stream_id,
-        status: None,
-        buf: String::new(),
-        ended: false,
+        response: ResponseLines::default(),
+        socket_closed: false,
       }),
     }
   }
@@ -482,90 +489,213 @@ pub struct Subscription<S = MaybeTlsStream<TcpStream>> {
   ws: WebSocketStream<S>,
   transport: NoiseTransport,
   stream_id: u64,
-  status: Option<u16>,
-  buf: String,
-  ended: bool,
+  response: ResponseLines,
+  socket_closed: bool,
 }
 
-impl<S> Subscription<S>
-where
-  S: AsyncRead + AsyncWrite + Unpin,
-{
+#[derive(Default)]
+struct ResponseLines {
+  status: Option<u16>,
+  buf: Vec<u8>,
+  ended: bool,
+  reset: Option<(u32, String)>,
+}
+
+impl ResponseLines {
+  fn accept(&mut self, frame: InboundFrame) -> Result<(), GatewayError> {
+    let body = match frame {
+      InboundFrame::Response {
+        status,
+        body,
+        end_body,
+        ..
+      } => {
+        self.status = Some(status);
+        self.ended = end_body;
+        body
+      }
+      InboundFrame::BodyChunk { data, end_body, .. } => {
+        self.ended = end_body;
+        data
+      }
+      InboundFrame::Reset { code, reason, .. } => {
+        self.reset = Some((code, reason));
+        return Ok(());
+      }
+    };
+    if self.buf.len().saturating_add(body.len()) > 2 * 1024 * 1024 {
+      return Err(GatewayError::Protocol(
+        "buffered response exceeds limit".to_string(),
+      ));
+    }
+    self.buf.extend(body);
+    Ok(())
+  }
+
+  fn line(&mut self) -> Result<Option<String>, GatewayError> {
+    loop {
+      let len = match self.buf.iter().position(|b| *b == b'\n') {
+        Some(pos) => pos + 1,
+        None if self.ended => self.buf.len(),
+        None => 0,
+      };
+      if len == 0 {
+        break;
+      }
+      let line = String::from_utf8(self.buf.drain(..len).collect())
+        .map_err(|_| GatewayError::Protocol("invalid NDJSON UTF-8".to_string()))?;
+      let line = line.trim_end_matches(['\r', '\n']);
+      if !line.is_empty() {
+        return Ok(Some(line.to_string()));
+      }
+    }
+    if let Some((code, reason)) = self.reset.take() {
+      return Err(GatewayError::Reset(code, reason));
+    }
+    Ok(None)
+  }
+}
+
+/// A second RPC on the existing Noise connection. While it is being read,
+/// frames for the original event subscription are buffered separately.
+pub(crate) struct ParallelResponse<'a, S> {
+  subscription: &'a mut Subscription<S>,
+  id: u64,
+  response: ResponseLines,
+}
+
+impl<S: AsyncRead + AsyncWrite + Unpin> ParallelResponse<'_, S> {
+  pub(crate) fn status(&self) -> Option<u16> {
+    self.response.status
+  }
+
+  pub(crate) async fn next_line(
+    &mut self,
+    timeout: Duration,
+  ) -> Result<Option<String>, GatewayError> {
+    let deadline = tokio::time::Instant::now() + timeout;
+    loop {
+      if let Some(line) = self.response.line()? {
+        return Ok(Some(line));
+      }
+      if self.response.ended || self.subscription.socket_closed {
+        return Ok(None);
+      }
+      self
+        .subscription
+        .receive(deadline, Some((self.id, &mut self.response)))
+        .await?;
+    }
+  }
+}
+
+impl<S: AsyncRead + AsyncWrite + Unpin> Subscription<S> {
   pub fn stream_id(&self) -> u64 {
     self.stream_id
   }
 
   pub fn status(&self) -> Option<u16> {
-    self.status
+    self.response.status
+  }
+
+  pub fn stream_ended(&self) -> bool {
+    self.response.ended
+  }
+
+  pub async fn wait_ready(&mut self, timeout: Duration) -> Result<(), GatewayError> {
+    let deadline = tokio::time::Instant::now() + timeout;
+    loop {
+      if self.socket_closed || self.response.ended {
+        return Err(GatewayError::Closed(
+          "event subscription closed before send".to_string(),
+        ));
+      }
+      if let Some((code, reason)) = self.response.reset.take() {
+        return Err(GatewayError::Reset(code, reason));
+      }
+      if let Some(status) = self.status() {
+        if !(200..300).contains(&status) {
+          return Err(GatewayError::Http(status));
+        }
+        if let Some(line) = self.response.line()? {
+          let Ok(value) = serde_json::from_str::<serde_json::Value>(&line) else {
+            continue;
+          };
+          if !value.is_object() || value["type"] == "event" {
+            continue;
+          }
+          if value["ok"] == false || value["success"] == false || !value["error"].is_null() {
+            return Err(GatewayError::Protocol(
+              "event subscription rejected".to_string(),
+            ));
+          }
+          return Ok(());
+        }
+      }
+      self.receive(deadline, None).await?;
+    }
+  }
+
+  pub(crate) async fn open_parallel(
+    &mut self,
+    req: HttpRequest,
+    cancel: Option<&mut watch::Receiver<bool>>,
+  ) -> (bool, usize, Result<ParallelResponse<'_, S>, GatewayError>) {
+    let (id, frames) = match self.transport.encrypt_request(&req) {
+      Ok(v) => v,
+      Err(e) => return (false, 0, Err(e.into())),
+    };
+    let wrote = write_frames(&mut WsSink { ws: &mut self.ws }, frames, cancel).await;
+    let response = match wrote.error {
+      Some(e) => Err(e),
+      None => Ok(ParallelResponse {
+        subscription: self,
+        id,
+        response: ResponseLines::default(),
+      }),
+    };
+    (wrote.entered_write, wrote.wrote, response)
   }
 
   pub async fn next_line(&mut self, timeout: Duration) -> Result<Option<String>, GatewayError> {
     let deadline = tokio::time::Instant::now() + timeout;
     loop {
-      if let Some(pos) = self.buf.find('\n') {
-        let mut line: String = self.buf.drain(..=pos).collect();
-        while line.ends_with('\n') || line.ends_with('\r') {
-          line.pop();
-        }
-        if line.is_empty() {
-          continue;
-        }
+      if let Some(line) = self.response.line()? {
         return Ok(Some(line));
       }
-      if self.ended {
-        let rest = std::mem::take(&mut self.buf);
-        let rest = rest.trim();
-        return Ok(if rest.is_empty() {
-          None
-        } else {
-          Some(rest.to_string())
-        });
+      if self.response.ended || self.socket_closed {
+        return Ok(None);
       }
-      let msg = match tokio::time::timeout_at(deadline, self.ws.next()).await {
-        Err(_) => return Err(GatewayError::Timeout("subscription read")),
-        Ok(None) => return Ok(None),
-        Ok(Some(Err(e))) => return Err(e.into()),
-        Ok(Some(Ok(m))) => m,
-      };
-      match msg {
-        Message::Binary(data) => {
-          if let Some(frame) = self.transport.decrypt(&data)? {
-            match frame {
-              InboundFrame::Response {
-                status,
-                body,
-                end_body,
-                ..
-              } => {
-                // 响应头帧**可以**自带正文（unary 的常见形态）。以前这里只取
-                // status、把 body 丢掉：如果 ack 正好在这个帧里，就会被误判成
-                // 「ended without ack」。这里一并拼进缓冲，交给上层按行解析。
-                self.status = Some(status);
-                if !body.is_empty() {
-                  self.buf.push_str(&String::from_utf8_lossy(&body));
-                }
-                if end_body {
-                  self.ended = true;
-                }
-              }
-              InboundFrame::BodyChunk {
-                data, end_body, ..
-              } => {
-                self.buf.push_str(&String::from_utf8_lossy(&data));
-                if end_body {
-                  self.ended = true;
-                }
-              }
-              InboundFrame::Reset { code, reason, .. } => {
-                return Err(GatewayError::Reset(code, reason));
-              }
-            }
+      self.receive(deadline, None).await?;
+    }
+  }
+
+  async fn receive(
+    &mut self,
+    deadline: tokio::time::Instant,
+    parallel: Option<(u64, &mut ResponseLines)>,
+  ) -> Result<(), GatewayError> {
+    match tokio::time::timeout_at(deadline, self.ws.next()).await {
+      Err(_) => return Err(GatewayError::Timeout("subscription read")),
+      Ok(None | Some(Ok(Message::Close(_)))) => self.socket_closed = true,
+      Ok(Some(Err(e))) => return Err(e.into()),
+      Ok(Some(Ok(Message::Binary(data)))) => {
+        if let Some(frame) = self.transport.decrypt(&data)? {
+          let id = match &frame {
+            InboundFrame::Response { stream_id, .. }
+            | InboundFrame::BodyChunk { stream_id, .. }
+            | InboundFrame::Reset { stream_id, .. } => *stream_id,
+          };
+          if id == self.stream_id {
+            self.response.accept(frame)?;
+          } else if let Some((_, response)) = parallel.filter(|(aux, _)| *aux == id) {
+            response.accept(frame)?;
           }
         }
-        Message::Close(_) => return Ok(None),
-        _ => {}
       }
+      Ok(Some(Ok(_))) => {}
     }
+    Ok(())
   }
 }
 
@@ -756,6 +886,110 @@ async fn write_frames<K: FrameSink>(
 #[cfg(test)]
 mod tests {
   use super::*;
+
+  #[tokio::test]
+  async fn subscription_routes_interleaved_ack_and_events_by_noise_stream() {
+    use crate::chat_send::send_on_subscription;
+    use crate::collect::subscription_request;
+    use crate::noise::CipherState;
+    use tokio_tungstenite::tungstenite::protocol::Role;
+
+    fn response(cipher: &mut CipherState, id: u64, body: &[u8], ended: bool) -> Message {
+      let mut r = PbWriter::new();
+      r.uint(1, 200).bytes(3, body).bool(4, ended);
+      let mut stream = PbWriter::new();
+      stream.uint(1, id).bytes(3, &r.finish());
+      let mut service = PbWriter::new();
+      service.bytes(1, &stream.finish());
+      let mut frame = PbWriter::new();
+      frame
+        .uint(1, id)
+        .uint(2, 0)
+        .uint(3, 1)
+        .bytes(4, &service.finish());
+      Message::Binary(cipher.encrypt_with_ad(&[], &frame.finish()).unwrap().into())
+    }
+
+    let (client, server) = tokio::io::duplex(8192);
+    let mut server = WebSocketStream::from_raw_socket(server, Role::Server, None).await;
+    let client = ConnectedGateway {
+      ws: WebSocketStream::from_raw_socket(client, Role::Client, None).await,
+      transport: NoiseTransport::new(
+        CipherState::new(Some([1; 32])),
+        CipherState::new(Some([2; 32])),
+      ),
+    };
+    let peer = tokio::spawn(async move {
+      let mut cipher = CipherState::new(Some([2; 32]));
+      assert!(server.next().await.unwrap().unwrap().is_binary());
+      server
+        .send(response(&mut cipher, 1, b"{\"type\":\"res\"}\n", false))
+        .await
+        .unwrap();
+      assert!(server.next().await.unwrap().unwrap().is_binary());
+      server
+        .send(response(
+          &mut cipher,
+          99,
+          b"{\"message_id\":\"wrong\"}",
+          true,
+        ))
+        .await
+        .unwrap();
+      server
+        .send(response(
+          &mut cipher,
+          1,
+          b"{\"type\":\"event\",\"event\":\"message.user\"}\n",
+          false,
+        ))
+        .await
+        .unwrap();
+      server
+        .send(response(
+          &mut cipher,
+          2,
+          b"{\"message_id\":\"accepted\",\"session_id\":\"new\"}",
+          true,
+        ))
+        .await
+        .unwrap();
+    });
+
+    let mut sub = client.subscribe(subscription_request()).await.unwrap();
+    let wait = Duration::from_secs(1);
+    sub.wait_ready(wait).await.unwrap();
+    let (_tx, mut rx) = watch::channel(false);
+    let sent = send_on_subscription(&mut sub, "test", "new", wait, &mut rx).await;
+    assert!(sent.on_wire);
+    assert_eq!(sent.outcome.unwrap().message_id, "accepted");
+    let event = sub.next_line(wait).await.unwrap().unwrap();
+    assert!(event.contains("message.user"));
+    assert!(!sub.stream_ended());
+    peer.await.unwrap();
+  }
+
+  #[test]
+  fn split_utf8_stays_intact_at_ndjson_chunk_boundary() {
+    let bytes = "回复\n".as_bytes();
+    let mut lines = ResponseLines::default();
+    lines
+      .accept(InboundFrame::BodyChunk {
+        stream_id: 1,
+        data: bytes[..2].to_vec(),
+        end_body: false,
+      })
+      .unwrap();
+    assert!(lines.line().unwrap().is_none());
+    lines
+      .accept(InboundFrame::BodyChunk {
+        stream_id: 1,
+        data: bytes[2..].to_vec(),
+        end_body: true,
+      })
+      .unwrap();
+    assert_eq!(lines.line().unwrap().as_deref(), Some("回复"));
+  }
 
   #[test]
   fn rv_challenge_detection() {

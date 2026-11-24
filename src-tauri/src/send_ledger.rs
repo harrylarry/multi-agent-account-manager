@@ -110,7 +110,7 @@ pub struct SendLedger {
 }
 
 const JOURNAL_VERSION: u32 = 1;
-/// 日志只保留最近这么多条，避免长期使用后无限增长。
+/// 最近记录的保留窗口。更早的未决记录仍需保留供核对。
 const JOURNAL_MAX_ENTRIES: usize = 500;
 
 #[derive(Serialize, Deserialize)]
@@ -427,8 +427,28 @@ impl SendLedger {
     self.persist_locked(&mut st);
   }
 
-  pub fn mark_in_flight(&self, send_id: &str) {
-    self.update(send_id, SendStatus::InFlight, None);
+  pub fn mark_in_flight(&self, send_id: &str) -> Result<(), SendError> {
+    self.mark_in_flight_in(send_id, None)
+  }
+
+  pub fn mark_in_flight_in(
+    &self,
+    send_id: &str,
+    conversation_id: Option<&str>,
+  ) -> Result<(), SendError> {
+    self.commit(|st| {
+      let attempt = st
+        .attempts
+        .iter_mut()
+        .find(|attempt| attempt.send_id == send_id)
+        .filter(|attempt| attempt.status == SendStatus::Prepared)
+        .ok_or_else(|| SendError::Unknown("缺少待发送记录".to_string()))?;
+      attempt.status = SendStatus::InFlight;
+      if let Some(id) = conversation_id {
+        attempt.conversation_id = id.to_string();
+      }
+      Ok(())
+    })
   }
 
   /// 收到明确 ack：释放锁并记 CONFIRMED。
@@ -544,9 +564,18 @@ fn persist_journal(path: &Path, st: &LedgerState) -> Result<(), String> {
   let skip = st.attempts.len().saturating_sub(JOURNAL_MAX_ENTRIES);
   let file = JournalFile {
     version: JOURNAL_VERSION,
-    attempts: st.attempts[skip..]
+    attempts: st
+      .attempts
       .iter()
-      .map(JournalEntry::from_attempt)
+      .enumerate()
+      .filter(|(index, entry)| {
+        *index >= skip
+          || matches!(
+            entry.status,
+            SendStatus::Prepared | SendStatus::InFlight | SendStatus::Unknown
+          )
+      })
+      .map(|(_, entry)| JournalEntry::from_attempt(entry))
       .collect(),
   };
   let json = serde_json::to_vec(&file).map_err(|e| format!("序列化状态日志失败: {e}"))?;
@@ -704,13 +733,13 @@ mod tests {
     let l = SendLedger::new();
     let m = l.mission("u1").unwrap();
     let a = m.begin_probe("fp", "p1").unwrap();
-    l.mark_in_flight(&a);
+    l.mark_in_flight(&a).unwrap();
     l.confirm(&a);
     let b = m.begin_probe("fp", "p2").unwrap();
-    l.mark_in_flight(&b);
+    l.mark_in_flight(&b).unwrap();
     l.fail(&b, "HTTP 500".to_string());
     let c = m.begin_probe("fp", "p3").unwrap();
-    l.mark_in_flight(&c);
+    l.mark_in_flight(&c).unwrap();
     l.mark_unknown(&c, "采集超时".to_string());
 
     let list = l.attempts();
@@ -783,7 +812,7 @@ mod tests {
       let (l, report) = SendLedger::open(path.clone());
       assert_eq!(report, RecoveryReport::default());
       let id = l.begin("u1", "c1", "hello world").unwrap();
-      l.mark_in_flight(&id);
+      l.mark_in_flight(&id).unwrap();
       // 进程在这里「崩掉」：不 confirm、不 fail，也不 drop 任何 guard。
     }
     let (l, report) = SendLedger::open(path.clone());
@@ -905,6 +934,43 @@ mod tests {
     assert_eq!(f.attempts.len(), 1);
     assert_eq!(f.attempts[0].send_id, id);
     assert_eq!(f.attempts[0].status, SendStatus::Prepared);
+    let _ = std::fs::remove_dir_all(path.parent().unwrap());
+  }
+
+  #[test]
+  fn trimming_retains_unknown_and_unfinished_attempts_across_restart() {
+    let path = tmp_journal("trim");
+    let ledger = SendLedger::new();
+    for (index, status) in [
+      SendStatus::Unknown,
+      SendStatus::Prepared,
+      SendStatus::InFlight,
+      SendStatus::Confirmed,
+    ]
+    .into_iter()
+    .enumerate()
+    {
+      let account = format!("old-{index}");
+      let id = ledger.begin(&account, "conversation", "sample").unwrap();
+      ledger.update(&id, status, None);
+    }
+    for index in 0..JOURNAL_MAX_ENTRIES {
+      let account = format!("recent-{index}");
+      let id = ledger.begin(&account, "conversation", "sample").unwrap();
+      ledger.confirm(&id);
+    }
+    persist_journal(&path, &ledger.state.lock().unwrap()).unwrap();
+    let (recovered, report) = SendLedger::open(path.clone());
+    assert_eq!(report.restored, JOURNAL_MAX_ENTRIES + 3);
+    assert_eq!(report.marked_unknown, 2);
+    assert_eq!(
+      recovered
+        .attempts()
+        .iter()
+        .filter(|a| a.status == SendStatus::Unknown)
+        .count(),
+      3
+    );
     let _ = std::fs::remove_dir_all(path.parent().unwrap());
   }
 

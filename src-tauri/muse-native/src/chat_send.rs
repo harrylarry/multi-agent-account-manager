@@ -24,7 +24,7 @@
 //! 3. **取消要能中断写入和等 ack。** 只在外面 `select!` 拦一层是不够的：
 //!    写入阶段要逐帧检查，等 ack 阶段要能被唤醒，采集阶段同理。
 
-use crate::gateway::{ConnectedGateway, GatewayError, Subscription};
+use crate::gateway::{ConnectedGateway, GatewayError, ParallelResponse, Subscription};
 use crate::transport::{HttpRequest, Service};
 use serde_json::{json, Value};
 use std::time::Duration;
@@ -173,10 +173,16 @@ pub fn validate_ack(v: &Value, http_status: Option<u16>) -> Result<Ack, AckRejec
     }
   }
 
-  match non_empty_str(obj.get("message_id")) {
+  let fields = v
+    .get("result")
+    .filter(|value| value.is_object())
+    .unwrap_or(v);
+  match non_empty_str(fields.get("message_id"))
+    .or_else(|| non_empty_str(fields.get("user_message_id")))
+  {
     Some(message_id) => Ok(Ack {
       message_id,
-      session_id: non_empty_str(obj.get("session_id")),
+      session_id: non_empty_str(fields.get("session_id")),
       raw: v.clone(),
     }),
     None => Err(AckReject::NotAck),
@@ -188,6 +194,9 @@ pub fn validate_ack(v: &Value, http_status: Option<u16>) -> Result<Ack, AckRejec
 #[allow(async_fn_in_trait)] // 只在本 crate 内使用，不做 dyn，Send 约束由调用方的 select! 保证
 pub trait LineSource {
   fn http_status(&self) -> Option<u16>;
+  fn stream_ended(&self) -> bool {
+    false
+  }
   async fn next_line(&mut self, wait: Duration) -> Result<Option<String>, GatewayError>;
 }
 
@@ -199,8 +208,22 @@ where
     self.status()
   }
 
+  fn stream_ended(&self) -> bool {
+    Subscription::stream_ended(self)
+  }
+
   async fn next_line(&mut self, wait: Duration) -> Result<Option<String>, GatewayError> {
     Subscription::next_line(self, wait).await
+  }
+}
+
+impl<S: AsyncRead + AsyncWrite + Unpin> LineSource for ParallelResponse<'_, S> {
+  fn http_status(&self) -> Option<u16> {
+    self.status()
+  }
+
+  async fn next_line(&mut self, wait: Duration) -> Result<Option<String>, GatewayError> {
+    ParallelResponse::next_line(self, wait).await
   }
 }
 
@@ -221,6 +244,7 @@ pub async fn read_ack<L: LineSource>(
     }
     let next = match cancel.as_deref_mut() {
       Some(rx) => tokio::select! {
+        biased;
         r = src.next_line(left) => r,
         _ = rx.changed() => return Err(GatewayError::Cancelled),
       },
@@ -288,6 +312,22 @@ where
 
 /// 与 [`send_message`] 相同，但额外报告「请求是否已经写到线上」，并允许在
 /// 写入阶段与等 ack 阶段被 `cancel` 中断。
+fn chat_stream_request(text: &str, node_id: &str, session_id: Option<&str>) -> HttpRequest {
+  let params = build_params(text, node_id, session_id);
+  HttpRequest {
+    service: Service::Daemon,
+    verb: "POST".to_string(),
+    path: "/chat/stream".to_string(),
+    headers: vec![
+      ("Content-Type".to_string(), "application/json".to_string()),
+      ("x-request-id".to_string(), uuid::Uuid::new_v4().to_string()),
+      ("x-app-id".to_string(), "hatch-web".to_string()),
+      ("Accept-Language".to_string(), "en-US".to_string()),
+    ],
+    body: serde_json::to_vec(&params).unwrap_or_default(),
+  }
+}
+
 pub async fn send_message_tracked<S>(
   gw: ConnectedGateway<S>,
   text: &str,
@@ -299,22 +339,8 @@ pub async fn send_message_tracked<S>(
 where
   S: AsyncRead + AsyncWrite + Unpin,
 {
-  let params = build_params(text, node_id, session_id);
-  let req = HttpRequest {
-    service: Service::Daemon,
-    verb: "POST".to_string(),
-    path: "/chat/stream".to_string(),
-    headers: vec![
-      ("Content-Type".to_string(), "application/json".to_string()),
-      ("x-request-id".to_string(), uuid::Uuid::new_v4().to_string()),
-      ("x-app-id".to_string(), "hatch-web".to_string()),
-      ("Accept-Language".to_string(), "en-US".to_string()),
-    ],
-    body: serde_json::to_vec(&params).unwrap_or_default(),
-  };
-  let attempt = gw
-    .subscribe_tracked(req, cancel.as_deref_mut())
-    .await;
+  let req = chat_stream_request(text, node_id, session_id);
+  let attempt = gw.subscribe_tracked(req, cancel.as_deref_mut()).await;
   let wrote_frames = attempt.wrote_frames;
   // 只有「还没开始调用底层写操作」才能说这次发送没有开始；
   // 首帧写一半失败/被取消时 wrote_frames 仍是 0，但 on_wire 必须为 true。
@@ -336,6 +362,112 @@ where
     wrote_frames,
     outcome,
   }
+}
+
+/// Send on the connection that owns the already acknowledged event subscription.
+pub async fn send_on_subscription<S: AsyncRead + AsyncWrite + Unpin>(
+  subscription: &mut Subscription<S>,
+  text: &str,
+  session_id: &str,
+  timeout: Duration,
+  cancel: &mut watch::Receiver<bool>,
+) -> SendAttemptResult {
+  let req = chat_stream_request(text, "", Some(session_id));
+  let (on_wire, wrote_frames, response) = subscription.open_parallel(req, Some(cancel)).await;
+  let outcome = match response {
+    Ok(mut source) => read_ack(&mut source, timeout, Some(cancel)).await,
+    Err(error) => Err(error),
+  };
+  SendAttemptResult {
+    on_wire,
+    wrote_frames,
+    outcome,
+  }
+}
+
+/// The session RPC is separate from sending. A failed or ambiguous creation
+/// never falls back to the account's default chat.
+pub fn start_session_request() -> HttpRequest {
+  HttpRequest {
+    service: Service::Daemon,
+    verb: "POST".to_string(),
+    path: "/session/start".to_string(),
+    headers: vec![
+      ("Content-Type".to_string(), "application/json".to_string()),
+      ("x-request-id".to_string(), uuid::Uuid::new_v4().to_string()),
+      ("x-app-id".to_string(), "hatch-web".to_string()),
+      ("Accept-Language".to_string(), "en-US".to_string()),
+    ],
+    body:
+      br#"{"method":"/api/session/start","params":{"origin":"fresh","lifecycle":"persistent"}}"#
+        .to_vec(),
+  }
+}
+
+pub fn session_list_request() -> HttpRequest {
+  HttpRequest {
+    service: Service::Daemon,
+    verb: "GET".to_string(),
+    path: "/api/session/list".to_string(),
+    headers: vec![
+      ("x-request-id".to_string(), uuid::Uuid::new_v4().to_string()),
+      ("x-app-id".to_string(), "hatch-web".to_string()),
+      ("Accept-Language".to_string(), "en-US".to_string()),
+    ],
+    body: Vec::new(),
+  }
+}
+
+fn successful_json(status: u16, bytes: &[u8]) -> Result<Value, GatewayError> {
+  if !(200..300).contains(&status) {
+    return Err(GatewayError::Http(status));
+  }
+  let v: Value = serde_json::from_slice(bytes)
+    .map_err(|_| GatewayError::Protocol("invalid session response JSON".to_string()))?;
+  if v["ok"] == false || v["success"] == false || !v["error"].is_null() {
+    return Err(GatewayError::Protocol(
+      "session request rejected".to_string(),
+    ));
+  }
+  Ok(v)
+}
+
+fn session_id(v: &Value) -> Option<String> {
+  ["session_id", "sessionId", "thread_id", "threadId", "id"]
+    .iter()
+    .find_map(|key| non_empty_str(v.get(key)))
+}
+
+pub fn started_session_id(status: u16, bytes: &[u8]) -> Result<String, GatewayError> {
+  let v = successful_json(status, bytes)?;
+  let payload = v.get("result").or_else(|| v.get("data")).unwrap_or(&v);
+  payload
+    .get("session")
+    .or_else(|| payload.get("thread"))
+    .and_then(session_id)
+    .or_else(|| session_id(payload))
+    .filter(|id| !matches!(id.to_ascii_lowercase().as_str(), "main" | "default"))
+    .ok_or_else(|| GatewayError::Protocol("missing new session identity".to_string()))
+}
+
+pub fn listed_session_ids(status: u16, bytes: &[u8]) -> Result<Vec<String>, GatewayError> {
+  let v = successful_json(status, bytes)?;
+  let payload = v.get("result").or_else(|| v.get("data")).unwrap_or(&v);
+  let list = payload
+    .as_array()
+    .or_else(|| {
+      ["sessions", "items", "results"]
+        .iter()
+        .find_map(|key| payload.get(key)?.as_array())
+    })
+    .ok_or_else(|| GatewayError::Protocol("missing session list".to_string()))?;
+  list
+    .iter()
+    .map(|item| {
+      session_id(item)
+        .ok_or_else(|| GatewayError::Protocol("session list entry missing identity".to_string()))
+    })
+    .collect()
 }
 
 #[cfg(test)]
@@ -371,6 +503,25 @@ mod tests {
     let ack = validate_ack(&v, Some(200)).expect("合法 ack");
     assert_eq!(ack.message_id, "m-1");
     assert_eq!(ack.session_id.as_deref(), Some("s-1"));
+  }
+
+  #[test]
+  fn session_creation_requires_a_successful_new_session_identity() {
+    let valid = br#"{"ok":true,"result":{"session":{"id":"new-session"}}}"#;
+    assert_eq!(started_session_id(200, valid).unwrap(), "new-session");
+    assert!(started_session_id(403, valid).is_err());
+    assert!(started_session_id(200, br#"{"success":false,"session_id":"new-session"}"#).is_err());
+    assert!(started_session_id(200, br#"{"ok":true,"session_id":"default"}"#).is_err());
+    assert!(started_session_id(200, br#"{"ok":true}"#).is_err());
+    assert_eq!(
+      listed_session_ids(
+        200,
+        br#"{"result":{"sessions":[{"session_id":"existing"}]}}"#
+      )
+      .unwrap(),
+      ["existing"]
+    );
+    assert!(listed_session_ids(200, br#"{"result":{"sessions":[{}]}}"#).is_err());
   }
 
   #[test]

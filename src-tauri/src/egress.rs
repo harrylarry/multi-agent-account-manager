@@ -23,7 +23,7 @@
 
 use crate::secrets::Secrets;
 use crate::storage::ProxySetting;
-use muse_native_client::chat_send::SendAttemptResult;
+use muse_native_client::chat_send::{self, Ack, SendAttemptResult};
 use muse_native_client::collect::{collect_text, subscription_request, Collected};
 use muse_native_client::control_plane::ControlPlaneFetch;
 use muse_native_client::cookie::SessionCookies;
@@ -267,6 +267,30 @@ pub enum AccountSubscription {
 }
 
 impl AccountSubscription {
+  pub async fn wait_ready(&mut self, timeout: Duration) -> Result<(), GatewayError> {
+    match self {
+      Self::Direct(s) => s.wait_ready(timeout).await,
+      Self::Proxied(s) => s.wait_ready(timeout).await,
+    }
+  }
+
+  pub async fn send_on_subscription(
+    &mut self,
+    text: &str,
+    session_id: &str,
+    timeout: Duration,
+    cancel: &mut tokio::sync::watch::Receiver<bool>,
+  ) -> SendAttemptResult {
+    match self {
+      Self::Direct(s) => {
+        chat_send::send_on_subscription(s, text, session_id, timeout, cancel).await
+      }
+      Self::Proxied(s) => {
+        chat_send::send_on_subscription(s, text, session_id, timeout, cancel).await
+      }
+    }
+  }
+
   /// 订阅请求的 HTTP 状态（`None` 表示尚未拿到响应头）。
   pub fn status(&self) -> Option<u16> {
     match self {
@@ -285,14 +309,15 @@ impl AccountSubscription {
 
   /// 收一条助手回复，直到 message_done / 超时 / 断流。
   pub async fn collect(
-    mut self,
-    message_id: Option<&str>,
+    &mut self,
+    ack: &Ack,
+    session_id: &str,
     total: Duration,
     per_line: Duration,
   ) -> Collected {
-    match &mut self {
-      AccountSubscription::Direct(s) => collect_text(s, message_id, total, per_line).await,
-      AccountSubscription::Proxied(s) => collect_text(s, message_id, total, per_line).await,
+    match self {
+      AccountSubscription::Direct(s) => collect_text(s, ack, session_id, total, per_line).await,
+      AccountSubscription::Proxied(s) => collect_text(s, ack, session_id, total, per_line).await,
     }
   }
 }
@@ -367,6 +392,20 @@ pub(crate) fn safe_http_error(stage: &str, error: &reqwest::Error) -> String {
   let mut detail = format!("{stage}: {category}");
   let mut cause = error.source();
   while let Some(err) = cause {
+    // reqwest and hyper-util keep their SOCKS error types private.
+    // Match only fixed library messages and emit controlled labels.
+    let proxy_cause = match err.to_string().as_str() {
+      "error resolving for socks proxy" => Some("socks_target_dns"),
+      "error connecting to socks proxy" => Some("socks_connect"),
+      "credentials not accepted" => Some("socks_auth_rejected"),
+      "server does not support user/pass authentication"
+      | "server implements authentication incorrectly" => Some("socks_auth_negotiation"),
+      _ => None,
+    };
+    if let Some(label) = proxy_cause {
+      detail.push_str(" / ");
+      detail.push_str(label);
+    }
     if let Some(io) = err.downcast_ref::<std::io::Error>() {
       detail.push_str(&format!(" / io:{:?}", io.kind()));
       if let Some(code) = io.raw_os_error() {
@@ -483,7 +522,7 @@ mod tests {
       result = fetch.post(&url, &[], b"") => result.unwrap_err(),
       result = target.accept() => panic!("unexpected direct connection: {result:?}"),
     };
-    assert!(error.contains("connect"), "{error}");
+    assert!(error.contains("socks_connect"), "{error}");
     assert!(!error.contains(&url), "{error}");
     server.await.unwrap();
   }
