@@ -197,6 +197,9 @@ pub trait LineSource {
   fn stream_ended(&self) -> bool {
     false
   }
+  fn last_line_from_send(&self) -> bool {
+    false
+  }
   async fn next_line(&mut self, wait: Duration) -> Result<Option<String>, GatewayError>;
 }
 
@@ -210,6 +213,10 @@ where
 
   fn stream_ended(&self) -> bool {
     Subscription::stream_ended(self)
+  }
+
+  fn last_line_from_send(&self) -> bool {
+    Subscription::last_line_from_send(self)
   }
 
   async fn next_line(&mut self, wait: Duration) -> Result<Option<String>, GatewayError> {

@@ -462,6 +462,7 @@ where
         response: ResponseLines::default(),
         send_response: None,
         early_send_events: std::collections::VecDeque::new(),
+        last_line_from_send: false,
         socket_closed: false,
       }),
     }
@@ -494,6 +495,7 @@ pub struct Subscription<S = MaybeTlsStream<TcpStream>> {
   response: ResponseLines,
   send_response: Option<(u64, ResponseLines)>,
   early_send_events: std::collections::VecDeque<String>,
+  last_line_from_send: bool,
   socket_closed: bool,
 }
 
@@ -680,17 +682,24 @@ impl<S: AsyncRead + AsyncWrite + Unpin> Subscription<S> {
     (wrote.entered_write, wrote.wrote, response)
   }
 
+  pub(crate) fn last_line_from_send(&self) -> bool {
+    self.last_line_from_send
+  }
+
   pub async fn next_line(&mut self, timeout: Duration) -> Result<Option<String>, GatewayError> {
     let deadline = tokio::time::Instant::now() + timeout;
     loop {
       if let Some(line) = self.early_send_events.pop_front() {
+        self.last_line_from_send = true;
         return Ok(Some(line));
       }
       if let Some(line) = self.response.line()? {
+        self.last_line_from_send = false;
         return Ok(Some(line));
       }
       if let Some((_, response)) = &mut self.send_response {
         if let Some(line) = response.line()? {
+          self.last_line_from_send = true;
           return Ok(Some(line));
         }
         if response.ended {
@@ -1003,9 +1012,12 @@ mod tests {
     assert!(sent.on_wire);
     assert_eq!(sent.outcome.unwrap().message_id, "accepted");
     assert!(sub.next_line(wait).await.unwrap().unwrap().contains("delta.message_start"));
+    assert!(sub.last_line_from_send());
     let event = sub.next_line(wait).await.unwrap().unwrap();
     assert!(event.contains("message.user"));
+    assert!(!sub.last_line_from_send());
     assert!(sub.next_line(wait).await.unwrap().unwrap().contains("delta.text_append"));
+    assert!(sub.last_line_from_send());
     assert!(!sub.stream_ended());
     peer.await.unwrap();
   }

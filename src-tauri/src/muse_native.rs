@@ -487,6 +487,9 @@ pub struct FingerprintSendRecord {
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct FingerprintCollectionDiagnostics {
+  send_events: muse_native_client::collect::StreamEventCounts,
+  subscription_events: muse_native_client::collect::StreamEventCounts,
+  first_matched_delta_ms: Option<u64>,
   ended_by: String,
   lines: u64,
   text_deltas: u64,
@@ -705,6 +708,9 @@ pub async fn fingerprint_probe(
                 }
                 record.text_done = c.done;
                 record.diagnostics = Some(FingerprintCollectionDiagnostics {
+                  send_events: c.send_events,
+                  subscription_events: c.subscription_events,
+                  first_matched_delta_ms: c.first_matched_delta_ms,
                   ended_by: c.ended_by.clone(),
                   lines: c.lines,
                   text_deltas: c.text_deltas,

@@ -23,6 +23,9 @@ pub const SUBSCRIBE_CAPABILITIES: &[&str] = &[
 #[derive(Debug, Clone, Default, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct Collected {
+  pub send_events: StreamEventCounts,
+  pub subscription_events: StreamEventCounts,
+  pub first_matched_delta_ms: Option<u64>,
   /// 累积到的助手正文（按到达顺序拼接）。
   pub text: String,
   /// 收到的文本增量事件数。
@@ -41,6 +44,31 @@ pub struct Collected {
   pub saw_user: bool,
   pub saw_idle: bool,
   pub assistant_messages: usize,
+}
+
+/// Counts use a fixed event allowlist and include events rejected by correlation.
+#[derive(Debug, Clone, Default, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct StreamEventCounts {
+  pub user: u64,
+  pub start: u64,
+  pub delta: u64,
+  pub done: u64,
+  pub activity: u64,
+  pub other: u64,
+}
+
+impl StreamEventCounts {
+  fn observe(&mut self, name: &str) {
+    *match name {
+      "message.user" => &mut self.user,
+      "delta.message_start" => &mut self.start,
+      "delta.text_append" => &mut self.delta,
+      "delta.message_done" | "message.assistant" => &mut self.done,
+      "agent.status" => &mut self.activity,
+      _ => &mut self.other,
+    } += 1;
+  }
 }
 
 /// 构造 `chat.subscribe` 请求（供直连与代理两条路径复用）。
@@ -247,7 +275,8 @@ pub async fn collect_text<L: LineSource>(
   per_line: Duration,
 ) -> Collected {
   use tokio::time::{timeout_at, Instant};
-  let deadline = Instant::now() + total;
+  let started = Instant::now();
+  let deadline = started + total;
   let mut out = Collected::default();
   let mut messages = HashMap::<String, AssistantMessage>::new();
   let mut order = Vec::new();
@@ -296,6 +325,12 @@ pub async fn collect_text<L: LineSource>(
       out.parse_errors += 1;
       break "protocol_error";
     };
+    let counts = if sub.last_line_from_send() {
+      &mut out.send_events
+    } else {
+      &mut out.subscription_events
+    };
+    counts.observe(event);
     let payload = &root["payload"];
     let contexts = [
       payload,
@@ -393,6 +428,9 @@ pub async fn collect_text<L: LineSource>(
         if let Some(text) = text_field(&[payload, &root], &["text"]) {
           message.text.push_str(text);
           out.text_deltas += 1;
+          out
+            .first_matched_delta_ms
+            .get_or_insert_with(|| started.elapsed().as_millis() as u64);
         }
       }
       "delta.message_done" | "message.assistant" => {
@@ -525,6 +563,8 @@ mod tests {
     assert_eq!(result.ended_by, "done");
     assert_eq!(result.text, "one two");
     assert_eq!(result.text_deltas, 2);
+    assert_eq!(result.subscription_events.delta, 3);
+    assert!(result.first_matched_delta_ms.is_some());
     assert!(result.read_timeouts > 0);
     assert_eq!(result.unmatched_events, 1);
   }
