@@ -1190,6 +1190,10 @@ mod tests {
   }
 
   impl ControlPlaneFetch for MockFetch {
+    async fn get(&self, _: &str, _: &[(&str, &str)]) -> Result<(u16, Vec<u8>), String> {
+      panic!("unexpected session lookup")
+    }
+
     async fn post(
       &self,
       _url: &str,

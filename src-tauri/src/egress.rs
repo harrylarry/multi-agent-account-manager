@@ -375,14 +375,12 @@ impl ReqwestFetch {
   }
 }
 
-impl ControlPlaneFetch for ReqwestFetch {
-  async fn post(
+impl ReqwestFetch {
+  async fn send(
     &self,
-    url: &str,
+    mut req: reqwest::RequestBuilder,
     headers: &[(&str, &str)],
-    body: &[u8],
   ) -> Result<(u16, Vec<u8>), String> {
-    let mut req = self.client.post(url).body(body.to_vec());
     for (k, v) in headers {
       req = req.header(*k, *v);
     }
@@ -390,6 +388,16 @@ impl ControlPlaneFetch for ReqwestFetch {
     let status = resp.status().as_u16();
     let bytes = resp.bytes().await.map_err(|e| safe_http_error("读取控制面响应", &e))?;
     Ok((status, bytes.to_vec()))
+  }
+}
+
+impl ControlPlaneFetch for ReqwestFetch {
+  async fn get(&self, url: &str, headers: &[(&str, &str)]) -> Result<(u16, Vec<u8>), String> {
+    self.send(self.client.get(url), headers).await
+  }
+
+  async fn post(&self, url: &str, headers: &[(&str, &str)], body: &[u8]) -> Result<(u16, Vec<u8>), String> {
+    self.send(self.client.post(url).body(body.to_vec()), headers).await
   }
 }
 
@@ -518,14 +526,14 @@ mod tests {
         assert!(request.len() < 4096);
         request.push(stream.read_u8().await.unwrap());
       }
-      assert!(request.starts_with(b"POST /api/hatch/lease-vm HTTP/1.1\r\n"));
+      assert!(request.starts_with(b"GET /api/session?vm_state=live HTTP/1.1\r\n"));
       stream
         .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\n{}")
         .await
         .unwrap();
     });
     let fetch = ReqwestFetch::for_proxy(&config).unwrap();
-    let result = fetch.post("http://lease-target.invalid/api/hatch/lease-vm", &[], b"").await;
+    let result = fetch.get("http://lease-target.invalid/api/session?vm_state=live", &[]).await;
     assert_eq!(result.unwrap(), (200, b"{}".to_vec()));
     server.await.unwrap();
   }
