@@ -12,6 +12,16 @@
 
 ### 实时增量专项复测
 
+**`DEVICE_VERIFIED`**。2026-11-25 18:30–18:31（UTC+8），`8b7eb0a` 在 iPhone 前台完成三条 Muse 隔离探针。三条均收到 ACK，并由订阅流确认 `done`，全部入样评分。回传的摘要和脱敏帧记录相符。
+
+| 探针 | 关联文本增量 | 首末增量间隔（帧记录） | 首个增量至消息结束（帧记录） | 结束 |
+| --- | ---: | ---: | ---: | --- |
+| 1 | 72 | 2,438 ms | 2,834 ms | `done` |
+| 2 | 79 | 2,677 ms | 3,072 ms | `done` |
+| 3 | 80 | 2,913 ms | 3,213 ms | `done` |
+
+三条的解析数分别为 295/295、323/323、326/326，均超过有效样本阈值。lmfpd 完成 3/3 校准评分，闭集参考首位为 `deepseek-v4-pro`（60.3%）。本轮未单独验收退后台取消或自动锁屏设置恢复。
+
 当前前台采集复测包为 [叠号 Spike 0.1.26 `8b7eb0a`](https://github.com/harrylarry/multi-agent-account-manager/actions/runs/45592282143/artifacts/15012002699)，构建 SHA 为 `8b7eb0aec761c30d606c1f2883822453cd87e95d`。解压后未签名 IPA 的 SHA-256 为 `2e18af7d6a03ba816193860c4f17bba24bdcc70ed28db34df9c0fc2902a06771`。用同一账号和代理，在叠号前台运行一次「指纹探针 3 条」。生成时观察实时增量提示，逐条核对关联文本增量大于 0、结束原因为 `done`，并确认 3/3 入样评分。结束后回传顶部的结果摘要和脱敏流诊断。[Quick checks](https://github.com/harrylarry/multi-agent-account-manager/actions/runs/45592279913)
 
 当前流关联复测包为 [叠号 Spike 0.1.26 `07cf1fa`](https://github.com/harrylarry/multi-agent-account-manager/actions/runs/45587399034/artifacts/15010245635)，构建 SHA 为 `07cf1fa66981c108cdf10bf6e8b0eea12941a66f`。解压后未签名 IPA 的 SHA-256 为 `4ea3d42ab05e7d13c5cfba4f597220bf7e70c0793216cec7071faf5bc8dceebd`。同一账号和代理，保持前台亮屏并运行一次「指纹探针 3 条」。观察运行时是否出现增量提示。结束后回传顶部的结果摘要和脱敏流诊断，逐条核对关联文本增量大于 0、结束原因为 `done`。[Quick checks](https://github.com/harrylarry/multi-agent-account-manager/actions/runs/45587301157)
