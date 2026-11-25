@@ -42,7 +42,7 @@ export interface AccountRecord {
   quotaText: string | null;
   quotaPercent: number | null;
   quotaDetail: QuotaDetail | null;
-  quotaObservation?: { source: string; window: string | null; resetsAtMs: number | null; checkedAtMs: number; stale: boolean };
+  quotaObservation?: { source: string; window: string | null; percentUsed?: number | null; resetsAtMs: number | null; checkedAtMs: number; stale: boolean };
   authState: AuthState;
   // 0.1.15: the iOS task watcher saw a new reply for this account
   // while it was not active. Optional: the visual harness stubs and

@@ -1176,14 +1176,20 @@ impl SessionManager {
     if let Some(quota) = result {
       record.quota_observation = Some(crate::storage::QuotaObservation {
         source: "native".into(),
-        window: if quota.tier.is_empty() { None } else { Some(quota.tier.clone()) },
+        window: quota.window.clone(),
+        percent_used: quota.usage_observed.then_some(quota.percent_used as u8),
         resets_at_ms: u64::try_from(quota.resets_at_ms).ok().filter(|value| *value > 0),
         checked_at_ms: now_ms(),
         stale: false,
       });
-      if record.quota_detail.is_none() {
+      if quota.usage_observed {
         record.quota_text = Some(format!("已用 {}%", quota.percent_used));
         record.quota_percent = u8::try_from(100 - quota.percent_used.clamp(0, 100)).ok();
+        if let Some(detail) = &mut record.quota_detail {
+          if !quota.tier.is_empty() { detail.plan_label.clone_from(&quota.tier); }
+          detail.plan_value = format!("已用 {}%", quota.percent_used);
+          detail.plan_used_percent = u8::try_from(quota.percent_used).ok();
+        }
       }
     } else if let Some(observation) = &mut record.quota_observation {
       observation.stale = true;
@@ -1256,9 +1262,7 @@ impl SessionManager {
         notices.push((kind, key));
       }
     }
-    if let Some(pending) = pending {
-      account.pending_approval_count = Some(pending.len());
-    }
+    account.pending_approval_count = pending.map(|items| items.len());
     if *account == before { return Ok(()); }
     if let Err(error) = save_store_atomic(&locked.store_path, &locked.store) {
       locked.store.accounts[index] = before;
@@ -4632,16 +4636,15 @@ impl SessionManager {
       );
       if has_quota && result.observation == "loaded" {
         let target = &mut locked.store.accounts[index];
-        if target.quota_observation.as_ref().is_none_or(|observation| observation.source != "native") {
-          target.quota_observation = Some(crate::storage::QuotaObservation {
-            source: "page".into(),
-            window: target.quota_detail.as_ref().map(|detail| detail.plan_label.clone()),
-            resets_at_ms: None,
-            checked_at_ms: now_ms(),
-            stale: false,
-          });
-          changed = true;
-        }
+        target.quota_observation = Some(crate::storage::QuotaObservation {
+          source: "page".into(),
+          window: None,
+          percent_used: target.quota_detail.as_ref().and_then(|detail| detail.plan_used_percent),
+          resets_at_ms: None,
+          checked_at_ms: now_ms(),
+          stale: false,
+        });
+        changed = true;
       }
       any_changed |= changed;
       let after = &locked.store.accounts[index];

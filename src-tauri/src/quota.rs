@@ -58,6 +58,8 @@ impl std::fmt::Display for QuotaError {
 pub struct QuotaSnapshot {
   pub tier: String,
   pub percent_used: i64,
+  pub usage_observed: bool,
+  pub window: Option<String>,
   pub state: String,
   pub resets_at_ms: i64,
   pub source: String,
@@ -123,6 +125,11 @@ pub fn parse_subscription(v: &Value) -> Option<QuotaSnapshot> {
   Some(QuotaSnapshot {
     tier: tier_name,
     percent_used: if pct < 0 { 0 } else { pct.clamp(0, 100) },
+    usage_observed: pct >= 0,
+    window: {
+      let period = s(&usage, &["period", "window"]);
+      (!period.is_empty() && period.len() <= 60).then_some(period)
+    },
     state,
     resets_at_ms: resets,
     source: "action".to_string(),
@@ -692,6 +699,19 @@ mod tests {
     .unwrap();
     let q = parse_subscription(&v).expect("quota");
     assert_eq!(q.resets_at_ms, 1_762_100_300_000);
+  }
+
+  #[test]
+  fn records_quota_window_and_distinguishes_zero_usage_from_missing_usage() {
+    let mut raw = serde_json::json!({
+      "subscription": { "tier": { "name": "Pro" }, "usage": { "period": "monthly", "percentUsed": 0 } }
+    });
+    let observed = parse_subscription(&raw).unwrap();
+    assert!(observed.usage_observed);
+    assert_eq!(observed.percent_used, 0);
+    assert_eq!(observed.window.as_deref(), Some("monthly"));
+    raw["subscription"]["usage"]["percentUsed"] = serde_json::Value::Null;
+    assert!(!parse_subscription(&raw).unwrap().usage_observed);
   }
 
   #[test]

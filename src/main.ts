@@ -145,7 +145,7 @@ let spikeApprovals: SpikeApprovalsResult | null = null;
 let spikeApprovalsRunning = false;
 let spikeApprovalsError: string | null = null;
 interface SpikeQuota {
-  tier: string; percentUsed: number; state: string; resetsAtMs: number; source: string;
+  tier: string; percentUsed: number; usageObserved?: boolean; state: string; resetsAtMs: number; source: string;
 }
 interface SpikeQuotaProbe {
   ok: boolean; quota: SpikeQuota | null; diag: string[]; error: string | null;
@@ -1236,7 +1236,7 @@ function spikeDiagInnerHtml(accountUuid: string | undefined = pickWatchAccount()
     const q = spikeQuota;
     quotaHtml = `
       <div class="spike-diag-result ok">
-        <div>✓ 额度：${escapeHtml(q.tier || "—")}　已用 ${q.percentUsed}%　状态 ${escapeHtml(q.state || "—")}</div>
+        <div>✓ 额度：${escapeHtml(q.tier || "—")}　已用 ${q.usageObserved === false ? "未观测" : `${q.percentUsed}%`}　状态 ${escapeHtml(q.state || "—")}</div>
         <div>重置：${q.resetsAtMs ? new Date(q.resetsAtMs).toLocaleString() : "—"}　来源：${escapeHtml(q.source)}</div>
       </div>`;
   } else if (spikeQuotaProbe) {
@@ -2470,8 +2470,9 @@ function renderTasks(view: Extract<ModalMode, { kind: "tasks" }>): string {
           const quota = current.quotaObservation;
           const stale = quota.stale || Date.now() - quota.checkedAtMs > 10 * 60_000
             || (quota.resetsAtMs !== null && Date.now() >= quota.resetsAtMs);
-          return `<div class="modal-desc">额度 ${stale ? "已过期" : "已同步"} · ${quota.source === "native" ? "原生" : "网页"} · ${new Date(quota.checkedAtMs).toLocaleString()}
-            ${quota.resetsAtMs ? `<div>额度重置 ${formatAccountClock(quota.resetsAtMs, account.timezone)}</div>` : ""}</div>`;
+          return `<div class="modal-desc">额度 ${stale ? "已过期" : "已同步"} · ${quota.source === "native" ? "原生" : "网页"} · ${formatAccountClock(quota.checkedAtMs, current.timezone)}
+            <div>已用 ${quota.percentUsed != null ? `${quota.percentUsed}%` : "未观测"} · 窗口 ${escapeHtml(quota.window ?? "未观测")}</div>
+            <div>额度重置 ${quota.resetsAtMs ? formatAccountClock(quota.resetsAtMs, current.timezone) : "未观测"}</div></div>`;
         })() : ""}
         <div class="modal-desc">自动检测在前台运行，低电量模式下暂停。回前台后会补查停驻页面。</div>
         <label class="proxy-pool-actions"><input id="account-task-notifications" type="checkbox" ${current?.taskNotifications ? "checked" : ""}/> 监测并在系统允许时提醒</label>

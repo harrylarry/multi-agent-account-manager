@@ -156,6 +156,8 @@ pub enum AuthState {
 pub struct QuotaObservation {
   pub source: String,
   pub window: Option<String>,
+  #[serde(default)]
+  pub percent_used: Option<u8>,
   pub resets_at_ms: Option<u64>,
   pub checked_at_ms: u64,
   pub stale: bool,
