@@ -1,16 +1,16 @@
 # 当前开发进度
 
-2026-11-24 接续快照。任务状态和原始证据以 [PR #16 接续记录](https://github.com/harrylarry/multi-agent-account-manager/pull/16#issuecomment-7130670517)、[Issue #13](https://github.com/harrylarry/multi-agent-account-manager/issues/13) 和 [Issue #14](https://github.com/harrylarry/multi-agent-account-manager/issues/14) 为准。范围与验收门禁见[开发计划 v2.1](../叠号开发计划-严谨执行版-v2.1-2026-11-23.md)与[开发决策记录](../开发决策记录.md)。
+2026-11-25 接续快照。任务状态和原始证据以 [PR #16 接续记录](https://github.com/harrylarry/multi-agent-account-manager/pull/16#issuecomment-7130670517)、[Issue #13](https://github.com/harrylarry/multi-agent-account-manager/issues/13) 和 [Issue #14](https://github.com/harrylarry/multi-agent-account-manager/issues/14) 为准。范围与验收门禁见[开发计划 v2.1](../叠号开发计划-严谨执行版-v2.1-2026-11-23.md)与[开发决策记录](../开发决策记录.md)。
 
 ## Phase 0 技术 Spike
 
-开发分支为 `spike/native-methods`，本快照覆盖的功能提交为 `034415b41250c36bbb5b72a721a2735c07367659`。当前 0.1.26 Spike IPA 由 `034415b41250c36bbb5b72a721a2735c07367659` 构建，安装与校验见 [iPhone 真机验收](../acceptance/iphone-acceptance.md)。
+开发分支为 `spike/native-methods`。最新 Spike 候选 0.1.26 构建自 `dda5127fbbb38ae71efc98570af04296f051e36f`，覆盖 iOS 后台额度同步脱敏诊断。安装及校验见 [iPhone 后台额度同步真机复测](../acceptance/iphone-acceptance.md#ios-后台额度同步)。
 
 | 切片 | 已核对证据 | 待验收 |
 | --- | --- | --- |
 | Muse 认证、订阅、审批、额度 | 旧版真机已有 Noise 握手、Ping、订阅、空审批列表与额度证据，详见 PR #16。 | 新包回归。有待审批项的真实样本继续单独记录。 |
 | Muse 隔离发送、实时接收与模型指纹 | `8b7eb0a` 前台 `DEVICE_VERIFIED`。3 次 ACK，三条分别关联 72、79、80 个文本增量，均经流确认 `done` 并参加 lmfpd 校准评分。历史恢复路径已有独立真机证据。 | 退后台取消、锁屏设置恢复、原正常会话无污染的网页侧对照。 |
-| 原生代理与 WebView | `7588dca` 的三协议原生端到端与 SOCKS5 重启持久化 `DEVICE_VERIFIED`。错误密码下两种原生探针均未连通，Muse WebView 无法加载，恢复正确密码后重新载入。受控 reqwest 测试覆盖 SOCKS5 远端解析与代理拒绝时无直连。 | 故障时真机出口观测、账号切换隔离与后台额度同步 `UNVERIFIED`。 |
+| 原生代理与 WebView | `7588dca` 的三协议原生端到端与 SOCKS5 重启持久化 `DEVICE_VERIFIED`。错误密码下两种原生探针均未连通，Muse WebView 无法加载，恢复正确密码后重新载入。受控 reqwest 测试覆盖 SOCKS5 远端解析与代理拒绝时无直连。 | 后台额度诊断已 `CI_PASSED`，正误密码对照、故障时真机出口观测及账号切换隔离 `UNVERIFIED`。 |
 | VM 租约与后台 WSS | 旧版真机已取得租约。历史后台观测出现断连，PR #16 保留原始时间线。 | 租约到期与续租、新包锁屏及回前台恢复 `UNVERIFIED`。 |
 | Hark 只读检测 | `8eed8ff` 的 REST/SSE/poll 与两路去重 `CI_PASSED`，已包含在 0.1.26 IPA。 | Hark 真机登录、状态对照、断流回退、WebView 审批 `UNVERIFIED`。Hark 指纹按已确认裁决另做 Spike。 |
 
@@ -59,3 +59,5 @@
 `8b7eb0a` 的 18:52–18:56 真机对照中，HTTP CONNECT、HTTPS CONNECT、SOCKS5 的连通性均返回 200，原生验证均在控制面 `lease-vm` 返回 HTTP 400 `Invalid vmType`，尚未进入 WS 握手。旧实现最终只显示最后一次租约尝试的错误，第一种 VM 类型的具体响应未捕获。修复版本在该拒绝后沿用同一出站客户端查询账号已分配的 VM，继续使用现有 token 与 Noise 流程。
 
 `7588dca` 于 19:18–19:23（UTC+8）通过三种原生代理真机端到端，19:31 完成 SOCKS5 重启持久化复测。错误代理密码下原生探针无法连接、Muse WebView 无法加载，恢复正确密码后网页重新载入。后台额度同步的下一步是补充按账号脱敏的下发、联网和应用结果，供故障对照验收。已修正后台同步忽略代理下发结果的问题，只有下发成功的账号才交给 Swift 同步。该改动尚无真机证据。VM 新分配与续期仍待验收。[真机验收](../acceptance/iphone-acceptance.md#原生代理与重启回归)
+
+`dda5127` 的后台同步诊断按账号分别报告代理下发、隐藏 WebView 主页面联网和额度应用结果。测试入口重载页面并排除旧额度缓存，代理下发或应用失败时跳过该账号联网。Windows 主 crate 61 项测试、13 项嵌入脚本测试、[Quick checks](https://github.com/harrylarry/multi-agent-account-manager/actions/runs/45608432316) 和 [iOS Xcode 打包](https://github.com/harrylarry/multi-agent-account-manager/actions/runs/45608434585) 均通过，IPA 已下载并校验。下一步用同一 iPhone 测试账号做正确、错误、恢复正确三轮代理密码对照，回填账号尾号及三段状态。[下载与步骤](../acceptance/iphone-acceptance.md#ios-后台额度同步)
