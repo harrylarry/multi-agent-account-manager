@@ -2,7 +2,7 @@ use crate::providers::ProviderId;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::collections::BTreeMap;
-use std::fs::{self, File};
+use std::fs::{self, OpenOptions};
 use std::io::Write;
 use std::path::Path;
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -445,20 +445,25 @@ pub fn save_store_atomic(path: &Path, store: &AccountsStoreFile) -> Result<(), S
   );
   let tmp_path = path.with_file_name(tmp_name);
 
+  let mut options = OpenOptions::new();
+  options.write(true).create_new(true);
+  #[cfg(unix)]
   {
-    let mut file = File::create(&tmp_path).map_err(|e| format!("创建临时配置文件失败: {e}"))?;
-    file
-      .write_all(&bytes)
-      .map_err(|e| format!("写入临时配置文件失败: {e}"))?;
-    file
-      .sync_all()
-      .map_err(|e| format!("同步临时配置文件失败: {e}"))?;
+    use std::os::unix::fs::OpenOptionsExt;
+    options.mode(0o600);
   }
-
-  fs::rename(&tmp_path, path).map_err(|e| {
+  let mut file = options.open(&tmp_path)
+    .map_err(|e| format!("创建临时配置文件失败: {e}"))?;
+  let result = file.write_all(&bytes)
+    .and_then(|_| file.sync_all())
+    .map_err(|e| format!("写入临时配置文件失败: {e}"));
+  drop(file);
+  let result = result.and_then(|_| fs::rename(&tmp_path, path)
+    .map_err(|e| format!("原子替换 accounts.json 失败: {e}")));
+  if result.is_err() {
     let _ = fs::remove_file(&tmp_path);
-    format!("原子替换 accounts.json 失败: {e}")
-  })
+  }
+  result
 }
 
 pub fn load_or_migrate_store(path: &Path) -> LoadedAccountsStore {
@@ -533,6 +538,19 @@ pub fn load_or_migrate_store(path: &Path) -> LoadedAccountsStore {
 #[cfg(test)]
 mod proxy_tests {
   use super::*;
+
+  #[cfg(unix)]
+  #[test]
+  fn account_store_is_created_with_owner_only_permissions() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let dir = std::env::temp_dir().join(Uuid::new_v4().to_string());
+    let path = dir.join("accounts.json");
+    let store = AccountsStoreFile::default();
+    save_store_atomic(&path, &store).unwrap();
+    assert_eq!(fs::metadata(&path).unwrap().permissions().mode() & 0o777, 0o600);
+    fs::remove_dir_all(dir).unwrap();
+  }
 
   #[test]
   fn proxy_display_safe_hides_userinfo() {
