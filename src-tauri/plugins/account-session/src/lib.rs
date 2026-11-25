@@ -439,6 +439,41 @@ pub async fn check_capabilities(app: &AppHandle) -> Result<IosCapabilitiesRespon
 }
 
 #[cfg(target_os = "ios")]
+pub struct FingerprintForeground {
+  app: AppHandle,
+  task_id: String,
+}
+
+#[cfg(target_os = "ios")]
+impl Drop for FingerprintForeground {
+  fn drop(&mut self) {
+    let app = self.app.clone();
+    let task_id = self.task_id.clone();
+    tauri::async_runtime::spawn(async move {
+      let bridge = app.state::<IosSessionBridge<tauri::Wry>>();
+      let _ = bridge.0.run_mobile_plugin_async::<serde_json::Value>(
+        "setFingerprintForeground",
+        serde_json::json!({ "taskId": task_id }),
+      ).await;
+    });
+  }
+}
+
+#[cfg(target_os = "ios")]
+pub async fn keep_fingerprint_foreground(
+  app: &AppHandle,
+  task_id: String,
+  interrupted: Channel<serde_json::Value>,
+) -> Result<FingerprintForeground, String> {
+  let bridge = app.state::<IosSessionBridge<tauri::Wry>>();
+  bridge.0.run_mobile_plugin_async::<serde_json::Value>(
+    "setFingerprintForeground",
+    serde_json::json!({ "taskId": task_id, "interrupted": interrupted }),
+  ).await.map_err(|error| error.to_string())?;
+  Ok(FingerprintForeground { app: app.clone(), task_id })
+}
+
+#[cfg(target_os = "ios")]
 pub async fn open_account_session(
   app: &AppHandle,
   payload: OpenIosAccountPayload,

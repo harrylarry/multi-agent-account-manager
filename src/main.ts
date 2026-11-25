@@ -1594,6 +1594,7 @@ async function runSpikeFingerprint(): Promise<void> {
     desc:
       `将对测试账号「${acc.alias}」的隔离会话发送 3 条无语义计数探针（不是聊天内容），` +
       "采到回答后在本地评分，不会上传第三方。\n" +
+      (snapshot.platform === "ios" ? "探针运行期间会保持亮屏，叠号退入后台时会停止。\n" : "") +
       "请确认该账号是非主力测试账号。",
     confirmLabel: "开始探针",
   });

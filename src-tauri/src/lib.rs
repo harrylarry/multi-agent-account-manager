@@ -352,18 +352,60 @@ async fn muse_native_fingerprint_probe(
   let setting = account_proxy_setting(&mgr, &provider_id, &uuid).await;
   let dir = app.path().app_data_dir().map_err(|e| e.to_string())?;
   let secrets = secrets::Secrets::new(&dir);
-  Ok(
-    muse_native::fingerprint_probe(
-      &app,
-      &ledger,
-      &uuid,
-      task_id,
-      setting.as_ref(),
-      &secrets,
-      token,
-    )
-    .await,
-  )
+  #[cfg(target_os = "ios")]
+  let (foreground, reason) = {
+    use std::sync::atomic::{AtomicU8, Ordering};
+    let reason = Arc::new(AtomicU8::new(0));
+    let event_reason = Arc::clone(&reason);
+    let task_account = uuid.clone();
+    let cancellations = Arc::clone(cancel.inner());
+    let interrupted = tauri::ipc::Channel::new(move |body| {
+      if let tauri::ipc::InvokeResponseBody::Json(raw) = body {
+        if let Ok(event) = serde_json::from_str::<serde_json::Value>(&raw) {
+          let cause = match event["reason"].as_str() {
+            Some("background") => 1,
+            Some("deadline") => 2,
+            _ => return Ok(()),
+          };
+          event_reason.store(cause, Ordering::Release);
+          cancellations.cancel_task(&task_account, task_id);
+        }
+      }
+      Ok(())
+    });
+    let guard = platform::ios::keep_fingerprint_foreground(&app, task_id.to_string(), interrupted)
+      .await
+      .map_err(|_| "无法保持指纹探针前台运行，请在叠号前台重试".to_string())?;
+    (guard, reason)
+  };
+
+  let result = muse_native::fingerprint_probe(
+    &app,
+    &ledger,
+    &uuid,
+    task_id,
+    setting.as_ref(),
+    &secrets,
+    token,
+  ).await;
+  #[cfg(target_os = "ios")]
+  let result = {
+    let mut result = result;
+    drop(foreground);
+    if result.samples_collected < 3 {
+      use std::sync::atomic::Ordering;
+      let interruption = match reason.load(Ordering::Acquire) {
+        1 => Some("叠号离开前台，已停止本次指纹探针"),
+        2 => Some("本次指纹探针达到总时限，已停止"),
+        _ => None,
+      };
+      if let Some(message) = interruption {
+        result.error = Some(message.to_string());
+      }
+    }
+    result
+  };
+  Ok(result)
 }
 
 #[tauri::command]

@@ -29,6 +29,11 @@ private struct SubscribeEventsArgs: Decodable {
   let channel: Channel
 }
 
+private struct FingerprintForegroundArgs: Decodable {
+  let taskId: String
+  let interrupted: Channel?
+}
+
 private struct OpenSessionArgs: Decodable {
   let providerId: String
   let providerName: String
@@ -104,6 +109,70 @@ private struct QuarantineProxyArgs: Decodable {
 }
 
 class AccountSessionPlugin: Plugin {
+  private var fingerprintTasks: [String: (Channel, DispatchWorkItem)] = [:]
+  private var fingerprintPreviousIdleTimer: Bool?
+  private var fingerprintBackgroundObserver: NSObjectProtocol?
+
+  @objc public func setFingerprintForeground(_ invoke: Invoke) throws {
+    let args = try invoke.parseArgs(FingerprintForegroundArgs.self)
+    DispatchQueue.main.async {
+      guard let interrupted = args.interrupted else {
+        self.finishFingerprintForeground(args.taskId)
+        invoke.resolve()
+        return
+      }
+      guard UIApplication.shared.applicationState == .active else {
+        invoke.reject("指纹探针需要在前台运行")
+        return
+      }
+      if self.fingerprintTasks[args.taskId] != nil {
+        invoke.reject("该指纹任务已在运行")
+        return
+      }
+      if self.fingerprintTasks.isEmpty {
+        self.fingerprintPreviousIdleTimer = UIApplication.shared.isIdleTimerDisabled
+        UIApplication.shared.isIdleTimerDisabled = true
+        self.fingerprintBackgroundObserver = NotificationCenter.default.addObserver(
+          forName: UIApplication.didEnterBackgroundNotification, object: nil, queue: .main
+        ) { [weak self] _ in
+          MainActor.assumeIsolated {
+            guard let self else { return }
+            for id in Array(self.fingerprintTasks.keys) {
+              self.finishFingerprintForeground(id, interruption: "background")
+            }
+          }
+        }
+      }
+      let taskId = args.taskId
+      let expiry = DispatchWorkItem { [weak self] in
+        MainActor.assumeIsolated {
+          self?.finishFingerprintForeground(taskId, interruption: "deadline")
+        }
+      }
+      self.fingerprintTasks[taskId] = (interrupted, expiry)
+      DispatchQueue.main.asyncAfter(deadline: .now() + 570, execute: expiry)
+      invoke.resolve()
+    }
+  }
+
+  @MainActor
+  private func finishFingerprintForeground(_ taskId: String, interruption: String? = nil) {
+    guard let (channel, expiry) = fingerprintTasks.removeValue(forKey: taskId) else { return }
+    expiry.cancel()
+    if fingerprintTasks.isEmpty {
+      if let previous = fingerprintPreviousIdleTimer {
+        UIApplication.shared.isIdleTimerDisabled = previous
+      }
+      fingerprintPreviousIdleTimer = nil
+      if let observer = fingerprintBackgroundObserver {
+        NotificationCenter.default.removeObserver(observer)
+        fingerprintBackgroundObserver = nil
+      }
+    }
+    if let interruption {
+      channel.send(["reason": interruption])
+    }
+  }
 
   @objc public func subscribeEvents(_ invoke: Invoke) throws {
     let args = try invoke.parseArgs(SubscribeEventsArgs.self)
