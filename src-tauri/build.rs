@@ -33,6 +33,7 @@ const APP_COMMANDS: &[&str] = &[
   "observe_account_tasks",
   "set_account_task_notifications",
   "hark_native_watch_probe",
+  "hark_recover_replies",
   "muse_native_approvals_probe",
   "decide_muse_approval",
   "muse_native_quota_probe",

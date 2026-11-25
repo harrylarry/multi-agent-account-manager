@@ -1949,3 +1949,12 @@ body,
   display: block;
   color: var(--text-muted);
 }
+.hark-reply {
+  padding: 0.55rem 0;
+}
+
+.hark-reply-text {
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+  padding-block: 0.45rem;
+}

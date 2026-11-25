@@ -53,8 +53,10 @@ async fn add_account(
   mgr: State<'_, Arc<SessionManager>>,
   provider_id: String,
   alias: String,
+  cookie_input: Option<String>,
 ) -> Result<ManagerSnapshot, String> {
-  mgr.add_account(&app, &provider_id, &alias).await
+  let cookies = cookie_input.map(|raw| parse_account_cookies(&provider_id, raw)).transpose()?;
+  mgr.add_account(&app, &provider_id, &alias, cookies.as_deref()).await
 }
 
 #[tauri::command]
@@ -958,6 +960,43 @@ async fn hark_native_watch_probe(
   }
 }
 
+#[tauri::command]
+#[cfg_attr(not(target_os = "ios"), allow(unused_variables))]
+async fn hark_recover_replies(
+  app: AppHandle, uuid: String, timezone: String, mgr: State<'_, Arc<SessionManager>>,
+  cancel: State<'_, Arc<probe_cancel::ProbeCancel>>,
+) -> Result<hark_native::HarkRecovery, String> {
+  #[cfg(target_os = "ios")]
+  {
+    let uuid = storage::normalize_uuid(&uuid).ok_or("账号标识无效")?;
+    let proxy_lock = mgr.proxy_write_lock.lock().await;
+    let (mut token, _guard) = cancel.register(&uuid, "hark_recovery");
+    let snapshot = mgr.get_snapshot().await;
+    drop(proxy_lock);
+    let account = snapshot.accounts.iter().find(|account| account.provider_id == providers::ProviderId::Hark
+      && account.uuid == uuid && account.auth_state == storage::AuthState::Authenticated
+    ).ok_or("请先登录该 Hark 账号")?;
+    if snapshot.conflicts.iter().any(|conflict| conflict.uuid == uuid)
+      || snapshot.pending_cleanup.iter().any(|key| key.uuid == uuid) {
+      return Err("请先处理账号归属或清理状态".into());
+    }
+    let timezone = account.timezone.as_deref().unwrap_or(&timezone);
+    if timezone.is_empty() || timezone.len() > 96
+      || !timezone.bytes().all(|b| b.is_ascii_alphanumeric() || b"/_+-".contains(&b)) {
+      return Err("时区格式无效".into());
+    }
+    tokio::select! {
+      biased;
+      _ = token.cancelled() => Err("账号出站配置已变化，已停止读取".into()),
+      result = tokio::time::timeout(std::time::Duration::from_secs(44),
+        Box::pin(hark_native::recover(&app, &uuid, account.proxy.as_ref(), timezone))
+      ) => result.map_err(|_| "Hark 回复补同步达到总时限".into()),
+    }
+  }
+  #[cfg(not(target_os = "ios"))]
+  { Err("Hark 回复补同步需要 iOS".into()) }
+}
+
 /// #11/#16：用**该账号已保存的代理**验证控制面 + WSS 隧道 + Noise + ping（fail-closed）。
 ///
 /// 不再接受前端传入的 proxy URI：诊断必须与真实发送同源（ProxySetting +
@@ -1529,6 +1568,7 @@ pub fn run() {
       observe_account_tasks,
       set_account_task_notifications,
       hark_native_watch_probe,
+      hark_recover_replies,
       muse_native_approvals_probe,
       decide_muse_approval,
       muse_native_quota_probe,

@@ -15,10 +15,11 @@ import type {
 
 type ModalMode =
   | { kind: "none" }
-  | { kind: "add"; providerId: ProviderId; draft: string }
+  | { kind: "add"; providerId: ProviderId; draft: string; cookiePreview: boolean; pending: boolean }
   | { kind: "rename"; account: AccountRecord; draft: string; groupDraft: string; timezoneDraft: string }
   | { kind: "remove"; account: AccountRecord }
   | { kind: "tasks"; account: AccountRecord; checking: boolean; note: string; quotaChecking: boolean }
+  | { kind: "harkReplies"; account: AccountRecord; reading: boolean; result: HarkRecovery | null; error: string }
   | { kind: "backup"; busy: boolean; encrypted: string; fileName: string; preview: BackupPreview | null; message: string; mode: BackupMode; includeGroups: boolean; includeProxy: boolean; expiryDays: number }
   | { kind: "proxyPool"; account: AccountRecord; data: ProxyPoolView | null; setting: SpikeProxySettingView | null; busy: boolean; message: string }
   | { kind: "sessions"; account: AccountRecord; loading: boolean; items: MuseSession[] | null; error: string }
@@ -40,6 +41,13 @@ interface TaskObservation {
   activity: "idle" | "working" | "approval" | "unknown";
   source: "native" | "page" | null;
   observedAtMs: number | null;
+}
+
+interface HarkRecovery {
+  replies: { id: string; text: string; completed: boolean; updatedByPoll: boolean; card: { title: string; body: string } | null }[];
+  streamEnd: string | null;
+  pollStatus: number | null;
+  error: string | null;
 }
 
 const latestTaskObservations = new Map<string, TaskObservation>();
@@ -2518,10 +2526,57 @@ function renderTasks(view: Extract<ModalMode, { kind: "tasks" }>): string {
           <button id="modal-cancel-btn" class="btn" type="button">关闭</button>
           ${account.providerId === "muse" ? `<button id="account-quota-refresh" class="btn" type="button" ${view.quotaChecking ? "disabled" : ""}>刷新额度</button>` : ""}
           ${account.providerId === "hark" ? `<button id="account-task-open" class="btn" type="button">打开会话查看审批</button>` : ""}
+          ${account.providerId === "hark" ? `<button id="hark-replies-open" class="btn" type="button">补同步回复</button>` : ""}
           <button id="account-task-refresh" class="btn primary" type="button" ${checking ? "disabled" : ""}>刷新</button>
         </div>
       </div>
     </div>`;
+}
+
+function renderHarkReplies(view: Extract<ModalMode, { kind: "harkReplies" }>): string {
+  const { account, result, reading, error } = view;
+  return `
+    <div class="inline-modal" role="dialog" aria-modal="true" aria-labelledby="hark-replies-title">
+      <div class="modal-card proxy-pool-modal">
+        <div class="modal-title" id="hark-replies-title">Hark 主会话回复 · ${escapeHtml(account.alias)}</div>
+        <div class="modal-desc" role="status">${reading ? "正在只读同步…" : result ? `已读取 ${result.replies.length} 条可显示回复` : ""}</div>
+        ${result?.pollStatus ? `<div class="modal-desc">轮询补查 HTTP ${result.pollStatus}</div>` : ""}
+        ${error ? `<div class="modal-desc" role="alert">${escapeHtml(error)}</div>` : ""}
+        <div class="proxy-pool-body">
+          ${result?.replies.map((reply) => `
+            <details class="hark-reply">
+              <summary>${escapeHtml(reply.card?.title ?? reply.text.slice(0, 84))} · ${reply.completed ? "已完成" : "未确认完成"}${reply.updatedByPoll ? " · 轮询补回" : ""}</summary>
+              ${reply.text ? `<div class="hark-reply-text">${escapeHtml(reply.text)}</div>` : ""}
+              ${reply.card ? `<details><summary>展开卡片内容</summary><div class="hark-reply-text">${escapeHtml(reply.card.body)}</div></details>` : ""}
+            </details>`).join("") ?? ""}
+        </div>
+        <div class="modal-footer">
+          <button id="modal-cancel-btn" class="btn" type="button">关闭</button>
+          <button id="hark-replies-original" class="btn" type="button">在 Hark 打开</button>
+          <button id="hark-replies-retry" class="btn primary" type="button" ${reading ? "disabled" : ""}>重新读取</button>
+        </div>
+      </div>
+    </div>`;
+}
+
+async function loadHarkReplies(view: Extract<ModalMode, { kind: "harkReplies" }>): Promise<void> {
+  if (view.reading || modal !== view) return;
+  view.reading = true;
+  view.error = "";
+  render();
+  try {
+    const result = await invoke<HarkRecovery>("hark_recover_replies", {
+      uuid: view.account.uuid,
+      timezone: Intl.DateTimeFormat().resolvedOptions().timeZone || "UTC",
+    });
+    if (!result.error || result.replies.length > 0 || !view.result) view.result = result;
+    view.error = result.error ?? "";
+  } catch (error) {
+    view.error = String(error);
+  } finally {
+    view.reading = false;
+    if (modal === view) render();
+  }
 }
 
 async function checkAccountTasks(view: Extract<ModalMode, { kind: "tasks" }>): Promise<void> {
@@ -2891,6 +2946,43 @@ async function submitApproval(
   }
 }
 
+async function submitNewAccount(view: Extract<ModalMode, { kind: "add" }>, previewOnly: boolean): Promise<void> {
+  if (view.pending || modal !== view) return;
+  const input = document.querySelector<HTMLTextAreaElement>("#add-cookie-input");
+  const status = document.getElementById("add-account-result");
+  const cookieInput = input?.value.trim() || null;
+  if ((previewOnly && !cookieInput) || (!previewOnly && cookieInput && !view.cookiePreview)) {
+    if (status) status.textContent = cookieInput ? "请先预览这份 Cookie。" : "请先粘贴 Cookie。";
+    return;
+  }
+  const controls = document.querySelectorAll<HTMLButtonElement>("#modal-root .modal-card button");
+  view.pending = true;
+  if (input) input.readOnly = true;
+  for (const button of controls) button.disabled = true;
+  if (status) status.textContent = previewOnly ? "正在校验…" : "正在创建账号…";
+  try {
+    if (previewOnly) {
+      const checked = await invoke<CookiePreview>("preview_account_cookies", { providerId: view.providerId, raw: cookieInput });
+      if (input?.isConnected && input.value.trim() === cookieInput) {
+        view.cookiePreview = true;
+        if (status) status.textContent = `可导入 ${checked.count} 条 · ${checked.domains.join("、")}`;
+      }
+    } else {
+      snapshot = await invoke<ManagerSnapshot>("add_account", {
+        providerId: view.providerId, alias: view.draft.trim(), cookieInput,
+      });
+      if (input) input.value = "";
+      if (modal === view) await setModal({ kind: "none" });
+    }
+  } catch (error) {
+    if (status) status.textContent = String(error);
+  } finally {
+    view.pending = false;
+    if (input) input.readOnly = false;
+    for (const button of controls) button.disabled = false;
+  }
+}
+
 function renderModal(provider: ProviderInfo): string {
   if (modal.kind === "none") return "";
   if (modal.kind === "approvals") return renderApprovalsModal(modal);
@@ -2899,6 +2991,7 @@ function renderModal(provider: ProviderInfo): string {
   if (modal.kind === "proxyPool") return renderProxyPool(modal);
   if (modal.kind === "backup") return renderAccountBackup(modal);
   if (modal.kind === "tasks") return renderTasks(modal);
+  if (modal.kind === "harkReplies") return renderHarkReplies(modal);
   if (modal.kind === "update") {
     return renderUpdateModal();
   }
@@ -2909,6 +3002,10 @@ function renderModal(provider: ProviderInfo): string {
           <div class="modal-title">新增 ${escapeHtml(provider.shortName)} 账号</div>
           <div class="modal-desc">每个账号拥有独立隔离的登录态。备注可留空，登录成功后将自动显示邮箱名称。</div>
           <input id="modal-alias-input" class="modal-input" maxlength="60" placeholder="备注名称（留空则自动获取登录邮箱）" value="${escapeHtml(modal.draft)}" />
+          ${snapshot?.platform === "ios" ? `<label for="add-cookie-input">导入 Cookie（可选）</label>
+            <textarea id="add-cookie-input" class="modal-input account-cookie-input" placeholder="粘贴 JSON、Netscape 或 Cookie 请求头" autocomplete="off" autocapitalize="off" spellcheck="false"></textarea>
+            <button id="add-cookie-preview" class="btn" type="button">预览 Cookie</button>` : ""}
+          <div id="add-account-result" role="status"></div>
           <div class="modal-footer">
             <button id="modal-cancel-btn" class="btn" type="button">取消</button>
             <button id="modal-confirm-btn" class="btn primary" type="button">创建并打开</button>
@@ -3320,6 +3417,7 @@ function modalIdentityKey(provider: ProviderInfo): string | null {
       // 内容在打开时确定，不会在显示期间变化；标题 + 长度足以区分。
       return `confirm:${modal.title}:${modal.desc.length}:${modal.confirmLabel}`;
     case "approvals":
+    case "harkReplies":
     case "cookies":
     case "sessions":
     case "proxyPool":
@@ -4056,7 +4154,7 @@ function bindDelegatedEvents(): void {
       }
       case "add-account-btn":
       case "stage-add-btn":
-        await setModal({ kind: "add", providerId: provider.id, draft: "" });
+        await setModal({ kind: "add", providerId: provider.id, draft: "", cookiePreview: false, pending: false });
         break;
       case "dismiss-notice-btn":
         await callCommand("dismiss_notice");
@@ -4098,6 +4196,25 @@ function bindDelegatedEvents(): void {
         break;
       case "account-task-open":
         if (modal.kind === "tasks") {
+          const { providerId, uuid } = modal.account;
+          await setModal({ kind: "none" });
+          await callCommand("switch_account", { providerId, uuid }, { providerId, uuid });
+        }
+        break;
+      case "hark-replies-open":
+        if (modal.kind === "tasks" && modal.account.providerId === "hark") {
+          const view: Extract<ModalMode, { kind: "harkReplies" }> = {
+            kind: "harkReplies", account: modal.account, reading: false, result: null, error: "",
+          };
+          await setModal(view);
+          await loadHarkReplies(view);
+        }
+        break;
+      case "hark-replies-retry":
+        if (modal.kind === "harkReplies") await loadHarkReplies(modal);
+        break;
+      case "hark-replies-original":
+        if (modal.kind === "harkReplies") {
           const { providerId, uuid } = modal.account;
           await setModal({ kind: "none" });
           await callCommand("switch_account", { providerId, uuid }, { providerId, uuid });
@@ -4180,7 +4297,11 @@ function bindDelegatedEvents(): void {
         break;
       case "modal-cancel-btn":
         if (modal.kind === "update" && updateState.installing) break;
+        if (modal.kind === "add" && modal.pending) break;
         await setModal({ kind: "none" });
+        break;
+      case "add-cookie-preview":
+        if (modal.kind === "add") await submitNewAccount(modal, true);
         break;
       case "modal-confirm-btn": {
         const currentModal = modal;
@@ -4192,12 +4313,7 @@ function bindDelegatedEvents(): void {
           await setModal({ kind: "none" });
           resolve?.(true);
         } else if (currentModal.kind === "add") {
-          const alias = currentModal.draft.trim();
-          await setModal({ kind: "none" });
-          await callCommand("add_account", {
-            providerId: currentModal.providerId,
-            alias,
-          });
+          await submitNewAccount(currentModal, false);
         } else if (currentModal.kind === "rename") {
           const alias = currentModal.draft.trim();
           if (!alias) break;
@@ -4368,6 +4484,12 @@ function bindDelegatedEvents(): void {
 
   root.addEventListener("input", (ev) => {
     const input = ev.target as HTMLInputElement;
+    if (input.id === "add-cookie-input" && modal.kind === "add") {
+      modal.cookiePreview = false;
+      const status = document.getElementById("add-account-result");
+      if (status) status.textContent = "";
+      return;
+    }
     if (input.id === "account-cookie-input" && modal.kind === "cookies") {
       modal.preview = null;
       document.querySelector<HTMLButtonElement>("#account-cookie-import")?.setAttribute("disabled", "");
@@ -4412,7 +4534,7 @@ function bindDelegatedEvents(): void {
       document.querySelector<HTMLButtonElement>("#modal-confirm-btn")?.click();
     } else if (ev.key === "Escape") {
       ev.preventDefault();
-      await setModal({ kind: "none" });
+      if (modal.kind !== "add" || !modal.pending) await setModal({ kind: "none" });
     }
   });
 }

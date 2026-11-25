@@ -1823,7 +1823,10 @@ impl SessionManager {
     app: &AppHandle,
     raw_provider: &str,
     raw_alias: &str,
+    cookies: Option<&[crate::account_cookies::AccountCookie]>,
   ) -> Result<ManagerSnapshot, String> {
+    #[cfg(not(target_os = "ios"))]
+    if cookies.is_some() { return Err("新增时导入 Cookie 需要 iOS".into()); }
     let provider_id = ProviderId::parse(raw_provider).ok_or_else(|| "无效的服务标识".to_string())?;
     if !get_provider(provider_id).info.enabled {
       return Err(format!(
@@ -1838,6 +1841,8 @@ impl SessionManager {
       (trimmed.to_string(), false)
     };
 
+    #[cfg(target_os = "ios")]
+    let _cookie_guard = if cookies.is_some() { Some(self.quota_sync_lock.lock().await) } else { None };
     let created_key = {
       let mut locked = self.inner.lock().await;
       if !locked.conflicts.is_empty() {
@@ -1853,6 +1858,28 @@ impl SessionManager {
         }
       };
 
+      let key = AccountKey { provider_id, uuid: uuid.clone() };
+      #[cfg(target_os = "ios")]
+      if let Some(cookies) = cookies {
+        // Reserve a cleanup record before creating a WebKit profile so an
+        // interrupted import cannot leave an untracked credential store.
+        locked.store.pending_cleanup.push(key.clone());
+        if let Err(error) = save_store_atomic(&locked.store_path, &locked.store) {
+          locked.store.pending_cleanup.pop();
+          return Err(error);
+        }
+        let written = crate::platform::ios::transfer_profile_cookies(app, provider_id.as_str(), &uuid, Some(cookies), false).await;
+        if written.as_ref().map(|entry| entry.count).ok() != Some(cookies.len()) {
+          if crate::platform::ios::delete_profile(app, &uuid).await.is_ok() {
+            locked.store.pending_cleanup.retain(|entry| entry != &key);
+            if save_store_atomic(&locked.store_path, &locked.store).is_err() {
+              locked.store.pending_cleanup.push(key);
+            }
+          }
+          return Err(written.err().unwrap_or_else(|| "未能核对 Cookie 写入，账号未创建".into()));
+        }
+        locked.store.pending_cleanup.retain(|entry| entry != &key);
+      }
       locked.store.accounts.push(AccountRecord {
         provider_id,
         uuid: uuid.clone(),
@@ -1867,7 +1894,7 @@ impl SessionManager {
         quota_percent: None,
         quota_detail: None,
         quota_observation: None,
-        auth_state: AuthState::LoggedOut,
+        auth_state: if cookies.is_some() { AuthState::Unknown } else { AuthState::LoggedOut },
         has_unread_reply: false,
         muse_unread_counts: Default::default(),
         muse_unread_status: None,
@@ -1877,9 +1904,13 @@ impl SessionManager {
         pending_approval_count: None,
         proxy: None,
       });
-      save_store_atomic(&locked.store_path, &locked.store)?;
+      if let Err(error) = save_store_atomic(&locked.store_path, &locked.store) {
+        locked.store.accounts.pop();
+        if cookies.is_some() { locked.store.pending_cleanup.push(key); }
+        return Err(error);
+      }
       locked.selected_provider_id = provider_id;
-      AccountKey { provider_id, uuid }
+      key
     };
 
     self.switch_account_internal(app, created_key, false, None).await

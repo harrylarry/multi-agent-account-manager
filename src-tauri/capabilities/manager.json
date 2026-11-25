@@ -40,6 +40,7 @@
     "allow-observe-account-tasks",
     "allow-set-account-task-notifications",
     "allow-hark-native-watch-probe",
+    "allow-hark-recover-replies",
     "allow-muse-native-approvals-probe",
     "allow-decide-muse-approval",
     "allow-muse-native-quota-probe",
