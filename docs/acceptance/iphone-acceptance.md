@@ -12,7 +12,9 @@
 
 ### 实时增量专项复测
 
-当前流关联复测包为 [叠号 Spike 0.1.26 `11c6993`](https://github.com/harrylarry/multi-agent-account-manager/actions/runs/45584363920/artifacts/15008332630)，构建 SHA 为 `11c699367261b9400a46d8b440f520476289efb3`。解压后未签名 IPA 的 SHA-256 为 `b1648092ef0683d5ab41533f3c6d9ca597f3493afe7afaab3bf3c84433bdd317`。同一账号和代理，保持前台亮屏并运行一次「指纹探针 3 条」。结束后回传顶部的结果摘要和脱敏流诊断。逐条核对关联文本增量大于 0、结束原因为 `done`。用首个增量至消息结束的时差和帧时间辨别持续投递及批量到达。[Quick checks](https://github.com/harrylarry/multi-agent-account-manager/actions/runs/45584273929)
+当前流关联复测包为 [叠号 Spike 0.1.26 `07cf1fa`](https://github.com/harrylarry/multi-agent-account-manager/actions/runs/45587399034/artifacts/15010245635)，构建 SHA 为 `07cf1fa66981c108cdf10bf6e8b0eea12941a66f`。解压后未签名 IPA 的 SHA-256 为 `4ea3d42ab05e7d13c5cfba4f597220bf7e70c0793216cec7071faf5bc8dceebd`。同一账号和代理，保持前台亮屏并运行一次「指纹探针 3 条」。观察运行时是否出现增量提示。结束后回传顶部的结果摘要和脱敏流诊断，逐条核对关联文本增量大于 0、结束原因为 `done`。[Quick checks](https://github.com/harrylarry/multi-agent-account-manager/actions/runs/45587301157)
+
+[叠号 Spike 0.1.26 `11c6993`](https://github.com/harrylarry/multi-agent-account-manager/actions/runs/45584363920/artifacts/15008332630) 真机三次 ACK、三条 `done`、3/3 样本及评分均通过。三轮各收到 80、81、75 个订阅增量帧，首末间隔分别为 2,336、2,162、2,037 ms。增量关联均为 0。该包的 IPA SHA-256 为 `b1648092ef0683d5ab41533f3c6d9ca597f3493afe7afaab3bf3c84433bdd317`。
 
 [叠号 Spike 0.1.26 `2066ccb`](https://github.com/harrylarry/multi-agent-account-manager/actions/runs/45578059347/artifacts/15005551703) 真机的推送能力注册、隔离订阅、两次发送 ACK 均通过。第二条读取 147 个增量帧，关联数为 0，用户手动停止，第三条未发送。上一包的 IPA SHA-256 为 `a4e11a6f6417315d3311ed8f44743a6dd355934720e5a350cffd2b6c5f1b5615`。
 
