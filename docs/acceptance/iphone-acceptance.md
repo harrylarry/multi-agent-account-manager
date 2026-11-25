@@ -12,7 +12,9 @@
 
 ### 实时增量专项复测
 
-当前隔离推送复测包为 [叠号 Spike 0.1.26 `2066ccb`](https://github.com/harrylarry/multi-agent-account-manager/actions/runs/45578059347/artifacts/15005551703)，构建 SHA 为 `2066ccb43047594838affe65bc85893ff9f29c64`。解压后未签名 IPA 的 SHA-256 为 `a4e11a6f6417315d3311ed8f44743a6dd355934720e5a350cffd2b6c5f1b5615`。用同一账号和代理，在叠号前台运行一次「指纹探针 3 条」。生成时观察实时增量提示，结束后核对逐条的文本增量与 `done`，回传结果摘要和脱敏流诊断。能力注册或订阅中止时只需回传摘要。[Quick checks](https://github.com/harrylarry/multi-agent-account-manager/actions/runs/45577970755)
+当前流关联复测包为 [叠号 Spike 0.1.26 `11c6993`](https://github.com/harrylarry/multi-agent-account-manager/actions/runs/45584363920/artifacts/15008332630)，构建 SHA 为 `11c699367261b9400a46d8b440f520476289efb3`。解压后未签名 IPA 的 SHA-256 为 `b1648092ef0683d5ab41533f3c6d9ca597f3493afe7afaab3bf3c84433bdd317`。同一账号和代理，保持前台亮屏并运行一次「指纹探针 3 条」。结束后回传顶部的结果摘要和脱敏流诊断。逐条核对关联文本增量大于 0、结束原因为 `done`。用首个增量至消息结束的时差和帧时间辨别持续投递及批量到达。[Quick checks](https://github.com/harrylarry/multi-agent-account-manager/actions/runs/45584273929)
+
+[叠号 Spike 0.1.26 `2066ccb`](https://github.com/harrylarry/multi-agent-account-manager/actions/runs/45578059347/artifacts/15005551703) 真机的推送能力注册、隔离订阅、两次发送 ACK 均通过。第二条读取 147 个增量帧，关联数为 0，用户手动停止，第三条未发送。上一包的 IPA SHA-256 为 `a4e11a6f6417315d3311ed8f44743a6dd355934720e5a350cffd2b6c5f1b5615`。
 
 注册诊断包 [叠号 Spike 0.1.26 `775a49b`](https://github.com/harrylarry/multi-agent-account-manager/actions/runs/45575340271/artifacts/15005065668) 在设备节点注册时返回 `HTTP 400 · invalid_params`，没有写出任何探针消息。解压后的 IPA SHA-256 为 `fc55c7b75e73d78540edebb01e97f75adc4b5f119076d946a5d834b202842080`。
 
