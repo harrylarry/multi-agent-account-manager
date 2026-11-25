@@ -30,6 +30,12 @@ Windows 主 crate 67 项、muse-native 110 项、嵌入脚本 13 项与构建检
 
 ## 下一步
 
+`7ed2ab5` 的 Cookie 回贴预览与登录恢复通过，导出 20 条、恢复后 19 条的阶段差异未定位。回前台红点复测仍失败，另见一次无法复现的短暂红点。现有实现进入账号即清除本地红点，且上轮会话列表只看可选 `unread_count`，没有对该次回复的确定证据。
+
+候选 `258e428` 在 iOS 回前台时复用此前真机可用的 Muse Noise 历史读取。要求停驻会话有可核对的标识，且协议历史出现晚于停驻时间的同会话已完成助手消息。按账号和回复 ID 去重，未读计数仍可作补充。红点清除延后到账号页面成功提交。网页通知与本次原生历史信号的实际一致性需真机验证。已接入上游城市时区选择。[真机步骤](../acceptance/iphone-acceptance.md#muse-协议补查与城市时区) · [上游取舍](development-plan-v2.2.md#上游-v0110-的二次核对)
+
+同一 SHA 的 Quick checks、Xcode 和 IPA 完整性核验通过。主 crate 71 项测试通过，含协议历史解析的错会话、旧回复、未完成和非公开反例。两种移动 WebKit 视口验证预设和自定义时区保存后重开。协议补查和红点显示待 iPhone 复测。[下载候选](https://github.com/harrylarry/multi-agent-account-manager/actions/runs/45673505743/artifacts/15050354887)
+
 `9a7c229` 的后续真机回执确认任务入口、原生额度更新、会话和分组通过。生成中回账号列表后切后台，回前台 20 秒仍无账号红点，网页提示可见。App 自身导出的 Cookie 回贴后预览失败。订阅因无测试地址待验。候选 `7ed2ab5` 用同一导入解析器筛选并复查剪贴板导出内容，显示未复制条数。iOS 回前台事件触发近期停驻 Muse 账号的已知服务端未读读取，保持账号代理、读取结果去重和 DOM 补查。任务页显示本次补查结果，实际返回字段与头像红点仍需复测。[专项复测](../acceptance/iphone-acceptance.md#cookie-回贴与-muse-回前台红点专项)
 
 `7ed2ab5` 已通过 macOS CI 与 Xcode 打包。主 crate 70 项本地测试包括 Cookie 导出回贴契约及未读去重。移动端 WebKit 验证跳过条数、账号红点及补查状态显示。已下载并核验 IPA，未读字段和 Cookie 实际写入继续按真机验收。[验收包](https://github.com/harrylarry/multi-agent-account-manager/actions/runs/45663105641/artifacts/15046817245)
