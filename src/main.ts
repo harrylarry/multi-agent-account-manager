@@ -18,6 +18,7 @@ type ModalMode =
   | { kind: "add"; providerId: ProviderId; draft: string }
   | { kind: "rename"; account: AccountRecord; draft: string; groupDraft: string }
   | { kind: "remove"; account: AccountRecord }
+  | { kind: "cookies"; account: AccountRecord; busy: boolean; preview: CookiePreview | null; message: string; imported: boolean }
   | { kind: "approvals"; account: AccountRecord; loading: boolean; result: SpikeApprovalsResult | null; fetchedAt: number | null }
   | { kind: "update" }
   // 应用内确认框（替代 window.confirm）。WKWebView 的 UIDelegate 没有
@@ -30,6 +31,12 @@ type ModalMode =
       confirmLabel: string;
       danger: boolean;
     };
+
+interface CookiePreview {
+  count: number;
+  domains: string[];
+  nextExpiry: number | null;
+}
 
 const PROVIDER_LOGOS: Record<ProviderId, { src: string; fullBleed: boolean }> = {
   muse: { src: "/logos/muse.png", fullBleed: true },
@@ -2351,9 +2358,82 @@ async function loadAccountApprovals(view: Extract<ModalMode, { kind: "approvals"
   }
 }
 
+function renderCookieModal(view: Extract<ModalMode, { kind: "cookies" }>): string {
+  const { account, busy, preview, message, imported } = view;
+  return `
+    <div class="inline-modal" role="dialog" aria-modal="true" aria-labelledby="cookie-title">
+      <div class="modal-card">
+        <div class="modal-title" id="cookie-title">登录恢复 · ${escapeHtml(account.alias)}</div>
+        <div class="modal-desc">导入你自己的 JSON、Netscape 或 Cookie 请求头。Cookie 可用于登录，请勿分享。</div>
+        <label for="account-cookie-input">Cookie</label>
+        <textarea id="account-cookie-input" class="modal-input account-cookie-input" spellcheck="false" autocomplete="off" autocapitalize="off" ${busy ? "disabled" : ""}></textarea>
+        <div id="account-cookie-preview" role="status">${preview ? `
+          共 ${preview.count} 条 · ${escapeHtml(preview.domains.join("、"))}
+          <div>最早已知到期 ${preview.nextExpiry ? new Date(preview.nextExpiry * 1000).toLocaleString() : "未提供"}</div>
+          <div>同域、名称及路径的 Cookie 将被替换。</div>` : ""}</div>
+        ${message ? `<div role="status">${escapeHtml(message)}</div>` : ""}
+        <div class="modal-footer account-cookie-actions">
+          <button id="modal-cancel-btn" class="btn" type="button" ${busy ? "disabled" : ""}>关闭</button>
+          <button id="account-cookie-export" class="btn" type="button" ${busy ? "disabled" : ""}>导出到剪贴板</button>
+          <button id="account-cookie-preview-btn" class="btn" type="button" ${busy ? "disabled" : ""}>预览</button>
+          <button id="account-cookie-import" class="btn primary" type="button" ${preview && !busy ? "" : "disabled"}>导入</button>
+          <button id="account-cookie-open" class="btn" type="button" ${busy ? "disabled" : ""}>${imported ? "打开并验证" : "打开账号"}</button>
+        </div>
+      </div>
+    </div>`;
+}
+
+async function accountCookieAction(action: "preview" | "import" | "export"): Promise<void> {
+  if (modal.kind !== "cookies" || modal.busy) return;
+  const view = modal;
+  const { uuid, providerId } = view.account;
+  const raw = document.querySelector<HTMLTextAreaElement>("#account-cookie-input")?.value ?? "";
+  if (action === "import" && !view.preview) return;
+  if (action === "export" && !await askConfirm({
+    title: "导出登录 Cookie",
+    desc: "剪贴板内容可用于登录。导出只保留在本机剪贴板，60 秒后到期。",
+    confirmLabel: "复制",
+  })) {
+    if ((modal as ModalMode).kind === "none") await setModal(view);
+    return;
+  }
+  if (action === "export") await setModal(view);
+  view.busy = true;
+  view.message = "";
+  if (action !== "import") view.preview = null;
+  render();
+  try {
+    if (action === "preview") {
+      view.preview = await invoke<CookiePreview>("preview_account_cookies", { providerId, raw });
+    } else {
+      const count = await invoke<number>("transfer_account_cookies", {
+        uuid, providerId, raw: action === "import" ? raw : null,
+      });
+      view.preview = null;
+      view.imported = action === "import" || view.imported;
+      view.message = action === "import"
+        ? `已写入 ${count} 条 Cookie，请打开账号验证登录。`
+        : `已复制 ${count} 条 Cookie，60 秒后到期。`;
+    }
+  } catch (error) {
+    view.preview = null;
+    view.message = String(error);
+  } finally {
+    view.busy = false;
+    if (modal === view) {
+      render();
+      if (action === "preview" && view.preview) {
+        const input = document.querySelector<HTMLTextAreaElement>("#account-cookie-input");
+        if (input) input.value = raw;
+      }
+    }
+  }
+}
+
 function renderModal(provider: ProviderInfo): string {
   if (modal.kind === "none") return "";
   if (modal.kind === "approvals") return renderApprovalsModal(modal);
+  if (modal.kind === "cookies") return renderCookieModal(modal);
   if (modal.kind === "update") {
     return renderUpdateModal();
   }
@@ -2545,6 +2625,7 @@ function renderMiddleContent(state: ManagerSnapshot, provider: ProviderInfo): st
                 ${subHtmlFor(acc, d, isMobile)}
               </div>
               <div class="row-ops">
+                ${state.platform === "ios" ? `<button class="action-icon-btn account-approval-btn" data-cookies-uuid="${escapeHtml(acc.uuid)}" type="button">登录恢复</button>` : ""}
                 ${state.platform === "ios" && provider.id === "muse" && acc.authState === "authenticated" ? `<button class="action-icon-btn account-approval-btn" data-approvals-uuid="${escapeHtml(acc.uuid)}" type="button">审批</button>` : ""}
                 <button class="action-icon-btn" data-rename-uuid="${escapeHtml(acc.uuid)}" title="编辑账号备注与分组" aria-label="编辑账号备注与分组" type="button">${ICON_EDIT}</button>
                 <button class="action-icon-btn danger" data-remove-uuid="${escapeHtml(acc.uuid)}" title="从本机移除" type="button">${ICON_TRASH}</button>
@@ -2760,6 +2841,7 @@ function modalIdentityKey(provider: ProviderInfo): string | null {
       // 内容在打开时确定，不会在显示期间变化；标题 + 长度足以区分。
       return `confirm:${modal.title}:${modal.desc.length}:${modal.confirmLabel}`;
     case "approvals":
+    case "cookies":
       return null;
     case "update":
       // Dynamic content (update check / install progress): no stable
@@ -3188,6 +3270,13 @@ function bindDelegatedEvents(): void {
 
     // Most specific first; each branch returns after handling (this is
     // what stopPropagation used to do for the row-op buttons).
+    const cookieButton = target.closest<HTMLElement>("[data-cookies-uuid]");
+    if (cookieButton) {
+      if (modal.kind !== "none" || reorderMode) return;
+      const account = snapshot.accounts.find((entry) => entry.providerId === provider.id && entry.uuid === cookieButton.dataset.cookiesUuid);
+      if (account) await setModal({ kind: "cookies", account, busy: false, preview: null, message: "", imported: false });
+      return;
+    }
     const approvalButton = target.closest<HTMLElement>("[data-approvals-uuid]");
     if (approvalButton) {
       if (modal.kind !== "none" || reorderMode) return;
@@ -3446,6 +3535,22 @@ function bindDelegatedEvents(): void {
         render();
         restoreScrollPosition();
         break;
+      case "account-cookie-preview-btn":
+        await accountCookieAction("preview");
+        break;
+      case "account-cookie-import":
+        await accountCookieAction("import");
+        break;
+      case "account-cookie-export":
+        await accountCookieAction("export");
+        break;
+      case "account-cookie-open":
+        if (modal.kind === "cookies" && !modal.busy) {
+          const { providerId, uuid } = modal.account;
+          await setModal({ kind: "none" });
+          await callCommand("switch_account", { providerId, uuid }, { providerId, uuid });
+        }
+        break;
       case "approvals-refresh-btn":
         if (modal.kind === "approvals" && !modal.loading) await loadAccountApprovals(modal);
         break;
@@ -3571,6 +3676,13 @@ function bindDelegatedEvents(): void {
 
   root.addEventListener("input", (ev) => {
     const input = ev.target as HTMLInputElement;
+    if (input.id === "account-cookie-input" && modal.kind === "cookies") {
+      modal.preview = null;
+      document.querySelector<HTMLButtonElement>("#account-cookie-import")?.setAttribute("disabled", "");
+      const preview = document.getElementById("account-cookie-preview");
+      if (preview) preview.textContent = "";
+      return;
+    }
     if (input.id === "account-search" && snapshot) {
       const provider = currentProvider(snapshot);
       accountFilters[provider.id].query = input.value;
@@ -3667,6 +3779,7 @@ async function bootstrap(): Promise<void> {
         ev.key === "Escape" &&
         modal.kind !== "add" &&
         modal.kind !== "rename" &&
+        !(modal.kind === "cookies" && modal.busy) &&
         !(modal.kind === "update" && updateState.installing)
       ) {
         ev.preventDefault();

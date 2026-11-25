@@ -1043,6 +1043,26 @@ impl SessionManager {
     Ok(())
   }
 
+  #[cfg(target_os = "ios")]
+  pub async fn with_cookie_profile(
+    &self,
+    app: &AppHandle,
+    provider: ProviderId,
+    uuid: &str,
+    cookies: Option<&[crate::account_cookies::AccountCookie]>,
+  ) -> Result<usize, String> {
+    let _sync = self.quota_sync_lock.lock().await;
+    let locked = self.inner.lock().await;
+    let key = AccountKey { provider_id: provider, uuid: uuid.to_string() };
+    if !locked.store.accounts.iter().any(|account| account.provider_id == provider && account.uuid == uuid)
+      || locked.conflicts.iter().any(|conflict| conflict.uuid == uuid)
+      || locked.store.pending_cleanup.contains(&key)
+    {
+      return Err("账号不存在、正在清理或需要先解决归属冲突".to_string());
+    }
+    crate::platform::ios::transfer_profile_cookies(app, provider.as_str(), uuid, cookies).await
+  }
+
   fn snapshot_from_locked(locked: &InnerState) -> ManagerSnapshot {
     let (active_account, switching_account) = match &locked.active_slot {
       Some(slot) if slot.committed => (Some(slot.account_key.clone()), None),

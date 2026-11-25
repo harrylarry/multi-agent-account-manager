@@ -1895,3 +1895,13 @@ body,
   padding-top: 4px;
   color: var(--text-muted);
 }
+
+.account-cookie-input {
+  min-height: 110px;
+  padding: 8px;
+  resize: vertical;
+}
+
+.account-cookie-actions {
+  flex-wrap: wrap;
+}

@@ -1,3 +1,4 @@
+mod account_cookies;
 mod muse_native;
 mod platform;
 mod hark_native;
@@ -234,6 +235,49 @@ async fn muse_native_approvals_probe(
       let setting = account_proxy_setting(&mgr, &provider_id, &uuid).await;
       muse_native::approvals_probe(&app, &provider_id, &uuid, setting.as_ref()).await
     }) => response.map_err(|_| "审批查询超时".to_string())?,
+  }
+}
+
+#[tauri::command]
+fn preview_account_cookies(provider_id: String, raw: String) -> Result<serde_json::Value, String> {
+  let cookies = parse_account_cookies(&provider_id, raw)?;
+  let domains = cookies.iter().map(|cookie| cookie.domain.trim_start_matches('.'))
+    .collect::<std::collections::BTreeSet<_>>();
+  let next_expiry = cookies.iter().filter_map(|cookie| cookie.expiration_date)
+    .min_by(f64::total_cmp);
+  Ok(serde_json::json!({ "count": cookies.len(), "domains": domains, "nextExpiry": next_expiry }))
+}
+
+fn parse_account_cookies(provider_id: &str, raw: String) -> Result<Vec<account_cookies::AccountCookie>, String> {
+  let raw = zeroize::Zeroizing::new(raw);
+  let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH)
+    .map_err(|_| "系统时间异常".to_string())?.as_secs_f64();
+  account_cookies::parse(&raw, provider_id, now)
+}
+
+#[tauri::command]
+#[cfg_attr(not(target_os = "ios"), allow(unused_variables))]
+async fn transfer_account_cookies(
+  app: AppHandle,
+  mgr: State<'_, Arc<SessionManager>>,
+  cancel: State<'_, Arc<probe_cancel::ProbeCancel>>,
+  provider_id: String,
+  uuid: String,
+  raw: Option<String>,
+) -> Result<usize, String> {
+  #[cfg(target_os = "ios")]
+  {
+    let provider = providers::ProviderId::parse(&provider_id).ok_or("服务标识无效")?;
+    let uuid = storage::normalize_uuid(&uuid).ok_or("账号标识无效")?;
+    let cookies = raw.map(|raw| parse_account_cookies(&provider_id, raw)).transpose()?;
+    if cookies.is_some() {
+      cancel.cancel_account(&uuid);
+    }
+    mgr.with_cookie_profile(&app, provider, &uuid, cookies.as_deref()).await
+  }
+  #[cfg(not(target_os = "ios"))]
+  {
+    Err("此操作仅支持 iOS".to_string())
   }
 }
 
@@ -920,6 +964,8 @@ pub fn run() {
       resolve_uuid_conflict,
       dismiss_notice,
       trigger_quota_sync,
+      preview_account_cookies,
+      transfer_account_cookies,
       spike_ios_quota_sync_probe,
       reorder_accounts,
       check_for_updates,

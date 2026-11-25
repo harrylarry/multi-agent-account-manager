@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-transfer-account-cookies"
+description = "Enables the transfer_account_cookies command without any pre-configured scope."
+commands.allow = ["transfer_account_cookies"]
+
+[[permission]]
+identifier = "deny-transfer-account-cookies"
+description = "Denies the transfer_account_cookies command without any pre-configured scope."
+commands.deny = ["transfer_account_cookies"]

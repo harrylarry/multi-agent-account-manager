@@ -775,3 +775,22 @@ pub async fn sync_account_quotas(
     .map_err(|e| e.to_string())?;
   Ok(res.results)
 }
+
+#[cfg(target_os = "ios")]
+pub async fn transfer_profile_cookies(
+  app: &AppHandle,
+  provider: &str,
+  uuid: &str,
+  cookies: Option<&[impl serde::Serialize]>,
+) -> Result<usize, String> {
+  #[derive(Deserialize)]
+  struct ResultCount {
+    count: usize,
+  }
+  let bridge = app.state::<IosSessionBridge<tauri::Wry>>();
+  let response: ResultCount = bridge.0.run_mobile_plugin_async(
+    "transferProfileCookies",
+    serde_json::json!({ "provider": provider, "uuid": uuid, "cookies": cookies }),
+  ).await.map_err(|e| e.to_string())?;
+  Ok(response.count)
+}

@@ -81,3 +81,5 @@
 该轮后台实时监测验收为 `FAIL`。475 秒实测空窗确认该场景不能依赖常驻 WSS 提供实时提醒。后续产品路径采用回前台补查和现有红点。本批在 iOS 恢复 active 时立即与延迟复查停驻 Muse 页面，丢弃生命周期切换前发起的旧检查。iOS 账号列表加入 Muse 只读审批，服务端空列表与无法判定分别显示。原生审批决策继续等可核对的写协议及实际待审批样本。
 
 `bda84e7` 已通过 [Quick checks](https://github.com/harrylarry/multi-agent-account-manager/actions/runs/45631020421) 和 [iOS Xcode 打包](https://github.com/harrylarry/multi-agent-account-manager/actions/runs/45631028431)，IPA 已下载校验。主 crate 62 项、muse-native 109 项和嵌入 JS 13 项本地测试通过。WebKit 两个移动端视口用模拟响应验证了审批详情、过期、账号隔离、空列表和未知响应。两项产品功能仍需 iPhone 复测。
+
+进入 v2.2 批次 A。iOS 账号列表加入 Cookie 三格式预览、范围校验、写入核验与失败回滚、本机限时剪贴板导出，以及写入后打开原账号验证登录。审批、回前台补查及分组持久化纳入同一候选包。会话、代理池、任务与加密备份沿 v2.2 继续。

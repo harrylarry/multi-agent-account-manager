@@ -15,6 +15,8 @@ const APP_COMMANDS: &[&str] = &[
   "resolve_uuid_conflict",
   "dismiss_notice",
   "trigger_quota_sync",
+  "preview_account_cookies",
+  "transfer_account_cookies",
   "spike_ios_quota_sync_probe",
   "check_for_updates",
   "download_and_install_update",

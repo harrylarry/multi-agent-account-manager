@@ -24,6 +24,8 @@
     "allow-resolve-uuid-conflict",
     "allow-dismiss-notice",
     "allow-trigger-quota-sync",
+    "allow-preview-account-cookies",
+    "allow-transfer-account-cookies",
     "allow-check-for-updates",
     "allow-download-and-install-update",
     "allow-open-external-url",

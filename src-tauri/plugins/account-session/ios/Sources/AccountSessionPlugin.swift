@@ -60,6 +60,23 @@ private struct DeleteProfileArgs: Decodable {
   let uuid: String
 }
 
+private struct TransferProfileCookiesArgs: Decodable {
+  struct Entry: Decodable {
+    let name: String
+    let value: String
+    let domain: String
+    let path: String
+    let secure: Bool
+    let httpOnly: Bool
+    let expirationDate: Double?
+    let sameSite: String?
+  }
+
+  let uuid: String
+  let provider: String
+  let cookies: [Entry]?
+}
+
 private struct GetSessionCookiesArgs: Decodable {
   let uuid: String
   let provider: String?
@@ -322,6 +339,134 @@ class AccountSessionPlugin: Plugin {
         }
         invoke.resolve(["cookies": mine.map { ["name": $0.name, "value": $0.value] }])
       }
+    }
+  }
+
+  @objc public func transferProfileCookies(_ invoke: Invoke) throws {
+    let args = try invoke.parseArgs(TransferProfileCookiesArgs.self)
+    Task { @MainActor in
+      let domains: [String]
+      switch args.provider {
+      case "muse": domains = ["muse.ai", "meta.com"]
+      case "hark": domains = ["hark.com"]
+      default:
+        invoke.reject("不支持的登录态服务")
+        return
+      }
+      guard let identifier = UUID(uuidString: args.uuid),
+            !AccountSessionCoordinator.shared.isUuidActive(args.uuid) else {
+        invoke.reject("请关闭该账号会话后重试")
+        return
+      }
+      func allowed(_ domain: String) -> Bool {
+        let host = domain.trimmingCharacters(in: CharacterSet(charactersIn: ".")).lowercased()
+        return domains.contains { host == $0 || host.hasSuffix("." + $0) }
+      }
+      func key(_ cookie: HTTPCookie) -> String {
+        let host = cookie.domain.trimmingCharacters(in: CharacterSet(charactersIn: ".")).lowercased()
+        return [cookie.name, host, cookie.path].joined(separator: "\u{0}")
+      }
+      let store = WKWebsiteDataStore(forIdentifier: identifier).httpCookieStore
+      func allCookies() async -> [HTTPCookie] {
+        await withCheckedContinuation { continuation in
+          store.getAllCookies { cookies in continuation.resume(returning: cookies) }
+        }
+      }
+      func write(_ cookie: HTTPCookie) async {
+        await withCheckedContinuation { (continuation: CheckedContinuation<Void, Never>) in
+          store.setCookie(cookie) { continuation.resume() }
+        }
+      }
+      func remove(_ cookie: HTTPCookie) async {
+        await withCheckedContinuation { (continuation: CheckedContinuation<Void, Never>) in
+          store.delete(cookie) { continuation.resume() }
+        }
+      }
+      func matches(_ actual: HTTPCookie, _ expected: HTTPCookie) -> Bool {
+        let expiryMatches: Bool
+        switch (actual.expiresDate, expected.expiresDate) {
+        case (nil, nil): expiryMatches = true
+        case (let a?, let b?): expiryMatches = abs(a.timeIntervalSince(b)) <= 1
+        default: expiryMatches = false
+        }
+        return key(actual) == key(expected) && actual.value == expected.value &&
+          actual.isSecure == expected.isSecure && actual.isHTTPOnly == expected.isHTTPOnly &&
+          expiryMatches
+      }
+      if let entries = args.cookies {
+        var imported: [HTTPCookie] = []
+        var keys = Set<String>()
+        for entry in entries {
+          var properties: [HTTPCookiePropertyKey: Any] = [
+            .name: entry.name, .value: entry.value, .domain: entry.domain, .path: entry.path,
+          ]
+          if entry.secure { properties[.secure] = "TRUE" }
+          if entry.httpOnly { properties[HTTPCookiePropertyKey("HttpOnly")] = "TRUE" }
+          if let expiry = entry.expirationDate {
+            properties[.expires] = Date(timeIntervalSince1970: expiry)
+          } else {
+            properties[.discard] = "TRUE"
+          }
+          if let sameSite = entry.sameSite { properties[HTTPCookiePropertyKey("SameSite")] = sameSite }
+          guard allowed(entry.domain), let cookie = HTTPCookie(properties: properties),
+                cookie.name == entry.name, cookie.value == entry.value,
+                cookie.isSecure == entry.secure, cookie.isHTTPOnly == entry.httpOnly,
+                cookie.path == entry.path, keys.insert(key(cookie)).inserted else {
+            invoke.reject("系统无法保留 Cookie 属性，未写入")
+            return
+          }
+          imported.append(cookie)
+        }
+        RecentAccountPages.discardProfile(args.uuid)
+        TaskWatcher.shared.forget(uuid: args.uuid)
+        let previous = await allCookies().filter { keys.contains(key($0)) }
+        for cookie in imported { await write(cookie) }
+        let actual = await allCookies().filter { keys.contains(key($0)) }
+        if imported.allSatisfy({ expected in
+          actual.contains { matches($0, expected) }
+        }) {
+          DataStoreRegistry.markCreated(args.uuid)
+          invoke.resolve(["count": imported.count])
+        } else {
+          for cookie in actual { await remove(cookie) }
+          for cookie in previous { await write(cookie) }
+          let restored = await allCookies().filter { keys.contains(key($0)) }
+          let rollbackOK = restored.count == previous.count && previous.allSatisfy { expected in
+            restored.contains { matches($0, expected) }
+          }
+          invoke.reject(rollbackOK ? "Cookie 写入失败，已恢复原会话" : "Cookie 恢复未能确认，请在该账号重新登录")
+        }
+        return
+      }
+
+      let cookies = await allCookies().filter {
+        allowed($0.domain) && ($0.expiresDate.map { $0 > Date() } ?? true)
+      }
+      guard !cookies.isEmpty else {
+        invoke.reject("该账号没有可导出的 Cookie")
+        return
+      }
+      let export: [[String: Any]] = cookies.map { cookie in
+        var item: [String: Any] = [
+          "name": cookie.name, "value": cookie.value, "domain": cookie.domain, "path": cookie.path,
+          "secure": cookie.isSecure, "httpOnly": cookie.isHTTPOnly,
+        ]
+        if let expires = cookie.expiresDate { item["expirationDate"] = expires.timeIntervalSince1970 }
+        if let sameSite = cookie.properties?[HTTPCookiePropertyKey("SameSite")] as? String {
+          item["sameSite"] = sameSite
+        }
+        return item
+      }
+      guard let data = try? JSONSerialization.data(withJSONObject: export, options: [.sortedKeys]),
+            let text = String(data: data, encoding: .utf8) else {
+        invoke.reject("Cookie 导出失败")
+        return
+      }
+      UIPasteboard.general.setItems(
+        [["public.utf8-plain-text": text]],
+        options: [.localOnly: true, .expirationDate: Date().addingTimeInterval(60)]
+      )
+      invoke.resolve(["count": cookies.count])
     }
   }
 
