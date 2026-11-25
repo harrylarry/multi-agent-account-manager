@@ -16,6 +16,7 @@
 // call resolves immediately with no results — the in-flight sync covers it.
 
 import Foundation
+import UIKit
 import WebKit
 
 enum QuotaSyncRunner {
@@ -168,6 +169,8 @@ enum QuotaSyncRunner {
     private let fresh: Bool
     private let completion: (String, ProbeData?) -> Void
     private var webView: WKWebView?
+    private var renderHost: UIView?
+    private var committed = false
     private var timeoutWork: DispatchWorkItem?
     private var finished = false
     private var probeDeadline = Date.distantPast
@@ -185,6 +188,15 @@ enum QuotaSyncRunner {
         finish("setup_failed")
         return
       }
+      guard let window = UIApplication.shared.connectedScenes
+        .compactMap({ $0 as? UIWindowScene })
+        .filter({ $0.activationState == .foregroundActive })
+        .compactMap({ $0.keyWindow })
+        .first
+      else {
+        finish("no_foreground_window")
+        return
+      }
       let config = WKWebViewConfiguration()
       let store = WKWebsiteDataStore(forIdentifier: identifier)
       config.websiteDataStore = store
@@ -198,17 +210,27 @@ enum QuotaSyncRunner {
       config.preferences.javaScriptCanOpenWindowsAutomatically = false
       config.userContentController.addUserScript(
         WKUserScript(
-          source: (fresh ? "window.__maamRequireFreshQuota = true;\n" : "") + Scripts.quotaHookInitScript,
+          source: "window.__maamRequireFreshQuota = true;\n" + Scripts.quotaHookInitScript,
           injectionTime: .atDocumentStart,
           forMainFrameOnly: true
         )
       )
-      let view = WKWebView(frame: .zero, configuration: config)
+      // Give WebKit an attached viewport so document rendering and quota
+      // bootstrap can run. Clip it to a non-interactive point under app content.
+      let host = UIView(frame: CGRect(x: 0, y: 0, width: 1, height: 1))
+      host.clipsToBounds = true
+      host.isUserInteractionEnabled = false
+      host.accessibilityElementsHidden = true
+      host.alpha = 0.02
+      let view = WKWebView(frame: CGRect(origin: .zero, size: window.bounds.size), configuration: config)
       view.navigationDelegate = self
+      host.addSubview(view)
+      window.insertSubview(host, at: 0)
       webView = view
+      renderHost = host
 
       let timeout = DispatchWorkItem { [weak self] in
-        self?.finish("network_timeout")
+        self?.finish("navigation_commit_timeout")
       }
       timeoutWork = timeout
       DispatchQueue.main.asyncAfter(deadline: .now() + QuotaSyncRunner.loadTimeout, execute: timeout)
@@ -226,14 +248,16 @@ enum QuotaSyncRunner {
       }
     }
 
-    func webView(_ webView: WKWebView, didFinish navigation: WKNavigation!) {
+    func webView(_ webView: WKWebView, didCommit navigation: WKNavigation!) {
+      guard !finished, !committed, webView.url?.scheme == "https" else { return }
+      committed = true
       timeoutWork?.cancel()
       probeDeadline = Date().addingTimeInterval(12)
       let timeout = DispatchWorkItem { [weak self] in self?.finish("probe_timeout") }
       timeoutWork = timeout
       DispatchQueue.main.asyncAfter(deadline: .now() + 12, execute: timeout)
-      // Let the page's own API traffic run through the quota hooks for a
-      // moment before reading the captured values.
+      // Start after the document commits. Subresources and long-lived page
+      // requests need not finish before quota becomes available.
       DispatchQueue.main.asyncAfter(deadline: .now() + QuotaSyncRunner.settleDelay) { [weak self] in
         self?.probeAndFinish()
       }
@@ -244,7 +268,7 @@ enum QuotaSyncRunner {
       didFail navigation: WKNavigation!,
       withError error: Error
     ) {
-      finish("network_failed")
+      finish(navigationError(error, stage: "committed"))
     }
 
     func webView(
@@ -252,7 +276,13 @@ enum QuotaSyncRunner {
       didFailProvisionalNavigation navigation: WKNavigation!,
       withError error: Error
     ) {
-      finish("network_failed")
+      finish(navigationError(error, stage: "provisional"))
+    }
+
+    private func navigationError(_ error: Error, stage: String) -> String {
+      let cause = error as NSError
+      let code = cause.domain == NSURLErrorDomain ? "_url_\(cause.code)" : ""
+      return "navigation_\(stage)_failed\(code)"
     }
 
     func webViewWebContentProcessDidTerminate(_ webView: WKWebView) {
@@ -265,11 +295,12 @@ enum QuotaSyncRunner {
         finish("setup_failed")
         return
       }
-      view.evaluateJavaScript(Scripts.identityProbeScript) { [weak self] result, _ in
+      let script = "if (document.readyState !== 'loading') {\n" + Scripts.identityProbeScript + "\n}"
+      view.evaluateJavaScript(script) { [weak self] result, _ in
         guard let self, !self.finished else { return }
         let parsed = QuotaSyncRunner.parseProbeOutput(result)
-        if !self.fresh || parsed?.loggedOut == true ||
-           parsed?.quotaPct != nil || parsed?.quotaDetailJson.isEmpty == false {
+        if parsed?.loggedOut == true || parsed?.quotaPct != nil ||
+           parsed?.quotaDetailJson.isEmpty == false {
           self.finish("loaded", parsed)
           return
         }
@@ -295,6 +326,8 @@ enum QuotaSyncRunner {
       webView?.navigationDelegate = nil
       webView?.removeFromSuperview()
       webView = nil
+      renderHost?.removeFromSuperview()
+      renderHost = nil
     }
   }
 }

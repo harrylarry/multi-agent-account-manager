@@ -1371,8 +1371,9 @@ function backgroundQuotaLines(): string[] {
     applied: "已下发", disabled: "未启用", push_failed: "下发失败", blocked: "应用失败，已阻断",
   };
   const network: Record<string, string> = {
-    not_attempted: "未发起", loaded: "页面加载成功", parked: "使用已停驻页面",
-    network_failed: "联网失败", network_timeout: "联网超时", probe_timeout: "页面已加载，额度探测超时",
+    not_attempted: "未发起", loaded: "主文档已提交", parked: "使用已停驻页面",
+    navigation_commit_timeout: "主文档提交超时", probe_timeout: "主文档已提交，额度探测超时",
+    no_foreground_window: "未取得前台窗口，本轮未发起联网",
     setup_failed: "页面初始化失败", webview_terminated: "WebView 进程终止", runner_failed: "同步组件未返回结果",
   };
   const quota: Record<string, string> = {
@@ -1381,7 +1382,10 @@ function backgroundQuotaLines(): string[] {
   };
   return backgroundQuotaRows.map((row) => {
     const http = /^http_error_(\d{3})$/.exec(row.network);
-    const networkLabel = http ? `页面请求失败（HTTP ${http[1]}）` : network[row.network] ?? "未知状态";
+    const navigation = /^navigation_(provisional|committed)_failed(?:_url_(-?\d+))?$/.exec(row.network);
+    const networkLabel = http ? `页面请求失败（HTTP ${http[1]}）`
+      : navigation ? `联网失败（${navigation[1] === "provisional" ? "主文档提交前" : "主文档提交后"}${navigation[2] ? `，URL 错误 ${navigation[2]}` : ""}）`
+      : network[row.network] ?? "未知状态";
     const provider = row.provider === "muse" ? "Muse" : row.provider === "hark" ? "Hark" : "账号";
     return `${provider} ···${row.account} ｜ 代理 ${proxy[row.proxy] ?? "未知状态"} ｜ 联网 ${networkLabel} ｜ 额度 ${quota[row.quota] ?? "未知状态"}`;
   });

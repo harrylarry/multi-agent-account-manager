@@ -61,3 +61,5 @@
 `7588dca` 于 19:18–19:23（UTC+8）通过三种原生代理真机端到端，19:31 完成 SOCKS5 重启持久化复测。错误代理密码下原生探针无法连接、Muse WebView 无法加载，恢复正确密码后网页重新载入。后台额度同步的下一步是补充按账号脱敏的下发、联网和应用结果，供故障对照验收。已修正后台同步忽略代理下发结果的问题，只有下发成功的账号才交给 Swift 同步。该改动尚无真机证据。VM 新分配与续期仍待验收。[真机验收](../acceptance/iphone-acceptance.md#原生代理与重启回归)
 
 `dda5127` 的后台同步诊断按账号分别报告代理下发、隐藏 WebView 主页面联网和额度应用结果。测试入口重载页面并排除旧额度缓存，代理下发或应用失败时跳过该账号联网。Windows 主 crate 61 项测试、13 项嵌入脚本测试、[Quick checks](https://github.com/harrylarry/multi-agent-account-manager/actions/runs/45608432316) 和 [iOS Xcode 打包](https://github.com/harrylarry/multi-agent-account-manager/actions/runs/45608434585) 均通过，IPA 已下载并校验。下一步用同一 iPhone 测试账号做正确、错误、恢复正确三轮代理密码对照，回填账号尾号及三段状态。[下载与步骤](../acceptance/iphone-acceptance.md#ios-后台额度同步)
+
+`dda5127` iPhone 真机用同一账号测试启用及明确清除 SOCKS5。隐藏 WebView 两轮均超时，后台额度正向验收为 `FAIL`。原生额度经代理冷发现 GET 失败，匿名 HEAD 为 200，清除代理后原生额度成功。已在候选修复中让隐藏 WebView 使用前台窗口中的不可交互渲染视口，从主文档提交开始独立探测额度。原生路径补充脱敏的请求或响应体错误分类。后续需验证主文档是否提交、额度是否更新，再做错误密码及恢复正确密码的对照。[真机回执](../acceptance/iphone-acceptance.md#dda5127-真机回执)

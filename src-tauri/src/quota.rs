@@ -442,6 +442,14 @@ async fn fetch_chunks_no_cookie(
   out
 }
 
+fn quota_http_error(stage: &str, error: &reqwest::Error) -> QuotaError {
+  #[cfg(not(target_os = "android"))]
+  let detail = crate::egress::safe_http_error(stage, error);
+  #[cfg(target_os = "android")]
+  let detail = format!("{stage}: {}", if error.is_timeout() { "timeout" } else { "request" });
+  QuotaError::Network(detail)
+}
+
 /// 无重定向、显式带/不带 Cookie 的 GET。3xx 返回 (status, "")。
 async fn fetch_no_redirect(
   client: &reqwest::Client,
@@ -456,7 +464,7 @@ async fn fetch_no_redirect(
   if let Some(c) = cookie.flatten() {
     req = req.header("Cookie", c);
   }
-  let resp = req.send().await.map_err(|e| QuotaError::Network(e.to_string()))?;
+  let resp = req.send().await.map_err(|e| quota_http_error("额度发现 GET 请求", &e))?;
   let status = resp.status().as_u16();
   if (300..400).contains(&status) {
     return Ok((status, String::new()));
@@ -464,7 +472,7 @@ async fn fetch_no_redirect(
   let bytes = resp
     .bytes()
     .await
-    .map_err(|e| QuotaError::Network(e.to_string()))?;
+    .map_err(|e| quota_http_error("额度发现 GET 响应体", &e))?;
   if bytes.len() > CHUNK_MAX_BYTES {
     return Err(QuotaError::Network("响应体超过 2MB".into()));
   }
@@ -495,7 +503,7 @@ async fn post_action(
     .body(r#"[{"includeAgreement":true}]"#)
     .send()
     .await
-    .map_err(|e| QuotaError::Network(e.to_string()))?;
+    .map_err(|e| quota_http_error("额度 action POST 请求", &e))?;
   let status = resp.status().as_u16();
   let ctype = resp
     .headers()
@@ -506,7 +514,7 @@ async fn post_action(
   let bytes = resp
     .bytes()
     .await
-    .map_err(|e| QuotaError::Network(e.to_string()))?;
+    .map_err(|e| quota_http_error("额度 action POST 响应体", &e))?;
   Ok((status, ctype, String::from_utf8_lossy(&bytes).into_owned()))
 }
 
