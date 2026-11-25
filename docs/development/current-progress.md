@@ -32,6 +32,8 @@ Windows 主 crate 67 项、muse-native 110 项、嵌入脚本 13 项与构建检
 
 P4-C 多账号按 v4 接通代码开发、头脑风暴、评审、群发对比的真实顺序接力。独立审核使用当前请求绑定的结构化决定；只有已通过审核的产出进入有审核模板的整理阶段。审核打回回流执行，已用轮次不重置。用户补充要求在已发请求入账后暂停。手选成员或固定角色变更使用两步提议、确认，并保留原始分工。轮次或三次打回先到即停止，保留可核对记录。交付范围是可溯源文字，P4-D 自动选人和自动扩展继续独立推进。[多账号联合真机步骤](../acceptance/iphone-acceptance.md#muse-多账号接力与独立审核)
 
+`9c5ed9c` 联合候选 `CI_PASSED`。Windows 主 crate 80 项、muse-native 110 项、嵌入脚本 13 项通过，Noise 回环核对停止请求仅指向本轮隔离会话。两个手机尺寸的 WebKit 仿真通过多人评审和确认分工、定稿，并回归单账号房间与指定账号指纹档案。macOS iOS target 与 Xcode 通过，已核验 ZIP、IPA、Spike Bundle ID 和最低 iOS 版本。多账号真实派发、审核及返工、端到端停止均为 `UNVERIFIED`。停止请求应答只表示远端收到请求。单账号房间、指纹档案和红点仍等待用户回传。[CI](https://github.com/harrylarry/multi-agent-account-manager/actions/runs/45720907901) · [候选包和验收](../acceptance/iphone-acceptance.md#muse-多账号接力与独立审核)
+
 `4884cee` 交付 P4-B 单账号文字闭环与 P4-E 的 Muse 手动检测及账号指纹档案。语义沿用自有 v4 §3.1–3.11、v2.1 和已裁决的固定角色、轮次及定稿规则。新增「单账号任务」入口，四个正式场景继续按其角色规则工作。使用同一账号真实建立隔离会话、订阅就绪后发送一次、独立落账 ACK、优先流式回收，必要时按同会话和 ACK 只读回查。只有用户按钮推进定稿。会话、发送和回收来源可核对。当前交付类型是文字，多账号接力、独立审核、真实外部产物验证、自动指纹及模型选择属于后续工作。[联合真机步骤](../acceptance/iphone-acceptance.md#muse-单账号房间和指纹档案)
 
 联合候选 `CI_PASSED`。两种手机尺寸的本机 WebKit 仿真验证了派发入口、确认定稿和指定账号指纹档案；macOS Quick checks、iOS Rust target、Swift 编译及 Xcode IPA 构建通过。已核验 ZIP、IPA、Spike Bundle ID 和最低 iOS 版本。真机仍为 `UNVERIFIED`，等待单账号隔离发收、定稿及重启后的档案回执。Muse 红点仍等待「红点计时」真机回执。[CI](https://github.com/harrylarry/multi-agent-account-manager/actions/runs/45711886220) · [iOS 打包](https://github.com/harrylarry/multi-agent-account-manager/actions/runs/45711886482)
