@@ -1466,7 +1466,7 @@ pub async fn watch_probe(
   }
 }
 
-/// B2：只读拉取一次 `egress.approvals`，返回待审批数量与最新一条的脱敏摘要。
+/// B2：只读拉取一次 `egress.approvals`，返回待审批列表的最小字段。
 /// 不做任何 approve/deny，也不返回审批正文。
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -1475,7 +1475,7 @@ pub struct ApprovalsProbe {
   pub phase: String,
   pub status: Option<u16>,
   pub count: usize,
-  pub first: Option<ApprovalItem>,
+  pub items: Vec<ApprovalItem>,
   pub error: Option<String>,
 }
 
@@ -1511,7 +1511,7 @@ pub async fn approvals_probe(
     if cookies.is_empty() {
       return Ok(ApprovalsProbe {
         ok: false, phase: "no_cookies".to_string(), status: None, count: 0,
-        first: None, error: Some("该账号还没有 muse.ai 登录态".to_string()),
+        items: Vec::new(), error: Some("该账号还没有 muse.ai 登录态".to_string()),
       });
     }
     let egress = crate::egress::resolve_for_app(app, setting)?;
@@ -1521,7 +1521,7 @@ pub async fn approvals_probe(
         cookies.zeroize();
         return Ok(ApprovalsProbe {
           ok: false, phase: "connect".to_string(), status: None, count: 0,
-          first: None, error: Some(e.to_string()),
+          items: Vec::new(), error: Some(e.to_string()),
         });
       }
     };
@@ -1543,27 +1543,39 @@ pub async fn approvals_probe(
       Err(e) => {
         return Ok(ApprovalsProbe {
           ok: false, phase: "request".to_string(), status: None, count: 0,
-          first: None, error: Some(e.to_string()),
+          items: Vec::new(), error: Some(e.to_string()),
         });
       }
     };
+    let _ = tokio::time::timeout(Duration::from_secs(2), connected.close()).await;
+    if !(200..300).contains(&status) {
+      return Ok(ApprovalsProbe {
+        ok: false, phase: "http".to_string(), status: Some(status), count: 0,
+        items: Vec::new(), error: Some(format!("egress.approvals HTTP {status}")),
+      });
+    }
     let json: serde_json::Value = match serde_json::from_slice(&body) {
       Ok(v) => v,
       Err(e) => {
         return Ok(ApprovalsProbe {
           ok: false, phase: "parse".to_string(), status: Some(status), count: 0,
-          first: None, error: Some(format!("响应不是 JSON: {e}")),
+          items: Vec::new(), error: Some(format!("响应不是 JSON: {e}")),
         });
       }
     };
-    let list = parse_pending(&json);
+    let Some(list) = parse_pending(&json) else {
+      return Ok(ApprovalsProbe {
+        ok: false, phase: "schema".to_string(), status: Some(status), count: 0,
+        items: Vec::new(), error: Some("无法确认审批列表格式".to_string()),
+      });
+    };
     Ok(ApprovalsProbe {
-      ok: status < 400,
+      ok: true,
       phase: "ready".to_string(),
       status: Some(status),
       count: list.len(),
-      first: list.into_iter().next(),
-      error: if status < 400 { None } else { Some(format!("egress.approvals HTTP {status}")) },
+      items: list,
+      error: None,
     })
   }
 }

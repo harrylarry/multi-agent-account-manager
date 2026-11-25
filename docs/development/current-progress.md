@@ -75,3 +75,5 @@
 `d32511e` 的 [Xcode 打包](https://github.com/harrylarry/multi-agent-account-manager/actions/runs/45620072467/attempts/2) 重新运行后通过。首轮 runner 解析 GitHub 域名失败，SwiftPM 无法下载依赖。第二轮沿用同一功能 SHA，已下载并校验 IPA。GitHub 确认 [PR #15](https://github.com/harrylarry/multi-agent-account-manager/pull/15) 已合入，PR #16 继续承载当前 Spike。下一次真机集中核对租约到期字段、锁屏/后台观测间隔、取消及分组持久化。有 Hark 测试账号或真实待审批样本时，可在同一包核对已有只读路径。
 
 `d32511e` 获得 iPhone 回执。Noise、Ping、订阅和单次发送 ACK 回归通过。两次 standard 租约都返回 assigned，到期与 TTL 缺失。后台窗口结束时有 475 秒观测空窗，不能据此确认远端连接持续或断开。另开一轮确认手动停止为 cancelled。账号分组持久化、Hark 及真实待审批样本仍待验收。[真机回执](../acceptance/iphone-acceptance.md#d32511e-真机回执utc8)
+
+后台 475 秒实测空窗确认该场景不能依赖常驻 WSS 提供实时提醒。后续产品路径采用回前台补查和现有红点。本批在 iOS 恢复 active 时立即与延迟复查停驻 Muse 页面，丢弃生命周期切换前发起的旧检查。iOS 账号列表加入 Muse 只读审批，服务端空列表与无法判定分别显示。原生审批决策继续等可核对的写协议及实际待审批样本。

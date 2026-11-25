@@ -138,6 +138,9 @@ final class TaskWatcher: NSObject {
   private var started = false
   private var sweepTimer: Timer?
   private var foregroundObserver: NSObjectProtocol?
+  private var backgroundObserver: NSObjectProtocol?
+  private var foregroundChecks: [DispatchWorkItem] = []
+  private var foregroundGeneration = 0
   private var states: [String: WatchState] = [:]
 
   private override init() {
@@ -166,10 +169,31 @@ final class TaskWatcher: NSObject {
     // while the app was suspended; the parked page's DOM shows the
     // finished state, so the transition is detected on return.
     foregroundObserver = NotificationCenter.default.addObserver(
-      forName: UIApplication.willEnterForegroundNotification,
+      forName: UIApplication.didBecomeActiveNotification,
       object: nil,
       queue: .main
-    ) { [weak self] _ in self?.sweepParkedPages() }
+    ) { [weak self] _ in self?.resumeForegroundChecks() }
+    backgroundObserver = NotificationCenter.default.addObserver(
+      forName: UIApplication.didEnterBackgroundNotification, object: nil, queue: .main
+    ) { [weak self] _ in self?.cancelForegroundChecks() }
+  }
+
+  private func cancelForegroundChecks() {
+    foregroundGeneration += 1
+    foregroundChecks.forEach { $0.cancel() }
+    foregroundChecks.removeAll()
+  }
+
+  private func resumeForegroundChecks() {
+    cancelForegroundChecks()
+    sweepParkedPages()
+    // A parked document may need time to render new data after iOS resumes.
+    // Leave enough time between samples for the existing stability check.
+    for delay in [6.0, 12.0] {
+      let check = DispatchWorkItem { [weak self] in self?.sweepParkedPages() }
+      foregroundChecks.append(check)
+      DispatchQueue.main.asyncAfter(deadline: .now() + delay, execute: check)
+    }
   }
 
   /// Drops all state for an account (profile deleted).
@@ -194,6 +218,7 @@ final class TaskWatcher: NSObject {
     // First sighting: record the baseline, never notify.
     guard state.baselineSet else {
       state.baselineSet = true
+      state.sawStopButton = sample.working
       state.lastSignature = signature
       state.lastTailLen = sample.tailLen
       state.lastMsgCount = sample.msgCount
@@ -266,7 +291,13 @@ final class TaskWatcher: NSObject {
   /// One sweep over all parked Muse pages. Called by the 20s timer,
   /// the foreground-return catch-up, and (0.1.17) the coordinator
   /// when the user returns to the account list. Main-thread only.
+  private var appIsActive: Bool {
+    MainActor.assumeIsolated { UIApplication.shared.applicationState == .active }
+  }
+
   func sweepParkedPages() {
+    guard appIsActive else { return }
+    let generation = foregroundGeneration
     for entry in RecentAccountPages.parkedKeys() {
       guard entry.providerId == "muse" else { continue }
       RecentAccountPages.probeParked(
@@ -276,7 +307,9 @@ final class TaskWatcher: NSObject {
         // probeParked returns nil when the page was evicted between
         // listing and probing; parseSample(nil) is nil, so this is
         // a harmless no-op.
-        self?.noteSample(
+        guard let self, self.foregroundGeneration == generation,
+              self.appIsActive else { return }
+        self.noteSample(
           providerId: entry.providerId, uuid: entry.uuid, result: result)
       }
     }

@@ -1869,3 +1869,29 @@ body,
 #account-filter-empty[hidden] {
   display: none;
 }
+
+.account-approval-btn {
+  width: auto;
+  padding-inline: 6px;
+  font-size: 11px;
+}
+
+.approval-items {
+  max-height: min(45vh, 320px);
+  overflow-y: auto;
+}
+
+.approval-item {
+  padding: 8px 0;
+  border-bottom: 1px solid var(--border-strong);
+  overflow-wrap: anywhere;
+}
+
+.approval-item summary {
+  cursor: pointer;
+}
+
+.approval-item div {
+  padding-top: 4px;
+  color: var(--text-muted);
+}

@@ -66,14 +66,19 @@ fn item_from(v: &Value) -> ApprovalItem {
 }
 
 /// 解析待审批列表；兼容 snapshot / legacy 与 `result` 包装。
-pub fn parse_pending(raw: &Value) -> Vec<ApprovalItem> {
+pub fn parse_pending(raw: &Value) -> Option<Vec<ApprovalItem>> {
   let root = raw.get("result").unwrap_or(raw);
-  for key in ["pending_approvals", "pending"] {
-    if let Some(arr) = root.get(key).and_then(Value::as_array) {
-      return arr.iter().map(item_from).collect();
+  let items = root.get("pending_approvals").or_else(|| root.get("pending"))?.as_array()?;
+  let mut seen = std::collections::HashSet::new();
+  let mut pending = Vec::with_capacity(items.len());
+  for item in items {
+    let item = item_from(item);
+    if item.id.is_empty() || !seen.insert(item.id.clone()) {
+      return None;
     }
+    pending.push(item);
   }
-  Vec::new()
+  Some(pending)
 }
 
 #[cfg(test)]
@@ -95,7 +100,7 @@ mod tests {
         }
       ]
     });
-    let list = parse_pending(&v);
+    let list = parse_pending(&v).unwrap();
     assert_eq!(list.len(), 1);
     assert_eq!(list[0].id, "a1");
     assert_eq!(list[0].display_name, "GitHub");
@@ -117,7 +122,7 @@ mod tests {
         ]
       }
     });
-    let list = parse_pending(&v);
+    let list = parse_pending(&v).unwrap();
     assert_eq!(list.len(), 1);
     assert_eq!(list[0].display_name, "api.github.com");
     assert_eq!(list[0].kind, "create_repository");
@@ -125,8 +130,10 @@ mod tests {
   }
 
   #[test]
-  fn empty_or_unknown_shape_yields_empty() {
-    assert!(parse_pending(&json!({})).is_empty());
-    assert!(parse_pending(&json!({"pending_approvals": []})).is_empty());
+  fn empty_list_is_distinct_from_an_unrecognized_response() {
+    assert_eq!(parse_pending(&json!({"pending_approvals": []})), Some(Vec::new()));
+    assert!(parse_pending(&json!({})).is_none());
+    assert!(parse_pending(&json!({"pending": [{}]})).is_none());
+    assert!(parse_pending(&json!({"pending": [{"approval_id":"x"}, {"approval_id":"x"}]})).is_none());
   }
 }

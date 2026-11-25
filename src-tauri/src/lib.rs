@@ -217,9 +217,24 @@ async fn muse_native_approvals_probe(
   provider_id: String,
   uuid: String,
   mgr: State<'_, Arc<SessionManager>>,
+  cancel: State<'_, Arc<probe_cancel::ProbeCancel>>,
 ) -> Result<muse_native::ApprovalsProbe, String> {
-  let setting = account_proxy_setting(&mgr, &provider_id, &uuid).await;
-  muse_native::approvals_probe(&app, &provider_id, &uuid, setting.as_ref()).await
+  let uuid = storage::normalize_uuid(&uuid).ok_or_else(|| "账号标识无效".to_string())?;
+  if provider_id != "muse" || !mgr.get_snapshot().await.accounts.iter().any(|account| {
+    account.provider_id == providers::ProviderId::Muse && account.uuid == uuid
+      && account.auth_state == storage::AuthState::Authenticated
+  }) {
+    return Err("审批查询需要已登录的 Muse 账号".to_string());
+  }
+  let (mut token, _guard) = cancel.register(&uuid, "approvals");
+  tokio::select! {
+    biased;
+    _ = token.cancelled() => Err("审批查询已停止".into()),
+    response = tokio::time::timeout(std::time::Duration::from_secs(60), async {
+      let setting = account_proxy_setting(&mgr, &provider_id, &uuid).await;
+      muse_native::approvals_probe(&app, &provider_id, &uuid, setting.as_ref()).await
+    }) => response.map_err(|_| "审批查询超时".to_string())?,
+  }
 }
 
 /// B3：只读拉一次额度（Server Action 冷发现 + 重试），失败时带每步诊断。

@@ -18,6 +18,7 @@ type ModalMode =
   | { kind: "add"; providerId: ProviderId; draft: string }
   | { kind: "rename"; account: AccountRecord; draft: string; groupDraft: string }
   | { kind: "remove"; account: AccountRecord }
+  | { kind: "approvals"; account: AccountRecord; loading: boolean; result: SpikeApprovalsResult | null; fetchedAt: number | null }
   | { kind: "update" }
   // 应用内确认框（替代 window.confirm）。WKWebView 的 UIDelegate 没有
   // 实现 runJavaScriptConfirmPanel，iOS 上 confirm() 直接返回 false，
@@ -96,7 +97,7 @@ interface SpikeApprovalItem {
 }
 interface SpikeApprovalsResult {
   ok: boolean; phase: string; status: number | null;
-  count: number; first: SpikeApprovalItem | null; error: string | null;
+  count: number; items: SpikeApprovalItem[]; error: string | null;
 }
 let spikeApprovals: SpikeApprovalsResult | null = null;
 let spikeApprovalsRunning = false;
@@ -1170,11 +1171,9 @@ function spikeDiagInnerHtml(accountUuid: string | undefined = pickWatchAccount()
   let approvalsHtml = "";
   if (spikeApprovals) {
     const a = spikeApprovals;
-    const f = a.first;
     approvalsHtml = `
       <div class="spike-diag-result ${a.ok ? "ok" : "fail"}">
-        <div>${a.ok ? "✓ 审批只读查询成功" : "✗ 审批查询失败"}（HTTP ${a.status ?? "—"}，待审批 ${a.count} 条）</div>
-        ${f ? `<div>最新：${escapeHtml(f.displayName || "—")} / ${escapeHtml(f.kind || "—")} / ${escapeHtml(f.status)}${f.expiresAtMs ? ` / 到期 ${new Date(f.expiresAtMs).toLocaleTimeString()}` : ""}</div>` : ""}
+        <div>${a.ok ? "✓ 审批只读查询成功" : "✗ 审批查询失败"}（HTTP ${a.status ?? "—"}${a.ok ? `，服务端返回 ${a.count} 条` : ""}）</div>
         ${a.error ? `<div>错误：${escapeHtml(a.error)}</div>` : ""}
       </div>`;
   } else if (spikeApprovalsError) {
@@ -2301,8 +2300,60 @@ function renderUpdateModal(): string {
   `;
 }
 
+function renderApprovalsModal(view: Extract<ModalMode, { kind: "approvals" }>): string {
+  const { account, loading, result, fetchedAt } = view;
+  const formatTime = (ts: number) => ts > 0 && ts < 8.64e15 ? new Date(ts).toLocaleString() : "未提供";
+  const reason = result?.phase === "schema" || result?.phase === "parse"
+    ? "审批响应格式无法识别，请打开账号核对。"
+    : result?.phase === "no_cookies" || result?.status === 401 || result?.status === 403
+      ? "账号登录态或权限不可用，请打开账号核对。"
+      : "审批查询失败，当前待审批状态未知。";
+  const items = result?.items ?? [];
+  const content = loading ? "正在读取审批…" : !result?.ok ? reason : !items.length ? "当前没有待审批项。" : `
+    <div class="approval-items">${items.map((item) => `
+      <details class="approval-item">
+        <summary>${escapeHtml(item.displayName || item.kind || "审批请求")} · ${item.expiresAtMs > 0 && item.expiresAtMs <= Date.now() ? "已过期" : escapeHtml(item.status === "pending" ? "待审批" : item.status)}</summary>
+        <div>类型 ${escapeHtml(item.kind || "未提供")}</div>
+        <div>请求时间 ${formatTime(item.requestedAtMs)}</div>
+        <div>到期时间 ${formatTime(item.expiresAtMs)}</div>
+      </details>`).join("")}</div>`;
+  return `
+    <div class="inline-modal" role="dialog" aria-modal="true" aria-labelledby="approval-title">
+      <div class="modal-card approval-modal">
+        <div class="modal-title" id="approval-title">待审批 · ${escapeHtml(account.alias)}</div>
+        <div class="modal-desc">只读列表，在 Muse 会话中处理。${fetchedAt ? ` 最近读取 ${formatTime(fetchedAt)}` : ""}</div>
+        ${result?.ok && !loading && items.length ? content : `<div role="status">${content}</div>`}
+        <div class="modal-footer">
+          <button id="modal-cancel-btn" class="btn" type="button">关闭</button>
+          <button id="approvals-refresh-btn" class="btn" type="button" ${loading ? "disabled" : ""}>刷新</button>
+          <button id="approvals-open-account-btn" class="btn primary" type="button">打开账号</button>
+        </div>
+      </div>
+    </div>`;
+}
+
+async function loadAccountApprovals(view: Extract<ModalMode, { kind: "approvals" }>): Promise<void> {
+  if (modal !== view) return;
+  view.loading = true;
+  view.result = null;
+  view.fetchedAt = null;
+  render();
+  try {
+    view.result = await invoke<SpikeApprovalsResult>("muse_native_approvals_probe", {
+      providerId: view.account.providerId, uuid: view.account.uuid,
+    });
+    if (view.result.ok) view.fetchedAt = Date.now();
+  } catch {
+    view.result = null;
+  } finally {
+    view.loading = false;
+    if (modal === view) render();
+  }
+}
+
 function renderModal(provider: ProviderInfo): string {
   if (modal.kind === "none") return "";
+  if (modal.kind === "approvals") return renderApprovalsModal(modal);
   if (modal.kind === "update") {
     return renderUpdateModal();
   }
@@ -2494,6 +2545,7 @@ function renderMiddleContent(state: ManagerSnapshot, provider: ProviderInfo): st
                 ${subHtmlFor(acc, d, isMobile)}
               </div>
               <div class="row-ops">
+                ${state.platform === "ios" && provider.id === "muse" && acc.authState === "authenticated" ? `<button class="action-icon-btn account-approval-btn" data-approvals-uuid="${escapeHtml(acc.uuid)}" type="button">审批</button>` : ""}
                 <button class="action-icon-btn" data-rename-uuid="${escapeHtml(acc.uuid)}" title="编辑账号备注与分组" aria-label="编辑账号备注与分组" type="button">${ICON_EDIT}</button>
                 <button class="action-icon-btn danger" data-remove-uuid="${escapeHtml(acc.uuid)}" title="从本机移除" type="button">${ICON_TRASH}</button>
               </div>
@@ -2650,7 +2702,7 @@ function structuralSignature(state: ManagerSnapshot, provider: ProviderInfo): st
           `${p.id}:${p.enabled ? 1 : 0}:${p.name}:${p.shortName}:${p.statusText}`
       )
       .join(","),
-    JSON.stringify(providerAccounts.map((a) => [a.uuid, a.group])),
+    JSON.stringify(providerAccounts.map((a) => [a.uuid, a.group, a.authState === "authenticated"])),
     // 0.1.21: hasUnreadReply is NOT here — it already lives in
     // avatarSigFor, so patchRows updates the unread dot in place
     // instead of rebuilding the whole list when a reply arrives.
@@ -2707,6 +2759,8 @@ function modalIdentityKey(provider: ProviderInfo): string | null {
     case "confirm":
       // 内容在打开时确定，不会在显示期间变化；标题 + 长度足以区分。
       return `confirm:${modal.title}:${modal.desc.length}:${modal.confirmLabel}`;
+    case "approvals":
+      return null;
     case "update":
       // Dynamic content (update check / install progress): no stable
       // identity — the caller falls back to the full HTML.
@@ -3134,6 +3188,19 @@ function bindDelegatedEvents(): void {
 
     // Most specific first; each branch returns after handling (this is
     // what stopPropagation used to do for the row-op buttons).
+    const approvalButton = target.closest<HTMLElement>("[data-approvals-uuid]");
+    if (approvalButton) {
+      if (modal.kind !== "none" || reorderMode) return;
+      const account = snapshot.accounts.find((entry) => entry.providerId === "muse" && entry.uuid === approvalButton.dataset.approvalsUuid);
+      if (account?.authState === "authenticated") {
+        const view: Extract<ModalMode, { kind: "approvals" }> = {
+          kind: "approvals", account, loading: true, result: null, fetchedAt: null,
+        };
+        await setModal(view);
+        await loadAccountApprovals(view);
+      }
+      return;
+    }
     const renameBtn = target.closest<HTMLElement>("[data-rename-uuid]");
     if (renameBtn) {
       const uuid = renameBtn.dataset.renameUuid;
@@ -3378,6 +3445,16 @@ function bindDelegatedEvents(): void {
         reorderProviderId = null;
         render();
         restoreScrollPosition();
+        break;
+      case "approvals-refresh-btn":
+        if (modal.kind === "approvals" && !modal.loading) await loadAccountApprovals(modal);
+        break;
+      case "approvals-open-account-btn":
+        if (modal.kind === "approvals") {
+          const { providerId, uuid } = modal.account;
+          await setModal({ kind: "none" });
+          await callCommand("switch_account", { providerId, uuid }, { providerId, uuid });
+        }
         break;
       case "modal-cancel-btn":
         if (modal.kind === "update" && updateState.installing) break;
