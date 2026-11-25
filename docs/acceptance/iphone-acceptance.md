@@ -12,6 +12,8 @@
 
 ### 实时增量专项复测
 
+当前实时取证包为 [叠号 Spike 0.1.26 `5d8bf46`](https://github.com/harrylarry/multi-agent-account-manager/actions/runs/45563228807/artifacts/14998504572)，构建 SHA 为 `5d8bf46a3bc7cdda809ba9c3d448d0a1ce391a63`，包含诊断提交 `9e73c5e`。解压后未签名 IPA 的 SHA-256 为 `0ac460d3e88d798d8bd1965c2b5eff68ecf8c846d549cc264751c7aef911d679`。用同一测试账号和代理在前台运行一次「指纹探针 3 条」。结束后展开「解密后流诊断」，点击「复制脱敏流诊断」并回传内容。实时文本增量和流内结束仍待真机验证。[Quick checks](https://github.com/harrylarry/multi-agent-account-manager/actions/runs/45458401128)
+
 使用 [0.1.26 Spike 构建 `8f50c91`](https://github.com/harrylarry/multi-agent-account-manager/actions/runs/45417370699/artifacts/14932589152)。解压后未签名 IPA 的 SHA-256 为 `bcf5aa552c37c31fef7feed864ed5f08a9127917d18a6437081e51d7c31e66e8`。两个验收包显示同一版本号，以下载链接和校验值区分。[Quick checks](https://github.com/harrylarry/multi-agent-account-manager/actions/runs/45407570093)
 
 在前台运行「指纹探针 3 条」，回传每条的 ACK、文本增量数和结束原因。`文本增量 > 0` 表示采集器收到增量，`done` 表示从流判定结束。`history_completed` 表示由历史恢复确认。此包在结束后汇总增量计数，无法用汇总数核对首个增量的到达时间。
