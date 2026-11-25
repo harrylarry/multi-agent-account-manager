@@ -557,7 +557,7 @@ enum Scripts {
                 let qPct = -1;
                 let qDetailStr = '';
                 let dObj = window.__maamQuotaDetail || null;
-                if (!dObj) {
+                if (!dObj && !window.__maamRequireFreshQuota) {
                   try {
                     const cached = localStorage.getItem('__maam_cached_quota_detail_v2__');
                     if (cached) dObj = JSON.parse(cached);
@@ -633,7 +633,7 @@ enum Scripts {
                   qDetailStr = JSON.stringify(dObj);
                 } else {
                   let qObj = window.__maamQuota || null;
-                  if (!qObj) {
+                  if (!qObj && !window.__maamRequireFreshQuota) {
                     try {
                       const cachedQ = localStorage.getItem('__maam_cached_quota__');
                       if (cachedQ) qObj = JSON.parse(cachedQ);

@@ -109,6 +109,16 @@ interface SpikeQuotaProbe {
 }
 let spikeQuotaProbe: SpikeQuotaProbe | null = null;
 let spikeQuotaRunning = false;
+interface BackgroundQuotaDiagnostic {
+  account: string;
+  provider: ProviderId;
+  proxy: string;
+  network: string;
+  quota: string;
+}
+let backgroundQuotaRows: BackgroundQuotaDiagnostic[] | null = null;
+let backgroundQuotaRunning = false;
+let backgroundQuotaError = "";
 let spikeQuotaError: string | null = null;
 interface SpikeLiveness {
   running: boolean; phase: string; startedMs: number; connectedMs: number | null;
@@ -1321,6 +1331,13 @@ function spikeDiagInnerHtml(accountUuid: string | undefined = pickWatchAccount()
         <button id="spike-approvals-btn" class="mini-btn" type="button" ${spikeApprovalsRunning ? "disabled" : ""}>${spikeApprovalsRunning ? "查询中…" : "查询审批"}</button>
       </div>
       ${quotaHtml}${approvalsHtml}
+      ${snapshot?.platform === "ios" ? `
+        <div class="spike-actions">
+          <button id="spike-quota-sync-btn" class="mini-btn" type="button" ${backgroundQuotaRunning ? "disabled" : ""}>${backgroundQuotaRunning ? "同步中…" : "测试后台额度同步"}</button>
+          ${backgroundQuotaRows?.length ? '<button id="spike-quota-sync-copy-btn" class="mini-btn" type="button">复制脱敏同步结果</button>' : ""}
+        </div>
+        ${backgroundQuotaLines().map((line) => `<div class="spike-diag-result">${escapeHtml(line)}</div>`).join("")}
+      ` : ""}
     </details>
     <details class="spike-panel" data-spike-section="proxy">
       <summary>账号代理</summary>
@@ -1344,6 +1361,48 @@ function spikeDiagInnerHtml(accountUuid: string | undefined = pickWatchAccount()
       <summary>运行记录</summary>
       <div class="spike-trace" id="spike-front-trace" ${spikeTraceEntries.length ? "" : "hidden"}>${spikeTraceLinesHtml()}</div>
     </details>`;
+}
+
+function backgroundQuotaLines(): string[] {
+  if (backgroundQuotaError) return [backgroundQuotaError];
+  if (backgroundQuotaRows === null) return [];
+  if (!backgroundQuotaRows.length) return ["没有可同步的非活跃账号。请先退出会话，回到账号管理。"];
+  const proxy: Record<string, string> = {
+    applied: "已下发", disabled: "未启用", push_failed: "下发失败", blocked: "应用失败，已阻断",
+  };
+  const network: Record<string, string> = {
+    not_attempted: "未发起", loaded: "页面加载成功", parked: "使用已停驻页面",
+    network_failed: "联网失败", network_timeout: "联网超时", probe_timeout: "页面已加载，额度探测超时",
+    setup_failed: "页面初始化失败", webview_terminated: "WebView 进程终止", runner_failed: "同步组件未返回结果",
+  };
+  const quota: Record<string, string> = {
+    updated: "已更新并保存", unchanged: "已取得，数据未变", not_updated: "未取得可更新的额度",
+    signed_out: "登录已失效", account_changed: "账号状态已变化，本次跳过", save_failed: "保存失败",
+  };
+  return backgroundQuotaRows.map((row) => {
+    const http = /^http_error_(\d{3})$/.exec(row.network);
+    const networkLabel = http ? `页面请求失败（HTTP ${http[1]}）` : network[row.network] ?? "未知状态";
+    const provider = row.provider === "muse" ? "Muse" : row.provider === "hark" ? "Hark" : "账号";
+    return `${provider} ···${row.account} ｜ 代理 ${proxy[row.proxy] ?? "未知状态"} ｜ 联网 ${networkLabel} ｜ 额度 ${quota[row.quota] ?? "未知状态"}`;
+  });
+}
+
+async function runBackgroundQuotaDiagnostic(): Promise<void> {
+  if (backgroundQuotaRunning) return;
+  backgroundQuotaRunning = true;
+  backgroundQuotaRows = null;
+  backgroundQuotaError = "";
+  syncSpikeDiag();
+  try {
+    backgroundQuotaRows = await invoke<BackgroundQuotaDiagnostic[]>("spike_ios_quota_sync_probe");
+  } catch (error) {
+    backgroundQuotaError = error === "后台额度同步正在运行，请稍后重试"
+      ? error
+      : "未能启动后台额度同步。";
+  } finally {
+    backgroundQuotaRunning = false;
+    syncSpikeDiag();
+  }
 }
 
 function syncSpikeDiag(): void {
@@ -3122,12 +3181,17 @@ function bindDelegatedEvents(): void {
       await runSpikeApprovals();
       return;
     }
-    const copyBtn = target.closest<HTMLElement>("#spike-copy-btn, #spike-wire-copy-btn");
+    if (target.closest("#spike-quota-sync-btn")) {
+      await runBackgroundQuotaDiagnostic();
+      return;
+    }
+    const copyBtn = target.closest<HTMLElement>("#spike-copy-btn, #spike-wire-copy-btn, #spike-quota-sync-copy-btn");
     if (copyBtn) {
       const el = document.querySelector<HTMLElement>("#spike-workspace .spike-diag");
       const wireOnly = copyBtn.id === "spike-wire-copy-btn";
-      let text = el?.querySelector("#spike-wire-trace")?.textContent ?? "";
-      if (el && !wireOnly) {
+      const quotaOnly = copyBtn.id === "spike-quota-sync-copy-btn";
+      let text = quotaOnly ? backgroundQuotaLines().join("\n") : el?.querySelector("#spike-wire-trace")?.textContent ?? "";
+      if (el && !wireOnly && !quotaOnly) {
         const sections = el.querySelectorAll(".spike-diag-result, .spike-notice, #spike-front-trace:not([hidden])");
         text = ["原生诊断（Spike）", ...Array.from(sections, (section) => {
           const clone = section.cloneNode(true) as HTMLElement;
@@ -3163,7 +3227,7 @@ function bindDelegatedEvents(): void {
       }
       copyBtn.textContent = copied ? "已复制" : "复制失败";
       setTimeout(() => {
-        copyBtn.textContent = wireOnly ? "复制脱敏流诊断" : "复制结果摘要";
+        copyBtn.textContent = quotaOnly ? "复制脱敏同步结果" : wireOnly ? "复制脱敏流诊断" : "复制结果摘要";
       }, 1200);
       return;
     }

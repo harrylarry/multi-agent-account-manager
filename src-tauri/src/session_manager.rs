@@ -950,11 +950,22 @@ struct InnerState {
   modal_active: bool,
 }
 
+#[derive(serde::Serialize)]
+pub struct QuotaSyncDiagnostic {
+  account: String,
+  provider: String,
+  proxy: &'static str,
+  network: String,
+  quota: &'static str,
+}
+
 pub struct SessionManager {
   current_seq: Arc<AtomicU64>,
   active_view_id: Arc<AtomicU64>,
   view_counter: AtomicU64,
   last_sync_timestamp: AtomicU64,
+  #[cfg(target_os = "ios")]
+  quota_sync_lock: Mutex<()>,
   inner: Mutex<InnerState>,
 }
 
@@ -975,6 +986,8 @@ impl SessionManager {
       active_view_id: Arc::new(AtomicU64::new(0)),
       view_counter: AtomicU64::new(1),
       last_sync_timestamp: AtomicU64::new(0),
+      #[cfg(target_os = "ios")]
+      quota_sync_lock: Mutex::new(()),
       inner: Mutex::new(InnerState {
         store_path,
         app_data_dir,
@@ -1841,58 +1854,11 @@ impl SessionManager {
       // account is skipped — the foreground probe already covers it.
       // Runs in a spawned task: a sync can take a while (one hidden page
       // load per cold account) and must never block the caller.
-      let targets = {
-        let locked = self.inner.lock().await;
-        let active = locked.active_slot.as_ref().map(|s| s.account_key.clone());
-        locked
-          .store
-          .accounts
-          .iter()
-          .filter(|a| get_provider(a.provider_id).info.enabled)
-          .filter(|a| {
-            let k = AccountKey {
-              provider_id: a.provider_id,
-              uuid: a.uuid.clone(),
-            };
-            Some(&k) != active.as_ref() && !locked.store.pending_cleanup.contains(&k)
-          })
-          .map(|a| crate::platform::ios::SyncQuotaTarget {
-            provider_id: a.provider_id.as_str().to_string(),
-            uuid: a.uuid.clone(),
-            entry_url: get_provider(a.provider_id).info.entry_url.to_string(),
-          })
-          .collect::<Vec<_>>()
-      };
-      if !targets.is_empty() {
-        let mgr = Arc::clone(self);
-        let app_handle = app.clone();
-        tauri::async_runtime::spawn(async move {
-          // #11/#16（补 W）：先把每个目标账号的代理从 Rust 权威源下发到
-          // Swift，再让隐藏 WebView 联网。否则「Rust 有代理、Swift 表里
-          // 还没有这个账号」会被统一解析器判为未知而跳过——那是正确行为，
-          // 但会让冷账号的额度永远同步不到，所以这里主动补一次下发。
-          let mut eligible = Vec::with_capacity(targets.len());
-          for target in targets {
-            let pid = crate::providers::ProviderId::parse(&target.provider_id);
-            let setting = match pid {
-              Some(pid) => mgr.proxy_setting(pid, &target.uuid).await,
-              None => None,
-            };
-            let outcome = crate::webview_proxy::push(&app_handle, &target.uuid, setting.as_ref()).await;
-            if outcome.applied {
-              eligible.push(target);
-            }
-          }
-          if eligible.is_empty() {
-            return;
-          }
-          if let Ok(results) =
-            crate::platform::ios::sync_account_quotas(&app_handle, eligible).await
-          {
-            mgr.apply_synced_metadata(&app_handle, results).await;
-          }
-        });
-      }
+      let mgr = Arc::clone(self);
+      let app_handle = app.clone();
+      tauri::async_runtime::spawn(async move {
+        let _ = mgr.sync_ios_quotas(&app_handle, false).await;
+      });
     }
 
     #[cfg(target_os = "android")]
@@ -1971,6 +1937,76 @@ impl SessionManager {
         mgr_prewarm.prewarm_next_cold_account(&app_prewarm).await;
       });
     }
+  }
+
+  #[cfg(target_os = "ios")]
+  pub async fn sync_ios_quotas(
+    &self,
+    app: &AppHandle,
+    fresh: bool,
+  ) -> Result<Vec<QuotaSyncDiagnostic>, String> {
+    let _sync = self
+      .quota_sync_lock
+      .try_lock()
+      .map_err(|_| "后台额度同步正在运行，请稍后重试".to_string())?;
+    let targets = {
+      let locked = self.inner.lock().await;
+      locked.store.accounts.iter().filter_map(|account| {
+        let key = AccountKey { provider_id: account.provider_id, uuid: account.uuid.clone() };
+        let provider = get_provider(key.provider_id);
+        if !provider.info.enabled || locked.store.pending_cleanup.contains(&key)
+          || locked.active_slot.as_ref().is_some_and(|slot| slot.account_key == key)
+        {
+          return None;
+        }
+        Some((key, provider.info.entry_url.to_string()))
+      }).collect::<Vec<_>>()
+    };
+
+    let mut diagnostics = Vec::with_capacity(targets.len());
+    let mut eligible = Vec::with_capacity(targets.len());
+    for (key, entry_url) in targets {
+      let setting = self.proxy_setting(key.provider_id, &key.uuid).await;
+      let outcome = crate::webview_proxy::push(app, &key.uuid, setting.as_ref()).await;
+      let provider_id = key.provider_id.as_str().to_string();
+      let mut suffix = key.uuid.chars().rev().take(8).collect::<Vec<_>>();
+      suffix.reverse();
+      diagnostics.push((key.uuid.clone(), QuotaSyncDiagnostic {
+        account: suffix.into_iter().collect(),
+        provider: provider_id.clone(),
+        proxy: if !outcome.applied { "push_failed" } else if setting.as_ref().is_some_and(|p| p.enabled) {
+          "applied"
+        } else {
+          "disabled"
+        },
+        network: if outcome.applied { "runner_failed" } else { "not_attempted" }.into(),
+        quota: "not_updated",
+      }));
+      if outcome.applied {
+        eligible.push(crate::platform::ios::SyncQuotaTarget { provider_id, uuid: key.uuid, entry_url });
+      }
+    }
+
+    if !eligible.is_empty() {
+      if let Ok(results) = crate::platform::ios::sync_account_quotas(app, eligible, fresh).await {
+        let statuses = self.apply_synced_metadata(app, &results).await;
+        for (result, status) in results.into_iter().zip(statuses) {
+          if let Some((_, row)) = diagnostics
+            .iter_mut()
+            .find(|(uuid, row)| uuid == &result.uuid && row.provider == result.provider_id)
+          {
+            if result.observation == "proxy_blocked" {
+              row.proxy = "blocked";
+              row.network = "not_attempted".into();
+            } else {
+              row.network = result.observation;
+            }
+            row.quota = status;
+          }
+        }
+      }
+    }
+    Ok(diagnostics.into_iter().map(|(_, row)| row).collect())
   }
 
   async fn switch_account_internal(
@@ -4255,88 +4291,81 @@ impl SessionManager {
     }
   }
 
-  /// Batch-1: applies background sync results (iOS). Unlike
-  /// apply_detected_metadata there is no live session to validate
-  /// against — the sync deliberately covers accounts that are NOT open —
-  /// so there is no view-instance check. Saves once and emits one
-  /// snapshot. A logged-out finding is applied directly: the probe ran
-  /// after a full page load, and opening the account re-verifies (a false
-  /// positive self-corrects on open via apply_detected_metadata).
   #[cfg(target_os = "ios")]
   async fn apply_synced_metadata(
     &self,
     app: &AppHandle,
-    results: Vec<crate::platform::ios::SyncQuotaResult>,
-  ) {
-    let changed_any = {
-      let mut locked = self.inner.lock().await;
-      let mut any = false;
-      for r in results {
-        let Some(pid) = ProviderId::parse(&r.provider_id) else {
-          continue;
-        };
-        let Some(norm_uuid) = normalize_uuid(&r.uuid) else {
-          continue;
-        };
-        let key = AccountKey {
-          provider_id: pid,
-          uuid: norm_uuid,
-        };
-        if r.logged_out {
-          let Some(target) = locked
-            .store
-            .accounts
-            .iter_mut()
-            .find(|a| a.provider_id == key.provider_id && a.uuid == key.uuid)
-          else {
-            continue;
-          };
-          if target.auth_state == AuthState::LoggedOut
-            && target.quota_detail.is_none()
-            && target.quota_text.is_none()
-            && target.quota_percent.is_none()
-          {
-            continue;
-          }
-          target.auth_state = AuthState::LoggedOut;
-          target.quota_detail = None;
-          target.quota_text = None;
-          target.quota_percent = None;
-          any = true;
-          continue;
-        }
-        let detail = r
-          .quota_detail_json
-          .as_deref()
-          .and_then(|s| serde_json::from_str::<QuotaDetail>(s).ok());
-        let (changed, _) = Self::update_account_metadata_locked(
-          &mut locked,
-          &key,
-          if r.identity.is_empty() {
-            None
-          } else {
-            Some(r.identity)
-          },
-          r.avatar_url,
-          r.quota_text,
-          r.quota_percent,
-          detail,
-        );
-        any = any || changed;
+    results: &[crate::platform::ios::SyncQuotaResult],
+  ) -> Vec<&'static str> {
+    let mut locked = self.inner.lock().await;
+    let previous = locked.store.clone();
+    let mut any_changed = false;
+    let mut statuses = Vec::with_capacity(results.len());
+    for result in results {
+      let (Some(provider_id), Some(uuid)) = (ProviderId::parse(&result.provider_id), normalize_uuid(&result.uuid)) else {
+        statuses.push(("not_updated", false));
+        continue;
+      };
+      let key = AccountKey { provider_id, uuid };
+      if locked.active_slot.as_ref().is_some_and(|slot| slot.account_key == key) {
+        statuses.push(("account_changed", false));
+        continue;
       }
-      if !any {
-        return;
+      let Some(index) = locked.store.accounts.iter().position(|a| a.provider_id == key.provider_id && a.uuid == key.uuid) else {
+        statuses.push(("account_changed", false));
+        continue;
+      };
+      let before = &previous.accounts[index];
+      if result.logged_out {
+        let target = &mut locked.store.accounts[index];
+        let changed = target.auth_state != AuthState::LoggedOut || target.quota_detail.is_some()
+          || target.quota_text.is_some() || target.quota_percent.is_some();
+        target.auth_state = AuthState::LoggedOut;
+        target.quota_detail = None;
+        target.quota_text = None;
+        target.quota_percent = None;
+        any_changed |= changed;
+        statuses.push(("signed_out", changed));
+        continue;
       }
-      if save_store_atomic(&locked.store_path, &locked.store).is_err() {
-        return;
+      if !result.authenticated {
+        statuses.push(("not_updated", false));
+        continue;
       }
-      true
-    };
-    if changed_any {
-      let snap = self.get_snapshot().await;
-      self.emit_snapshot(app, &snap);
+      let detail = result.quota_detail_json.as_deref()
+        .and_then(|json| serde_json::from_str::<QuotaDetail>(json).ok())
+        .filter(|detail| !detail.plan_label.is_empty());
+      let quota_text = result.quota_text.as_deref().map(str::trim)
+        .filter(|text| !text.is_empty() && text.len() <= 60 && !matches!(*text, "额度充足" | "正在同步额度…"));
+      let has_quota = detail.is_some() || quota_text.is_some();
+      let (changed, _) = Self::update_account_metadata_locked(
+        &mut locked, &key, (!result.identity.is_empty()).then(|| result.identity.clone()),
+        result.avatar_url.clone(), quota_text.map(str::to_string), result.quota_percent, detail,
+      );
+      any_changed |= changed;
+      let after = &locked.store.accounts[index];
+      let status = if !has_quota {
+        "not_updated"
+      } else if before.quota_text != after.quota_text || before.quota_percent != after.quota_percent
+        || before.quota_detail != after.quota_detail {
+        "updated"
+      } else {
+        "unchanged"
+      };
+      statuses.push((status, changed));
     }
+    let save_ok = !any_changed || save_store_atomic(&locked.store_path, &locked.store).is_ok();
+    if !save_ok {
+      locked.store = previous;
+    }
+    drop(locked);
+    if any_changed && save_ok {
+      let snapshot = self.get_snapshot().await;
+      self.emit_snapshot(app, &snapshot);
+    }
+    statuses.into_iter().map(|(status, changed)| if changed && !save_ok { "save_failed" } else { status }).collect()
   }
+
 }
 
 #[cfg(desktop)]

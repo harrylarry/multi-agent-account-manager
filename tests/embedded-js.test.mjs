@@ -243,3 +243,21 @@ test("the identity probe runs the quota hook first", () => {
   assert.equal(page.context.__maamNetHooked, true);
   assert.equal(typeof page.context.__maamOrigFetch, "function");
 });
+
+test("fresh quota diagnostics ignore cached values and accept a new quota response", async () => {
+  const page = createPage({ fetchImpl: async () => jsonResponse(subscriptionPayload) });
+  const cached = { planLabel: "免费版", planValue: "已使用 80%", planUsedPercent: 80 };
+  page.context.localStorage.setItem("__maam_cached_quota_detail_v2__", JSON.stringify(cached));
+  page.context.localStorage.setItem("__maam_cached_quota__", JSON.stringify({ text: "已使用 80%", pct: 20 }));
+  page.context.__maamRequireFreshQuota = true;
+
+  const before = JSON.parse(page.run(identityProbe));
+  assert.equal(before.quotaDetail, "");
+  assert.equal(before.quotaPct, -1);
+
+  await page.context.fetch("/api/subscription");
+  await tick();
+  const after = JSON.parse(page.run(identityProbe));
+  assert.equal(after.quotaPct, 95);
+  assert.equal(JSON.parse(after.quotaDetail).planUsedPercent, 5);
+});

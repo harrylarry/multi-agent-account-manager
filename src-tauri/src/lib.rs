@@ -117,6 +117,23 @@ async fn dismiss_notice(mgr: State<'_, Arc<SessionManager>>) -> Result<ManagerSn
 }
 
 #[tauri::command]
+async fn spike_ios_quota_sync_probe(
+  app: tauri::AppHandle,
+) -> Result<Vec<session_manager::QuotaSyncDiagnostic>, String> {
+  if !muse_native::is_spike_build(app.clone()) {
+    return Err("此功能仅用于 Spike 构建".into());
+  }
+  #[cfg(target_os = "ios")]
+  {
+    app.state::<Arc<SessionManager>>().sync_ios_quotas(&app, true).await
+  }
+  #[cfg(not(target_os = "ios"))]
+  {
+    Err("此功能仅支持 iOS".into())
+  }
+}
+
+#[tauri::command]
 async fn trigger_quota_sync(
   app: AppHandle,
   mgr: State<'_, Arc<SessionManager>>,
@@ -862,6 +879,7 @@ pub fn run() {
       resolve_uuid_conflict,
       dismiss_notice,
       trigger_quota_sync,
+      spike_ios_quota_sync_probe,
       reorder_accounts,
       check_for_updates,
       download_and_install_update,

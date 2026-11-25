@@ -89,6 +89,7 @@ private struct SyncAccountTarget: Decodable {
 
 private struct SyncAccountQuotasArgs: Decodable {
   let accounts: [SyncAccountTarget]
+  let fresh: Bool?
 }
 
 // #11/#16（补 W）：每账号 WebView 代理。口令不经这里传递——Swift 侧按
@@ -464,7 +465,7 @@ class AccountSessionPlugin: Plugin {
         QuotaSyncRunner.Target(
           providerId: $0.providerId, uuid: $0.uuid, entryUrl: $0.entryUrl)
       }
-      QuotaSyncRunner.run(targets: targets) { results in
+      QuotaSyncRunner.run(targets: targets, fresh: args.fresh ?? false) { results in
         invoke.resolve(["results": results.map { $0.json }])
       }
     }

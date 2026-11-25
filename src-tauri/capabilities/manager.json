@@ -32,6 +32,7 @@
     "allow-hark-native-watch-probe",
     "allow-muse-native-approvals-probe",
     "allow-muse-native-quota-probe",
+    "allow-spike-ios-quota-sync-probe",
     "allow-muse-native-send-probe",
     "allow-muse-native-fingerprint-probe",
     "allow-muse-native-proxy-probe",

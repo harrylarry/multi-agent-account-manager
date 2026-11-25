@@ -734,6 +734,8 @@ pub struct SyncQuotaTarget {
 pub struct SyncQuotaResult {
   pub provider_id: String,
   pub uuid: String,
+  pub observation: String,
+  pub authenticated: bool,
   #[serde(default)]
   pub identity: String,
   #[serde(default)]
@@ -760,13 +762,14 @@ pub struct SyncQuotasResponse {
 pub async fn sync_account_quotas(
   app: &AppHandle,
   accounts: Vec<SyncQuotaTarget>,
+  fresh: bool,
 ) -> Result<Vec<SyncQuotaResult>, String> {
   let bridge = app.state::<IosSessionBridge<tauri::Wry>>();
   let res: SyncQuotasResponse = bridge
     .0
     .run_mobile_plugin_async(
       "syncAccountQuotas",
-      serde_json::json!({ "accounts": accounts }),
+      serde_json::json!({ "accounts": accounts, "fresh": fresh }),
     )
     .await
     .map_err(|e| e.to_string())?;
