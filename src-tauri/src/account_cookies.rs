@@ -40,6 +40,10 @@ pub fn parse(raw: &str, provider: &str, now: f64) -> Result<Vec<AccountCookie>, 
     return Err("Cookie 输入过大".into());
   }
   let raw = raw.trim_matches([' ', '\r', '\n']);
+  let raw = raw.strip_prefix('\u{feff}').unwrap_or(raw);
+  if raw.trim().is_empty() {
+    return Err("请先粘贴要预览的 Cookie。下方预览只检查输入框里的内容。".into());
+  }
   let cookies = if raw.starts_with('[') || raw.starts_with('{') {
     let value: serde_json::Value = serde_json::from_str(raw).map_err(|_| invalid())?;
     let list = if value.is_array() {
@@ -96,10 +100,15 @@ pub fn parse(raw: &str, provider: &str, now: f64) -> Result<Vec<AccountCookie>, 
       || !cookie.name.bytes().all(|b| b.is_ascii_alphanumeric() || b"!#$%&'*+-.^_`|~".contains(&b))
       || !cookie.value.bytes().all(|b| matches!(b, 0x21 | 0x23..=0x2b | 0x2d..=0x3a | 0x3c..=0x5b | 0x5d..=0x7e))
       || !cookie.path.starts_with('/') || cookie.path.chars().any(|c| c.is_control() || c == ';')
-      || cookie.expiration_date.is_some_and(|expires| !(now..=253402300799.0).contains(&expires) || expires <= now)
       || !dedup.insert((cookie.name.clone(), host.to_string(), cookie.path.clone()))
     {
       return Err(invalid());
+    }
+    if cookie.expiration_date.is_some_and(|expires| expires <= now) {
+      return Err("输入含已过期的 Cookie，请重新导出后再试".into());
+    }
+    if cookie.expiration_date.is_some_and(|expires| !expires.is_finite() || expires > 253402300799.0) {
+      return Err("Cookie 到期时间无效，JSON 和 Netscape 应使用 Unix 秒".into());
     }
     if let Some(value) = &mut cookie.same_site {
       *value = match value.to_ascii_lowercase().as_str() {
@@ -139,5 +148,14 @@ mod tests {
     assert_eq!(parse(json, "hark", 100.0).unwrap()[0].same_site.as_deref(), Some("Lax"));
     assert!(parse("bad=x; bad=y", "hark", 100.0).is_err());
     assert!(parse("bad=x\nSet-Cookie: injected=y", "hark", 100.0).is_err());
+  }
+
+  #[test]
+  fn distinguishes_empty_and_expired_input_from_invalid_attributes() {
+    let error = |raw| parse(raw, "muse", 300.0).err().unwrap();
+    assert!(error("   ").contains("先粘贴"));
+    assert!(error(".muse.ai\tTRUE\t/\tTRUE\t200\tsession\tsample").contains("已过期"));
+    assert!(error("broken").contains("格式"));
+    assert!(parse("\u{feff}Cookie: session=sample", "muse", 300.0).is_ok());
   }
 }

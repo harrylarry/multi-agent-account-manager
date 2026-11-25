@@ -334,8 +334,10 @@ class AccountSessionPlugin: Plugin {
         invoke.reject("无效的会话标识")
         return
       }
-      let store = WKWebsiteDataStore(forIdentifier: identifier)
-      store.httpCookieStore.getAllCookies { cookies in
+      let store = RecentAccountPages.dataStore(providerId: args.provider ?? "muse", uuid: args.uuid)
+        ?? WKWebsiteDataStore(forIdentifier: identifier)
+      store.httpCookieStore.getAllCookies { [store] cookies in
+        defer { withExtendedLifetime(store) {} }
         let mine: [HTTPCookie]
         switch args.provider {
         case nil, "muse":
@@ -467,7 +469,10 @@ class AccountSessionPlugin: Plugin {
         let host = cookie.domain.trimmingCharacters(in: CharacterSet(charactersIn: ".")).lowercased()
         return [cookie.name, host, cookie.path].joined(separator: "\u{0}")
       }
-      let store = WKWebsiteDataStore(forIdentifier: identifier).httpCookieStore
+      let dataStore = RecentAccountPages.dataStore(providerId: args.provider, uuid: args.uuid)
+        ?? WKWebsiteDataStore(forIdentifier: identifier)
+      defer { withExtendedLifetime(dataStore) {} }
+      let store = dataStore.httpCookieStore
       func allCookies() async -> [HTTPCookie] {
         await withCheckedContinuation { continuation in
           store.getAllCookies { cookies in continuation.resume(returning: cookies) }

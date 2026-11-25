@@ -13,6 +13,25 @@ pub struct MuseSession {
   pub archived: bool,
 }
 
+#[cfg(target_os = "ios")]
+pub async fn fetch(
+  egress: &crate::egress::AccountEgress,
+  cookies: &muse_native_client::cookie::SessionCookies,
+) -> Result<Vec<MuseSession>, String> {
+  use muse_native_client::transport::{HttpRequest, Service};
+  let mut gateway = Box::pin(egress.connect(cookies)).await.map_err(|_| "无法连接 Muse 会话网关")?;
+  let (status, body) = gateway.request(HttpRequest {
+    service: Service::Daemon,
+    verb: "GET".into(),
+    path: "/api/session/list".into(),
+    headers: Vec::new(),
+    body: Vec::new(),
+  }).await.map_err(|_| "Muse 会话查询未完成")?;
+  if !(200..300).contains(&status) { return Err(format!("会话列表请求失败（HTTP {status}）")); }
+  if body.len() > 2 * 1024 * 1024 { return Err("会话列表响应过大".into()); }
+  parse_list(&body)
+}
+
 #[cfg(any(target_os = "ios", test))]
 pub fn parse_list(raw: &[u8]) -> Result<Vec<MuseSession>, String> {
   let raw: Value = serde_json::from_slice(raw).map_err(|_| "会话列表格式无效")?;

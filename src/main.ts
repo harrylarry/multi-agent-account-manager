@@ -2631,6 +2631,7 @@ function renderProxyPool(view: Extract<ModalMode, { kind: "proxyPool" }>): strin
         <div class="modal-desc">${setting?.enabled ? `当前 ${escapeHtml(setting.display)}` : "当前账号未启用代理"}</div>
         <div class="proxy-pool-body">
           <label for="proxy-pool-input">代理 URI（每行一个）或 HTTPS 订阅</label>
+          <div class="modal-desc">单个代理地址用「导入代理」。订阅请粘贴服务商的 HTTPS 下载链接，链接须直接返回纯文本，每行一个 http://、https:// 或 socks5:// 代理 URI。</div>
           <textarea id="proxy-pool-input" class="modal-input account-cookie-input" spellcheck="false" autocomplete="off" autocapitalize="off" ${disabled}></textarea>
           <div class="proxy-pool-actions">${action("导入代理", "import")}${action("添加订阅", "subscribe")}${setting?.enabled ? action("测速", "measure") + action("清除账号代理", "clear") : ""}</div>
           ${data?.sources.map((source) => `<div class="proxy-pool-row">
@@ -2754,16 +2755,16 @@ function renderCookieModal(view: Extract<ModalMode, { kind: "cookies" }>): strin
     <div class="inline-modal" role="dialog" aria-modal="true" aria-labelledby="cookie-title">
       <div class="modal-card">
         <div class="modal-title" id="cookie-title">登录恢复 · ${escapeHtml(account.alias)}</div>
-        <div class="modal-desc">导入你自己的 JSON、Netscape 或 Cookie 请求头。Cookie 可用于登录，请勿分享。</div>
+        <div class="modal-desc">先粘贴自己的 Cookie 导出内容，再点「预览」。本机 Cookie 数量与下方输入框分开显示。</div>
         <div class="modal-desc">已记录的登录状态 ${account.authState === "authenticated" ? "已登录" : account.authState === "logged_out" ? "需登录" : "未验证"}。</div>
-        <div class="modal-desc">${stored ? `本机会话有 ${stored.count} 条 Cookie · 最早已知到期 ${stored.nextExpiry ? new Date(stored.nextExpiry * 1000).toLocaleString() : "未提供"}` : "本机 Cookie 状态暂不可用。"}</div>
+        <div class="modal-desc" id="account-cookie-stored">${stored?.count ? `本机会话有 ${stored.count} 条 Cookie · 最早已知到期 ${stored.nextExpiry ? new Date(stored.nextExpiry * 1000).toLocaleString() : "未提供"}` : stored ? "暂未读到本机 Cookie。可打开此账号确认登录后再查看。" : "本机 Cookie 状态暂不可用。"}</div>
         <label for="account-cookie-input">Cookie</label>
-        <textarea id="account-cookie-input" class="modal-input account-cookie-input" spellcheck="false" autocomplete="off" autocapitalize="off" ${busy ? "disabled" : ""}></textarea>
+        <textarea id="account-cookie-input" class="modal-input account-cookie-input" placeholder="在这里粘贴 JSON、Netscape 或 Cookie 请求头" spellcheck="false" autocomplete="off" autocapitalize="off" ${busy ? "readonly" : ""}></textarea>
         <div id="account-cookie-preview" role="status">${preview ? `
           共 ${preview.count} 条 · ${escapeHtml(preview.domains.join("、"))}
           <div>最早已知到期 ${preview.nextExpiry ? new Date(preview.nextExpiry * 1000).toLocaleString() : "未提供"}</div>
           <div>同域、名称及路径的 Cookie 将被替换。</div>` : ""}</div>
-        ${message ? `<div role="status">${escapeHtml(message)}</div>` : ""}
+        <div id="account-cookie-message" role="status">${escapeHtml(message)}</div>
         <div class="modal-footer account-cookie-actions">
           <button id="modal-cancel-btn" class="btn" type="button" ${busy ? "disabled" : ""}>关闭</button>
           <button id="account-cookie-export" class="btn" type="button" ${busy ? "disabled" : ""}>导出到剪贴板</button>
@@ -2781,6 +2782,11 @@ async function accountCookieAction(action: "preview" | "import" | "export"): Pro
   const { uuid, providerId } = view.account;
   const raw = document.querySelector<HTMLTextAreaElement>("#account-cookie-input")?.value ?? "";
   if (action === "import" && !view.preview) return;
+  if (action === "preview" && !raw.trim()) {
+    view.message = "请先把要检查的 Cookie 粘贴到输入框。";
+    render();
+    return;
+  }
   if (action === "export" && !await askConfirm({
     title: "导出登录 Cookie",
     desc: "剪贴板内容可用于登录。导出只保留在本机剪贴板，60 秒后到期。",
@@ -2817,6 +2823,10 @@ async function accountCookieAction(action: "preview" | "import" | "export"): Pro
       if (action === "preview" && view.preview) {
         const input = document.querySelector<HTMLTextAreaElement>("#account-cookie-input");
         if (input) input.value = raw;
+      }
+      if (action === "import" && view.imported && view.message.startsWith("已写入")) {
+        const input = document.querySelector<HTMLTextAreaElement>("#account-cookie-input");
+        if (input) input.value = "";
       }
     }
   }
@@ -3301,6 +3311,26 @@ function renderModalRoot(provider: ProviderInfo): void {
   const html = renderModal(provider);
   const key = modalIdentityKey(provider) ?? html;
   if (mount === lastModalMount && key === lastModalKey) return;
+  if (modal.kind === "cookies" && mount === lastModalMount && mount.querySelector("#cookie-title")) {
+    const template = document.createElement("template");
+    template.innerHTML = html;
+    for (const id of ["account-cookie-stored", "account-cookie-preview", "account-cookie-message"]) {
+      const current = mount.querySelector<HTMLElement>(`#${id}`);
+      const next = template.content.querySelector<HTMLElement>(`#${id}`);
+      if (current && next) current.innerHTML = next.innerHTML;
+    }
+    for (const button of mount.querySelectorAll<HTMLButtonElement>(".account-cookie-actions button")) {
+      const next = template.content.querySelector<HTMLButtonElement>(`#${button.id}`);
+      if (next) {
+        button.disabled = next.disabled;
+        button.textContent = next.textContent;
+      }
+    }
+    const input = mount.querySelector<HTMLTextAreaElement>("#account-cookie-input");
+    if (input) input.readOnly = modal.busy;
+    lastModalKey = key;
+    return;
+  }
   lastModalMount = mount;
   lastModalKey = key;
   mount.innerHTML = html;

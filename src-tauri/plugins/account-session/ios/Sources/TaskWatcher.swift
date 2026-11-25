@@ -51,7 +51,7 @@ final class TaskWatcher: NSObject {
         if (host !== 'muse.ai' && !host.endsWith('.muse.ai')) {
           return JSON.stringify({ usable: false });
         }
-        if (document.readyState !== 'complete') {
+        if (document.readyState === 'loading') {
           return JSON.stringify({ usable: false });
         }
         const composerEls = Array.from(
@@ -77,6 +77,12 @@ final class TaskWatcher: NSObject {
           } catch (_) {}
         }
         const main = document.querySelector('main') || document.body;
+        const thread = /^\/thread\/([0-9a-f-]{36})\/?$/i.exec(location.pathname)?.[1] || '';
+        const replies = main.querySelectorAll(
+          '[data-message-author-role="assistant"], [data-message-role="assistant"], [data-role="assistant"]'
+        );
+        const lastReply = replies[replies.length - 1];
+        const reply = ((lastReply?.textContent || '').replace(/\s+/g, ' ')).trim().slice(-512);
         let txt = ((main.innerText || '').replace(/\s+/g, ' ')).trim();
         // The user's own draft in the composer is part of innerText;
         // strip it so typing never looks like a new reply.
@@ -105,6 +111,8 @@ final class TaskWatcher: NSObject {
         return JSON.stringify({
           usable: true, msgCount: best, tailHash: h,
           tailLen: txt.length, working: working,
+          thread, replyCount: replies.length,
+          replyHash: reply.split('').reduce((hash, ch) => ((hash * 31) + ch.charCodeAt(0)) | 0, 0),
         });
       } catch (_) {
         return JSON.stringify({ usable: false });
@@ -120,6 +128,10 @@ final class TaskWatcher: NSObject {
     var sawStopButton: Bool = false
     var stableCount: Int = 0
     var baselineSet: Bool = false
+    var thread = ""
+    var replyCount = 0
+    var replyHash = 0
+    var sawAssistantChange = false
     // 0.1.17: arrival time of the last accepted sample, for the
     // near-duplicate guard in noteSample.
     var lastSampleAt: Date?
@@ -130,6 +142,9 @@ final class TaskWatcher: NSObject {
     let tailHash: Int
     let tailLen: Int
     let working: Bool
+    let thread: String
+    let replyCount: Int
+    let replyHash: Int
   }
 
   private static let sweepInterval: TimeInterval = 20
@@ -212,12 +227,16 @@ final class TaskWatcher: NSObject {
     guard let sample = parseSample(result) else { return false }
     let key = "\(providerId)|\(uuid)"
     var state = states[key] ?? WatchState()
-    let signature = "\(sample.msgCount)|\(sample.tailHash)|\(sample.working)"
+    let signature = "\(sample.msgCount)|\(sample.tailHash)|\(sample.working)|\(sample.replyCount)|\(sample.replyHash)"
     let now = Date()
 
     // First sighting: record the baseline, never notify.
-    guard state.baselineSet else {
+    guard state.baselineSet, state.thread == sample.thread else {
+      state = WatchState()
       state.baselineSet = true
+      state.thread = sample.thread
+      state.replyCount = sample.replyCount
+      state.replyHash = sample.replyHash
       state.sawStopButton = sample.working
       state.lastSignature = signature
       state.lastTailLen = sample.tailLen
@@ -244,10 +263,11 @@ final class TaskWatcher: NSObject {
       state.stableCount += 1
       states[key] = state
       if !sample.working && state.stableCount >= Self.stableChecksToFire
-        && (state.sawStopButton || state.growthEvents >= 2)
+        && (state.sawStopButton || state.sawAssistantChange || state.growthEvents >= 2)
       {
         // Working → idle, with real growth behind it: task done.
         state.sawStopButton = false
+        state.sawAssistantChange = false
         state.growthEvents = 0
         state.stableCount = 0
         states[key] = state
@@ -267,6 +287,9 @@ final class TaskWatcher: NSObject {
       state.lastMsgCount = sample.msgCount
       state.growthEvents = 0
       state.sawStopButton = false
+      state.sawAssistantChange = false
+      state.replyCount = sample.replyCount
+      state.replyHash = sample.replyHash
       state.stableCount = 0
       states[key] = state
       return true
@@ -278,6 +301,12 @@ final class TaskWatcher: NSObject {
     if sample.working {
       state.sawStopButton = true
     }
+    if !sample.thread.isEmpty, sample.replyHash != 0,
+       sample.replyCount > state.replyCount || (sample.replyCount == state.replyCount && sample.replyHash != state.replyHash) {
+      state.sawAssistantChange = true
+    }
+    state.replyCount = sample.replyCount
+    state.replyHash = sample.replyHash
     state.stableCount = 0
     state.lastSignature = signature
     state.lastTailLen = sample.tailLen
@@ -335,7 +364,10 @@ final class TaskWatcher: NSObject {
       msgCount: obj["msgCount"] as? Int ?? 0,
       tailHash: obj["tailHash"] as? Int ?? 0,
       tailLen: obj["tailLen"] as? Int ?? 0,
-      working: obj["working"] as? Bool ?? false
+      working: obj["working"] as? Bool ?? false,
+      thread: obj["thread"] as? String ?? "",
+      replyCount: obj["replyCount"] as? Int ?? 0,
+      replyHash: obj["replyHash"] as? Int ?? 0
     )
   }
 }

@@ -171,6 +171,12 @@ enum RecentAccountPages {
     }
     pages.append((key: key, entry: Entry(view: view, delegate: delegate, alias: spec.alias, timezone: spec.timezone)))
     trim(maxAccountPages)
+    if spec.providerId == "muse" {
+      view.evaluateJavaScript(TaskWatcher.taskStateScript) { [weak view] result, _ in
+        guard let view, pages.contains(where: { $0.key == key && $0.entry.view === view }) else { return }
+        TaskWatcher.shared.noteSample(providerId: spec.providerId, uuid: spec.uuid, result: result)
+      }
+    }
   }
 
   /// Snapshot of parked accounts (provider, uuid, alias) for the task
@@ -191,6 +197,10 @@ enum RecentAccountPages {
       destroy(item.entry.view)
     }
     trim(maxAccountPages)
+  }
+
+  static func dataStore(providerId: String, uuid: String) -> WKWebsiteDataStore? {
+    pages.first { $0.key.providerId == providerId && $0.key.uuid == uuid }?.entry.view.configuration.websiteDataStore
   }
 
   /// Drops every parked page. Used when memory is tight or the active web

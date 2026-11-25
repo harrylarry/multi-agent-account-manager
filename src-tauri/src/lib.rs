@@ -250,56 +250,66 @@ async fn observe_account_tasks(
     {
       return Err("自动任务检测暂缓".into());
     }
-    let native = async {
-      match provider {
-        providers::ProviderId::Muse => {
-          let probe = muse_native::watch_probe(&app, "muse", &uuid, 5, account.proxy.as_ref()).await
-            .ok().filter(|probe| probe.status.is_some_and(|status| (200..300).contains(&status)));
-          probe.map_or((None, Vec::new()), |probe| {
-            (probe.ok.then_some(probe.summary.activity).flatten(), probe.completed_ids)
-          })
+    // Construct the native network futures on a Tokio worker. The WKWebView
+    // IPC callback has a small main-thread stack and must not construct them.
+    let app = app.clone();
+    let mgr = Arc::clone(&mgr);
+    let timezone = timezone.to_owned();
+    let task_notifications = account.task_notifications;
+    let proxy = account.proxy.clone();
+    let observation = tokio::spawn(async move {
+      let native = Box::pin(async {
+        match provider {
+          providers::ProviderId::Muse => {
+            let probe = Box::pin(muse_native::watch_probe(&app, "muse", &uuid, 5, proxy.as_ref())).await
+              .ok().filter(|probe| probe.status.is_some_and(|status| (200..300).contains(&status)));
+            probe.map_or((None, Vec::new()), |probe| {
+              (probe.ok.then_some(probe.summary.activity).flatten(), probe.completed_ids)
+            })
+          }
+          providers::ProviderId::Hark => {
+            let probe = Box::pin(hark_native::diagnose(&app, &uuid, proxy.as_ref(), &timezone)).await;
+            (probe.task_status(), probe.completed_ids)
+          }
         }
-        providers::ProviderId::Hark => {
-          let probe = hark_native::diagnose(&app, &uuid, account.proxy.as_ref(), timezone).await;
-          (probe.task_status(), probe.completed_ids)
+      });
+      let approval_poll = Box::pin(async {
+        if task_notifications && provider == providers::ProviderId::Muse {
+          Box::pin(muse_native::approvals_probe(&app, "muse", &uuid, proxy.as_ref())).await
+            .ok().filter(|result| result.ok).map(|result| {
+              let now = storage::now_ms() as i64;
+              result.items.into_iter().filter(|item| {
+                item.status == "pending" && (item.expires_at_ms == 0 || item.expires_at_ms > now)
+              }).collect::<Vec<_>>()
+            })
+        } else {
+          None
+        }
+      });
+      if token.is_cancelled() {
+        return Err("账号出站配置已变化，已停止检测".into());
+      }
+      let ((native, completed), approvals) = tokio::select! {
+        biased;
+        _ = token.cancelled() => return Err("账号出站配置已变化，已停止检测".into()),
+        status = tokio::time::timeout(std::time::Duration::from_secs(32), Box::pin(async {
+          tokio::join!(native, approval_poll)
+        })) => status.unwrap_or_default(),
+      };
+      mgr.record_task_observations(&app, provider, &uuid, &completed, approvals.as_deref()).await?;
+      if let Some(activity) = native {
+        return Ok(serde_json::json!({ "activity": activity, "source": "native", "observedAtMs": storage::now_ms() }));
+      }
+      if provider == providers::ProviderId::Muse && !token.is_cancelled() {
+        let fallback = tokio::time::timeout(std::time::Duration::from_secs(3), platform::ios::read_parked_task_state(&app, &uuid))
+          .await.ok().and_then(Result::ok).flatten();
+        if let Some(activity) = fallback {
+          return Ok(serde_json::json!({ "activity": activity, "source": "page", "observedAtMs": storage::now_ms() }));
         }
       }
-    };
-    let approval_poll = async {
-      if account.task_notifications && provider == providers::ProviderId::Muse {
-        muse_native::approvals_probe(&app, "muse", &uuid, account.proxy.as_ref()).await
-          .ok().filter(|result| result.ok).map(|result| {
-            let now = storage::now_ms() as i64;
-            result.items.into_iter().filter(|item| {
-              item.status == "pending" && (item.expires_at_ms == 0 || item.expires_at_ms > now)
-            }).collect::<Vec<_>>()
-          })
-      } else {
-        None
-      }
-    };
-    if token.is_cancelled() {
-      return Err("账号出站配置已变化，已停止检测".into());
-    }
-    let ((native, completed), approvals) = tokio::select! {
-      biased;
-      _ = token.cancelled() => return Err("账号出站配置已变化，已停止检测".into()),
-      status = tokio::time::timeout(std::time::Duration::from_secs(32), async {
-        tokio::join!(native, approval_poll)
-      }) => status.unwrap_or_default(),
-    };
-    mgr.record_task_observations(&app, provider, &uuid, &completed, approvals.as_deref()).await?;
-    if let Some(activity) = native {
-      return Ok(serde_json::json!({ "activity": activity, "source": "native", "observedAtMs": storage::now_ms() }));
-    }
-    if provider == providers::ProviderId::Muse && !token.is_cancelled() {
-      let fallback = tokio::time::timeout(std::time::Duration::from_secs(3), platform::ios::read_parked_task_state(&app, &uuid))
-        .await.ok().and_then(Result::ok).flatten();
-      if let Some(activity) = fallback {
-        return Ok(serde_json::json!({ "activity": activity, "source": "page", "observedAtMs": storage::now_ms() }));
-      }
-    }
-    Ok(serde_json::json!({ "activity": "unknown", "source": null, "observedAtMs": null }))
+      Ok(serde_json::json!({ "activity": "unknown", "source": null, "observedAtMs": null }))
+    });
+    observation.await.map_err(|_| "任务检测未能完成".to_string())?
   }
   #[cfg(not(target_os = "ios"))]
   {
@@ -547,20 +557,9 @@ async fn list_muse_sessions(
       result = tokio::time::timeout(std::time::Duration::from_secs(35), async {
         let header = zeroize::Zeroizing::new(muse_native::cookie_header_for(&app, &uuid).await?);
         if header.is_empty() { return Err("没有可用的 Muse 登录态".into()); }
-        let client = egress::resolve_for_app(&app, account.proxy.as_ref())?
-          .http_client(std::time::Duration::from_secs(20), false)
-          .map_err(|_| "无法初始化账号网络")?;
-        let mut response = client.get("https://muse.ai/api/session/list")
-          .header("Accept", "application/json").header("Cookie", header.as_str()).send().await
-          .map_err(|error| egress::safe_http_error("读取会话", &error))?;
-        let status = response.status();
-        if !status.is_success() { return Err(format!("会话列表请求失败（HTTP {}）", status.as_u16())); }
-        let mut body = Vec::new();
-        while let Some(chunk) = response.chunk().await.map_err(|error| egress::safe_http_error("读取会话响应", &error))? {
-          if body.len() + chunk.len() > 2 * 1024 * 1024 { return Err("会话列表响应过大".into()); }
-          body.extend_from_slice(&chunk);
-        }
-        muse_sessions::parse_list(&body)
+        let cookies = muse_native_client::cookie::SessionCookies::from_header(&header);
+        let egress = egress::resolve_for_app(&app, account.proxy.as_ref())?;
+        Box::pin(muse_sessions::fetch(&egress, &cookies)).await
       }) => result.map_err(|_| "会话查询超时".to_string())?,
     }
   }
