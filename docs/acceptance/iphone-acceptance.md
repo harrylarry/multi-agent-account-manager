@@ -114,7 +114,7 @@ SOCKS5 启用时，后台同步显示「代理 已下发」「联网超时」「
 
 ## VM 租约、后台连接与账号组织
 
-使用 [叠号 Spike 0.1.26 `d32511e`](https://github.com/harrylarry/multi-agent-account-manager/actions/runs/45620072467/artifacts/15028035192)。解压后未签名 IPA 的 SHA-256 为 `d07a4af43bed96e51de0b1c2a9b9eab470f486cbf94ee0c057481ee11f2b846c`。[Quick checks](https://github.com/harrylarry/multi-agent-account-manager/actions/runs/45619968807) 与 [Xcode 打包第 2 次尝试](https://github.com/harrylarry/multi-agent-account-manager/actions/runs/45620072467/attempts/2) 均通过。此批功能真机结果为 `UNVERIFIED`。
+使用 [叠号 Spike 0.1.26 `d32511e`](https://github.com/harrylarry/multi-agent-account-manager/actions/runs/45620072467/artifacts/15028035192)。解压后未签名 IPA 的 SHA-256 为 `d07a4af43bed96e51de0b1c2a9b9eab470f486cbf94ee0c057481ee11f2b846c`。[Quick checks](https://github.com/harrylarry/multi-agent-account-manager/actions/runs/45619968807) 与 [Xcode 打包第 2 次尝试](https://github.com/harrylarry/multi-agent-account-manager/actions/runs/45620072467/attempts/2) 均通过。分项真机结果见下方回执。
 
 1. **VM 租约**。在已登录的 Muse 测试账号上打开「诊断 → 连接与消息测试 → 租约探针」。保存调用轨迹、到期时间、TTL 和复查结论。若显示「已确认 VM 分配」且无到期字段，记录分配可见、租期不可观测。若两次对应不同 VM，分开记录，勿算作续期。用同一账号分别记录代理和直连条件下的结果。
 2. **后台连接**。运行「存活 5 分钟」，等到「订阅就绪」有时间再退后台。分别记录前台、锁屏、短后台、长后台、低电量的结果与最大观测间隔。强制结束进程单独记为测试中止。另开一轮点击「停止」，确认结束原因为 `cancelled`。再用不同账号重复，核对停止与原探针绑定。此测试不会依靠静音音频维持连接。
@@ -122,6 +122,18 @@ SOCKS5 启用时，后台同步显示「代理 已下发」「联网超时」「
 4. **账号组织**。在两个测试账号上设置不同分组，搜索备注及分组名。按分组过滤，再清空分组，确认账号仍在且可打开。切换 Muse/Hark 检查过滤独立。无过滤时长按拖动，重启后核对备注、分组和排序均保留。
 
 ## 回填结果
+
+### `d32511e` 真机回执（UTC+8）
+
+| 场景 | 实测 | 结论 |
+| --- | --- | --- |
+| Muse 原生连接、订阅与单发 | Noise 握手通过，Ping 200。15 秒订阅返回 HTTP 200，4 个事件含 1 次空闲。单发收到有效 ACK，台账为 `CONFIRMED`。 | 本轮回归 `DEVICE_VERIFIED`。订阅中的生成及完成事件去重未在这段实测覆盖。 |
+| VM 租约 | 两次 `lease-vm(standard)` 均返回 `assigned`。到期与 TTL 均未见。 | 租约获取 `DEVICE_VERIFIED`。到期和续租不可观测，`UNVERIFIED`。 |
+| 后台观测窗口 | 21:43:10 订阅就绪，最后事件同秒。21:51:15 记录 `window_elapsed`。目标窗口 300 秒，墙钟经过 486 秒，最大本地观测空窗 475 秒。 | 已观测到本地任务存在长空窗。空窗内的 WSS 状态和连接恢复 `UNVERIFIED`。 |
+| 手动停止存活探针 | 21:52:16 订阅就绪，21:52:17 结束，结果为 `cancelled`。 | 手动停止 `DEVICE_VERIFIED`。 |
+| CVM | 界面显示「未检测到」，诊断当前没有实际 CVM 能力查询。 | `UNVERIFIED`。 |
+
+账号分组的重启持久化、Hark 和有待审批样本的只读查询仍待真机回执。
 
 ### 0.1.26 Muse 指纹真机回执
 

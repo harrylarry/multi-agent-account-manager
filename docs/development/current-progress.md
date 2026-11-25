@@ -11,7 +11,7 @@
 | Muse 认证、订阅、审批、额度 | 旧版真机已有 Noise 握手、Ping、订阅、空审批列表与额度证据，详见 PR #16。 | 新包回归。有待审批项的真实样本继续单独记录。 |
 | Muse 隔离发送、实时接收与模型指纹 | `8b7eb0a` 前台 `DEVICE_VERIFIED`。3 次 ACK，三条分别关联 72、79、80 个文本增量，均经流确认 `done` 并参加 lmfpd 校准评分。历史恢复路径已有独立真机证据。 | 退后台取消、锁屏设置恢复、原正常会话无污染的网页侧对照。 |
 | 原生代理与 WebView | `7588dca` 的三协议原生端到端与 SOCKS5 重启持久化 `DEVICE_VERIFIED`。`ab6f6fa` 的 Muse 后台额度直连、SOCKS5 正误密码对照及经 SOCKS5 的原生额度读取 `DEVICE_VERIFIED`。错误密码下两种原生探针均未连通，Muse WebView 无法加载，恢复正确密码后重新载入。受控 reqwest 测试覆盖 SOCKS5 远端解析与代理拒绝时无直连。 | 故障时真机出口观测、账号切换隔离、后台额度数值变化写入 `UNVERIFIED`。 |
-| VM 租约与后台 WSS | 旧版真机已取得租约。历史后台观测出现断连，PR #16 保留原始时间线。 | 租约到期与续租、新包锁屏及回前台恢复 `UNVERIFIED`。 |
+| VM 租约与后台 WSS | `d32511e` 真机两次取得租约，订阅就绪与手动停止通过，实测最大任务观测空窗 475 秒。 | 租约到期字段与续租不可观测，后台空窗内的 WSS 状态、回前台连接恢复和 CVM `UNVERIFIED`。 |
 | Hark 只读检测 | `8eed8ff` 的 REST/SSE/poll 与两路去重 `CI_PASSED`，已包含在 0.1.26 IPA。 | Hark 真机登录、状态对照、断流回退、WebView 审批 `UNVERIFIED`。Hark 指纹按已确认裁决另做 Spike。 |
 
 0.1.25 的 [Quick checks](https://github.com/harrylarry/multi-agent-account-manager/actions/runs/45389037648)、[Xcode 打包](https://github.com/harrylarry/multi-agent-account-manager/actions/runs/45389039398)和 [Hark Quick checks](https://github.com/harrylarry/multi-agent-account-manager/actions/runs/45390431182)均有对应提交。真机结果需记录对应包和测试环境。
@@ -73,3 +73,5 @@
 `d32511e` 的 [Quick checks](https://github.com/harrylarry/multi-agent-account-manager/actions/runs/45619968807) 已通过。Windows 测试为主 crate 62 项、muse-native 109 项及前端脚本 13 项。WebKit 和 Edge 在 320×568、390×844 验证了账号搜索、分组筛选、编辑、清空及搜索焦点。WebKit 另模拟切换展示账号后停止存活探针，核对取消请求仍使用启动时的账号和任务 ID。设备端的真实租约、连接存活、操作取消与账号组织回归仍需 iPhone 核对。
 
 `d32511e` 的 [Xcode 打包](https://github.com/harrylarry/multi-agent-account-manager/actions/runs/45620072467/attempts/2) 重新运行后通过。首轮 runner 解析 GitHub 域名失败，SwiftPM 无法下载依赖。第二轮沿用同一功能 SHA，已下载并校验 IPA。GitHub 确认 [PR #15](https://github.com/harrylarry/multi-agent-account-manager/pull/15) 已合入，PR #16 继续承载当前 Spike。下一次真机集中核对租约到期字段、锁屏/后台观测间隔、取消及分组持久化。有 Hark 测试账号或真实待审批样本时，可在同一包核对已有只读路径。
+
+`d32511e` 获得 iPhone 回执。Noise、Ping、订阅和单次发送 ACK 回归通过。两次 standard 租约都返回 assigned，到期与 TTL 缺失。后台窗口结束时有 475 秒观测空窗，不能据此确认远端连接持续或断开。另开一轮确认手动停止为 cancelled。账号分组持久化、Hark 及真实待审批样本仍待验收。[真机回执](../acceptance/iphone-acceptance.md#d32511e-真机回执utc8)
