@@ -94,7 +94,14 @@ pub async fn run(
     let _guard = gate.0.lock().await;
     !ledger.is_poisoned() && rooms::record(path, dispatch, Milestone::Acknowledged { user_message_id: ack.message_id.clone() }).is_ok()
   };
-  if !ack_saved { return finish(gate, path, dispatch, Milestone::Uncertain).await; }
+  if !ack_saved {
+    if token.is_cancelled() {
+      let acknowledged = subscription.cancel_isolated_turn(&route).await;
+      finish(gate, path, dispatch, Milestone::Uncertain).await?;
+      return finish(gate, path, dispatch, Milestone::RemoteCancel { acknowledged }).await;
+    }
+    return finish(gate, path, dispatch, Milestone::Uncertain).await;
+  }
   let live = tokio::select! {
     biased;
     _ = token.cancelled() => None,
@@ -109,6 +116,11 @@ pub async fn run(
     result = tokio::time::timeout(Duration::from_secs(22), Box::pin(read_fingerprint_history(&egress, &cookies, session, &ack.message_id))) =>
       result.ok().and_then(Result::ok).flatten(),
   };
+  if token.is_cancelled() {
+    let acknowledged = subscription.cancel_isolated_turn(&route).await;
+    finish(gate, path, dispatch, Milestone::Uncertain).await?;
+    return finish(gate, path, dispatch, Milestone::RemoteCancel { acknowledged }).await;
+  }
   finish(gate, path, dispatch, history.map_or(Milestone::Uncertain, |text| Milestone::Complete {
     text, source: "history",
   })).await
@@ -116,16 +128,17 @@ pub async fn run(
 
 async fn finish(gate: &RoomGate, path: &Path, dispatch: &Dispatch, event: Milestone) -> Result<RoomBook, String> {
   let _guard = gate.0.lock().await;
+  let cancellation_result = matches!(&event, Milestone::RemoteCancel { .. });
   match rooms::record(path, dispatch, event) {
     Ok(book) => Ok(book),
     Err(error) => {
       // Resolve a late completion or storage-side failure conservatively. A
       // valid ACK remains available for an explicit read-only recovery.
-      if rooms::record(path, dispatch, Milestone::Uncertain).is_ok() {
+      if !cancellation_result && rooms::record(path, dispatch, Milestone::Uncertain).is_ok() {
         rooms::apply(path, rooms::Command::List, &[], false)
       } else {
         let current = rooms::apply(path, rooms::Command::List, &[], false)?;
-        if current.is_in_flight(dispatch.room_id, dispatch.attempt.id) {
+        if current.is_in_flight(dispatch.room_id, &dispatch.attempt) && !cancellation_result {
           Err(error)
         } else {
           Ok(current)

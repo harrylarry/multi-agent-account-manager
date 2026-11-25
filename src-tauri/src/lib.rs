@@ -83,33 +83,50 @@ async fn manage_rooms(
 
 #[tauri::command]
 #[cfg_attr(not(target_os = "ios"), allow(unused_variables))]
-async fn run_solo_room(
+async fn run_room(
   app: AppHandle, mgr: State<'_, Arc<SessionManager>>, gate: State<'_, rooms::RoomGate>,
   ledger: State<'_, Arc<send_ledger::SendLedger>>, cancel: State<'_, Arc<probe_cancel::ProbeCancel>>,
   id: uuid::Uuid, revision: u64, recover: bool,
 ) -> Result<rooms::RoomBook, String> {
   #[cfg(target_os = "ios")]
   {
+    use tauri::Emitter;
     let dir = app.path().app_data_dir().map_err(|_| "无法读取应用目录")?;
     let path = dir.join("rooms-v1.json");
-    let proxy_guard = mgr.proxy_write_lock.lock().await;
-    let mut initialized = gate.0.lock().await;
-    let snapshot = mgr.get_snapshot().await;
-    if !*initialized {
-      rooms::apply(&path, rooms::Command::List, &snapshot.accounts, true)?;
+    let mut next_revision = revision;
+    loop {
+      let proxy_guard = mgr.proxy_write_lock.lock().await;
+      let mut initialized = gate.0.lock().await;
+      let snapshot = mgr.get_snapshot().await;
+      let current = rooms::apply(&path, rooms::Command::List, &snapshot.accounts, !*initialized)?;
       *initialized = true;
+      if next_revision != revision && current.next_relay_revision(id) != Some(next_revision) {
+        return Ok(current);
+      }
+      let allowed: Vec<_> = snapshot.accounts.into_iter().filter(|account| {
+        !snapshot.conflicts.iter().any(|conflict| conflict.uuid == account.uuid)
+          && !snapshot.pending_cleanup.iter().any(|key| key.uuid == account.uuid)
+      }).collect();
+      let Some(dispatch) = rooms::begin_dispatch(&path, id, next_revision, &allowed, recover)? else {
+        return rooms::apply(&path, rooms::Command::List, &allowed, false);
+      };
+      let account = allowed.iter().find(|account| account.uuid == dispatch.attempt.account_uuid
+        && account.provider_id == providers::ProviderId::Muse).ok_or("账号不存在")?;
+      let worker_id = dispatch.attempt.worker_id.unwrap_or(dispatch.attempt.id);
+      let (token, _cancel_guard) = cancel.register_task(&account.uuid, "room", worker_id);
+      drop(initialized);
+      drop(proxy_guard);
+      let _ = app.emit("room-progress", id);
+      let result = Box::pin(room_dispatch::run(
+        &app, &gate, &ledger, &path, &dispatch, account.proxy.as_ref(), token, recover,
+      )).await?;
+      let _ = app.emit("room-progress", id);
+      // Explicit recovery reads just this attempt, without authorizing another send.
+      let Some(revision) = result.after_relay_attempt(id, &dispatch.attempt).filter(|_| !recover) else {
+        return Ok(result);
+      };
+      next_revision = revision;
     }
-    let allowed: Vec<_> = snapshot.accounts.into_iter().filter(|account| {
-      !snapshot.conflicts.iter().any(|conflict| conflict.uuid == account.uuid)
-        && !snapshot.pending_cleanup.iter().any(|key| key.uuid == account.uuid)
-    }).collect();
-    let dispatch = rooms::begin_dispatch(&path, id, revision, &allowed, recover)?;
-    let account = allowed.iter().find(|account| account.uuid == dispatch.attempt.account_uuid
-      && account.provider_id == providers::ProviderId::Muse).ok_or("账号不存在")?;
-    let (token, _cancel_guard) = cancel.register_task(&account.uuid, "room", dispatch.attempt.id);
-    drop(initialized);
-    drop(proxy_guard);
-    Box::pin(room_dispatch::run(&app, &gate, &ledger, &path, &dispatch, account.proxy.as_ref(), token, recover)).await
   }
   #[cfg(not(target_os = "ios"))]
   { Err("房间真实派发需要 iOS".into()) }
@@ -1626,7 +1643,7 @@ pub fn run() {
       select_provider,
       add_account,
       manage_rooms,
-      run_solo_room,
+      run_room,
       rename_account,
       remove_account,
       switch_account,

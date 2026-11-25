@@ -3027,11 +3027,11 @@ async function submitNewAccount(view: Extract<ModalMode, { kind: "add" }>, previ
 
 async function updateRooms(view: RoomsView, command: { action?: string; id?: string; revision?: number }): Promise<void> {
   if (modal !== view) return;
-  if (command.action === "interrupt") {
+  if (command.action === "interrupt" || (command.action === "supplement" && view.busy)) {
     try {
-      view.book = await invoke<RoomBook>("manage_rooms", { command: { action: "interrupt", id: command.id } });
-      view.runningRoomId = undefined;
-      if (modal === view) render();
+      const result = await invoke<RoomBook>("manage_rooms", { command });
+      if (command.action === "interrupt") view.runningRoomId = undefined;
+      paintRoomUpdate(view, result, command.id, command.action !== "supplement");
     } catch (error) {
       const line = document.getElementById("room-result");
       if (line) line.textContent = String(error);
@@ -3050,7 +3050,7 @@ async function updateRooms(view: RoomsView, command: { action?: string; id?: str
   const status = document.getElementById("room-result");
   if (status) status.textContent = "正在保存或读取…";
   try {
-    view.book = run ? await invoke<RoomBook>("run_solo_room", {
+    view.book = run ? await invoke<RoomBook>("run_room", {
       id: command.id, revision: command.revision, recover: command.action === "recover",
     }) : await invoke<RoomBook>("manage_rooms", { command });
     if (status) status.textContent = "";
@@ -3071,6 +3071,34 @@ async function updateRooms(view: RoomsView, command: { action?: string; id?: str
       }
     }
   }
+}
+
+function paintRoomUpdate(view: RoomsView, book: RoomBook, id?: string, retainNote = true): void {
+  const incoming = book.rooms.find((room) => room.id === id);
+  const shown = view.book?.rooms.find((room) => room.id === id);
+  if (incoming && shown && incoming.revision < shown.revision) return;
+  view.book = book;
+  if (modal !== view || !id) return;
+  const selector = `[data-room-panel="${CSS.escape(id)}"]`;
+  const panel = document.querySelector<HTMLElement>(selector);
+  const note = panel?.querySelector("textarea");
+  const text = retainNote ? note?.value : undefined;
+  const focused = note && document.activeElement === note;
+  const scroll = panel?.closest(".proxy-pool-body")?.scrollTop;
+  const openSteps = Array.from(panel?.querySelectorAll<HTMLElement>("[data-room-step][open]") ?? []);
+  render();
+  const rendered = document.querySelector<HTMLElement>(selector);
+  rendered?.setAttribute("open", "");
+  for (const step of openSteps) {
+    rendered?.querySelector(`[data-room-step="${CSS.escape(step.dataset.roomStep ?? "")}"]`)?.setAttribute("open", "");
+  }
+  const restored = rendered?.querySelector("textarea");
+  if (restored && text !== undefined) {
+    restored.value = text;
+    if (focused) restored.focus({ preventScroll: true });
+  }
+  const body = rendered?.closest(".proxy-pool-body");
+  if (body && scroll !== undefined) body.scrollTop = scroll;
 }
 
 function renderModal(provider: ProviderInfo): string {
@@ -4666,6 +4694,15 @@ async function bootstrap(): Promise<void> {
     spikeFingerprintProgress = payload;
     syncSpikeDiag();
     if (modal.kind === "tasks" && modal.account.uuid === payload.accountUuid) render();
+  });
+
+  await listen<string>("room-progress", ({ payload: id }) => {
+    const view = modal;
+    if (view.kind !== "rooms" || !view.book || (view.runningRoomId !== id &&
+      !document.querySelector(`[data-room-panel="${CSS.escape(id)}"][open]`))) return;
+    void invoke<RoomBook>("manage_rooms", { command: { action: "list" } })
+      .then((book) => paintRoomUpdate(view, book, id))
+      .catch(() => { /* The active command also returns the authoritative room state. */ });
   });
 
   await listen<ManagerSnapshot>("manager-state-changed", (event) => {

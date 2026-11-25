@@ -278,6 +278,14 @@ pub enum AccountSubscription {
 }
 
 impl AccountSubscription {
+  #[cfg(target_os = "ios")]
+  pub async fn cancel_isolated_turn(&mut self, route: &IsolatedProbeRoute) -> bool {
+    match self {
+      Self::Direct(s) => chat_send::cancel_isolated_turn(s, route).await,
+      Self::Proxied(s) => chat_send::cancel_isolated_turn(s, route).await,
+    }
+  }
+
   pub fn enable_chat_wire_trace(&mut self) {
     match self {
       Self::Direct(s) => s.enable_chat_wire_trace(),
