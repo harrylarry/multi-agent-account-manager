@@ -10,7 +10,7 @@
 | --- | --- | --- |
 | Muse 认证、订阅、审批、额度 | 旧版真机已有 Noise 握手、Ping、订阅、空审批列表与额度证据，详见 PR #16。 | 新包回归。有待审批项的真实样本继续单独记录。 |
 | Muse 隔离发送、实时接收与模型指纹 | `8b7eb0a` 前台 `DEVICE_VERIFIED`。3 次 ACK，三条分别关联 72、79、80 个文本增量，均经流确认 `done` 并参加 lmfpd 校准评分。历史恢复路径已有独立真机证据。 | 退后台取消、锁屏设置恢复、原正常会话无污染的网页侧对照。 |
-| 原生代理与 WebView | `7588dca` 的三协议原生端到端与 SOCKS5 重启持久化 `DEVICE_VERIFIED`。`ab6f6fa` 的 Muse 后台额度直连及 SOCKS5 正误密码对照 `DEVICE_VERIFIED`。错误密码下两种原生探针均未连通，Muse WebView 无法加载，恢复正确密码后重新载入。受控 reqwest 测试覆盖 SOCKS5 远端解析与代理拒绝时无直连。 | 故障时真机出口观测、账号切换隔离、后台额度数值变化写入及经代理的原生额度查询 `UNVERIFIED`。 |
+| 原生代理与 WebView | `7588dca` 的三协议原生端到端与 SOCKS5 重启持久化 `DEVICE_VERIFIED`。`ab6f6fa` 的 Muse 后台额度直连、SOCKS5 正误密码对照及经 SOCKS5 的原生额度读取 `DEVICE_VERIFIED`。错误密码下两种原生探针均未连通，Muse WebView 无法加载，恢复正确密码后重新载入。受控 reqwest 测试覆盖 SOCKS5 远端解析与代理拒绝时无直连。 | 故障时真机出口观测、账号切换隔离、后台额度数值变化写入 `UNVERIFIED`。 |
 | VM 租约与后台 WSS | 旧版真机已取得租约。历史后台观测出现断连，PR #16 保留原始时间线。 | 租约到期与续租、新包锁屏及回前台恢复 `UNVERIFIED`。 |
 | Hark 只读检测 | `8eed8ff` 的 REST/SSE/poll 与两路去重 `CI_PASSED`，已包含在 0.1.26 IPA。 | Hark 真机登录、状态对照、断流回退、WebView 审批 `UNVERIFIED`。Hark 指纹按已确认裁决另做 Spike。 |
 
@@ -66,4 +66,4 @@
 
 `ab6f6fa` 的 [Quick checks](https://github.com/harrylarry/multi-agent-account-manager/actions/runs/45613514999) 和 [Xcode 打包](https://github.com/harrylarry/multi-agent-account-manager/actions/runs/45613523633) 均通过，已下载校验新 IPA。下一次真机先确认清除代理时后台额度路径能到达主文档提交及实际额度，再用正确 SOCKS5 重跑同一入口；若原生查询仍失败，回填新诊断。新构建实际结果 `UNVERIFIED`。[复测包和步骤](../acceptance/iphone-acceptance.md#ios-后台额度同步)
 
-`ab6f6fa` 的 Muse 后台额度同步已完成同一账号的直连、错误 SOCKS5 密码和恢复正确密码对照。错误密码下主文档提交前失败且未取得额度。恢复正确密码后代理已下发，主文档已提交，额度已取得且数据未变。独立网络出口、跨账号隔离、数值变化写入及经代理的原生额度查询继续保留待验收。[真机回执](../acceptance/iphone-acceptance.md#ab6f6fa-真机回执)
+`ab6f6fa` 的 Muse 后台额度同步已完成同一账号的直连、错误 SOCKS5 密码和恢复正确密码对照。错误密码下主文档提交前失败且未取得额度。恢复正确密码后代理已下发，主文档已提交，额度已取得且数据未变。用户补充确认正确 SOCKS5 密码下的原生「查询额度」也成功。独立网络出口、跨账号隔离与数值变化写入继续保留待验收。[真机回执](../acceptance/iphone-acceptance.md#ab6f6fa-真机回执)
