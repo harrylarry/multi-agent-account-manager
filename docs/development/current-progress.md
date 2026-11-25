@@ -30,6 +30,10 @@ Windows 主 crate 67 项、muse-native 110 项、嵌入脚本 13 项与构建检
 
 ## 下一步
 
+2026-11-26 首轮 A–C iPhone 回执。`815cffa` 的任务入口闪退和 Muse 会话列表为 `FAIL`。本机 Cookie 枚举结果在打开会话前后不一致，预览输入区闪烁。回前台未看到叠号红点，Muse 网页点可见。手动代理添加与使用、审批空态、备份导出为本次 `DEVICE_VERIFIED`。订阅导入、实际审批和备份恢复继续待验。
+
+修复候选 `9a7c229`。核对真机日志和原 IPA Mach-O 的 UUID 与故障指令，确认任务入口触及主线程栈保护页，已将原生网络 future 移至 Tokio worker 并拆分装箱。会话列表改为按账号出站策略进行的 Noise daemon 请求。Cookie 摘要复用停驻页的 WebKit 数据存储并保持其生命周期，前端原位更新预览。Muse 回前台补查增加停驻基线及同会话助手消息变化判断。Quick checks 和 Xcode 均成功，IPA 已下载核验。两个移动端 WebKit 视口验证 Cookie 预览保留输入框节点。新包仍需真机比对。[下载和逐步复测](../acceptance/iphone-acceptance.md#v22-真机回归修复复测)
+
 按联合验收清单收集 A–C 的真机证据。有授权的 Hark 账号及真实待审批项时同步验收。房间与指纹产品化按 [执行计划 v2.2](development-plan-v2.2.md)进入后续批次。以下保留历史验证时间线。
 
 实时流式专项包 `8f50c91` 的 CI 与 Xcode 打包通过。本次 iPhone 专项实测中，实时增量与流内结束验收均未通过。三条均为零关联文本增量，最终由历史恢复完成。下一轮按发送流和订阅流分别记录匹配前的事件类型计数，以区分未观测到文本事件与关联失败。[下载与步骤](../acceptance/iphone-acceptance.md#实时增量专项复测)
