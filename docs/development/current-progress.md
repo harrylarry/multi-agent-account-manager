@@ -4,7 +4,7 @@
 
 ## Phase 0 技术 Spike
 
-开发分支为 `spike/native-methods`。最新 Spike 候选 0.1.26 构建自 `ab6f6fa43b627ce2ceff0123e7675fd6a2554897`，覆盖 iOS 后台额度同步脱敏诊断。安装及校验见 [iPhone 后台额度同步真机复测](../acceptance/iphone-acceptance.md#ios-后台额度同步)。
+开发分支为 `spike/native-methods`。最新 Spike 候选 0.1.26 来自 `d32511e6581eb6fed1359224e8ed904890441f34`，包含 VM 租约观测、连接与发送探针取消及账号组织。[候选与真机步骤](../acceptance/iphone-acceptance.md#vm-租约后台连接与账号组织)
 
 | 切片 | 已核对证据 | 待验收 |
 | --- | --- | --- |
@@ -69,3 +69,7 @@
 `ab6f6fa` 的 Muse 后台额度同步已完成同一账号的直连、错误 SOCKS5 密码和恢复正确密码对照。错误密码下主文档提交前失败且未取得额度。恢复正确密码后代理已下发，主文档已提交，额度已取得且数据未变。用户补充确认正确 SOCKS5 密码下的原生「查询额度」也成功。独立网络出口、跨账号隔离与数值变化写入继续保留待验收。[真机回执](../acceptance/iphone-acceptance.md#ab6f6fa-真机回执)
 
 本批转入 VM 租约、后台连接与账号组织。租约探针区分已有 VM 分配和明确租约，去掉原始 VM 名称和网关标识，复查不同 VM 时不推断为续期。订阅就绪后才开始计算存活窗口，租约、存活、订阅和单发沿用启动账号与任务 ID 的停止操作，发送仍按实际网络写入保留未知状态。Muse/Hark 账号支持分组与搜索，旧档默认为未分组。Phase 1 的通知和 watcher 产品能力、Phase 2 的审批及代理池、后续备份和协作房间仍按执行计划保留。[集中复测入口](../acceptance/iphone-acceptance.md#vm-租约后台连接与账号组织)
+
+`d32511e` 的 [Quick checks](https://github.com/harrylarry/multi-agent-account-manager/actions/runs/45619968807) 已通过。Windows 测试为主 crate 62 项、muse-native 109 项及前端脚本 13 项。WebKit 和 Edge 在 320×568、390×844 验证了账号搜索、分组筛选、编辑、清空及搜索焦点。WebKit 另模拟切换展示账号后停止存活探针，核对取消请求仍使用启动时的账号和任务 ID。设备端的真实租约、连接存活、操作取消与账号组织回归仍需 iPhone 核对。
+
+`d32511e` 的 [Xcode 打包](https://github.com/harrylarry/multi-agent-account-manager/actions/runs/45620072467/attempts/2) 重新运行后通过。首轮 runner 解析 GitHub 域名失败，SwiftPM 无法下载依赖。第二轮沿用同一功能 SHA，已下载并校验 IPA。GitHub 确认 [PR #15](https://github.com/harrylarry/multi-agent-account-manager/pull/15) 已合入，PR #16 继续承载当前 Spike。下一次真机集中核对租约到期字段、锁屏/后台观测间隔、取消及分组持久化。有 Hark 测试账号或真实待审批样本时，可在同一包核对已有只读路径。
