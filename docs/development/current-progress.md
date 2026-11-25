@@ -18,6 +18,8 @@
 
 ## 下一步
 
+当前开发与上游适配顺序见[执行计划 v2.2](development-plan-v2.2.md)。下一批启动 iOS Cookie 导入、登录失效与异常恢复，已有审批和回前台补查合并进入候选回归。以下保留历史验证时间线。
+
 实时流式专项包 `8f50c91` 的 CI 与 Xcode 打包通过。本次 iPhone 专项实测中，实时增量与流内结束验收均未通过。三条均为零关联文本增量，最终由历史恢复完成。下一轮按发送流和订阅流分别记录匹配前的事件类型计数，以区分未观测到文本事件与关联失败。[下载与步骤](../acceptance/iphone-acceptance.md#实时增量专项复测)
 
 诊断构建 `d983d52` 的 CI 与 Xcode 打包均通过。iPhone 回报三条均经 `history_completed` 入样，发送流和订阅流均未报告文本增量或结束事件。BotArk 桌面端 02:03 的手测可见文字逐步出现，当时的日志过滤未保留足够帧证据，尚无法确认两端收到的事件差异。[构建](https://github.com/harrylarry/multi-agent-account-manager/actions/runs/45431942405)

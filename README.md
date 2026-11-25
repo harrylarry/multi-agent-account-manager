@@ -13,7 +13,7 @@
 - **当前版本**：0.1.22。
 - **IPA 构建**：由 GitHub Actions（`.github/workflows/ios.yml`）在 `macos-15-intel` runner 上构建，产物为未签名 IPA（`account-manager-ios-unsigned.ipa`），无需 Apple 开发者账号。
 - **安装方式**：未签名 IPA（iOS 17.0+），需自行签名后侧载安装，详见「iOS 安装注意事项」。
-- **上游更新**：上游更新不再合入本 fork。
+- **上游更新**：按 iOS 需求逐项评估和适配上游变更，排期见[执行计划 v2.2](docs/development/development-plan-v2.2.md)。
 
 ---
 

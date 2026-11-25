@@ -3,6 +3,7 @@
 > 本文件约束**开发这个仓库的 AI Agent**，不改变 App 内协作房间的指挥者、执行者、审核者等产品角色。
 > 产品需求与设计决策基线：[《叠号 iOS 借鉴 BotArk 优化设计规划 v4》](<docs/叠号 iOS 借鉴 BotArk 优化设计规划 v4.md>)。
 > 开发执行与验收基线：[《叠号开发计划·严谨执行版 v2.1》](docs/叠号开发计划-严谨执行版-v2.1-2026-11-23.md)。
+> 当前开发批次与上游适配：[执行计划 v2.2](docs/development/development-plan-v2.2.md)。
 > 实际开发进度与验收状态以最新 GitHub Issue、PR、提交、Actions 和真机验收记录为准。两份基线保留原始日期与内容。历史进度需要复核，已确认的功能需求继续适用。实质性需求冲突提交用户裁决，其他切片继续推进。
 > 已确认的差异裁决见[开发决策记录](docs/开发决策记录.md)。
 > 接续工作先看[当前进度](docs/development/current-progress.md)。iPhone 验包和结果回填参照[真机验收指南](docs/acceptance/iphone-acceptance.md)。
