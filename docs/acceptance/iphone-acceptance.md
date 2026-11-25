@@ -12,7 +12,9 @@
 
 ### 实时增量专项复测
 
-当前实时取证包为 [叠号 Spike 0.1.26 `7a8dd54`](https://github.com/harrylarry/multi-agent-account-manager/actions/runs/45567860405/artifacts/15000649381)，构建 SHA 为 `7a8dd54698f76a4fade1aa5536cfa750d353bf0b`。解压后未签名 IPA 的 SHA-256 为 `701827c022e50ab9e5de89f9c19565c2f9605615ee08229c4cd47b66635cdae9`。从 Muse 顶栏点「诊断」，用同一测试账号和代理在前台运行一次「指纹探针 3 条」。结果出来后直接点诊断页顶部「复制脱敏流诊断」并回传。滚动、顶部复制和实时回复均待 iPhone 复测。[Quick checks](https://github.com/harrylarry/multi-agent-account-manager/actions/runs/45567818630)
+当前实时复测包为 [叠号 Spike 0.1.26 `7ae68db`](https://github.com/harrylarry/multi-agent-account-manager/actions/runs/45572061671/artifacts/15003088501)，构建 SHA 为 `7ae68db2ae1d8735e22536e23ebb6bccb34f7bf3`。解压后未签名 IPA 的 SHA-256 为 `612bac62bc52807b90dd436d8a0a36b8108ccbd62e53e111b7e968fdc8c923eb`。用同一 Muse 测试账号和代理，在前台从「诊断」运行一次「指纹探针 3 条」。生成期间观察「已收到实时文本增量，等待流内结束」。结束后在逐条结果核对「文本增量 > 0」与结束原因为 `done`，回传顶部的结果摘要和脱敏流诊断。注册或订阅阶段中止时回传摘要。服务端实际推送仍待真机复测。[Quick checks](https://github.com/harrylarry/multi-agent-account-manager/actions/runs/45572018340)
+
+界面诊断包 [叠号 Spike 0.1.26 `7a8dd54`](https://github.com/harrylarry/multi-agent-account-manager/actions/runs/45567860405/artifacts/15000649381) 的 IPA SHA-256 为 `701827c022e50ab9e5de89f9c19565c2f9605615ee08229c4cd47b66635cdae9`。顶部复制真机通过，三条均走历史恢复，实时文本增量与流内结束未通过。
 
 上一取证包 [0.1.26 `5d8bf46`](https://github.com/harrylarry/multi-agent-account-manager/actions/runs/45563228807/artifacts/14998504572) 解压后的 IPA SHA-256 为 `0ac460d3e88d798d8bd1965c2b5eff68ecf8c846d549cc264751c7aef911d679`。真机三条均走 `history_completed`，增量为零，旧诊断区无法滚到底，未取得独立帧日志。
 
