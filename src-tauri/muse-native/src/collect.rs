@@ -1,7 +1,7 @@
 //! Collect a correlated assistant turn on the same Noise connection as the send.
 
 use std::collections::{HashMap, HashSet};
-use std::time::Duration;
+use std::time::{Duration, SystemTime};
 
 use crate::chat_send::{Ack, LineSource};
 use crate::gateway::{ConnectedGateway, GatewayError, Subscription};
@@ -26,6 +26,7 @@ pub struct Collected {
   pub send_events: StreamEventCounts,
   pub subscription_events: StreamEventCounts,
   pub first_matched_delta_ms: Option<u64>,
+  pub first_delta_to_message_done_ms: Option<u64>,
   /// 累积到的助手正文（按到达顺序拼接）。
   pub text: String,
   /// 收到的文本增量事件数。
@@ -41,6 +42,10 @@ pub struct Collected {
   /// 是否出现过智能体忙态（用于判断这轮是否真的开始了）。
   pub read_timeouts: u64,
   pub unmatched_events: u64,
+  pub outside_turn_events: u64,
+  pub conflicting_events: u64,
+  pub missing_message_id_events: u64,
+  pub unlinked_events: u64,
   pub saw_user: bool,
   pub saw_idle: bool,
   pub assistant_messages: usize,
@@ -120,6 +125,12 @@ fn text_field<'a>(objects: &[&'a Value], keys: &[&str]) -> Option<&'a str> {
     keys
       .iter()
       .find_map(|key| value.get(key)?.as_str().filter(|text| !text.is_empty()))
+  })
+}
+
+fn event_time_ms(root: &Value, payload: &Value) -> Option<u64> {
+  [root, payload].into_iter().find_map(|record| {
+    ["occurred_at_ms", "ts_ms"].into_iter().find_map(|key| record[key].as_u64().filter(|ms| *ms > 0))
   })
 }
 
@@ -288,11 +299,17 @@ pub async fn collect_text<L: LineSource>(
 ) -> Collected {
   use tokio::time::{timeout_at, Instant};
   let started = Instant::now();
+  let wall_started = SystemTime::now();
   let deadline = started + total;
   let mut out = Collected::default();
   let mut messages = HashMap::<String, AssistantMessage>::new();
   let mut order = Vec::new();
   let mut seen = HashSet::new();
+  let scoped_subscription = sub.is_scoped_to(session_id);
+  let mut scoped_user_seen = false;
+  let mut user_time_ms = None;
+  let mut earlier_assistants = HashSet::new();
+  let mut idle_after_output = false;
   let fields = ack.raw.get("result").unwrap_or(&ack.raw);
   let mut turn = text_field(&[fields], &["turn_id"]).map(str::to_string);
   let mut task = text_field(&[fields], &["task_id"]).map(str::to_string);
@@ -300,6 +317,10 @@ pub async fn collect_text<L: LineSource>(
 
   out.ended_by = loop {
     let now = Instant::now();
+    // A monotonic timer alone may undercount elapsed time when iOS suspends the app.
+    if wall_started.elapsed().is_ok_and(|elapsed| elapsed >= total) {
+      break "timeout";
+    }
     if settle_at.is_some_and(|end| end <= now && end <= deadline) {
       out.done = true;
       break "done";
@@ -325,6 +346,9 @@ pub async fn collect_text<L: LineSource>(
       }
       Ok(Err(_)) => break "protocol_error",
     };
+    if wall_started.elapsed().is_ok_and(|elapsed| elapsed >= total) {
+      break "timeout";
+    }
     out.lines += 1;
     let Ok(root) = serde_json::from_str::<Value>(&line) else {
       out.parse_errors += 1;
@@ -337,7 +361,8 @@ pub async fn collect_text<L: LineSource>(
       out.parse_errors += 1;
       break "protocol_error";
     };
-    let counts = if sub.last_line_from_send() {
+    let from_send = sub.last_line_from_send();
+    let counts = if from_send {
       &mut out.send_events
     } else {
       &mut out.subscription_events
@@ -357,8 +382,6 @@ pub async fn collect_text<L: LineSource>(
     );
     let event_turn = text_field(&contexts, &["turn_id"]);
     let event_task = text_field(&contexts, &["task_id"]);
-    let msg = text_field(&[payload, &root], &["message_id", "assistant_message_id"])
-      .or_else(|| text_field(&[&payload["message"]], &["message_id", "id"]));
     let parent = text_field(
       &contexts,
       &[
@@ -369,38 +392,57 @@ pub async fn collect_text<L: LineSource>(
     );
     if session.is_some_and(|id| id != session_id) {
       out.unmatched_events += 1;
+      out.conflicting_events += 1;
       continue;
     }
+    let before_user = event_time_ms(&root, payload)
+      .zip(user_time_ms)
+      .is_some_and(|(event, user)| event < user);
     if event == "message.user" {
+      let msg = text_field(&[payload, &root], &["message_id", "user_message_id"])
+        .or_else(|| text_field(&[&payload["message"]], &["message_id", "id"]));
       if msg.or(parent) == Some(ack.message_id.as_str()) {
+        if user_time_ms.is_none() {
+          user_time_ms = event_time_ms(&root, payload);
+        }
         out.saw_user = true;
+        scoped_user_seen |= scoped_subscription && !from_send;
         if turn.is_none() {
           turn = event_turn.map(str::to_string);
         }
         if task.is_none() {
           task = event_task.map(str::to_string);
         }
-      } else if session == Some(session_id) || (session.is_none() && out.saw_user) {
+      } else if !before_user && (out.saw_user || (!scoped_subscription && session == Some(session_id))) {
         break "competing_turn";
       }
       continue;
     }
+    let scoped_current = scoped_user_seen && !from_send && !before_user;
     if event_turn.zip(turn.as_deref()).is_some_and(|(a, b)| a != b)
       || event_task.zip(task.as_deref()).is_some_and(|(a, b)| a != b)
       || parent.is_some_and(|id| id != ack.message_id)
     {
       out.unmatched_events += 1;
+      out.conflicting_events += 1;
       continue;
     }
     if event == "agent.status" {
       match text_field(&[payload, &root], &["activity_code"]) {
-        Some("idle" | "online") if !messages.is_empty() && messages.values().all(|m| m.done) => {
-          out.saw_idle = true;
-          settle_at.get_or_insert(Instant::now() + Duration::from_secs(1));
+        Some("idle" | "online") if !before_user && !messages.is_empty() => {
+          if messages.values().all(|m| m.done) {
+            out.saw_idle = true;
+            settle_at.get_or_insert(Instant::now() + Duration::from_secs(1));
+          } else if scoped_current {
+            idle_after_output = true;
+          }
         }
         Some("idle" | "online") | None => {}
         Some(_) => {
-          settle_at = None;
+          if !before_user {
+            idle_after_output = false;
+            settle_at = None;
+          }
         }
       }
       continue;
@@ -411,17 +453,39 @@ pub async fn collect_text<L: LineSource>(
     ) {
       continue;
     }
-    let Some(id) = msg.filter(|id| *id != ack.message_id) else {
+    let Some(id) = [&root["assistant_message_id"], &payload["assistant_message_id"], &root["message_id"],
+      &payload["message_id"], &payload["message"]["message_id"], &payload["message"]["id"]]
+      .into_iter().filter_map(Value::as_str).find(|id| !id.is_empty() && *id != ack.message_id) else {
       out.unmatched_events += 1;
+      out.missing_message_id_events += 1;
       continue;
     };
-    let linked = parent == Some(ack.message_id.as_str())
+    let explicit_link = parent == Some(ack.message_id.as_str())
       || event_turn.zip(turn.as_deref()).is_some_and(|(a, b)| a == b)
-      || event_task.zip(task.as_deref()).is_some_and(|(a, b)| a == b)
+      || event_task.zip(task.as_deref()).is_some_and(|(a, b)| a == b);
+    // The subscription can still deliver the previous turn while we wait for the current user event.
+    if scoped_subscription && !from_send && !scoped_current && !explicit_link {
+      if earlier_assistants.len() >= 64 && !earlier_assistants.contains(id) {
+        break "response_limit";
+      }
+      earlier_assistants.insert(id.to_string());
+      out.unmatched_events += 1;
+      out.outside_turn_events += 1;
+      continue;
+    }
+    let linked = explicit_link
       || (out.saw_user && session == Some(session_id))
-      || messages.contains_key(id);
+      || messages.contains_key(id)
+      // Only an assistant start on the isolated subscription can claim a new sparse event chain.
+      || (scoped_current && event == "delta.message_start");
+    if before_user || earlier_assistants.contains(id) {
+      out.unmatched_events += 1;
+      out.outside_turn_events += 1;
+      continue;
+    }
     if !linked {
       out.unmatched_events += 1;
+      out.unlinked_events += 1;
       continue;
     }
     if let Some(seq) = root["seq"].as_u64().filter(|seq| *seq > 0) {
@@ -434,10 +498,14 @@ pub async fn collect_text<L: LineSource>(
     }
     let message = messages.entry(id.to_string()).or_default();
     match event {
-      "delta.message_start" => settle_at = None,
-      "delta.text_append" if !message.done => {
+      "delta.message_start" => {
+        idle_after_output = false;
         settle_at = None;
-        if let Some(text) = text_field(&[payload, &root], &["text"]) {
+      }
+      "delta.text_append" if !message.done => {
+        idle_after_output = false;
+        settle_at = None;
+        if let Some(text) = text_field(&[payload, &root], &["text", "delta"]) {
           message.text.push_str(text);
           out.text_deltas += 1;
           if out.first_matched_delta_ms.is_none() {
@@ -447,6 +515,9 @@ pub async fn collect_text<L: LineSource>(
         }
       }
       "delta.message_done" | "message.assistant" => {
+        if event == "message.assistant" && (payload["display_text_ready"] == false || root["display_text_ready"] == false) {
+          continue;
+        }
         let status = text_field(&[payload, &root], &["status"]);
         match status {
           Some("completed" | "complete" | "done" | "finished" | "ok") | None => {}
@@ -459,6 +530,9 @@ pub async fn collect_text<L: LineSource>(
           message.text = text;
         }
         if !message.done {
+          out.first_delta_to_message_done_ms = out.first_matched_delta_ms.map(|first| {
+            (started.elapsed().as_millis() as u64).saturating_sub(first)
+          });
           settle_at = None;
           message.done = true;
         }
@@ -467,6 +541,10 @@ pub async fn collect_text<L: LineSource>(
     }
     if out.lines > 16_384 || message.text.len() > 512 * 1024 || order.len() > 64 {
       break "response_limit";
+    }
+    if idle_after_output && messages.values().all(|m| m.done) {
+      out.saw_idle = true;
+      settle_at.get_or_insert(Instant::now() + Duration::from_secs(1));
     }
   }
   .to_string();
@@ -519,11 +597,14 @@ mod tests {
   }
   use std::collections::VecDeque;
 
-  struct Scripted(VecDeque<Result<Option<String>, GatewayError>>);
+  struct Scripted(VecDeque<Result<Option<String>, GatewayError>>, bool);
 
   impl LineSource for Scripted {
     fn http_status(&self) -> Option<u16> {
       Some(200)
+    }
+    fn is_scoped_to(&self, session_id: &str) -> bool {
+      self.1 && session_id == "test-session"
     }
     async fn next_line(&mut self, _wait: Duration) -> Result<Option<String>, GatewayError> {
       if let Some(item) = self.0.pop_front() {
@@ -547,7 +628,54 @@ mod tests {
         .iter()
         .map(|line| Ok(Some((*line).to_string())))
         .collect(),
+      false,
     )
+  }
+
+  #[tokio::test]
+  async fn scoped_reply_uses_acked_user_anchor_and_ignores_the_previous_burst() {
+    let mut source = lines(&[
+      r#"{"type":"event","event":"message.user","message_id":"prior-user","payload":{"session_id":"test-session"}}"#,
+      r#"{"type":"event","event":"delta.message_start","message_id":"prior-reply"}"#,
+      r#"{"type":"event","event":"delta.text_append","message_id":"prior-reply","payload":{"text":"previous reply"}}"#,
+      r#"{"type":"event","event":"delta.message_done","message_id":"prior-reply"}"#,
+      r#"{"type":"event","event":"message.user","message_id":"user-1","ts_ms":200}"#,
+      r#"{"type":"event","event":"delta.message_start","message_id":"prior-reply"}"#,
+      r#"{"type":"event","event":"delta.message_start","message_id":"older-unknown","occurred_at_ms":100}"#,
+      r#"{"type":"event","event":"delta.message_start","message_id":"wrong-session","payload":{"session_id":"another"}}"#,
+      r#"{"type":"event","event":"delta.message_start","message_id":"assistant","payload":{"message_id":"user-1"}}"#,
+      r#"{"type":"event","event":"delta.text_append","message_id":"assistant","payload":{"text":"current "}}"#,
+      r#"{"type":"event","event":"message.assistant","message_id":"assistant","payload":{"display_text_ready":false}}"#,
+      r#"{"type":"event","event":"delta.text_append","message_id":"assistant","payload":{"delta":"reply"}}"#,
+      r#"{"type":"event","event":"agent.status","payload":{"activity_code":"idle"}}"#,
+      r#"{"type":"event","event":"delta.message_done","message_id":"assistant"}"#,
+    ]);
+    source.1 = true;
+    let mut notified = 0;
+    let result = collect_text(&mut source, &ack(), "test-session", Duration::from_secs(2), Duration::from_millis(100), || notified += 1).await;
+    assert_eq!(result.ended_by, "done");
+    assert_eq!(result.text, "current reply");
+    assert_eq!(result.text_deltas, 2);
+    assert!(result.first_delta_to_message_done_ms.is_some());
+    assert_eq!(result.outside_turn_events, 5);
+    assert_eq!(result.conflicting_events, 1);
+    assert_eq!(notified, 1);
+  }
+
+  #[tokio::test]
+  async fn unscoped_or_unanchored_events_do_not_create_a_reply() {
+    for (scoped, user) in [(false, "user-1"), (true, "different-user")] {
+      let user = format!(r#"{{"type":"event","event":"message.user","message_id":"{user}"}}"#);
+      let mut source = lines(&[
+        &user,
+        r#"{"type":"event","event":"delta.message_start","message_id":"assistant"}"#,
+        r#"{"type":"event","event":"delta.text_append","message_id":"assistant","payload":{"text":"unlinked"}}"#,
+      ]);
+      source.1 = scoped;
+      let result = collect_text(&mut source, &ack(), "test-session", Duration::from_millis(30), Duration::from_millis(5), || panic!("unlinked notification")).await;
+      assert!(result.text.is_empty());
+      assert_eq!(result.text_deltas, 0);
+    }
   }
 
   #[tokio::test]
@@ -613,7 +741,7 @@ mod tests {
         "protocol_error",
       ),
     ] {
-      let mut src = Scripted(VecDeque::from([event]));
+      let mut src = Scripted(VecDeque::from([event]), false);
       let result = collect_text(
         &mut src,
         &ack(),

@@ -463,6 +463,7 @@ where
         send_response: None,
         early_send_events: std::collections::VecDeque::new(),
         last_line_from_send: false,
+        session_scope: None,
         socket_closed: false,
         wire_trace: None,
       }),
@@ -497,6 +498,7 @@ pub struct Subscription<S = MaybeTlsStream<TcpStream>> {
   send_response: Option<(u64, ResponseLines)>,
   early_send_events: std::collections::VecDeque<String>,
   last_line_from_send: bool,
+  pub(crate) session_scope: Option<String>,
   socket_closed: bool,
   wire_trace: Option<crate::wire_trace::WireTrace>,
 }

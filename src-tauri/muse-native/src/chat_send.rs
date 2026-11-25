@@ -201,6 +201,9 @@ pub trait LineSource {
   fn last_line_from_send(&self) -> bool {
     false
   }
+  fn is_scoped_to(&self, _session_id: &str) -> bool {
+    false
+  }
   async fn next_line(&mut self, wait: Duration) -> Result<Option<String>, GatewayError>;
 }
 
@@ -218,6 +221,10 @@ where
 
   fn last_line_from_send(&self) -> bool {
     Subscription::last_line_from_send(self)
+  }
+
+  fn is_scoped_to(&self, session_id: &str) -> bool {
+    self.session_scope.as_deref() == Some(session_id)
   }
 
   async fn next_line(&mut self, wait: Duration) -> Result<Option<String>, GatewayError> {
@@ -389,10 +396,12 @@ impl IsolatedProbeRoute {
       return Err(ProbeRouteError { phase, error, rejection: registration_rejection(&body) });
     }
     // The registered connection supplies the node identity; the subscribe body scopes its events.
-    gateway
+    let mut subscription = gateway
       .subscribe(crate::collect::isolated_subscription_request(&self.session_id))
       .await
-      .map_err(|error| ProbeRouteError { phase: "subscribe", error, rejection: None })
+      .map_err(|error| ProbeRouteError { phase: "subscribe", error, rejection: None })?;
+    subscription.session_scope = Some(self.session_id.clone());
+    Ok(subscription)
   }
 }
 

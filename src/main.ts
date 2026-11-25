@@ -163,6 +163,17 @@ function formatStreamEventCounts(label: string, counts: SpikeStreamEventCounts):
   return `${label} 用户 ${counts.user} · 开始 ${counts.start} · 增量 ${counts.delta} · 结束 ${counts.done} · 活动 ${counts.activity} · 其他 ${counts.other}`;
 }
 
+function formatUnmatchedEvents(diagnostics: NonNullable<SpikeFingerprintSendRecord["diagnostics"]>): string {
+  if (!diagnostics.unmatchedEvents) return "";
+  return `<div class="hint">未关联明细 · 本轮范围外 ${diagnostics.outsideTurnEvents} · 标识冲突 ${diagnostics.conflictingEvents} · 缺助手标识 ${diagnostics.missingMessageIdEvents} · 缺关联依据 ${diagnostics.unlinkedEvents}</div>`;
+}
+
+function formatMessageTiming(diagnostics: NonNullable<SpikeFingerprintSendRecord["diagnostics"]>): string {
+  const first = diagnostics.firstMatchedDeltaMs;
+  const span = diagnostics.firstDeltaToMessageDoneMs;
+  return `开始采集至首个关联增量 ${first === null ? "未观测" : `${first} ms`} · 首个增量至消息结束 ${span === null ? "未观测" : `${span} ms`}`;
+}
+
 interface SpikeFingerprintSendRecord {
   probeId: string; sendStatus: string; textDone: boolean;
   sampleUsed: boolean; error: string | null;
@@ -170,7 +181,10 @@ interface SpikeFingerprintSendRecord {
     endedBy: string; lines: number; textDeltas: number; readTimeouts: number;
     sendEvents: SpikeStreamEventCounts; subscriptionEvents: SpikeStreamEventCounts;
     firstMatchedDeltaMs: number | null;
+    firstDeltaToMessageDoneMs: number | null;
     parseErrors: number; unmatchedEvents: number; sawUser: boolean;
+    outsideTurnEvents: number; conflictingEvents: number;
+    missingMessageIdEvents: number; unlinkedEvents: number;
     assistantMessages: number; sawIdle: boolean;
   } | null;
 }
@@ -1245,7 +1259,7 @@ function spikeDiagInnerHtml(accountUuid: string | undefined = pickWatchAccount()
           .map(
             (s) =>
               `<div>探针 ${escapeHtml(s.probeId)}：${escapeHtml(s.sendStatus)}${s.textDone ? "（回复完成）" : ""}${s.sampleUsed ? "（入样）" : ""}${s.error ? `｜${escapeHtml(s.error)}` : ""}</div>
-              ${s.diagnostics ? `<div class="hint">${escapeHtml(s.diagnostics.endedBy)} · 事件行 ${s.diagnostics.lines} · 文本增量 ${s.diagnostics.textDeltas} · 读取超时 ${s.diagnostics.readTimeouts} · 解析错误 ${s.diagnostics.parseErrors} · 未关联事件 ${s.diagnostics.unmatchedEvents} · 用户事件 ${s.diagnostics.sawUser ? "已关联" : "未观察"} · 助手消息 ${s.diagnostics.assistantMessages} · 空闲 ${s.diagnostics.sawIdle ? "已观察" : "未观察"}</div><div class="hint">${formatStreamEventCounts("发送流", s.diagnostics.sendEvents)}</div><div class="hint">${formatStreamEventCounts("订阅流", s.diagnostics.subscriptionEvents)} · 开始采集至首个关联增量 ${s.diagnostics.firstMatchedDeltaMs ?? "未观测"} ms</div>` : ""}`
+              ${s.diagnostics ? `<div class="hint">${escapeHtml(s.diagnostics.endedBy)} · 事件行 ${s.diagnostics.lines} · 文本增量 ${s.diagnostics.textDeltas} · 读取超时 ${s.diagnostics.readTimeouts} · 解析错误 ${s.diagnostics.parseErrors} · 未关联事件 ${s.diagnostics.unmatchedEvents} · 用户事件 ${s.diagnostics.sawUser ? "已关联" : "未观察"} · 助手消息 ${s.diagnostics.assistantMessages} · 空闲 ${s.diagnostics.sawIdle ? "已观察" : "未观察"}</div>${formatUnmatchedEvents(s.diagnostics)}<div class="hint">${formatStreamEventCounts("发送流", s.diagnostics.sendEvents)}</div><div class="hint">${formatStreamEventCounts("订阅流", s.diagnostics.subscriptionEvents)}</div><div class="hint">${formatMessageTiming(s.diagnostics)}</div>` : ""}`
           )
           .join("")
       : "";
