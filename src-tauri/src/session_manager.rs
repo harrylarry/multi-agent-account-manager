@@ -1871,16 +1871,23 @@ impl SessionManager {
           // Swift，再让隐藏 WebView 联网。否则「Rust 有代理、Swift 表里
           // 还没有这个账号」会被统一解析器判为未知而跳过——那是正确行为，
           // 但会让冷账号的额度永远同步不到，所以这里主动补一次下发。
-          for target in &targets {
+          let mut eligible = Vec::with_capacity(targets.len());
+          for target in targets {
             let pid = crate::providers::ProviderId::parse(&target.provider_id);
             let setting = match pid {
               Some(pid) => mgr.proxy_setting(pid, &target.uuid).await,
               None => None,
             };
-            let _ = crate::webview_proxy::push(&app_handle, &target.uuid, setting.as_ref()).await;
+            let outcome = crate::webview_proxy::push(&app_handle, &target.uuid, setting.as_ref()).await;
+            if outcome.applied {
+              eligible.push(target);
+            }
+          }
+          if eligible.is_empty() {
+            return;
           }
           if let Ok(results) =
-            crate::platform::ios::sync_account_quotas(&app_handle, targets).await
+            crate::platform::ios::sync_account_quotas(&app_handle, eligible).await
           {
             mgr.apply_synced_metadata(&app_handle, results).await;
           }
