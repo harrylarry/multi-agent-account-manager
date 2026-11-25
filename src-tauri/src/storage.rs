@@ -196,6 +196,10 @@ pub struct AccountRecord {
   pub has_unread_reply: bool,
   #[serde(default, skip_serializing_if = "Option::is_none")]
   pub last_task_reply_at_ms: Option<u64>,
+  #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+  pub muse_unread_counts: BTreeMap<Uuid, u64>,
+  #[serde(default, skip_serializing_if = "Option::is_none")]
+  pub muse_unread_status: Option<String>,
   #[serde(default)]
   pub task_notifications: bool,
   #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -443,6 +447,8 @@ fn migrate_from_value(root: Value) -> Result<(AccountsStoreFile, bool), String> 
         auth_state,
         has_unread_reply: false,
         last_task_reply_at_ms: item_obj.get("lastTaskReplyAtMs").and_then(Value::as_u64),
+        muse_unread_counts: item_obj.get("museUnreadCounts").and_then(|value| serde_json::from_value(value.clone()).ok()).unwrap_or_default(),
+        muse_unread_status: item_obj.get("museUnreadStatus").and_then(Value::as_str).map(str::to_string),
         task_notifications: item_obj.get("taskNotifications").and_then(Value::as_bool).unwrap_or(false),
         task_notice_keys: item_obj.get("taskNoticeKeys")
           .and_then(|value| serde_json::from_value(value.clone()).ok()).unwrap_or_default(),

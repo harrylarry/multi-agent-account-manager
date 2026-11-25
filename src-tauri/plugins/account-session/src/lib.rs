@@ -391,6 +391,10 @@ pub enum IosSessionEvent {
     provider_id: String,
     uuid: String,
   },
+  #[serde(rename_all = "camelCase")]
+  ForegroundTaskCatchUp {
+    account_ids: Vec<String>,
+  },
 }
 
 #[cfg(target_os = "ios")]
@@ -799,6 +803,18 @@ pub async fn transfer_profile_cookies(
 pub struct ProfileCookieSummary {
   pub count: usize,
   pub next_expiry: Option<f64>,
+  pub cookie_export_json: Option<String>,
+}
+
+#[cfg(target_os = "ios")]
+pub async fn copy_profile_cookies(
+  app: &AppHandle, provider: &str, uuid: &str, text: &str, count: usize,
+) -> Result<(), String> {
+  let bridge = app.state::<IosSessionBridge<tauri::Wry>>();
+  bridge.0.run_mobile_plugin_async::<ProfileCookieSummary>(
+    "transferProfileCookies",
+    serde_json::json!({ "provider": provider, "uuid": uuid, "clipboardText": text, "clipboardCount": count }),
+  ).await.map(|_| ()).map_err(|error| error.to_string())
 }
 
 #[cfg(target_os = "ios")]

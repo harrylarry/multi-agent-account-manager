@@ -2476,6 +2476,10 @@ function renderTasks(view: Extract<ModalMode, { kind: "tasks" }>): string {
     working: "任务进行中", idle: "未见任务正在生成", approval: "等待审批", unknown: "暂不可判定",
   };
   const recent = current?.lastTaskReplyAtMs;
+  const unreadStatus: Record<string, string> = {
+    unread: "Muse 返回未读", zero: "服务已返回未读计数，本次为零",
+    unavailable: "本次未收到未读计数", network_or_protocol: "未读查询失败", timeout: "未读查询超时",
+  };
   return `
     <div class="inline-modal" role="dialog" aria-modal="true" aria-labelledby="account-task-title">
       <div class="modal-card">
@@ -2484,6 +2488,7 @@ function renderTasks(view: Extract<ModalMode, { kind: "tasks" }>): string {
         ${observation?.observedAtMs ? `<div class="modal-desc">最近一次成功检测 ${new Date(observation.observedAtMs).toLocaleString()} · ${observation.source === "native" ? "原生" : "停驻页面"}</div>` : ""}
         ${current?.pendingApprovalCount != null ? `<div class="modal-desc">待审批 ${current.pendingApprovalCount} 项</div>` : ""}
         ${recent ? `<div class="modal-desc">最近发现回复 ${new Date(recent).toLocaleString()}</div>` : ""}
+        ${current?.museUnreadStatus ? `<div class="modal-desc">回前台补查 · ${unreadStatus[current.museUnreadStatus] ?? "暂不可判定"}</div>` : ""}
         ${note ? `<div class="modal-desc">${escapeHtml(note)}</div>` : ""}
         ${current?.quotaObservation ? (() => {
           const quota = current.quotaObservation;
@@ -2804,14 +2809,14 @@ async function accountCookieAction(action: "preview" | "import" | "export"): Pro
     if (action === "preview") {
       view.preview = await invoke<CookiePreview>("preview_account_cookies", { providerId, raw });
     } else {
-      const count = await invoke<number>("transfer_account_cookies", {
+      const { count, skipped } = await invoke<{ count: number; skipped: number }>("transfer_account_cookies", {
         uuid, providerId, raw: action === "import" ? raw : null,
       });
       view.preview = null;
       view.imported = action === "import" || view.imported;
       view.message = action === "import"
         ? `已写入 ${count} 条 Cookie，请打开账号验证登录。`
-        : `已复制 ${count} 条 Cookie，60 秒后到期。`;
+        : `已复制 ${count} 条 Cookie，60 秒后到期。${skipped ? `其中有 ${skipped} 条本机记录未导出，可能需要重新登录。` : ""}`;
     }
   } catch (error) {
     view.preview = null;

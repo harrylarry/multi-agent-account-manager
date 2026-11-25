@@ -11,6 +11,8 @@ pub struct MuseSession {
   pub updated_at_ms: Option<u64>,
   pub pinned: bool,
   pub archived: bool,
+  #[serde(skip)]
+  pub unread_count: Option<u64>,
 }
 
 #[cfg(target_os = "ios")]
@@ -18,18 +20,61 @@ pub async fn fetch(
   egress: &crate::egress::AccountEgress,
   cookies: &muse_native_client::cookie::SessionCookies,
 ) -> Result<Vec<MuseSession>, String> {
+  fetch_list(egress, cookies, "/api/session/list").await
+}
+
+#[cfg(target_os = "ios")]
+async fn fetch_list(
+  egress: &crate::egress::AccountEgress,
+  cookies: &muse_native_client::cookie::SessionCookies,
+  path: &str,
+) -> Result<Vec<MuseSession>, String> {
   use muse_native_client::transport::{HttpRequest, Service};
   let mut gateway = Box::pin(egress.connect(cookies)).await.map_err(|_| "无法连接 Muse 会话网关")?;
   let (status, body) = gateway.request(HttpRequest {
     service: Service::Daemon,
     verb: "GET".into(),
-    path: "/api/session/list".into(),
+    path: path.into(),
     headers: Vec::new(),
     body: Vec::new(),
   }).await.map_err(|_| "Muse 会话查询未完成")?;
   if !(200..300).contains(&status) { return Err(format!("会话列表请求失败（HTTP {status}）")); }
   if body.len() > 2 * 1024 * 1024 { return Err("会话列表响应过大".into()); }
   parse_list(&body)
+}
+
+#[cfg(target_os = "ios")]
+pub async fn fetch_unread(
+  egress: &crate::egress::AccountEgress,
+  cookies: &muse_native_client::cookie::SessionCookies,
+) -> Result<Option<std::collections::BTreeMap<Uuid, u64>>, String> {
+  let sessions = Box::pin(fetch_list(egress, cookies, "/api/session/list?include_peer_sidechats=true")).await?;
+  if !sessions.iter().any(|session| session.unread_count.is_some()) {
+    return Ok(None);
+  }
+  Ok(Some(sessions.into_iter().filter_map(|session| {
+    session.unread_count.map(|count| (session.id, count))
+  }).collect()))
+}
+
+#[cfg(any(target_os = "ios", test))]
+pub fn update_unread_counts(
+  previous: &mut std::collections::BTreeMap<Uuid, u64>,
+  observed: &std::collections::BTreeMap<Uuid, u64>,
+) -> bool {
+  let mut increased = false;
+  for (&id, &count) in observed {
+    if count == 0 {
+      previous.remove(&id);
+    } else {
+      increased |= count > previous.insert(id, count).unwrap_or(0);
+    }
+  }
+  // Keep a bounded baseline. Eviction is only for sessions absent from this sample.
+  if previous.len() > 2048 {
+    previous.retain(|id, _| observed.contains_key(id));
+  }
+  increased
 }
 
 #[cfg(any(target_os = "ios", test))]
@@ -64,6 +109,7 @@ pub fn parse_list(raw: &[u8]) -> Result<Vec<MuseSession>, String> {
         || field(&["pin_state", "pinState"]).is_some_and(|value| value.eq_ignore_ascii_case("pinned")),
       archived: ["archived", "is_archived", "isArchived"].iter().any(|key| item[*key] == true)
         || field(&["status", "state"]).is_some_and(|value| value.eq_ignore_ascii_case("archived")),
+      unread_count: item["unread_count"].as_u64(),
     });
   }
   sessions.sort_by_key(|session| (session.archived, !session.pinned, std::cmp::Reverse(session.updated_at_ms)));
@@ -75,15 +121,30 @@ mod tests {
   use super::*;
 
   #[test]
+  fn catches_new_server_unread_and_deduplicates_repeated_reads() {
+    let id = Uuid::from_u128(1);
+    let other = Uuid::from_u128(2);
+    let mut previous = Default::default();
+    assert!(update_unread_counts(&mut previous, &[(id, 1)].into()));
+    assert!(!update_unread_counts(&mut previous, &[(id, 1)].into()));
+    assert!(!update_unread_counts(&mut previous, &[(other, 0)].into()));
+    assert!(!update_unread_counts(&mut previous, &[(id, 0)].into()));
+    assert!(update_unread_counts(&mut previous, &[(id, 1)].into()));
+    assert!(update_unread_counts(&mut previous, &[(other, 1)].into()));
+  }
+
+  #[test]
   fn parses_valid_sessions_without_treating_an_error_as_empty() {
     let raw = br#"{"ok":true,"result":{"sessions":[
       {"session_id":"6ea0907b-13b5-448b-bcc1-5659db9c7ae6","title":"regular"},
-      {"sessionId":"bd097124-f7a3-46b4-8eb5-370db511c53d","displayTitle":"pinned","updatedAt":1777000000,"isPinned":true}
+      {"sessionId":"bd097124-f7a3-46b4-8eb5-370db511c53d","displayTitle":"pinned","updatedAt":1777000000,"isPinned":true,"unread_count":2}
     ]}}"#;
     let result = parse_list(raw).unwrap();
     assert_eq!(result.len(), 2);
     assert_eq!(result[0].title, "pinned");
     assert_eq!(result[0].updated_at_ms, Some(1_777_000_000_000));
+    assert_eq!(result[0].unread_count, Some(2));
+    assert_eq!(result[1].unread_count, None);
     assert!(parse_list(br#"{"sessions":[]}"#).unwrap().is_empty());
     assert!(parse_list(br#"{"ok":false,"sessions":[]}"#).is_err());
     assert!(parse_list(br#"{"sessions":[{"id":"../../"}]}"#).is_err());

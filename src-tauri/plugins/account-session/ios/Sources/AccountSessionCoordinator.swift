@@ -467,4 +467,10 @@ final class AccountSessionCoordinator {
     ]
     ch.send(obj)
   }
+
+  func emitForegroundTaskCatchUp(accountIds: [String]) {
+    guard !accountIds.isEmpty else { return }
+    let channel: Channel? = lock.withLock { eventChannel }
+    channel?.send(["kind": "foregroundTaskCatchUp", "accountIds": accountIds])
+  }
 }

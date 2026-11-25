@@ -131,6 +131,35 @@ fn flag(value: &str) -> Option<bool> {
   }
 }
 
+#[cfg(any(target_os = "ios", test))]
+pub fn prepare_export(
+  cookies: Vec<AccountCookie>, provider: &str, now: f64,
+) -> Result<(zeroize::Zeroizing<String>, usize, usize), String> {
+  let mut supported = Vec::new();
+  let mut seen = std::collections::HashSet::new();
+  let count = cookies.len();
+  for mut cookie in cookies {
+    // WebKit may explicitly report an unset policy.
+    if cookie.same_site.as_deref().is_some_and(|site| site.is_empty() || site.eq_ignore_ascii_case("default")) {
+      cookie.same_site = None;
+    }
+    let entry = zeroize::Zeroizing::new(serde_json::to_string(&[cookie]).map_err(|_| "无法编码本机 Cookie")?);
+    let Ok(mut validated) = parse(&entry, provider, now) else { continue; };
+    let Some(cookie) = validated.pop() else { continue; };
+    if !seen.insert((cookie.name.clone(), cookie.domain.trim_start_matches('.').to_owned(), cookie.path.clone())) {
+      continue;
+    }
+    supported.push(cookie);
+  }
+  let written = supported.len();
+  if written == 0 {
+    return Err("没有可安全导出并重新导入的 Cookie，请打开账号检查登录".into());
+  }
+  let text = zeroize::Zeroizing::new(serde_json::to_string(&supported).map_err(|_| "无法编码本机 Cookie")?);
+  parse(&text, provider, now).map_err(|error| format!("Cookie 导出未复制：{error}"))?;
+  Ok((text, written, count - written))
+}
+
 #[cfg(test)]
 mod tests {
   use super::*;
@@ -157,5 +186,19 @@ mod tests {
     assert!(error(".muse.ai\tTRUE\t/\tTRUE\t200\tsession\tsample").contains("已过期"));
     assert!(error("broken").contains("格式"));
     assert!(parse("\u{feff}Cookie: session=sample", "muse", 300.0).is_ok());
+  }
+
+  #[test]
+  fn exported_webkit_rows_pass_the_same_import_parser() {
+    let rows = serde_json::from_str(r#"[
+      {"domain":"muse.ai","name":"session","value":"abc","path":"/","secure":true,"sameSite":"Default"},
+      {"domain":".muse.ai","name":"session","value":"duplicate","path":"/"},
+      {"domain":"muse.ai","name":"invalid","value":"a;b","path":"/"},
+      {"domain":"muse.ai","name":"expired","value":"abc","path":"/","expirationDate":20},
+      {"domain":"muse.ai","name":"other","value":"def","path":"/","secure":true,"sameSite":"none"}
+    ]"#).unwrap();
+    let (export, written, skipped) = prepare_export(rows, "muse", 100.0).unwrap();
+    assert_eq!((written, skipped), (2, 3));
+    assert_eq!(parse(&export, "muse", 100.0).unwrap().len(), 2);
   }
 }

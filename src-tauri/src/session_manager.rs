@@ -967,6 +967,8 @@ pub struct SessionManager {
   pub(crate) proxy_write_lock: Mutex<()>,
   #[cfg(target_os = "ios")]
   quota_sync_lock: Mutex<()>,
+  #[cfg(target_os = "ios")]
+  unread_catch_up_lock: Mutex<()>,
   inner: Mutex<InnerState>,
 }
 
@@ -990,6 +992,8 @@ impl SessionManager {
       proxy_write_lock: Mutex::new(()),
       #[cfg(target_os = "ios")]
       quota_sync_lock: Mutex::new(()),
+      #[cfg(target_os = "ios")]
+      unread_catch_up_lock: Mutex::new(()),
       inner: Mutex::new(InnerState {
         store_path,
         app_data_dir,
@@ -1053,7 +1057,7 @@ impl SessionManager {
     uuid: &str,
     cookies: Option<&[crate::account_cookies::AccountCookie]>,
     inspect: bool,
-  ) -> Result<crate::platform::ios::ProfileCookieSummary, String> {
+  ) -> Result<(crate::platform::ios::ProfileCookieSummary, usize), String> {
     let _sync = self.quota_sync_lock.lock().await;
     let locked = self.inner.lock().await;
     let key = AccountKey { provider_id: provider, uuid: uuid.to_string() };
@@ -1063,7 +1067,14 @@ impl SessionManager {
     {
       return Err("账号不存在、正在清理或需要先解决归属冲突".to_string());
     }
-    crate::platform::ios::transfer_profile_cookies(app, provider.as_str(), uuid, cookies, inspect).await
+    let mut response = crate::platform::ios::transfer_profile_cookies(app, provider.as_str(), uuid, cookies, inspect).await?;
+    if inspect || cookies.is_some() { return Ok((response, 0)); }
+    let raw = zeroize::Zeroizing::new(response.cookie_export_json.take().ok_or("无法读取 Cookie 导出数据")?);
+    let entries = serde_json::from_str(&raw).map_err(|_| "无法读取 Cookie 导出格式")?;
+    let (text, count, skipped) = crate::account_cookies::prepare_export(entries, provider.as_str(), now_ms() as f64 / 1000.0)?;
+    crate::platform::ios::copy_profile_cookies(app, provider.as_str(), uuid, &text, count).await?;
+    response.count = count;
+    Ok((response, skipped))
   }
 
   pub async fn restore_account_backup(
@@ -1118,6 +1129,7 @@ impl SessionManager {
         created_at_ms: saved.created_at_ms, auto_alias: false,
         avatar_url: None, quota_text: None, quota_percent: None, quota_detail: None, quota_observation: None,
         auth_state: AuthState::Unknown, has_unread_reply: false, last_task_reply_at_ms: None,
+        muse_unread_counts: Default::default(), muse_unread_status: None,
         task_notifications: false, task_notice_keys: Vec::new(), pending_approval_count: None, proxy,
       });
     }
@@ -1279,6 +1291,75 @@ impl SessionManager {
       crate::platform::ios::post_task_notification(app, &key, kind).await;
     }
     Ok(())
+  }
+
+  #[cfg(target_os = "ios")]
+  async fn catch_up_muse_unread(&self, app: &AppHandle, account_ids: &[String]) {
+    let Ok(_batch) = self.unread_catch_up_lock.try_lock() else { return; };
+    let cancel = app.state::<Arc<crate::probe_cancel::ProbeCancel>>();
+    for uuid in account_ids.iter().filter_map(|uuid| normalize_uuid(uuid)).take(8) {
+      if !crate::platform::ios::automatic_task_polling_available(app).await.unwrap_or(false) {
+        return;
+      }
+      let proxy_lock = self.proxy_write_lock.lock().await;
+      let (mut token, _guard) = cancel.register(&uuid, "muse_unread_catch_up");
+      let sequence = self.current_seq.load(Ordering::SeqCst);
+      let snapshot = self.get_snapshot().await;
+      drop(proxy_lock);
+      let Some(account) = snapshot.accounts.iter().find(|account| account.provider_id == ProviderId::Muse
+        && account.uuid == uuid && account.auth_state == AuthState::Authenticated
+      ) else { continue; };
+      if snapshot.active_account.is_some() || snapshot.switching_account.is_some()
+        || snapshot.conflicts.iter().any(|entry| entry.uuid == uuid)
+        || snapshot.pending_cleanup.iter().any(|key| key.uuid == uuid) {
+        continue;
+      }
+      let query = Box::pin(async {
+        let header = zeroize::Zeroizing::new(crate::muse_native::cookie_header_for(app, &uuid).await?);
+        if header.is_empty() { return Err("缺少可用登录态".to_string()); }
+        let cookies = muse_native_client::cookie::SessionCookies::from_header(&header);
+        let egress = crate::egress::resolve_for_app(app, account.proxy.as_ref())?;
+        Box::pin(crate::muse_sessions::fetch_unread(&egress, &cookies)).await
+      });
+      let result = tokio::select! {
+        biased;
+        _ = token.cancelled() => continue,
+        result = tokio::time::timeout(std::time::Duration::from_secs(18), query) => result,
+      };
+      let mut locked = self.inner.lock().await;
+      if self.current_seq.load(Ordering::SeqCst) != sequence || token.is_cancelled() {
+        continue;
+      }
+      let Some(index) = locked.store.accounts.iter().position(|account| account.provider_id == ProviderId::Muse
+        && account.uuid == uuid && account.auth_state == AuthState::Authenticated
+      ) else { continue; };
+      let account = &mut locked.store.accounts[index];
+      let previous = account.clone();
+      let status = match result {
+        Ok(Ok(Some(counts))) => {
+          let new_reply = crate::muse_sessions::update_unread_counts(&mut account.muse_unread_counts, &counts);
+          if new_reply && !account.has_unread_reply {
+            account.has_unread_reply = true;
+            account.last_task_reply_at_ms = Some(now_ms());
+          }
+          if counts.values().any(|count| *count > 0) { "unread" } else { "zero" }
+        }
+        Ok(Ok(None)) => "unavailable",
+        Ok(Err(_)) => "network_or_protocol",
+        Err(_) => "timeout",
+      };
+      account.muse_unread_status = Some(status.into());
+      if *account == previous { continue; }
+      if save_store_atomic(&locked.store_path, &locked.store).is_err() {
+        locked.store.accounts[index] = previous;
+        continue;
+      }
+      let snapshot = Self::snapshot_from_locked(&locked);
+      drop(locked);
+      self.emit_snapshot(app, &snapshot);
+      let any_unread = snapshot.accounts.iter().any(|account| account.has_unread_reply);
+      let _ = crate::platform::ios::set_unread_badge(app, any_unread).await;
+    }
   }
 
   fn snapshot_from_locked(locked: &InnerState) -> ManagerSnapshot {
@@ -1773,6 +1854,8 @@ impl SessionManager {
         quota_observation: None,
         auth_state: AuthState::LoggedOut,
         has_unread_reply: false,
+        muse_unread_counts: Default::default(),
+        muse_unread_status: None,
         last_task_reply_at_ms: None,
         task_notifications: false,
         task_notice_keys: Vec::new(),
@@ -3911,6 +3994,9 @@ impl SessionManager {
       // (0.1.16: the active account never reaches here — the Swift
       // coordinator skips it). Mark it unread in the manager list;
       // the flag clears when the account is opened (open_ios_session).
+      IosSessionEvent::ForegroundTaskCatchUp { account_ids } => {
+        Box::pin(self.catch_up_muse_unread(app, &account_ids)).await;
+      }
       IosSessionEvent::TaskReplyDetected {
         provider_id,
         uuid,

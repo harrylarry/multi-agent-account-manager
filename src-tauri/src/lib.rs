@@ -511,7 +511,7 @@ async fn transfer_account_cookies(
   provider_id: String,
   uuid: String,
   raw: Option<String>,
-) -> Result<usize, String> {
+) -> Result<serde_json::Value, String> {
   #[cfg(target_os = "ios")]
   {
     let provider = providers::ProviderId::parse(&provider_id).ok_or("服务标识无效")?;
@@ -520,7 +520,8 @@ async fn transfer_account_cookies(
     if cookies.is_some() {
       cancel.cancel_account(&uuid);
     }
-    Ok(mgr.with_cookie_profile(&app, provider, &uuid, cookies.as_deref(), false).await?.count)
+    let (result, skipped) = mgr.with_cookie_profile(&app, provider, &uuid, cookies.as_deref(), false).await?;
+    Ok(serde_json::json!({ "count": result.count, "skipped": skipped }))
   }
   #[cfg(not(target_os = "ios"))]
   {
@@ -668,7 +669,7 @@ async fn inspect_account_cookies(
   {
     let provider = providers::ProviderId::parse(&provider_id).ok_or("服务标识无效")?;
     let uuid = storage::normalize_uuid(&uuid).ok_or("账号标识无效")?;
-    let info = mgr.with_cookie_profile(&app, provider, &uuid, None, true).await?;
+    let (info, _) = mgr.with_cookie_profile(&app, provider, &uuid, None, true).await?;
     Ok(serde_json::json!({ "count": info.count, "nextExpiry": info.next_expiry }))
   }
   #[cfg(not(target_os = "ios"))]

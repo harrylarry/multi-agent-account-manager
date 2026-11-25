@@ -51,6 +51,7 @@ export interface AccountRecord {
   lastTaskReplyAtMs?: number | null;
   taskNotifications?: boolean;
   pendingApprovalCount?: number | null;
+  museUnreadStatus?: string | null;
 }
 
 export interface ConflictItem {

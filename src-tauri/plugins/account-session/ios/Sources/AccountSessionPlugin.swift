@@ -78,6 +78,8 @@ private struct TransferProfileCookiesArgs: Decodable {
   let provider: String
   let cookies: [Entry]?
   let inspect: Bool?
+  let clipboardText: String?
+  let clipboardCount: Int?
 }
 
 private struct TaskNotificationArgs: Decodable {
@@ -461,6 +463,14 @@ class AccountSessionPlugin: Plugin {
         invoke.reject("请关闭该账号会话后重试")
         return
       }
+      if let text = args.clipboardText, let count = args.clipboardCount {
+        UIPasteboard.general.setItems(
+          [["public.utf8-plain-text": text]],
+          options: [.localOnly: true, .expirationDate: Date().addingTimeInterval(60)]
+        )
+        invoke.resolve(["count": count])
+        return
+      }
       func allowed(_ domain: String) -> Bool {
         let host = domain.trimmingCharacters(in: CharacterSet(charactersIn: ".")).lowercased()
         return domains.contains { host == $0 || host.hasSuffix("." + $0) }
@@ -575,11 +585,8 @@ class AccountSessionPlugin: Plugin {
         invoke.reject("Cookie 导出失败")
         return
       }
-      UIPasteboard.general.setItems(
-        [["public.utf8-plain-text": text]],
-        options: [.localOnly: true, .expirationDate: Date().addingTimeInterval(60)]
-      )
-      invoke.resolve(["count": cookies.count])
+      // The trusted Rust bridge validates the document against the import parser.
+      invoke.resolve(["count": cookies.count, "cookieExportJson": text])
     }
   }
 
