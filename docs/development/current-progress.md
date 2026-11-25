@@ -10,7 +10,7 @@
 | --- | --- | --- |
 | Muse 认证、订阅、审批、额度 | 旧版真机已有 Noise 握手、Ping、订阅、空审批列表与额度证据，详见 PR #16。 | 新包回归。有待审批项的真实样本继续单独记录。 |
 | Muse 隔离发送、实时接收与模型指纹 | `8b7eb0a` 前台 `DEVICE_VERIFIED`。3 次 ACK，三条分别关联 72、79、80 个文本增量，均经流确认 `done` 并参加 lmfpd 校准评分。历史恢复路径已有独立真机证据。 | 退后台取消、锁屏设置恢复、原正常会话无污染的网页侧对照。 |
-| 原生代理与 WebView | `7588dca` 的 SOCKS5、HTTP CONNECT、HTTPS CONNECT 真机原生端到端 `DEVICE_VERIFIED`，均 `ready`、握手完成、Ping 200。受控 reqwest 测试覆盖 SOCKS5 远端解析与代理拒绝时无直连。 | 当前包重启后代理与凭据持久化、真机故障阻断、账号切换隔离及 WebView 与后台额度同步 `UNVERIFIED`。 |
+| 原生代理与 WebView | `7588dca` 的三协议原生端到端与 SOCKS5 重启持久化 `DEVICE_VERIFIED`。错误代理密码下两种原生探针均未连通。受控 reqwest 测试覆盖 SOCKS5 远端解析与代理拒绝时无直连。 | 故障时真机出口观测、账号切换隔离、WebView 与后台额度同步 `UNVERIFIED`。 |
 | VM 租约与后台 WSS | 旧版真机已取得租约。历史后台观测出现断连，PR #16 保留原始时间线。 | 租约到期与续租、新包锁屏及回前台恢复 `UNVERIFIED`。 |
 | Hark 只读检测 | `8eed8ff` 的 REST/SSE/poll 与两路去重 `CI_PASSED`，已包含在 0.1.26 IPA。 | Hark 真机登录、状态对照、断流回退、WebView 审批 `UNVERIFIED`。Hark 指纹按已确认裁决另做 Spike。 |
 
@@ -58,4 +58,4 @@
 
 `8b7eb0a` 的 18:52–18:56 真机对照中，HTTP CONNECT、HTTPS CONNECT、SOCKS5 的连通性均返回 200，原生验证均在控制面 `lease-vm` 返回 HTTP 400 `Invalid vmType`，尚未进入 WS 握手。旧实现最终只显示最后一次租约尝试的错误，第一种 VM 类型的具体响应未捕获。修复版本在该拒绝后沿用同一出站客户端查询账号已分配的 VM，继续使用现有 token 与 Noise 流程。
 
-`7588dca` 于 19:18–19:23（UTC+8）通过三种原生代理真机端到端。下一步沿用该 IPA，先验收重启持久化，再验证故障阻断。正常网络结果无法区分是否命中已分配 VM 查询，也未验证 VM 新分配、续期或故障场景。[真机验收](../acceptance/iphone-acceptance.md#原生代理与重启回归)
+`7588dca` 于 19:18–19:23（UTC+8）通过三种原生代理真机端到端，19:31 完成 SOCKS5 重启持久化复测。错误代理密码下，连通性测试报 SOCKS 连接错误，完整原生探针达到连接总时限。已将总超时的诊断阶段修正为 `connect_timeout`。下一步沿用该 IPA 验证错误凭据下的 Muse WebView 表现。正常网络结果无法区分是否命中已分配 VM 查询，VM 新分配与续期仍待验收。[真机验收](../acceptance/iphone-acceptance.md#原生代理与重启回归)

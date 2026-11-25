@@ -1678,19 +1678,20 @@ pub async fn proxy_probe(
     return ProxyProbe::fail("cancelled", tunnel_via, scheme, "用户取消（建立隧道前）");
   }
   let connected = tokio::select! {
-    r = egress.connect(&cookies) => Some(r),
+    r = tokio::time::timeout(Duration::from_secs(30), egress.connect(&cookies)) => Some(r),
     _ = cancel_token.cancelled() => None,
-    _ = tokio::time::sleep(Duration::from_secs(30)) => Some(Err(crate::egress::EgressError::Http(
-      "代理隧道建立超时（30 秒）".to_string(),
-    ))),
   };
   let mut connected = match connected {
     None => {
       cookies.zeroize();
       return ProxyProbe::fail("cancelled", tunnel_via, scheme, "用户取消（建立隧道阶段）")
     }
-    Some(Ok(c)) => c,
-    Some(Err(e)) => {
+    Some(Err(_)) => {
+      cookies.zeroize();
+      return ProxyProbe::fail("connect_timeout", tunnel_via, scheme, "原生连接总超时（30 秒），未能确认失败子阶段");
+    }
+    Some(Ok(Ok(c))) => c,
+    Some(Ok(Err(e))) => {
       cookies.zeroize();
       use crate::egress::EgressError;
       let phase = match &e {
