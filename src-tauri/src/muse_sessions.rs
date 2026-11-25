@@ -16,6 +16,23 @@ pub struct MuseSession {
 }
 
 #[cfg(target_os = "ios")]
+#[derive(Clone, Default, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct BadgeTiming {
+  pub resumed_at_ms: u64,
+  pub handler_at_ms: u64,
+  pub query_at_ms: Option<u64>,
+  pub gateway_at_ms: Option<u64>,
+  pub history_request_at_ms: Option<u64>,
+  pub history_response_at_ms: Option<u64>,
+  pub result_at_ms: Option<u64>,
+  pub snapshot_at_ms: Option<u64>,
+  pub server_reply_at_ms: Option<u64>,
+  pub expected_dot: Option<bool>,
+  pub state: &'static str,
+}
+
+#[cfg(target_os = "ios")]
 pub async fn fetch(
   egress: &crate::egress::AccountEgress,
   cookies: &muse_native_client::cookie::SessionCookies,
@@ -55,15 +72,23 @@ pub async fn fetch_unread(
   thread: Option<Uuid>,
   primary: bool,
   parked_at: u64,
+  timing: &mut BadgeTiming,
 ) -> Result<(Option<std::collections::BTreeMap<Uuid, u64>>, Option<String>, &'static str), String> {
   let mut gateway = Box::pin(egress.connect(cookies)).await.map_err(|_| "无法连接 Muse 会话网关")?;
+  timing.gateway_at_ms = Some(crate::storage::now_ms());
   let has_history_target = thread.is_some() || primary;
   let status = if has_history_target {
     let mut path = "/chat/history?limit=30&transcript_mode=messages".to_string();
     if let Some(thread) = thread { path.push_str(&format!("&session_id={thread}")); }
-    match Box::pin(request(&mut gateway, &path)).await {
+    timing.history_request_at_ms = Some(crate::storage::now_ms());
+    let response = Box::pin(request(&mut gateway, &path)).await;
+    timing.history_response_at_ms = Some(crate::storage::now_ms());
+    match response {
       Ok(body) => match completed_since_park(&body, thread, parked_at) {
-        Some(Some(id)) => return Ok((None, Some(id), "history_completed")),
+        Some(Some((id, at))) => {
+          timing.server_reply_at_ms = Some(at);
+          return Ok((None, Some(id), "history_completed"));
+        }
         Some(None) => "history_no_completion",
         None => "history_unavailable",
       },
@@ -86,7 +111,7 @@ pub async fn fetch_unread(
 }
 
 #[cfg(any(target_os = "ios", test))]
-fn completed_since_park(body: &[u8], thread: Option<Uuid>, parked_at: u64) -> Option<Option<String>> {
+fn completed_since_park(body: &[u8], thread: Option<Uuid>, parked_at: u64) -> Option<Option<(String, u64)>> {
   let raw: Value = serde_json::from_slice(body).ok()?;
   if raw["ok"] == false || !raw["error"].is_null() { return None; }
   let result = raw.get("result").unwrap_or(&raw);
@@ -117,10 +142,10 @@ fn completed_since_park(body: &[u8], thread: Option<Uuid>, parked_at: u64) -> Op
     if reply_to.is_some_and(|parent| parent != user) || row["visibility"] != "public" || id == user {
       continue;
     }
-    if matches!(payload["status"].as_str().or_else(|| row["status"].as_str()), Some("completed" | "complete" | "done" | "finished"))
-      && row["occurred_at_ms"].as_u64().is_some_and(|time| time >= parked_at)
-    {
-      completed = Some(id.to_owned());
+    if matches!(payload["status"].as_str().or_else(|| row["status"].as_str()), Some("completed" | "complete" | "done" | "finished")) {
+      if let Some(at) = row["occurred_at_ms"].as_u64().filter(|time| *time >= parked_at) {
+        completed = Some((id.to_owned(), at));
+      }
     }
   }
   Some(completed)
@@ -199,8 +224,8 @@ mod tests {
       {"seq":19, "event_name":"message.user", "message_id":"u", "payload":{"session_id":thread}},
     ]}});
     let parse = |body: &Value, target, time| completed_since_park(&serde_json::to_vec(body).unwrap(), target, time);
-    assert_eq!(parse(&body, Some(thread), 180), Some(Some("a".into())));
-    assert_eq!(parse(&body, None, 180), Some(Some("a".into())));
+    assert_eq!(parse(&body, Some(thread), 180), Some(Some(("a".into(), 200))));
+    assert_eq!(parse(&body, None, 180), Some(Some(("a".into(), 200))));
     assert_eq!(parse(&body, Some(thread), 201), Some(None));
     assert_eq!(parse(&body, Some(Uuid::from_u128(2)), 180), None);
     body["result"]["chat_events"][0]["payload"]["status"] = json!("running");

@@ -889,6 +889,8 @@ const IDENTITY_PROBE_JS: &str = r#"(() => {
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ManagerSnapshot {
+  #[serde(skip_serializing_if = "Option::is_none")]
+  pub badge_sample_at_ms: Option<u64>,
   pub platform: &'static str,
   pub providers: Vec<ProviderInfo>,
   pub accounts: Vec<AccountRecord>,
@@ -1294,13 +1296,27 @@ impl SessionManager {
   }
 
   #[cfg(target_os = "ios")]
-  async fn catch_up_muse_unread(&self, app: &AppHandle, targets: &[crate::platform::ios::ForegroundTaskTarget]) {
-    let Ok(_batch) = self.unread_catch_up_lock.try_lock() else { return; };
+  async fn catch_up_muse_unread(&self, app: &AppHandle, targets: &[crate::platform::ios::ForegroundTaskTarget], resumed_at_ms: u64) {
+    let base = crate::muse_sessions::BadgeTiming { resumed_at_ms, handler_at_ms: now_ms(), ..Default::default() };
+    let emit = |uuid: Option<&str>, timing: &crate::muse_sessions::BadgeTiming| {
+      let _ = app.emit("muse-badge-timing", serde_json::json!({ "uuid": uuid, "timing": timing }));
+    };
+    if targets.is_empty() {
+      emit(None, &crate::muse_sessions::BadgeTiming { state: "no_parked_account", ..base });
+      return;
+    }
+    let Ok(_batch) = self.unread_catch_up_lock.try_lock() else {
+      emit(None, &crate::muse_sessions::BadgeTiming { state: "batch_busy", ..base });
+      return;
+    };
     let cancel = app.state::<Arc<crate::probe_cancel::ProbeCancel>>();
     for target in targets.iter().take(8) {
       let Some(uuid) = normalize_uuid(&target.uuid) else { continue; };
+      let mut timing = base.clone();
       let thread = target.thread_id.as_deref().and_then(|id| Uuid::parse_str(id).ok());
       if !crate::platform::ios::automatic_task_polling_available(app).await.unwrap_or(false) {
+        timing.state = "polling_unavailable";
+        emit(Some(&uuid), &timing);
         return;
       }
       let proxy_lock = self.proxy_write_lock.lock().await;
@@ -1310,26 +1326,41 @@ impl SessionManager {
       drop(proxy_lock);
       let Some(account) = snapshot.accounts.iter().find(|account| account.provider_id == ProviderId::Muse
         && account.uuid == uuid && account.auth_state == AuthState::Authenticated
-      ) else { continue; };
+      ) else {
+        timing.state = "account_unavailable";
+        emit(Some(&uuid), &timing);
+        continue;
+      };
       if snapshot.active_account.is_some() || snapshot.switching_account.is_some()
         || snapshot.conflicts.iter().any(|entry| entry.uuid == uuid)
         || snapshot.pending_cleanup.iter().any(|key| key.uuid == uuid) {
+        timing.state = "account_ineligible";
+        emit(Some(&uuid), &timing);
         continue;
       }
+      timing.query_at_ms = Some(now_ms());
       let query = Box::pin(async {
         let header = zeroize::Zeroizing::new(crate::muse_native::cookie_header_for(app, &uuid).await?);
         if header.is_empty() { return Err("缺少可用登录态".to_string()); }
         let cookies = muse_native_client::cookie::SessionCookies::from_header(&header);
         let egress = crate::egress::resolve_for_app(app, account.proxy.as_ref())?;
-        Box::pin(crate::muse_sessions::fetch_unread(&egress, &cookies, thread, target.primary, target.parked_at_ms)).await
+        Box::pin(crate::muse_sessions::fetch_unread(&egress, &cookies, thread, target.primary, target.parked_at_ms, &mut timing)).await
       });
       let result = tokio::select! {
         biased;
-        _ = token.cancelled() => continue,
-        result = tokio::time::timeout(std::time::Duration::from_secs(18), query) => result,
+        _ = token.cancelled() => None,
+        result = tokio::time::timeout(std::time::Duration::from_secs(18), query) => Some(result),
+      };
+      timing.result_at_ms = Some(now_ms());
+      let Some(result) = result else {
+        timing.state = "cancelled";
+        emit(Some(&uuid), &timing);
+        continue;
       };
       let mut locked = self.inner.lock().await;
       if self.current_seq.load(Ordering::SeqCst) != sequence || token.is_cancelled() {
+        timing.state = "account_changed";
+        emit(Some(&uuid), &timing);
         continue;
       }
       let Some(index) = locked.store.accounts.iter().position(|account| account.provider_id == ProviderId::Muse
@@ -1364,14 +1395,24 @@ impl SessionManager {
         Err(_) => "timeout",
       };
       account.muse_unread_status = Some(status.into());
-      if *account == previous { continue; }
-      if save_store_atomic(&locked.store_path, &locked.store).is_err() {
-        locked.store.accounts[index] = previous;
+      timing.state = status;
+      timing.expected_dot = Some(account.has_unread_reply);
+      if *account == previous {
+        emit(Some(&uuid), &timing);
         continue;
       }
-      let snapshot = Self::snapshot_from_locked(&locked);
+      if save_store_atomic(&locked.store_path, &locked.store).is_err() {
+        locked.store.accounts[index] = previous;
+        timing.state = "store_failed";
+        emit(Some(&uuid), &timing);
+        continue;
+      }
+      let mut snapshot = Self::snapshot_from_locked(&locked);
       drop(locked);
+      timing.snapshot_at_ms = Some(now_ms());
+      snapshot.badge_sample_at_ms = timing.snapshot_at_ms;
       self.emit_snapshot(app, &snapshot);
+      emit(Some(&uuid), &timing);
       let any_unread = snapshot.accounts.iter().any(|account| account.has_unread_reply);
       let _ = crate::platform::ios::set_unread_badge(app, any_unread).await;
     }
@@ -1396,6 +1437,7 @@ impl SessionManager {
     let warm_accounts = Vec::new();
 
     ManagerSnapshot {
+      badge_sample_at_ms: None,
       platform: current_platform_name(),
       providers: all_provider_infos(),
       accounts: locked.store.accounts.clone(),
@@ -4015,8 +4057,8 @@ impl SessionManager {
       // (0.1.16: the active account never reaches here — the Swift
       // coordinator skips it). Mark it unread in the manager list;
       // the flag clears when the account is opened (open_ios_session).
-      IosSessionEvent::ForegroundTaskCatchUp { targets } => {
-        Box::pin(self.catch_up_muse_unread(app, &targets)).await;
+      IosSessionEvent::ForegroundTaskCatchUp { targets, resumed_at_ms } => {
+        Box::pin(self.catch_up_muse_unread(app, &targets, resumed_at_ms)).await;
       }
       IosSessionEvent::TaskReplyDetected {
         provider_id,

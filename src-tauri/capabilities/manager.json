@@ -15,6 +15,7 @@
     "allow-get-manager-state",
     "allow-select-provider",
     "allow-add-account",
+    "allow-manage-rooms",
     "allow-rename-account",
     "allow-remove-account",
     "allow-reorder-accounts",

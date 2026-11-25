@@ -500,14 +500,15 @@ fn migrate_from_value(root: Value) -> Result<(AccountsStoreFile, bool), String> 
 }
 
 pub fn save_store_atomic(path: &Path, store: &AccountsStoreFile) -> Result<(), String> {
+  save_json_atomic(path, store)
+}
+
+pub(crate) fn save_json_atomic(path: &Path, document: &impl Serialize) -> Result<(), String> {
   if let Some(parent) = path.parent() {
     fs::create_dir_all(parent).map_err(|e| format!("创建配置目录失败: {e}"))?;
   }
-  let bytes = serde_json::to_vec_pretty(store).map_err(|e| format!("序列化配置失败: {e}"))?;
-  let tmp_name = format!(
-    ".accounts.json.tmp.{}",
-    Uuid::new_v4().simple()
-  );
+  let bytes = serde_json::to_vec_pretty(document).map_err(|e| format!("序列化配置失败: {e}"))?;
+  let tmp_name = format!(".maam.tmp.{}", Uuid::new_v4().simple());
   let tmp_path = path.with_file_name(tmp_name);
 
   let mut options = OpenOptions::new();
@@ -524,7 +525,7 @@ pub fn save_store_atomic(path: &Path, store: &AccountsStoreFile) -> Result<(), S
     .map_err(|e| format!("写入临时配置文件失败: {e}"));
   drop(file);
   let result = result.and_then(|_| fs::rename(&tmp_path, path)
-    .map_err(|e| format!("原子替换 accounts.json 失败: {e}")));
+    .map_err(|e| format!("原子替换本地资料失败: {e}")));
   if result.is_err() {
     let _ = fs::remove_file(&tmp_path);
   }

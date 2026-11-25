@@ -200,9 +200,11 @@ final class TaskWatcher: NSObject {
   }
 
   private func resumeForegroundChecks() {
+    let resumedAtMs = Int64(Date().timeIntervalSince1970 * 1000)
     cancelForegroundChecks()
     sweepParkedPages()
-    AccountSessionCoordinator.shared.emitForegroundTaskCatchUp(targets: RecentAccountPages.museCatchUpTargets())
+    AccountSessionCoordinator.shared.emitForegroundTaskCatchUp(targets: RecentAccountPages.museCatchUpTargets(),
+                                                               resumedAtMs: resumedAtMs)
     // A parked document may need time to render new data after iOS resumes.
     // Leave enough time between samples for the existing stability check.
     for delay in [6.0, 12.0] {

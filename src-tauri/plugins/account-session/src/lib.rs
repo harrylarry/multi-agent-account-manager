@@ -394,6 +394,7 @@ pub enum IosSessionEvent {
   #[serde(rename_all = "camelCase")]
   ForegroundTaskCatchUp {
     targets: Vec<ForegroundTaskTarget>,
+    resumed_at_ms: u64,
   },
 }
 

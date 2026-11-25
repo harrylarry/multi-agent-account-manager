@@ -1,5 +1,6 @@
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
+import { renderRooms, roomCommand, type RoomBook, type RoomsView } from "./rooms";
 import "./styles.css";
 import type {
   AccountKey,
@@ -15,6 +16,7 @@ import type {
 
 type ModalMode =
   | { kind: "none" }
+  | RoomsView
   | { kind: "add"; providerId: ProviderId; draft: string; cookiePreview: boolean; pending: boolean }
   | { kind: "rename"; account: AccountRecord; draft: string; groupDraft: string; timezoneDraft: string }
   | { kind: "remove"; account: AccountRecord }
@@ -51,6 +53,27 @@ interface HarkRecovery {
 }
 
 const latestTaskObservations = new Map<string, TaskObservation>();
+interface BadgeTiming {
+  resumedAtMs: number; handlerAtMs: number; queryAtMs: number | null; gatewayAtMs: number | null;
+  historyRequestAtMs: number | null; historyResponseAtMs: number | null;
+  resultAtMs: number | null; snapshotAtMs: number | null; serverReplyAtMs: number | null; expectedDot: boolean | null; state: string;
+}
+const badgeTimings = new Map<string, BadgeTiming>();
+const badgePaints = new Map<string, { sample: number; received: number; painted: number; actual: boolean | null }>();
+
+function badgeTimingLine(uuid: string): string {
+  const account = badgeTimings.get(uuid);
+  const global = badgeTimings.get("");
+  const timing = global && (!account || global.resumedAtMs > account.resumedAtMs) ? global : account;
+  if (!timing) return "红点计时 · 尚未收到回前台采样";
+  const gap = (start: number | null, end: number | null) =>
+    start != null && end != null && end >= start ? `${end - start}ms` : "—";
+  const paint = badgePaints.get(uuid);
+  const correlated = paint && paint.sample === timing.snapshotAtMs ? paint : null;
+  const service = timing.serverReplyAtMs == null ? "—" : `${timing.serverReplyAtMs - timing.resumedAtMs}ms`;
+  const dot = (value: boolean | null) => value == null ? "—" : value ? "有" : "无";
+  return `红点计时 · ${new Date(timing.resumedAtMs).toLocaleTimeString()} · ${timing.state} · 前台→启动 ${gap(timing.resumedAtMs, timing.queryAtMs)}（桥接 ${gap(timing.resumedAtMs, timing.handlerAtMs)}） · 启动→网关 ${gap(timing.queryAtMs, timing.gatewayAtMs)} · 历史请求→回包 ${gap(timing.historyRequestAtMs, timing.historyResponseAtMs)} · 服务回复相对前台 ${service} · 启动→判定 ${gap(timing.queryAtMs,timing.resultAtMs)} · 判定→快照 ${gap(timing.resultAtMs,timing.snapshotAtMs)} · 快照→界面 ${gap(timing.snapshotAtMs,correlated?.received ?? null)} · 界面→头像 ${gap(correlated?.received ?? null,correlated?.painted ?? null)} · 应有/实有 ${dot(timing.expectedDot)}/${dot(correlated?.actual ?? null)}`;
+}
 const accountTimezoneChoices = [
   ["", "跟随系统"],
   ["Asia/Shanghai", "上海"],
@@ -2511,6 +2534,7 @@ function renderTasks(view: Extract<ModalMode, { kind: "tasks" }>): string {
         ${current?.pendingApprovalCount != null ? `<div class="modal-desc">待审批 ${current.pendingApprovalCount} 项</div>` : ""}
         ${recent ? `<div class="modal-desc">最近发现回复 ${new Date(recent).toLocaleString()}</div>` : ""}
         ${current?.museUnreadStatus ? `<div class="modal-desc">回前台补查 · ${unreadStatus[current.museUnreadStatus] ?? "暂不可判定"}</div>` : ""}
+        ${account.providerId === "muse" && isSpikeBuild ? `<div class="modal-desc" id="badge-timing-line" style="user-select:text;-webkit-user-select:text">${escapeHtml(badgeTimingLine(account.uuid))}</div>` : ""}
         ${note ? `<div class="modal-desc">${escapeHtml(note)}</div>` : ""}
         ${current?.quotaObservation ? (() => {
           const quota = current.quotaObservation;
@@ -2983,8 +3007,29 @@ async function submitNewAccount(view: Extract<ModalMode, { kind: "add" }>, previ
   }
 }
 
+async function updateRooms(view: RoomsView, command: object): Promise<void> {
+  if (modal !== view || view.busy) return;
+  view.busy = true;
+  view.error = "";
+  const status = document.getElementById("room-result");
+  if (status) status.textContent = "正在保存或读取…";
+  try {
+    view.book = await invoke<RoomBook>("manage_rooms", { command });
+    if (status) status.textContent = "";
+  } catch (error) {
+    view.error = String(error);
+  } finally {
+    view.busy = false;
+    if (modal === view) {
+      if (view.error && status && view.book) status.textContent = view.error;
+      else render();
+    }
+  }
+}
+
 function renderModal(provider: ProviderInfo): string {
   if (modal.kind === "none") return "";
+  if (modal.kind === "rooms") return renderRooms(modal, snapshot?.accounts ?? [], escapeHtml);
   if (modal.kind === "approvals") return renderApprovalsModal(modal);
   if (modal.kind === "cookies") return renderCookieModal(modal);
   if (modal.kind === "sessions") return renderSessionsModal(modal);
@@ -3257,7 +3302,7 @@ function renderMiddleContent(state: ManagerSnapshot, provider: ProviderInfo): st
               : ""
         }
       </div>
-      <div class="header-actions">${museDiagnostics ? `<button id="spike-open-btn" class="mini-btn" type="button">诊断</button>` : ""}${state.platform === "ios" && !inReorder ? '<button id="account-backup-btn" class="mini-btn" type="button">备份</button>' : ""}${headerBtnHtml}</div>
+      <div class="header-actions">${museDiagnostics ? `<button id="spike-open-btn" class="mini-btn" type="button">诊断</button>` : ""}${state.platform === "ios" && !inReorder ? '<button id="account-backup-btn" class="mini-btn" type="button">备份</button>' : ""}${museDiagnostics && state.platform === "ios" && isSpikeBuild && !inReorder ? '<button id="rooms-open-btn" class="mini-btn" type="button">房间</button>' : ""}${headerBtnHtml}</div>
     </div>
     ${noticeHtml}
     ${conflictsHtml}
@@ -3417,6 +3462,7 @@ function modalIdentityKey(provider: ProviderInfo): string | null {
       // 内容在打开时确定，不会在显示期间变化；标题 + 长度足以区分。
       return `confirm:${modal.title}:${modal.desc.length}:${modal.confirmLabel}`;
     case "approvals":
+    case "rooms":
     case "harkReplies":
     case "cookies":
     case "sessions":
@@ -4136,6 +4182,11 @@ function bindDelegatedEvents(): void {
       return;
     }
 
+    const roomAction = target.closest<HTMLElement>("[data-room-action]");
+    if (roomAction && modal.kind === "rooms") {
+      await updateRooms(modal, roomCommand(roomAction));
+      return;
+    }
     const id = target.closest<HTMLElement>("[id]")?.id;
     switch (id) {
       case "open-site-btn":
@@ -4245,6 +4296,12 @@ function bindDelegatedEvents(): void {
           mode: "light", includeGroups: true, includeProxy: false, expiryDays: 0,
         });
         break;
+      case "rooms-open-btn": {
+        const view: RoomsView = { kind: "rooms", book: null, busy: false, error: "" };
+        await setModal(view);
+        await updateRooms(view, { action: "list" });
+        break;
+      }
       case "backup-export":
         if (modal.kind === "backup") await accountBackupAction(modal, "export");
         break;
@@ -4550,6 +4607,7 @@ async function bootstrap(): Promise<void> {
   });
 
   await listen<ManagerSnapshot>("manager-state-changed", (event) => {
+    const received = Date.now();
     saveScrollPosition();
     snapshot = event.payload;
     if (snapshot.activeAccount || !snapshot.switchingAccount) {
@@ -4557,6 +4615,26 @@ async function bootstrap(): Promise<void> {
     }
     render();
     restoreScrollPosition();
+    const sample = event.payload.badgeSampleAtMs;
+    if (isSpikeBuild && sample != null) {
+      const accounts = snapshot.accounts.filter((account) => account.providerId === "muse");
+      if (accounts.length) requestAnimationFrame(() => {
+        const painted = Date.now();
+        for (const account of accounts) {
+          const row = document.querySelector<HTMLElement>(`[data-switch-uuid="${CSS.escape(account.uuid)}"]`);
+          badgePaints.set(account.uuid, { sample, received, painted, actual: row?.getClientRects().length ? Boolean(row.querySelector(".unread-dot")) : null });
+        }
+        const line = document.getElementById("badge-timing-line");
+        if (line && modal.kind === "tasks") line.textContent = badgeTimingLine(modal.account.uuid);
+      });
+    }
+  });
+
+  await listen<{ uuid: string | null; timing: BadgeTiming }>("muse-badge-timing", ({ payload }) => {
+    if (!isSpikeBuild) return;
+    badgeTimings.set(payload.uuid ?? "", payload.timing);
+    const line = document.getElementById("badge-timing-line");
+    if (line && modal.kind === "tasks") line.textContent = badgeTimingLine(modal.account.uuid);
   });
 
   await listen<UpdateProgressEvent>("update-progress", (event) => {

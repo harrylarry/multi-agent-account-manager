@@ -60,6 +60,7 @@ export interface ConflictItem {
 }
 
 export interface ManagerSnapshot {
+  badgeSampleAtMs?: number;
   platform: string;
   providers: ProviderInfo[];
   accounts: AccountRecord[];

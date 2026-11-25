@@ -6,6 +6,7 @@ mod platform;
 mod hark_native;
 mod probe_cancel;
 mod proxy_pool;
+mod rooms;
 mod webview_proxy;
 mod providers;
 mod quota;
@@ -57,6 +58,18 @@ async fn add_account(
 ) -> Result<ManagerSnapshot, String> {
   let cookies = cookie_input.map(|raw| parse_account_cookies(&provider_id, raw)).transpose()?;
   mgr.add_account(&app, &provider_id, &alias, cookies.as_deref()).await
+}
+
+#[tauri::command]
+async fn manage_rooms(
+  app: AppHandle, mgr: State<'_, Arc<SessionManager>>, gate: State<'_, rooms::RoomGate>, command: rooms::Command,
+) -> Result<rooms::RoomBook, String> {
+  let mut initialized = gate.0.lock().await;
+  let dir = app.path().app_data_dir().map_err(|_| "无法读取应用目录")?;
+  let snapshot = mgr.get_snapshot().await;
+  let result = rooms::apply(&dir.join("rooms-v1.json"), command, &snapshot.accounts, !*initialized);
+  if result.is_ok() { *initialized = true; }
+  result
 }
 
 #[tauri::command]
@@ -1429,6 +1442,7 @@ fn muse_native_liveness_status(
 pub fn run() {
   let builder = tauri::Builder::default();
   let builder = builder.manage(proxy_pool::ProxyPoolGate::default());
+  let builder = builder.manage(rooms::RoomGate::default());
 
   #[cfg(target_os = "android")]
   let builder = builder.plugin(platform::android::init());
@@ -1542,6 +1556,7 @@ pub fn run() {
       get_manager_state,
       select_provider,
       add_account,
+      manage_rooms,
       rename_account,
       remove_account,
       switch_account,
