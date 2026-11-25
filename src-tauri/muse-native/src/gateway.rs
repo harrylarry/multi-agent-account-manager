@@ -965,8 +965,12 @@ mod tests {
   use tokio_tungstenite::tungstenite::protocol::Role;
 
   fn response(cipher: &mut CipherState, id: u64, body: &[u8], ended: bool) -> Message {
+    response_status(cipher, id, 200, body, ended)
+  }
+
+  fn response_status(cipher: &mut CipherState, id: u64, status: u64, body: &[u8], ended: bool) -> Message {
     let mut r = PbWriter::new();
-    r.uint(1, 200).bytes(3, body).bool(4, ended);
+    r.uint(1, status).bytes(3, body).bool(4, ended);
     let mut stream = PbWriter::new();
     stream.uint(1, id).bytes(3, &r.finish());
     let mut service = PbWriter::new();
@@ -1098,15 +1102,20 @@ mod tests {
         let mut cipher = CipherState::new(Some([2; 32]));
         for id in 1..=rejected_at {
           assert!(server.next().await.unwrap().unwrap().is_binary());
-          let body = if id == rejected_at { b"{\"ok\":false}".as_slice() } else { b"{}" };
-          server.send(response(&mut cipher, id, body, true)).await.unwrap();
+          let message = if id == rejected_at {
+            response_status(&mut cipher, id, 400, br#"{"ok":false,"error":{"code":"invalid_params","message":"Unknown value for platform: synthetic-secret"}}"#, true)
+          } else {
+            response(&mut cipher, id, b"{}", true)
+          };
+          server.send(message).await.unwrap();
         }
         assert!(!matches!(server.next().await, Some(Ok(Message::Binary(_)))));
       });
       let route = IsolatedProbeRoute::new("isolated".to_string());
       let failure = route.subscribe(client, "0.1.26").await.err().unwrap();
       assert_eq!(failure.phase, if rejected_at == 1 { "node_registration" } else { "capability_registration" });
-      assert!(matches!(failure.error, GatewayError::Protocol(_)));
+      assert!(matches!(failure.error, GatewayError::Http(400)));
+      assert_eq!(failure.rejection.as_deref(), Some("invalid_params · platform"));
       peer.await.unwrap();
     }
   }

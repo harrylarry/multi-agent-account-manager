@@ -629,7 +629,14 @@ pub async fn fingerprint_probe(
     let mut subscription = tokio::select! {
       res = tokio::time::timeout(Duration::from_secs(45), gateway.subscribe_isolated_probe(&route)) => match res {
         Ok(Ok(subscription)) => subscription,
-        Ok(Err(failure)) => return FingerprintProbe::fail(failure.phase, "indeterminate", safe_gateway_status(&failure.error)),
+        Ok(Err(failure)) => {
+          let mut status = safe_gateway_status(&failure.error);
+          if let Some(rejection) = failure.rejection {
+            status.push_str(" · ");
+            status.push_str(&rejection);
+          }
+          return FingerprintProbe::fail(failure.phase, "indeterminate", status);
+        }
         Err(_) => return FingerprintProbe::fail("register_route", "indeterminate", "注册临时节点或建立隔离订阅超时"),
       },
       _ = cancel_token.cancelled() => return FingerprintProbe::fail("cancelled", "indeterminate", "用户取消"),

@@ -347,6 +347,7 @@ pub struct IsolatedProbeRoute {
 pub struct ProbeRouteError {
   pub phase: &'static str,
   pub error: GatewayError,
+  pub rejection: Option<String>,
 }
 
 impl IsolatedProbeRoute {
@@ -389,14 +390,16 @@ impl IsolatedProbeRoute {
       let (status, body) = gateway
         .request(request)
         .await
-        .map_err(|error| ProbeRouteError { phase, error })?;
-      registration_ack(status, &body).map_err(|error| ProbeRouteError { phase, error })?;
+        .map_err(|error| ProbeRouteError { phase, error, rejection: None })?;
+      if let Err(error) = registration_ack(status, &body) {
+        return Err(ProbeRouteError { phase, error, rejection: registration_rejection(&body) });
+      }
     }
     // The registered connection supplies the node identity; the subscribe body scopes its events.
     gateway
       .subscribe(crate::collect::isolated_subscription_request(&self.session_id))
       .await
-      .map_err(|error| ProbeRouteError { phase: "subscribe", error })
+      .map_err(|error| ProbeRouteError { phase: "subscribe", error, rejection: None })
   }
 }
 
@@ -415,6 +418,39 @@ fn registration_ack(status: u16, body: &[u8]) -> Result<(), GatewayError> {
     return Ok(());
   }
   Err(GatewayError::Protocol("probe route registration rejected".to_string()))
+}
+
+/// Convert a rejection into fixed protocol labels. Server messages and field values are never exported.
+fn registration_rejection(body: &[u8]) -> Option<String> {
+  const FIELDS: &[&str] = &[
+    "method", "params", "node_id", "client_id", "platform", "device_family",
+    "display_name", "commands_v2", "capabilities", "version",
+  ];
+  let value: Value = serde_json::from_slice(body).ok()?;
+  let error = value.get("error").or_else(|| value["result"].get("error")).unwrap_or(&value);
+  let code = match error["code"].as_str() {
+    Some("invalid_params" | "invalid_request" | "invalid_argument" | "bad_request" | "not_supported"
+      | "forbidden" | "unauthorized" | "method_not_found" | "validation_error") => error["code"].as_str(),
+    Some(_) => Some("unrecognized_error_code"),
+    None => None,
+  };
+  let message = error["message"].as_str().or_else(|| error.as_str()).unwrap_or_default();
+  let message = message.to_ascii_lowercase();
+  let words: Vec<_> = message.split(|c: char| !c.is_ascii_alphanumeric() && c != '_').collect();
+  let field = FIELDS.iter().copied().find(|field| {
+    ["field", "param", "parameter"].iter().any(|key| error[*key].as_str() == Some(*field))
+  }).or_else(|| FIELDS.iter().copied().find(|field| words.contains(field)));
+  let reason = if words.contains(&"required") || words.contains(&"missing") {
+    Some("required")
+  } else if words.contains(&"unsupported") || words.windows(2).any(|w| w == ["not", "supported"]) {
+    Some("unsupported")
+  } else if words.contains(&"invalid") || words.contains(&"expected") || (field.is_some() && words.contains(&"must")) {
+    Some("invalid")
+  } else {
+    None
+  };
+  let labels = [code, field, reason].into_iter().flatten().collect::<Vec<_>>();
+  (!labels.is_empty()).then(|| labels.join(" · "))
 }
 
 pub async fn send_message_tracked<S>(
@@ -757,5 +793,15 @@ mod tests {
     let res = read_ack(&mut src, Duration::from_secs(30), Some(&mut rx)).await;
     handle.await.unwrap();
     assert!(matches!(res, Err(GatewayError::Cancelled)));
+  }
+
+  #[test]
+  fn registration_rejection_exports_only_known_protocol_labels() {
+    let denied = br#"{"ok":false,"error":{"code":"invalid_params","message":"`params` is required (account=synthetic-secret)"}}"#;
+    assert_eq!(registration_rejection(denied).as_deref(), Some("invalid_params · params · required"));
+    let unsupported = br#"{"result":{"error":{"code":"synthetic-secret","field":"platform","message":"platform is not supported: synthetic-value"}}}"#;
+    assert_eq!(registration_rejection(unsupported).as_deref(), Some("unrecognized_error_code · platform · unsupported"));
+    assert_eq!(registration_rejection(b"<html>synthetic-secret</html>"), None);
+    assert_eq!(registration_rejection(br#"{"error":{"field":"synthetic-secret","message":"synthetic-value"}}"#), None);
   }
 }
