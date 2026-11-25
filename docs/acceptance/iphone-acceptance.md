@@ -157,6 +157,23 @@ SOCKS5 启用时，后台同步显示「代理 已下发」「联网超时」「
 
 ## 回填结果
 
+### `9a7c229` 复测回执（2026-11-26，UTC+8）
+
+| 场景 | 状态与证据 |
+| --- | --- |
+| 任务入口、原生额度 | `DEVICE_VERIFIED`。任务页正常打开并返回原生检测，原生额度显示更新。 |
+| 会话与分组 | `DEVICE_VERIFIED`。用户确认会话能打开及分组复测正常。 |
+| 回前台红点 | `FAIL`。生成中先回账号列表，再切到后台。回前台等 20 秒，账号头像旁无红点，打开同账号后网页提示可见。 |
+| Cookie 导出再预览 | `FAIL`。同账号导出的内容粘回输入框后显示格式或属性无效。 |
+| 代理订阅 | `BLOCKED`。本轮没有可用测试订阅地址。手动代理保留先前通过记录。 |
+
+### Cookie 回贴与 Muse 回前台红点专项
+
+候选为 0.1.26 Spike，提交 `7ed2ab599159c9746954ef976879e32b20f9bec5`。解压后的 IPA SHA-256 为 `11d8bc911fe6bfe2db2b102bdcac5fecf0e1a3c130a3607fa5617f70bb1b4535`。CI 和 iOS 打包通过，待真机。[下载 IPA](https://github.com/harrylarry/multi-agent-account-manager/actions/runs/45663105641/artifacts/15046817245) · [Quick checks](https://github.com/harrylarry/multi-agent-account-manager/actions/runs/45663102947) · [iOS 打包](https://github.com/harrylarry/multi-agent-account-manager/actions/runs/45663105641)
+
+1. **Cookie 回贴**。Muse 账号行 →「登录恢复」→「导出到剪贴板」→「复制」。立即粘回同页输入框，再点「预览」。预览应显示有效条数，与刚才显示的复制条数一致。若导出提示部分记录未复制，记下条数。只测回贴时到预览即止。
+2. **红点**。沿用上一轮相同操作。生成中点「← 账号」回叠号列表，再回 iPhone 主屏。回复完成后打开叠号，在列表等 20 秒。先看头像红点，再从编辑图标打开「任务」，记下「回前台补查」一行。测试同一账号时先记录红点与补查情况，再进入网页。
+
 ### `d32511e` 真机回执（UTC+8）
 
 | 场景 | 实测 | 结论 |

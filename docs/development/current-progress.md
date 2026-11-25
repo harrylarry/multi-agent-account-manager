@@ -30,6 +30,10 @@ Windows 主 crate 67 项、muse-native 110 项、嵌入脚本 13 项与构建检
 
 ## 下一步
 
+`9a7c229` 的后续真机回执确认任务入口、原生额度更新、会话和分组通过。生成中回账号列表后切后台，回前台 20 秒仍无账号红点，网页提示可见。App 自身导出的 Cookie 回贴后预览失败。订阅因无测试地址待验。候选 `7ed2ab5` 用同一导入解析器筛选并复查剪贴板导出内容，显示未复制条数。iOS 回前台事件触发近期停驻 Muse 账号的已知服务端未读读取，保持账号代理、读取结果去重和 DOM 补查。任务页显示本次补查结果，实际返回字段与头像红点仍需复测。[专项复测](../acceptance/iphone-acceptance.md#cookie-回贴与-muse-回前台红点专项)
+
+`7ed2ab5` 已通过 macOS CI 与 Xcode 打包。主 crate 70 项本地测试包括 Cookie 导出回贴契约及未读去重。移动端 WebKit 验证跳过条数、账号红点及补查状态显示。已下载并核验 IPA，未读字段和 Cookie 实际写入继续按真机验收。[验收包](https://github.com/harrylarry/multi-agent-account-manager/actions/runs/45663105641/artifacts/15046817245)
+
 2026-11-26 首轮 A–C iPhone 回执。`815cffa` 的任务入口闪退和 Muse 会话列表为 `FAIL`。本机 Cookie 枚举结果在打开会话前后不一致，预览输入区闪烁。回前台未看到叠号红点，Muse 网页点可见。手动代理添加与使用、审批空态、备份导出为本次 `DEVICE_VERIFIED`。订阅导入、实际审批和备份恢复继续待验。
 
 修复候选 `9a7c229`。核对真机日志和原 IPA Mach-O 的 UUID 与故障指令，确认任务入口触及主线程栈保护页，已将原生网络 future 移至 Tokio worker 并拆分装箱。会话列表改为按账号出站策略进行的 Noise daemon 请求。Cookie 摘要复用停驻页的 WebKit 数据存储并保持其生命周期，前端原位更新预览。Muse 回前台补查增加停驻基线及同会话助手消息变化判断。Quick checks 和 Xcode 均成功，IPA 已下载核验。两个移动端 WebKit 视口验证 Cookie 预览保留输入框节点。新包仍需真机比对。[下载和逐步复测](../acceptance/iphone-acceptance.md#v22-真机回归修复复测)
