@@ -794,3 +794,25 @@ pub async fn transfer_profile_cookies(
   ).await.map_err(|e| e.to_string())?;
   Ok(response.count)
 }
+
+#[cfg(target_os = "ios")]
+pub async fn share_account_backup(app: &AppHandle, contents: &str) -> Result<bool, String> {
+  #[derive(Deserialize)]
+  struct ShareResult { shared: bool }
+  let bridge = app.state::<IosSessionBridge<tauri::Wry>>();
+  let response: ShareResult = bridge.0.run_mobile_plugin_async(
+    "shareAccountBackup", serde_json::json!({ "contents": contents }),
+  ).await.map_err(|e| e.to_string())?;
+  Ok(response.shared)
+}
+
+#[cfg(target_os = "ios")]
+pub async fn read_parked_task_state(app: &AppHandle, uuid: &str) -> Result<Option<String>, String> {
+  #[derive(Deserialize)]
+  struct TaskState { activity: Option<String> }
+  let bridge = app.state::<IosSessionBridge<tauri::Wry>>();
+  let response: TaskState = bridge.0.run_mobile_plugin_async(
+    "readParkedTaskState", serde_json::json!({ "uuid": uuid, "provider": "muse" }),
+  ).await.map_err(|e| e.to_string())?;
+  Ok(response.activity)
+}

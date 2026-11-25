@@ -298,6 +298,11 @@ impl ProxyConfig {
     self.username.is_some() && self.password.is_some()
   }
 
+  /// Access the proxy password for secure storage. Never use it in diagnostics.
+  pub fn password(&self) -> Option<&str> {
+    self.password.as_deref().map(String::as_str)
+  }
+
   /// 打通到目标的隧道。任何失败都返回 Err；调用方不得回退直连。
   pub async fn connect(&self, target_host: &str, target_port: u16) -> Result<TunnelStream, ProxyError> {
     tokio::time::timeout(CONNECT_TIMEOUT, self.connect_inner(target_host, target_port))

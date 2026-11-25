@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-decide-muse-approval"
+description = "Enables the decide_muse_approval command without any pre-configured scope."
+commands.allow = ["decide_muse_approval"]
+
+[[permission]]
+identifier = "deny-decide-muse-approval"
+description = "Denies the decide_muse_approval command without any pre-configured scope."
+commands.deny = ["decide_muse_approval"]

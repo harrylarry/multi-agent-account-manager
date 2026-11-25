@@ -132,6 +132,7 @@ pub struct WatchSummary {
   pub messages_done: u64,
   pub busy: u64,
   pub idle: u64,
+  pub activity: Option<&'static str>,
   pub duplicates: u64,
   pub ignored: u64,
   pub events_by_name: BTreeMap<String, u64>,
@@ -199,12 +200,17 @@ impl WatchTracker {
         self.summary.messages_done += 1;
         Some(Notice::Completed(id))
       }
-      WatchKind::AgentBusy(_) => {
+      WatchKind::AgentBusy(code) => {
         self.summary.busy += 1;
+        self.summary.activity = Some(if code == "needs_approval" { "approval" } else { "working" });
         None
       }
-      WatchKind::AgentIdle(_) => {
+      WatchKind::AgentIdle(code) => {
         self.summary.idle += 1;
+        self.summary.activity = match code.as_str() {
+          "online" | "idle" => Some("idle"),
+          _ => None,
+        };
         None
       }
       WatchKind::Other => {

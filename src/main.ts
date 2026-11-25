@@ -18,9 +18,12 @@ type ModalMode =
   | { kind: "add"; providerId: ProviderId; draft: string }
   | { kind: "rename"; account: AccountRecord; draft: string; groupDraft: string }
   | { kind: "remove"; account: AccountRecord }
+  | { kind: "tasks"; account: AccountRecord; checking: boolean; note: string; quotaChecking: boolean }
+  | { kind: "backup"; busy: boolean; encrypted: string; fileName: string; preview: BackupPreview | null; message: string; mode: BackupMode; includeGroups: boolean; includeProxy: boolean }
+  | { kind: "proxyPool"; account: AccountRecord; data: ProxyPoolView | null; setting: SpikeProxySettingView | null; busy: boolean; message: string }
   | { kind: "sessions"; account: AccountRecord; loading: boolean; items: MuseSession[] | null; error: string }
   | { kind: "cookies"; account: AccountRecord; busy: boolean; preview: CookiePreview | null; message: string; imported: boolean }
-  | { kind: "approvals"; account: AccountRecord; loading: boolean; result: SpikeApprovalsResult | null; fetchedAt: number | null }
+  | { kind: "approvals"; account: AccountRecord; loading: boolean; result: SpikeApprovalsResult | null; fetchedAt: number | null; decisionMessage: string }
   | { kind: "update" }
   // 应用内确认框（替代 window.confirm）。WKWebView 的 UIDelegate 没有
   // 实现 runJavaScriptConfirmPanel，iOS 上 confirm() 直接返回 false，
@@ -32,6 +35,27 @@ type ModalMode =
       confirmLabel: string;
       danger: boolean;
     };
+
+interface TaskObservation {
+  activity: "idle" | "working" | "approval" | "unknown";
+  source: "native" | "page" | null;
+  observedAtMs: number | null;
+}
+
+const latestTaskObservations = new Map<string, TaskObservation>();
+
+type BackupMode = "light" | "full" | "custom";
+interface BackupPreview {
+  added: number;
+  existing: number;
+  conflicts: string[];
+  checksum: string;
+}
+
+interface ProxyPoolView {
+  entries: { id: string; endpoint: string; requiresAuth: boolean; sourceId: string | null }[];
+  sources: { id: string; host: string; refreshedAt: number }[];
+}
 
 interface MuseSession {
   id: string;
@@ -110,6 +134,7 @@ let spikeWatchAccount: string | null = null;
 interface SpikeApprovalItem {
   id: string; kind: string; displayName: string;
   requestedAtMs: number; expiresAtMs: number; status: string;
+  sessionScopeId: string; choices: { decision: string; scope: string | null }[];
 }
 interface SpikeApprovalsResult {
   ok: boolean; phase: string; status: number | null;
@@ -1045,7 +1070,13 @@ async function callCommand(
 // Batch-1: silent sync triggers (iOS). Fire-and-forget: the Rust side
 // throttles to one sync per 30s and skips the currently open account
 // (the foreground probe already covers it).
+let lastProxyPoolRefresh = 0;
+
 function triggerAutoSync(): void {
+  if (snapshot?.platform === "ios" && Date.now() - lastProxyPoolRefresh >= 30 * 60 * 1000) {
+    lastProxyPoolRefresh = Date.now();
+    void invoke("manage_proxy_pool", { action: "refresh", entryId: null, input: null }).catch(() => {});
+  }
   void invoke("trigger_quota_sync", { force: false }).catch(() => {});
 }
 
@@ -2317,7 +2348,7 @@ function renderUpdateModal(): string {
 }
 
 function renderApprovalsModal(view: Extract<ModalMode, { kind: "approvals" }>): string {
-  const { account, loading, result, fetchedAt } = view;
+  const { account, loading, result, fetchedAt, decisionMessage } = view;
   const formatTime = (ts: number) => ts > 0 && ts < 8.64e15 ? new Date(ts).toLocaleString() : "未提供";
   const reason = result?.phase === "schema" || result?.phase === "parse"
     ? "审批响应格式无法识别，请打开账号核对。"
@@ -2326,19 +2357,26 @@ function renderApprovalsModal(view: Extract<ModalMode, { kind: "approvals" }>): 
       : "审批查询失败，当前待审批状态未知。";
   const items = result?.items ?? [];
   const content = loading ? "正在读取审批…" : !result?.ok ? reason : !items.length ? "当前没有待审批项。" : `
-    <div class="approval-items">${items.map((item) => `
+    <div class="approval-items">${items.map((item, index) => `
       <details class="approval-item">
         <summary>${escapeHtml(item.displayName || item.kind || "审批请求")} · ${item.expiresAtMs > 0 && item.expiresAtMs <= Date.now() ? "已过期" : escapeHtml(item.status === "pending" ? "待审批" : item.status)}</summary>
         <div>类型 ${escapeHtml(item.kind || "未提供")}</div>
         <div>请求时间 ${formatTime(item.requestedAtMs)}</div>
         <div>到期时间 ${formatTime(item.expiresAtMs)}</div>
+        ${item.status === "pending" && item.expiresAtMs > Date.now() && item.sessionScopeId ?
+          `<div class="proxy-pool-actions">${(item.choices ?? []).map((choice, choiceIndex) => {
+            const label = { allow_once: "允许一次", deny: "拒绝", allow_always: "始终允许" }[choice.decision];
+            if (!label || (choice.decision === "allow_always" && !choice.scope)) return "";
+            return `<button class="mini-btn" type="button" data-approval-item="${index}" data-approval-choice="${choiceIndex}" ${loading ? "disabled" : ""}>${label}</button>`;
+          }).join("")}</div>` : ""}
       </details>`).join("")}</div>`;
   return `
     <div class="inline-modal" role="dialog" aria-modal="true" aria-labelledby="approval-title">
       <div class="modal-card approval-modal">
         <div class="modal-title" id="approval-title">待审批 · ${escapeHtml(account.alias)}</div>
-        <div class="modal-desc">只读列表，在 Muse 会话中处理。${fetchedAt ? ` 最近读取 ${formatTime(fetchedAt)}` : ""}</div>
+        <div class="modal-desc">提交前会复查账号、会话与有效期。${fetchedAt ? ` 最近读取 ${formatTime(fetchedAt)}` : ""}</div>
         ${result?.ok && !loading && items.length ? content : `<div role="status">${content}</div>`}
+        ${decisionMessage ? `<div role="status">${escapeHtml(decisionMessage)}</div>` : ""}
         <div class="modal-footer">
           <button id="modal-cancel-btn" class="btn" type="button">关闭</button>
           <button id="approvals-refresh-btn" class="btn" type="button" ${loading ? "disabled" : ""}>刷新</button>
@@ -2363,6 +2401,245 @@ async function loadAccountApprovals(view: Extract<ModalMode, { kind: "approvals"
     view.result = null;
   } finally {
     view.loading = false;
+    if (modal === view) render();
+  }
+}
+
+function renderTasks(view: Extract<ModalMode, { kind: "tasks" }>): string {
+  const { account, checking, note } = view;
+  const current = snapshot?.accounts.find((entry) => entry.uuid === account.uuid && entry.providerId === account.providerId);
+  const observation = latestTaskObservations.get(`${account.providerId}:${account.uuid}`);
+  const status: Record<TaskObservation["activity"], string> = {
+    working: "任务进行中", idle: "未见任务正在生成", approval: "等待审批", unknown: "暂不可判定",
+  };
+  const recent = current?.lastTaskReplyAtMs;
+  return `
+    <div class="inline-modal" role="dialog" aria-modal="true" aria-labelledby="account-task-title">
+      <div class="modal-card">
+        <div class="modal-title" id="account-task-title">任务 · ${escapeHtml(account.alias)}</div>
+        <div role="status">${checking ? "正在检测…" : escapeHtml(status[observation?.activity ?? "unknown"])}</div>
+        ${observation?.observedAtMs ? `<div class="modal-desc">最近一次成功检测 ${new Date(observation.observedAtMs).toLocaleString()} · ${observation.source === "native" ? "原生" : "停驻页面"}</div>` : ""}
+        ${recent ? `<div class="modal-desc">最近发现回复 ${new Date(recent).toLocaleString()}</div>` : ""}
+        ${note ? `<div class="modal-desc">${escapeHtml(note)}</div>` : ""}
+        ${current?.quotaObservation ? (() => {
+          const quota = current.quotaObservation;
+          const stale = quota.stale || Date.now() - quota.checkedAtMs > 10 * 60_000
+            || (quota.resetsAtMs !== null && Date.now() >= quota.resetsAtMs);
+          return `<div class="modal-desc">额度 ${stale ? "已过期" : "已同步"} · ${quota.source === "native" ? "原生" : "网页"} · ${new Date(quota.checkedAtMs).toLocaleString()}
+            ${quota.resetsAtMs ? `<div>额度重置 ${new Date(quota.resetsAtMs).toLocaleString()}</div>` : ""}</div>`;
+        })() : ""}
+        <div class="modal-desc">应用在前台时可检测。回前台后会补查停驻页面。</div>
+        <div class="modal-footer">
+          <button id="modal-cancel-btn" class="btn" type="button">关闭</button>
+          ${account.providerId === "muse" ? `<button id="account-quota-refresh" class="btn" type="button" ${view.quotaChecking ? "disabled" : ""}>刷新额度</button>` : ""}
+          <button id="account-task-refresh" class="btn primary" type="button" ${checking ? "disabled" : ""}>刷新</button>
+        </div>
+      </div>
+    </div>`;
+}
+
+async function checkAccountTasks(view: Extract<ModalMode, { kind: "tasks" }>): Promise<void> {
+  if (modal !== view || view.checking || document.hidden) return;
+  view.checking = true;
+  view.note = "";
+  render();
+  const { uuid, providerId } = view.account;
+  const key = `${providerId}:${uuid}`;
+  try {
+    const result = await invoke<TaskObservation>("observe_account_tasks", {
+      uuid, providerId, timezone: Intl.DateTimeFormat().resolvedOptions().timeZone || "UTC",
+    });
+    const previous = latestTaskObservations.get(key);
+    if (!result.observedAtMs) {
+      result.observedAtMs = previous?.observedAtMs ?? null;
+      result.source = previous?.source ?? null;
+    }
+    latestTaskObservations.set(key, result);
+  } catch (error) {
+    const previous = latestTaskObservations.get(key);
+    latestTaskObservations.set(key, { activity: "unknown", observedAtMs: previous?.observedAtMs ?? null, source: previous?.source ?? null });
+    view.note = String(error);
+  } finally {
+    view.checking = false;
+    if (modal === view) render();
+  }
+}
+
+function renderAccountBackup(view: Extract<ModalMode, { kind: "backup" }>): string {
+  const { busy, fileName, preview, message, mode, includeGroups, includeProxy } = view;
+  const disabled = busy ? "disabled" : "";
+  return `
+    <div class="inline-modal" role="dialog" aria-modal="true" aria-labelledby="account-backup-title">
+      <div class="modal-card proxy-pool-modal">
+        <div class="modal-title" id="account-backup-title">本机加密备份</div>
+        <div class="modal-desc">备份包含账号资料。网页登录、Cookie 和代理口令需在恢复后重新配置。</div>
+        <div class="proxy-pool-body">
+          <label for="backup-mode">备份范围</label>
+          <select id="backup-mode" class="modal-input" ${disabled}>
+            <option value="light" ${mode === "light" ? "selected" : ""}>轻量（账号、备注及分组）</option>
+            <option value="full" ${mode === "full" ? "selected" : ""}>全量（含账号代理端点）</option>
+            <option value="custom" ${mode === "custom" ? "selected" : ""}>自定义</option>
+          </select>
+          ${mode === "custom" ? `<div class="proxy-pool-actions">
+            <label><input id="backup-include-groups" type="checkbox" ${includeGroups ? "checked" : ""} ${disabled} />分组</label>
+            <label><input id="backup-include-proxy" type="checkbox" ${includeProxy ? "checked" : ""} ${disabled} />账号代理端点</label>
+          </div>` : ""}
+          <label for="backup-file">选择加密备份以恢复</label>
+          <input id="backup-file" type="file" class="modal-input" accept=".maambackup" ${disabled} />
+          ${fileName ? `<div>${escapeHtml(fileName)}</div>` : ""}
+          <label for="backup-password">${preview ? "再次输入备份口令确认恢复" : "备份口令（至少 8 字符）"}</label>
+          <input id="backup-password" type="password" autocomplete="off" class="modal-input" ${disabled} />
+          ${preview ? `<div class="approval-items">
+            <div>新增 ${preview.added} · 已有 ${preview.existing}</div>
+            ${preview.conflicts.map((conflict) => `<div>冲突 · ${escapeHtml(conflict)}</div>`).join("")}
+          </div>` : ""}
+        </div>
+        ${message ? `<div role="status">${escapeHtml(message)}</div>` : ""}
+        <div class="modal-footer account-cookie-actions">
+          <button id="modal-cancel-btn" type="button" class="btn" ${disabled}>关闭</button>
+          <button id="backup-export" type="button" class="btn primary" ${disabled}>导出备份</button>
+          <button id="backup-preview" type="button" class="btn" ${disabled}>预览恢复</button>
+          ${preview ? `<button id="backup-merge" type="button" class="btn" ${disabled}>合并</button><button id="backup-overwrite" type="button" class="btn" ${disabled}>覆盖冲突资料</button>` : ""}
+        </div>
+      </div>
+    </div>`;
+}
+
+async function accountBackupAction(view: Extract<ModalMode, { kind: "backup" }>, action: "export" | "preview" | "merge" | "overwrite"): Promise<void> {
+  if (modal !== view || view.busy) return;
+  const passwordInput = document.querySelector<HTMLInputElement>("#backup-password");
+  const password = passwordInput?.value ?? "";
+  if (passwordInput) passwordInput.value = "";
+  if (action === "overwrite" && !await askConfirm({
+    title: "覆盖冲突资料",
+    desc: "备份中的备注和分组会替换匹配账号的同名资料。",
+    confirmLabel: "覆盖",
+    danger: true,
+  })) {
+    if ((modal as ModalMode).kind === "none") await setModal(view);
+    return;
+  }
+  if (action === "overwrite") await setModal(view);
+  view.busy = true;
+  view.message = "处理中…";
+  render();
+  try {
+    if (action === "export") {
+      const shared = await invoke<boolean>("export_account_backup", {
+        password, includeGroups: view.mode !== "custom" || view.includeGroups,
+        includeProxyEndpoints: view.mode === "full" || (view.mode === "custom" && view.includeProxy),
+      });
+      view.message = shared ? "备份已导出。" : "已取消导出。";
+    } else if (action === "preview") {
+      if (!view.encrypted) throw new Error("请先选择备份文件");
+      view.preview = await invoke<BackupPreview>("preview_account_backup", { encrypted: view.encrypted, password });
+      view.message = "";
+    } else if (view.preview) {
+      snapshot = await invoke<ManagerSnapshot>("restore_account_backup", {
+        encrypted: view.encrypted, password, overwrite: action === "overwrite", previewChecksum: view.preview.checksum,
+      });
+      view.preview = null;
+      view.encrypted = "";
+      view.fileName = "";
+      view.message = "账号资料已恢复。";
+    }
+  } catch (error) {
+    if (action !== "export") view.preview = null;
+    view.message = String(error);
+  } finally {
+    view.busy = false;
+    if (modal === view) render();
+  }
+}
+
+function renderProxyPool(view: Extract<ModalMode, { kind: "proxyPool" }>): string {
+  const { account, data, setting, message, busy } = view;
+  const disabled = busy ? "disabled" : "";
+  const action = (label: string, name: string, id = "") =>
+    `<button type="button" class="mini-btn" data-proxy-pool-action="${name}" data-pool-id="${escapeHtml(id)}" ${disabled}>${label}</button>`;
+  return `
+    <div class="inline-modal" role="dialog" aria-modal="true" aria-labelledby="proxy-pool-title">
+      <div class="modal-card proxy-pool-modal">
+        <div class="modal-title" id="proxy-pool-title">代理池 · ${escapeHtml(account.alias)}</div>
+        <div class="modal-desc">${setting?.enabled ? `当前 ${escapeHtml(setting.display)}` : "当前账号未启用代理"}</div>
+        <div class="proxy-pool-body">
+          <label for="proxy-pool-input">代理 URI（每行一个）或 HTTPS 订阅</label>
+          <textarea id="proxy-pool-input" class="modal-input account-cookie-input" spellcheck="false" autocomplete="off" autocapitalize="off" ${disabled}></textarea>
+          <div class="proxy-pool-actions">${action("导入代理", "import")}${action("添加订阅", "subscribe")}${setting?.enabled ? action("测速", "measure") + action("清除账号代理", "clear") : ""}</div>
+          ${data?.sources.map((source) => `<div class="proxy-pool-row">
+            <div>${escapeHtml(source.host)}<small>上次刷新 ${new Date(source.refreshedAt * 1000).toLocaleString()}</small></div>
+            <div>${action("刷新", "refresh", source.id)}${action("删除订阅", "remove-source", source.id)}</div>
+          </div>`).join("") ?? ""}
+          ${data?.entries.map((entry) => `<div class="proxy-pool-row">
+            <div>${escapeHtml(entry.endpoint)}${entry.requiresAuth ? "<small>需要认证</small>" : ""}</div>
+            <div>${action("用此代理", "apply", entry.id)}${entry.sourceId ? "" : action("移除", "remove", entry.id)}</div>
+          </div>`).join("") ?? ""}
+        </div>
+        ${message ? `<div role="status">${escapeHtml(message)}</div>` : ""}
+        <div class="modal-footer">
+          <button id="modal-cancel-btn" type="button" class="btn" ${disabled}>关闭</button>
+        </div>
+      </div>
+    </div>`;
+}
+
+async function proxyPoolAction(view: Extract<ModalMode, { kind: "proxyPool" }>, action: string, entryId: string | null): Promise<void> {
+  if (modal !== view || view.busy) return;
+  const input = document.querySelector<HTMLTextAreaElement>("#proxy-pool-input");
+  const secret = input?.value.trim() ?? "";
+  if (input) input.value = "";
+  const { providerId, uuid } = view.account;
+  if (action === "apply" || action === "remove-source" || action === "clear") {
+    const confirm = action === "apply" ? {
+      title: "更换账号代理",
+      desc: `将所选代理用于「${view.account.alias}」，已打开的会话需要重新打开。`,
+      confirmLabel: "应用",
+    } : action === "clear" ? {
+      title: "清除账号代理",
+      desc: `清除后「${view.account.alias}」将使用系统网络。`,
+      confirmLabel: "清除",
+      danger: true,
+    } : {
+      title: "删除订阅",
+      desc: "删除订阅及其中的池条目。已经分配给账号的代理继续保留。",
+      confirmLabel: "删除",
+      danger: true,
+    };
+    if (!await askConfirm(confirm)) {
+      if ((modal as ModalMode).kind === "none") await setModal(view);
+      return;
+    }
+    await setModal(view);
+  }
+
+  view.busy = true;
+  view.message = "处理中…";
+  render();
+  try {
+    if (action === "apply") {
+      view.setting = await invoke<SpikeProxySettingView>("apply_proxy_pool_entry", { providerId, uuid, entryId });
+      view.message = proxySaveSummary(view.setting).join(" · ");
+    } else if (action === "clear") {
+      await invoke("muse_native_clear_account_proxy", { providerId, uuid });
+      view.setting = null;
+      view.message = "账号代理已清除。";
+    } else if (action === "measure") {
+      const result = await invoke<{ milliseconds: number; status: number }>("measure_account_proxy", { providerId, uuid });
+      view.message = `代理 HTTPS · HTTP ${result.status} · ${result.milliseconds} ms`;
+    } else {
+      const poolAction = action === "remove-source" ? "remove" : action;
+      view.data = await invoke<ProxyPoolView>("manage_proxy_pool", {
+        action: poolAction, entryId, input: poolAction === "import" || poolAction === "subscribe" ? secret : null,
+      });
+      if (action === "list") {
+        view.setting = await invoke<SpikeProxySettingView | null>("muse_native_get_account_proxy", { providerId, uuid });
+      }
+      view.message = "";
+    }
+  } catch (error) {
+    view.message = String(error);
+  } finally {
+    view.busy = false;
     if (modal === view) render();
   }
 }
@@ -2475,11 +2752,54 @@ async function accountCookieAction(action: "preview" | "import" | "export"): Pro
   }
 }
 
+async function submitApproval(
+  view: Extract<ModalMode, { kind: "approvals" }>, item: SpikeApprovalItem,
+  choice: SpikeApprovalItem["choices"][number]
+): Promise<void> {
+  const permanent = choice.decision === "allow_always";
+  const label = permanent ? "始终允许" : choice.decision === "deny" ? "拒绝" : "允许一次";
+  const name = item.displayName || item.kind || "此审批";
+  const accepted = await askConfirm({
+    title: label,
+    desc: `在「${view.account.alias}」对「${name}」执行「${label}」。`,
+    confirmLabel: label,
+    danger: permanent,
+  });
+  const confirmed = accepted && (!permanent || await askConfirm({
+    title: "确认持久授权",
+    desc: `后续同一${choice.scope === "destination_domain" ? "目标域名" : "对象"}的相关请求可能继续被允许。`,
+    confirmLabel: "确认持久授权", danger: true,
+  }));
+  await setModal(view);
+  if (!confirmed) return;
+  view.loading = true;
+  view.decisionMessage = "";
+  render();
+  try {
+    await invoke("decide_muse_approval", {
+      uuid: view.account.uuid,
+      request: {
+        approvalId: item.id, sessionScopeId: item.sessionScopeId, expiresAtMs: item.expiresAtMs,
+        decision: choice.decision, scope: choice.scope, permanentConfirmed: permanent,
+      },
+    });
+    view.decisionMessage = "审批结果已确认。";
+  } catch (error) {
+    view.decisionMessage = String(error);
+  } finally {
+    view.loading = false;
+    await loadAccountApprovals(view);
+  }
+}
+
 function renderModal(provider: ProviderInfo): string {
   if (modal.kind === "none") return "";
   if (modal.kind === "approvals") return renderApprovalsModal(modal);
   if (modal.kind === "cookies") return renderCookieModal(modal);
   if (modal.kind === "sessions") return renderSessionsModal(modal);
+  if (modal.kind === "proxyPool") return renderProxyPool(modal);
+  if (modal.kind === "backup") return renderAccountBackup(modal);
+  if (modal.kind === "tasks") return renderTasks(modal);
   if (modal.kind === "update") {
     return renderUpdateModal();
   }
@@ -2508,6 +2828,8 @@ function renderModal(provider: ProviderInfo): string {
           <label for="modal-group-input">分组</label>
           <input id="modal-group-input" class="modal-input" maxlength="32" placeholder="留空为未分组" value="${escapeHtml(modal.groupDraft)}" />
           <div class="modal-footer">
+            ${snapshot?.platform === "ios" && modal.account.authState === "authenticated" ? '<button id="account-task-btn" class="btn" type="button">任务</button>' : ""}
+            ${snapshot?.platform === "ios" ? '<button id="account-proxy-pool" class="btn" type="button">代理池</button>' : ""}
             <button id="modal-cancel-btn" class="btn" type="button">取消</button>
             <button id="modal-confirm-btn" class="btn primary" type="button">保存</button>
           </div>
@@ -2728,7 +3050,7 @@ function renderMiddleContent(state: ManagerSnapshot, provider: ProviderInfo): st
               : ""
         }
       </div>
-      <div class="header-actions">${museDiagnostics ? `<button id="spike-open-btn" class="mini-btn" type="button">诊断</button>` : ""}${headerBtnHtml}</div>
+      <div class="header-actions">${museDiagnostics ? `<button id="spike-open-btn" class="mini-btn" type="button">诊断</button>` : ""}${state.platform === "ios" && !inReorder ? '<button id="account-backup-btn" class="mini-btn" type="button">备份</button>' : ""}${headerBtnHtml}</div>
     </div>
     ${noticeHtml}
     ${conflictsHtml}
@@ -2890,6 +3212,9 @@ function modalIdentityKey(provider: ProviderInfo): string | null {
     case "approvals":
     case "cookies":
     case "sessions":
+    case "proxyPool":
+    case "backup":
+    case "tasks":
       return null;
     case "update":
       // Dynamic content (update check / install progress): no stable
@@ -3318,6 +3643,18 @@ function bindDelegatedEvents(): void {
 
     // Most specific first; each branch returns after handling (this is
     // what stopPropagation used to do for the row-op buttons).
+    const approvalChoice = target.closest<HTMLElement>("[data-approval-choice]");
+    if (approvalChoice && modal.kind === "approvals" && !modal.loading) {
+      const item = modal.result?.items[Number(approvalChoice.dataset.approvalItem)];
+      const choice = item?.choices[Number(approvalChoice.dataset.approvalChoice)];
+      if (item && choice) await submitApproval(modal, item, choice);
+      return;
+    }
+    const poolAction = target.closest<HTMLElement>("[data-proxy-pool-action]");
+    if (poolAction && modal.kind === "proxyPool") {
+      await proxyPoolAction(modal, poolAction.dataset.proxyPoolAction ?? "", poolAction.dataset.poolId || null);
+      return;
+    }
     const sessionButton = target.closest<HTMLElement>("[data-sessions-uuid]");
     if (sessionButton) {
       if (modal.kind !== "none" || reorderMode) return;
@@ -3351,7 +3688,7 @@ function bindDelegatedEvents(): void {
       const account = snapshot.accounts.find((entry) => entry.providerId === "muse" && entry.uuid === approvalButton.dataset.approvalsUuid);
       if (account?.authState === "authenticated") {
         const view: Extract<ModalMode, { kind: "approvals" }> = {
-          kind: "approvals", account, loading: true, result: null, fetchedAt: null,
+          kind: "approvals", account, loading: true, result: null, fetchedAt: null, decisionMessage: "",
         };
         await setModal(view);
         await loadAccountApprovals(view);
@@ -3603,6 +3940,64 @@ function bindDelegatedEvents(): void {
         render();
         restoreScrollPosition();
         break;
+      case "account-task-btn":
+        if (modal.kind === "rename") {
+          const view: Extract<ModalMode, { kind: "tasks" }> = {
+            kind: "tasks", account: modal.account, checking: false, note: "", quotaChecking: false,
+          };
+          await setModal(view);
+          await checkAccountTasks(view);
+        }
+        break;
+      case "account-task-refresh":
+        if (modal.kind === "tasks") await checkAccountTasks(modal);
+        break;
+      case "account-quota-refresh":
+        if (modal.kind === "tasks" && !modal.quotaChecking) {
+          const view = modal;
+          view.quotaChecking = true;
+          view.note = "正在查询额度…";
+          render();
+          try {
+            const result = await invoke<SpikeQuotaProbe>("muse_native_quota_probe", {
+              providerId: view.account.providerId, uuid: view.account.uuid,
+            });
+            view.note = result.ok ? "额度已更新。" : "额度未更新，请保留上次记录。";
+          } catch {
+            view.note = "额度未更新，请稍后重试。";
+          } finally {
+            view.quotaChecking = false;
+            if (modal === view) render();
+          }
+        }
+        break;
+      case "account-backup-btn":
+        if (modal.kind === "none") await setModal({
+          kind: "backup", busy: false, encrypted: "", fileName: "", preview: null, message: "",
+          mode: "light", includeGroups: true, includeProxy: false,
+        });
+        break;
+      case "backup-export":
+        if (modal.kind === "backup") await accountBackupAction(modal, "export");
+        break;
+      case "backup-preview":
+        if (modal.kind === "backup") await accountBackupAction(modal, "preview");
+        break;
+      case "backup-merge":
+        if (modal.kind === "backup") await accountBackupAction(modal, "merge");
+        break;
+      case "backup-overwrite":
+        if (modal.kind === "backup") await accountBackupAction(modal, "overwrite");
+        break;
+      case "account-proxy-pool":
+        if (modal.kind === "rename") {
+          const view: Extract<ModalMode, { kind: "proxyPool" }> = {
+            kind: "proxyPool", account: modal.account, data: null, setting: null, busy: false, message: "",
+          };
+          await setModal(view);
+          await proxyPoolAction(view, "list", null);
+        }
+        break;
       case "muse-sessions-refresh":
         if (modal.kind === "sessions" && !modal.loading) await loadMuseSessions(modal);
         break;
@@ -3737,7 +4132,40 @@ function bindDelegatedEvents(): void {
     { passive: false }
   );
 
-  root.addEventListener("change", (ev) => {
+  root.addEventListener("change", async (ev) => {
+    const input = ev.target as HTMLInputElement;
+    if (modal.kind === "backup") {
+      const view = modal;
+      if (input.id === "backup-mode") {
+        view.mode = input.value as BackupMode;
+        render();
+      } else if (input.id === "backup-include-groups") {
+        view.includeGroups = input.checked;
+      } else if (input.id === "backup-include-proxy") {
+        view.includeProxy = input.checked;
+      } else if (input.id === "backup-file") {
+        const file = input.files?.[0];
+        view.preview = null;
+        view.encrypted = "";
+        view.fileName = "";
+        if (file && file.size <= 2_800_000) {
+          view.busy = true;
+          try {
+            view.encrypted = await file.text();
+            view.fileName = file.name;
+            view.message = "";
+          } catch {
+            view.message = "无法读取备份文件。";
+          } finally {
+            view.busy = false;
+          }
+        } else {
+          view.message = file ? "备份文件过大。" : "";
+        }
+        if (modal === view) render();
+      }
+      return;
+    }
     const select = ev.target as HTMLSelectElement;
     if (select.id !== "account-group-select" || !snapshot) return;
     const provider = currentProvider(snapshot);
@@ -3850,7 +4278,7 @@ async function bootstrap(): Promise<void> {
         ev.key === "Escape" &&
         modal.kind !== "add" &&
         modal.kind !== "rename" &&
-        !(modal.kind === "cookies" && modal.busy) &&
+        !((modal.kind === "cookies" || modal.kind === "proxyPool" || modal.kind === "backup") && modal.busy) &&
         !(modal.kind === "update" && updateState.installing)
       ) {
         ev.preventDefault();
@@ -3942,6 +4370,7 @@ async function bootstrap(): Promise<void> {
       // 回前台立刻取一次存活探针状态：后台期间定时器不会运行，
       // 界面上的秒数是旧的，必须以真实快照为准。
       if (spikeLive?.running) void refreshSpikeLive();
+      if (modal.kind === "tasks") void checkAccountTasks(modal);
     }
   });
   window.addEventListener("focus", () => triggerAutoSync());

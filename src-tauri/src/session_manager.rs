@@ -964,6 +964,7 @@ pub struct SessionManager {
   active_view_id: Arc<AtomicU64>,
   view_counter: AtomicU64,
   last_sync_timestamp: AtomicU64,
+  pub(crate) proxy_write_lock: Mutex<()>,
   #[cfg(target_os = "ios")]
   quota_sync_lock: Mutex<()>,
   inner: Mutex<InnerState>,
@@ -986,6 +987,7 @@ impl SessionManager {
       active_view_id: Arc::new(AtomicU64::new(0)),
       view_counter: AtomicU64::new(1),
       last_sync_timestamp: AtomicU64::new(0),
+      proxy_write_lock: Mutex::new(()),
       #[cfg(target_os = "ios")]
       quota_sync_lock: Mutex::new(()),
       inner: Mutex::new(InnerState {
@@ -1061,6 +1063,115 @@ impl SessionManager {
       return Err("账号不存在、正在清理或需要先解决归属冲突".to_string());
     }
     crate::platform::ios::transfer_profile_cookies(app, provider.as_str(), uuid, cookies).await
+  }
+
+  pub async fn restore_account_backup(
+    &self,
+    app: &AppHandle,
+    backup: crate::account_backup::AccountBackup,
+    overwrite: bool,
+    preview_checksum: &str,
+  ) -> Result<ManagerSnapshot, String> {
+    let _proxy_guard = self.proxy_write_lock.lock().await;
+    let mut locked = self.inner.lock().await;
+    if locked.active_slot.is_some() || !locked.store.pending_cleanup.is_empty() || !locked.conflicts.is_empty() {
+      return Err("请关闭会话并完成账号清理或冲突处理后再恢复".into());
+    }
+    let preview = crate::account_backup::preview(&backup, &locked.store.accounts);
+    if preview.checksum != preview_checksum {
+      return Err("账号数据已变化，请重新预览".into());
+    }
+    let mut updated = locked.store.clone();
+    for saved in backup.accounts {
+      if let Some(record) = updated.accounts.iter_mut().find(|record| record.uuid == saved.uuid) {
+        if record.provider_id != saved.provider_id {
+          return Err("备份含归属冲突，未修改任何账号".into());
+        }
+        if overwrite {
+          record.alias = saved.alias;
+          record.auto_alias = false;
+          if backup.includes_groups { record.group = saved.group; }
+        }
+        continue;
+      }
+      let proxy = saved.proxy_endpoint.map(|uri| ProxySetting {
+        uri,
+        username: None,
+        // A missing credential intentionally blocks egress until explicit setup.
+        credential_ref: saved.proxy_requires_auth.then(|| format!("proxy-{}", saved.uuid)),
+        enabled: saved.proxy_enabled,
+      });
+      updated.accounts.push(AccountRecord {
+        provider_id: saved.provider_id, uuid: saved.uuid, alias: saved.alias,
+        group: saved.group, created_at_ms: saved.created_at_ms, auto_alias: false,
+        avatar_url: None, quota_text: None, quota_percent: None, quota_detail: None, quota_observation: None,
+        auth_state: AuthState::Unknown, has_unread_reply: false, last_task_reply_at_ms: None, proxy,
+      });
+    }
+    save_store_atomic(&locked.store_path, &updated)?;
+    locked.store = updated;
+    let snapshot = Self::snapshot_from_locked(&locked);
+    drop(locked);
+    self.emit_snapshot(app, &snapshot);
+    Ok(snapshot)
+  }
+
+  pub async fn record_approval_attempt(&self, key: &str, confirm: bool) -> Result<(), String> {
+    let mut locked = self.inner.lock().await;
+    let existing = locked.store.approval_attempts.get(key).copied();
+    if (!confirm && existing.is_some()) || (confirm && existing != Some(false)) {
+      return Err("本地已有该审批的提交记录，请打开会话核对".into());
+    }
+    if !confirm && locked.store.approval_attempts.len() >= 8192 {
+      return Err("审批台账已达容量，请在服务页面处理".into());
+    }
+    locked.store.approval_attempts.insert(key.to_string(), confirm);
+    if let Err(error) = save_store_atomic(&locked.store_path, &locked.store) {
+      match existing {
+        Some(value) => { locked.store.approval_attempts.insert(key.to_string(), value); }
+        None => { locked.store.approval_attempts.remove(key); }
+      }
+      return Err(error);
+    }
+    Ok(())
+  }
+
+  pub async fn record_native_quota(
+    &self,
+    app: &AppHandle,
+    uuid: &str,
+    result: Option<&crate::quota::QuotaSnapshot>,
+  ) -> Result<(), String> {
+    let mut locked = self.inner.lock().await;
+    let Some(index) = locked.store.accounts.iter().position(|account| {
+      account.provider_id == ProviderId::Muse && account.uuid == uuid && account.auth_state == AuthState::Authenticated
+    }) else { return Ok(()); };
+    let record = &mut locked.store.accounts[index];
+    let previous = record.clone();
+    if let Some(quota) = result {
+      record.quota_observation = Some(crate::storage::QuotaObservation {
+        source: "native".into(),
+        window: if quota.tier.is_empty() { None } else { Some(quota.tier.clone()) },
+        resets_at_ms: u64::try_from(quota.resets_at_ms).ok().filter(|value| *value > 0),
+        checked_at_ms: now_ms(),
+        stale: false,
+      });
+      if record.quota_detail.is_none() {
+        record.quota_text = Some(format!("已用 {}%", quota.percent_used));
+        record.quota_percent = u8::try_from(100 - quota.percent_used.clamp(0, 100)).ok();
+      }
+    } else if let Some(observation) = &mut record.quota_observation {
+      observation.stale = true;
+    }
+    if *record == previous { return Ok(()); }
+    if let Err(error) = save_store_atomic(&locked.store_path, &locked.store) {
+      locked.store.accounts[index] = previous;
+      return Err(error);
+    }
+    let snapshot = Self::snapshot_from_locked(&locked);
+    drop(locked);
+    self.emit_snapshot(app, &snapshot);
+    Ok(())
   }
 
   fn snapshot_from_locked(locked: &InnerState) -> ManagerSnapshot {
@@ -1550,8 +1661,10 @@ impl SessionManager {
         quota_text: None,
         quota_percent: None,
         quota_detail: None,
+        quota_observation: None,
         auth_state: AuthState::LoggedOut,
         has_unread_reply: false,
+        last_task_reply_at_ms: None,
         proxy: None,
       });
       save_store_atomic(&locked.store_path, &locked.store)?;
@@ -3692,19 +3805,19 @@ impl SessionManager {
         };
         let snap_opt = {
           let mut locked = self.inner.lock().await;
-          let Some(acc) = locked
+          let Some(index) = locked
             .store
             .accounts
-            .iter_mut()
-            .find(|a| a.provider_id == pid && a.uuid == norm_uuid)
+            .iter()
+            .position(|a| a.provider_id == pid && a.uuid == norm_uuid)
           else {
             return;
           };
-          if acc.has_unread_reply {
-            return;
-          }
-          acc.has_unread_reply = true;
+          let previous = locked.store.accounts[index].clone();
+          locked.store.accounts[index].has_unread_reply = true;
+          locked.store.accounts[index].last_task_reply_at_ms = Some(now_ms());
           if save_store_atomic(&locked.store_path, &locked.store).is_err() {
+            locked.store.accounts[index] = previous;
             return;
           }
           Some(Self::snapshot_from_locked(&locked))
@@ -4176,6 +4289,7 @@ impl SessionManager {
       target.auth_state = AuthState::LoggedOut;
       target.quota_detail = None;
       target.quota_text = None;
+    target.quota_observation = None;
       target.quota_percent = None;
 
       if save_store_atomic(&locked.store_path, &locked.store).is_err() {
@@ -4366,10 +4480,11 @@ impl SessionManager {
       if result.logged_out {
         let target = &mut locked.store.accounts[index];
         let changed = target.auth_state != AuthState::LoggedOut || target.quota_detail.is_some()
-          || target.quota_text.is_some() || target.quota_percent.is_some();
+          || target.quota_text.is_some() || target.quota_percent.is_some() || target.quota_observation.is_some();
         target.auth_state = AuthState::LoggedOut;
         target.quota_detail = None;
         target.quota_text = None;
+        target.quota_observation = None;
         target.quota_percent = None;
         any_changed |= changed;
         statuses.push(("signed_out", changed));
@@ -4385,10 +4500,23 @@ impl SessionManager {
       let quota_text = result.quota_text.as_deref().map(str::trim)
         .filter(|text| !text.is_empty() && text.len() <= 60 && !matches!(*text, "额度充足" | "正在同步额度…"));
       let has_quota = detail.is_some() || quota_text.is_some();
-      let (changed, _) = Self::update_account_metadata_locked(
+      let (mut changed, _) = Self::update_account_metadata_locked(
         &mut locked, &key, (!result.identity.is_empty()).then(|| result.identity.clone()),
         result.avatar_url.clone(), quota_text.map(str::to_string), result.quota_percent, detail,
       );
+      if has_quota && result.observation == "loaded" {
+        let target = &mut locked.store.accounts[index];
+        if target.quota_observation.as_ref().is_none_or(|observation| observation.source != "native") {
+          target.quota_observation = Some(crate::storage::QuotaObservation {
+            source: "page".into(),
+            window: target.quota_detail.as_ref().map(|detail| detail.plan_label.clone()),
+            resets_at_ms: None,
+            checked_at_ms: now_ms(),
+            stale: false,
+          });
+          changed = true;
+        }
+      }
       any_changed |= changed;
       let after = &locked.store.accounts[index];
       let status = if !has_quota {

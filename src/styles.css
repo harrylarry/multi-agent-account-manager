@@ -1922,3 +1922,30 @@ body,
 .muse-thread-row small {
   color: var(--text-muted);
 }
+
+.proxy-pool-body {
+  max-height: 48vh;
+  overflow-y: auto;
+}
+
+.proxy-pool-actions,
+.proxy-pool-row > div:last-child {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 5px;
+}
+
+.proxy-pool-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  padding: 8px 0;
+  border-bottom: 1px solid var(--border-strong);
+  overflow-wrap: anywhere;
+}
+
+.proxy-pool-row small {
+  display: block;
+  color: var(--text-muted);
+}

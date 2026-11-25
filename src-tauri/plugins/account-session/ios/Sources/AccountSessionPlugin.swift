@@ -77,6 +77,10 @@ private struct TransferProfileCookiesArgs: Decodable {
   let cookies: [Entry]?
 }
 
+private struct ShareAccountBackupArgs: Decodable {
+  let contents: String
+}
+
 private struct GetSessionCookiesArgs: Decodable {
   let uuid: String
   let provider: String?
@@ -339,6 +343,64 @@ class AccountSessionPlugin: Plugin {
         }
         invoke.resolve(["cookies": mine.map { ["name": $0.name, "value": $0.value] }])
       }
+    }
+  }
+
+  @objc public func readParkedTaskState(_ invoke: Invoke) throws {
+    let args = try invoke.parseArgs(GetSessionCookiesArgs.self)
+    DispatchQueue.main.async {
+      guard let provider = args.provider, provider == "muse",
+            UIApplication.shared.applicationState == .active else {
+        invoke.resolve(["activity": NSNull()])
+        return
+      }
+      RecentAccountPages.probeParked(providerId: provider, uuid: args.uuid,
+                                      javascript: TaskWatcher.taskStateScript) { raw in
+        guard let text = raw as? String, let data = text.data(using: .utf8),
+              let payload = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+              payload["usable"] as? Bool == true,
+              let working = payload["working"] as? Bool else {
+          invoke.resolve(["activity": NSNull()])
+          return
+        }
+        invoke.resolve(["activity": working ? "working" : "idle"])
+      }
+    }
+  }
+
+  @objc public func shareAccountBackup(_ invoke: Invoke) throws {
+    let args = try invoke.parseArgs(ShareAccountBackupArgs.self)
+    DispatchQueue.main.async {
+      guard args.contents.utf8.count <= 2_800_000,
+            let decoded = Data(base64Encoded: args.contents),
+            decoded.starts(with: Data("MAAMBAK1".utf8)),
+            let window = UIApplication.shared.connectedScenes.compactMap({ $0 as? UIWindowScene })
+              .first(where: { $0.activationState == .foregroundActive })?.keyWindow,
+            let root = window.rootViewController else {
+        invoke.reject("无法打开备份分享")
+        return
+      }
+      var presenter = root
+      while let next = presenter.presentedViewController { presenter = next }
+      let file = FileManager.default.temporaryDirectory.appendingPathComponent(
+        "diehao-" + String(UUID().uuidString.prefix(8)) + ".maambackup"
+      )
+      do {
+        try Data(args.contents.utf8).write(to: file, options: [.atomic, .completeFileProtection])
+      } catch {
+        invoke.reject("无法创建加密备份文件")
+        return
+      }
+      let controller = UIActivityViewController(activityItems: [file], applicationActivities: nil)
+      if let popover = controller.popoverPresentationController {
+        popover.sourceView = presenter.view
+        popover.sourceRect = CGRect(x: presenter.view.bounds.midX, y: presenter.view.bounds.midY, width: 1, height: 1)
+      }
+      controller.completionWithItemsHandler = { _, shared, _, _ in
+        try? FileManager.default.removeItem(at: file)
+        invoke.resolve(["shared": shared])
+      }
+      presenter.present(controller, animated: true)
     }
   }
 

@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-apply-proxy-pool-entry"
+description = "Enables the apply_proxy_pool_entry command without any pre-configured scope."
+commands.allow = ["apply_proxy_pool_entry"]
+
+[[permission]]
+identifier = "deny-apply-proxy-pool-entry"
+description = "Denies the apply_proxy_pool_entry command without any pre-configured scope."
+commands.deny = ["apply_proxy_pool_entry"]

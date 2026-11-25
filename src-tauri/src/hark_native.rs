@@ -19,6 +19,7 @@ pub struct SyncSummary {
   frames: usize,
   malformed_frames: usize,
   known_messages: usize,
+  running_now: usize,
   running: usize,
   completed: usize,
   failed: usize,
@@ -181,6 +182,18 @@ pub struct HarkProbe {
 }
 
 #[cfg(target_os = "ios")]
+impl HarkProbe {
+  pub fn task_status(&self) -> Option<&'static str> {
+    if !self.rest_status.is_some_and(|status| (200..300).contains(&status))
+      || self.summary.malformed_frames > 0 || self.summary.known_messages == 0
+      || (self.error.is_some() && self.summary.running_now == 0)
+    {
+      return None;
+    }
+    Some(if self.summary.running_now > 0 { "working" } else { "idle" })
+  }
+}
+#[cfg(target_os = "ios")]
 pub async fn diagnose(
   app: &tauri::AppHandle,
   uuid: &str,
@@ -331,7 +344,8 @@ async fn run_probe(
   }
   .await;
   result.error = checked.err();
-  tracker.summary.known_messages = tracker.states.len();
+  tracker.summary.known_messages = tracker.states.values().filter(|state| state.is_some()).count();
+  tracker.summary.running_now = tracker.states.values().filter(|state| **state == Some(JobState::Running)).count();
   result.summary = tracker.summary;
   result
 }

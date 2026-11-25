@@ -153,6 +153,16 @@ pub enum AuthState {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
+pub struct QuotaObservation {
+  pub source: String,
+  pub window: Option<String>,
+  pub resets_at_ms: Option<u64>,
+  pub checked_at_ms: u64,
+  pub stale: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct AccountRecord {
   pub provider_id: ProviderId,
   pub uuid: String,
@@ -170,12 +180,16 @@ pub struct AccountRecord {
   pub quota_percent: Option<u8>,
   #[serde(default)]
   pub quota_detail: Option<QuotaDetail>,
+  #[serde(default, skip_serializing_if = "Option::is_none")]
+  pub quota_observation: Option<QuotaObservation>,
   #[serde(default)]
   pub auth_state: AuthState,
   /// 0.1.15: the iOS task watcher saw a new reply for this account
   /// while it was not active. Cleared when the account is opened.
   #[serde(default)]
   pub has_unread_reply: bool,
+  #[serde(default, skip_serializing_if = "Option::is_none")]
+  pub last_task_reply_at_ms: Option<u64>,
   /// #11/#16：每账号 1:1 代理引用（脱敏存储，fail-closed）。
   #[serde(default)]
   pub proxy: Option<ProxySetting>,
@@ -195,6 +209,8 @@ pub struct AccountsStoreFile {
   pub accounts: Vec<AccountRecord>,
   pub last_committed: Option<AccountKey>,
   pub pending_cleanup: Vec<AccountKey>,
+  #[serde(default)]
+  pub approval_attempts: BTreeMap<String, bool>,
 }
 
 impl Default for AccountsStoreFile {
@@ -204,6 +220,7 @@ impl Default for AccountsStoreFile {
       accounts: Vec::new(),
       last_committed: None,
       pending_cleanup: Vec::new(),
+      approval_attempts: BTreeMap::new(),
     }
   }
 }
@@ -393,8 +410,12 @@ fn migrate_from_value(root: Value) -> Result<(AccountsStoreFile, bool), String> 
         quota_text,
         quota_percent,
         quota_detail,
+        quota_observation: item_obj.get("quotaObservation")
+          .and_then(|value| serde_json::from_value(value.clone()).ok())
+          .filter(|_: &QuotaObservation| auth_state != AuthState::LoggedOut),
         auth_state,
         has_unread_reply: false,
+        last_task_reply_at_ms: item_obj.get("lastTaskReplyAtMs").and_then(Value::as_u64),
         proxy,
       });
     }
@@ -423,12 +444,18 @@ fn migrate_from_value(root: Value) -> Result<(AccountsStoreFile, bool), String> 
     }
   }
 
+  let approval_attempts = match obj.get("approvalAttempts") {
+    None => BTreeMap::new(),
+    Some(value) => serde_json::from_value(value.clone()).map_err(|_| "审批台账损坏".to_string())?,
+  };
+
   Ok((
     AccountsStoreFile {
       version: STORE_VERSION,
       accounts,
       last_committed,
       pending_cleanup,
+      approval_attempts,
     },
     is_legacy,
   ))
