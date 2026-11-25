@@ -65,3 +65,5 @@
 `dda5127` iPhone 真机用同一账号测试启用及明确清除 SOCKS5。隐藏 WebView 两轮均超时，后台额度正向验收为 `FAIL`。原生额度经代理冷发现 GET 失败，匿名 HEAD 为 200，清除代理后原生额度成功。已在候选修复中让隐藏 WebView 使用前台窗口中的不可交互渲染视口，从主文档提交开始独立探测额度。原生路径补充脱敏的请求或响应体错误分类。后续需验证主文档是否提交、额度是否更新，再做错误密码及恢复正确密码的对照。[真机回执](../acceptance/iphone-acceptance.md#dda5127-真机回执)
 
 `ab6f6fa` 的 [Quick checks](https://github.com/harrylarry/multi-agent-account-manager/actions/runs/45613514999) 和 [Xcode 打包](https://github.com/harrylarry/multi-agent-account-manager/actions/runs/45613523633) 均通过，已下载校验新 IPA。下一次真机先确认清除代理时后台额度路径能到达主文档提交及实际额度，再用正确 SOCKS5 重跑同一入口；若原生查询仍失败，回填新诊断。新构建实际结果 `UNVERIFIED`。[复测包和步骤](../acceptance/iphone-acceptance.md#ios-后台额度同步)
+
+`ab6f6fa` 真机已通过 Muse 直连后台额度采集和错误 SOCKS5 密码下的客户端故障阻断。标为有代理的那轮读取到代理未启用，因此正确 SOCKS5 密码和恢复路径仍为 `UNVERIFIED`。下一步等待代理保存完成后，用同一账号重跑一次正确密码，观察实际代理下发、主文档与额度状态。原生代理额度若继续失败，收集新版脱敏错误分类。[真机回执](../acceptance/iphone-acceptance.md#ab6f6fa-真机回执)
