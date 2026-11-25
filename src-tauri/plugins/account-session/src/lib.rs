@@ -300,6 +300,7 @@ pub struct OpenIosAccountPayload {
   pub provider_name: String,
   pub uuid: String,
   pub alias: String,
+  pub timezone: Option<String>,
   pub auto_alias: bool,
   pub entry_url: String,
   pub allowed_hosts: Vec<String>,
@@ -726,6 +727,7 @@ pub struct SyncQuotaTarget {
   pub provider_id: String,
   pub uuid: String,
   pub entry_url: String,
+  pub timezone: Option<String>,
 }
 
 #[cfg(target_os = "ios")]
@@ -782,17 +784,21 @@ pub async fn transfer_profile_cookies(
   provider: &str,
   uuid: &str,
   cookies: Option<&[impl serde::Serialize]>,
-) -> Result<usize, String> {
-  #[derive(Deserialize)]
-  struct ResultCount {
-    count: usize,
-  }
+  inspect: bool,
+) -> Result<ProfileCookieSummary, String> {
   let bridge = app.state::<IosSessionBridge<tauri::Wry>>();
-  let response: ResultCount = bridge.0.run_mobile_plugin_async(
+  bridge.0.run_mobile_plugin_async(
     "transferProfileCookies",
-    serde_json::json!({ "provider": provider, "uuid": uuid, "cookies": cookies }),
-  ).await.map_err(|e| e.to_string())?;
-  Ok(response.count)
+    serde_json::json!({ "provider": provider, "uuid": uuid, "cookies": cookies, "inspect": inspect }),
+  ).await.map_err(|e| e.to_string())
+}
+
+#[cfg(target_os = "ios")]
+#[derive(Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ProfileCookieSummary {
+  pub count: usize,
+  pub next_expiry: Option<f64>,
 }
 
 #[cfg(target_os = "ios")]
@@ -815,4 +821,34 @@ pub async fn read_parked_task_state(app: &AppHandle, uuid: &str) -> Result<Optio
     "readParkedTaskState", serde_json::json!({ "uuid": uuid, "provider": "muse" }),
   ).await.map_err(|e| e.to_string())?;
   Ok(response.activity)
+}
+
+#[cfg(target_os = "ios")]
+pub async fn task_notification_permission(app: &AppHandle) -> Result<bool, String> {
+  #[derive(Deserialize)]
+  struct Permission { granted: bool }
+  let bridge = app.state::<IosSessionBridge<tauri::Wry>>();
+  let result: Permission = bridge.0.run_mobile_plugin_async(
+    "requestTaskNotificationPermission", serde_json::json!({}),
+  ).await.map_err(|e| e.to_string())?;
+  Ok(result.granted)
+}
+
+#[cfg(target_os = "ios")]
+pub async fn post_task_notification(app: &AppHandle, identifier: &str, kind: &str) {
+  let bridge = app.state::<IosSessionBridge<tauri::Wry>>();
+  let _ = bridge.0.run_mobile_plugin_async::<serde_json::Value>(
+    "postTaskNotification", serde_json::json!({ "identifier": identifier, "kind": kind }),
+  ).await;
+}
+
+#[cfg(target_os = "ios")]
+pub async fn automatic_task_polling_available(app: &AppHandle) -> Result<bool, String> {
+  #[derive(Deserialize)]
+  struct Availability { available: bool }
+  let bridge = app.state::<IosSessionBridge<tauri::Wry>>();
+  let result: Availability = bridge.0.run_mobile_plugin_async(
+    "isAutomaticTaskPollingAvailable", serde_json::json!({}),
+  ).await.map_err(|e| e.to_string())?;
+  Ok(result.available)
 }

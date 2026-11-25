@@ -106,6 +106,7 @@ enum RecentAccountPages {
     /// (0.1.15). May lag the live alias by one park cycle; refreshed
     /// whenever the account is re-parked.
     let alias: String
+    let timezone: String?
   }
 
   // Park-ordered (oldest first = least recently active); eviction takes
@@ -147,7 +148,7 @@ enum RecentAccountPages {
     else { return nil }
     let entry = pages.remove(at: idx).entry
     trim(maxAccountPages - 1)
-    if spec.isColdStart || !isReusable(entry.view, spec: spec) {
+    if spec.isColdStart || entry.timezone != spec.timezone || !isReusable(entry.view, spec: spec) {
       destroy(entry.view)
       return nil
     }
@@ -168,7 +169,7 @@ enum RecentAccountPages {
     if let idx = pages.firstIndex(where: { $0.key == key }) {
       destroy(pages.remove(at: idx).entry.view)
     }
-    pages.append((key: key, entry: Entry(view: view, delegate: delegate, alias: spec.alias)))
+    pages.append((key: key, entry: Entry(view: view, delegate: delegate, alias: spec.alias, timezone: spec.timezone)))
     trim(maxAccountPages)
   }
 

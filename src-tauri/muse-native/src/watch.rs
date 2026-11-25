@@ -143,6 +143,8 @@ pub struct WatchSummary {
 pub struct WatchTracker {
   seen: HashSet<(String, i64)>,
   completed: HashSet<String>,
+  seen_live_messages: HashSet<String>,
+  live_completed: HashSet<String>,
   summary: WatchSummary,
 }
 
@@ -153,6 +155,10 @@ impl WatchTracker {
 
   pub fn summary(&self) -> &WatchSummary {
     &self.summary
+  }
+
+  pub fn live_completed(&self) -> impl Iterator<Item = &String> {
+    self.live_completed.iter()
   }
 
   /// 处理一行 NDJSON，返回需要通知调用方的状态变化。
@@ -181,13 +187,15 @@ impl WatchTracker {
       }
       WatchKind::MessageStarted => {
         self.summary.messages_started += 1;
+        if let Some(id) = &ev.message_id { self.seen_live_messages.insert(id.clone()); }
         ev.message_id.map(Notice::MessageStarted)
       }
       WatchKind::TextDelta(_) => {
         self.summary.text_deltas += 1;
+        if let Some(id) = ev.message_id { self.seen_live_messages.insert(id); }
         None
       }
-      WatchKind::MessageDone { .. } => {
+      WatchKind::MessageDone { status } => {
         let id = ev.message_id.unwrap_or_default();
         if id.is_empty() {
           self.summary.messages_done += 1;
@@ -198,6 +206,11 @@ impl WatchTracker {
           return None;
         }
         self.summary.messages_done += 1;
+        if self.seen_live_messages.contains(&id)
+          && status.as_deref().is_none_or(|status| matches!(status, "complete" | "completed" | "done" | "success" | "succeeded"))
+        {
+          self.live_completed.insert(id.clone());
+        }
         Some(Notice::Completed(id))
       }
       WatchKind::AgentBusy(code) => {

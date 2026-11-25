@@ -21,6 +21,7 @@ import Foundation
 import Network
 import Tauri
 import UIKit
+import UserNotifications
 import WebKit
 
 // MARK: - Command arguments (field names must match the Rust JSON keys)
@@ -41,6 +42,7 @@ private struct OpenSessionArgs: Decodable {
   let alias: String
   let autoAlias: Bool
   let entryUrl: String
+  let timezone: String?
   let allowedHosts: [String]
   let switchSeq: Int64
   let viewInstanceId: Int64
@@ -75,6 +77,12 @@ private struct TransferProfileCookiesArgs: Decodable {
   let uuid: String
   let provider: String
   let cookies: [Entry]?
+  let inspect: Bool?
+}
+
+private struct TaskNotificationArgs: Decodable {
+  let identifier: String
+  let kind: String
 }
 
 private struct ShareAccountBackupArgs: Decodable {
@@ -106,6 +114,7 @@ private struct SyncAccountTarget: Decodable {
   let providerId: String
   let uuid: String
   let entryUrl: String
+  let timezone: String?
 }
 
 private struct SyncAccountQuotasArgs: Decodable {
@@ -233,6 +242,7 @@ class AccountSessionPlugin: Plugin {
         alias: args.alias,
         autoAlias: args.autoAlias,
         entryUrl: args.entryUrl,
+        timezone: args.timezone,
         allowedHosts: args.allowedHosts,
         switchSeq: args.switchSeq,
         viewInstanceId: args.viewInstanceId,
@@ -343,6 +353,35 @@ class AccountSessionPlugin: Plugin {
         }
         invoke.resolve(["cookies": mine.map { ["name": $0.name, "value": $0.value] }])
       }
+    }
+  }
+
+  @objc public func isAutomaticTaskPollingAvailable(_ invoke: Invoke) {
+    DispatchQueue.main.async {
+      let active = UIApplication.shared.applicationState == .active
+      invoke.resolve(["available": active && !ProcessInfo.processInfo.isLowPowerModeEnabled])
+    }
+  }
+
+  @objc public func requestTaskNotificationPermission(_ invoke: Invoke) {
+    UNUserNotificationCenter.current().requestAuthorization(options: [.alert, .sound]) { granted, _ in
+      invoke.resolve(["granted": granted])
+    }
+  }
+
+  @objc public func postTaskNotification(_ invoke: Invoke) throws {
+    let args = try invoke.parseArgs(TaskNotificationArgs.self)
+    DispatchQueue.main.async {
+      guard UIApplication.shared.applicationState != .active else {
+        invoke.resolve()
+        return
+      }
+      let content = UNMutableNotificationContent()
+      content.title = "叠号"
+      content.body = args.kind == "approval" ? "有待处理的审批。" : "检测到任务回复。"
+      content.sound = .default
+      let request = UNNotificationRequest(identifier: args.identifier, content: content, trigger: nil)
+      UNUserNotificationCenter.current().add(request) { _ in invoke.resolve() }
     }
   }
 
@@ -503,6 +542,13 @@ class AccountSessionPlugin: Plugin {
 
       let cookies = await allCookies().filter {
         allowed($0.domain) && ($0.expiresDate.map { $0 > Date() } ?? true)
+      }
+      if args.inspect == true {
+        let expiry = cookies.compactMap { $0.expiresDate?.timeIntervalSince1970 }.min()
+        var summary: [String: Any] = ["count": cookies.count]
+        if let expiry { summary["nextExpiry"] = expiry }
+        invoke.resolve(summary)
+        return
       }
       guard !cookies.isEmpty else {
         invoke.reject("该账号没有可导出的 Cookie")
@@ -670,7 +716,7 @@ class AccountSessionPlugin: Plugin {
     DispatchQueue.main.async {
       let targets = args.accounts.map {
         QuotaSyncRunner.Target(
-          providerId: $0.providerId, uuid: $0.uuid, entryUrl: $0.entryUrl)
+          providerId: $0.providerId, uuid: $0.uuid, entryUrl: $0.entryUrl, timezone: $0.timezone)
       }
       QuotaSyncRunner.run(targets: targets, fresh: args.fresh ?? false) { results in
         invoke.resolve(["results": results.map { $0.json }])

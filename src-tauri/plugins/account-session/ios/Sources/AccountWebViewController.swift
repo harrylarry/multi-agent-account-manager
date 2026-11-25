@@ -509,6 +509,7 @@ final class AccountWebViewController: UIViewController, WKNavigationDelegate, WK
       // default, which breaks avatar videos (muted autoplay) and leaves
       // no working close control. Inline playback keeps video in-page.
       config.allowsInlineMediaPlayback = true
+      AccountTimeZone.install(spec.timezone, into: config)
       config.userContentController.addUserScript(
         WKUserScript(
           source: Scripts.quotaHookInitScript,

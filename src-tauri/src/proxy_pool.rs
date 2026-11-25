@@ -1,4 +1,5 @@
 use crate::secrets::Secrets;
+use crate::account_backup::ProxyPoolProfile;
 use muse_native_client::proxy::ProxyConfig;
 use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
@@ -51,6 +52,7 @@ struct EntryView {
   id: Uuid,
   endpoint: String,
   requires_auth: bool,
+  missing_credentials: bool,
   source_id: Option<Uuid>,
 }
 
@@ -110,7 +112,7 @@ impl ProxyPool {
       let proxy = ProxyConfig::parse(&entry.uri).map_err(|_| "代理池中有无效配置")?;
       Ok(EntryView {
         id: entry.id, endpoint: proxy.display_safe(),
-        requires_auth: proxy.has_credentials(), source_id: entry.source,
+        requires_auth: proxy.has_credentials(), missing_credentials: false, source_id: entry.source,
       })
     }).collect::<Result<Vec<_>, &str>>()?;
     let sources = self.sources.iter().map(|source| {
@@ -121,6 +123,25 @@ impl ProxyPool {
       })
     }).collect::<Result<Vec<_>, &str>>()?;
     Ok(PoolView { entries, sources })
+  }
+
+  pub fn push_restored(view: &mut PoolView, restored: &[ProxyPoolProfile]) {
+    for row in restored {
+      if view.entries.iter().any(|entry| entry.endpoint == row.endpoint && entry.requires_auth == row.requires_auth) {
+        continue;
+      }
+      view.entries.push(EntryView {
+        id: restored_entry_id(row), endpoint: row.endpoint.clone(),
+        requires_auth: row.requires_auth, missing_credentials: row.requires_auth, source_id: None,
+      });
+    }
+  }
+
+  #[cfg(target_os = "ios")]
+  pub fn backup_metadata(&self) -> Result<Vec<ProxyPoolProfile>, String> {
+    Ok(self.view()?.entries.into_iter().map(|entry| ProxyPoolProfile {
+      endpoint: entry.endpoint, requires_auth: entry.requires_auth,
+    }).collect())
   }
 
   pub fn import(&mut self, raw: &str) -> Result<(), String> {
@@ -225,6 +246,14 @@ async fn fetch_source(url: Url) -> Result<Vec<String>, String> {
   }
   let content = std::str::from_utf8(&body).map_err(|_| "订阅内容格式无效")?;
   parse_lines(content)
+}
+
+pub fn restored_entry_id(entry: &ProxyPoolProfile) -> Uuid {
+  let key = format!("restored-proxy|{}|{}", entry.endpoint, entry.requires_auth);
+  let digest = ring::digest::digest(&ring::digest::SHA256, key.as_bytes());
+  let mut bytes = [0; 16];
+  bytes.copy_from_slice(&digest.as_ref()[..16]);
+  Uuid::from_bytes(bytes)
 }
 
 #[cfg(test)]

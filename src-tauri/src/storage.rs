@@ -169,6 +169,10 @@ pub struct AccountRecord {
   pub alias: String,
   #[serde(default, skip_serializing_if = "Option::is_none")]
   pub group: Option<String>,
+  #[serde(default, skip_serializing_if = "Option::is_none")]
+  pub timezone: Option<String>,
+  #[serde(default, skip_serializing_if = "Option::is_none")]
+  pub last_muse_thread: Option<Uuid>,
   pub created_at_ms: u64,
   #[serde(default)]
   pub auto_alias: bool,
@@ -190,6 +194,12 @@ pub struct AccountRecord {
   pub has_unread_reply: bool,
   #[serde(default, skip_serializing_if = "Option::is_none")]
   pub last_task_reply_at_ms: Option<u64>,
+  #[serde(default)]
+  pub task_notifications: bool,
+  #[serde(default, skip_serializing_if = "Vec::is_empty")]
+  pub task_notice_keys: Vec<String>,
+  #[serde(default)]
+  pub pending_approval_count: Option<usize>,
   /// #11/#16：每账号 1:1 代理引用（脱敏存储，fail-closed）。
   #[serde(default)]
   pub proxy: Option<ProxySetting>,
@@ -211,6 +221,8 @@ pub struct AccountsStoreFile {
   pub pending_cleanup: Vec<AccountKey>,
   #[serde(default)]
   pub approval_attempts: BTreeMap<String, bool>,
+  #[serde(default, skip_serializing_if = "Vec::is_empty")]
+  pub restored_proxy_pool: Vec<crate::account_backup::ProxyPoolProfile>,
 }
 
 impl Default for AccountsStoreFile {
@@ -221,6 +233,7 @@ impl Default for AccountsStoreFile {
       last_committed: None,
       pending_cleanup: Vec::new(),
       approval_attempts: BTreeMap::new(),
+      restored_proxy_pool: Vec::new(),
     }
   }
 }
@@ -262,6 +275,16 @@ pub fn detect_conflicts(accounts: &[AccountRecord]) -> Vec<ConflictItem> {
     }
   }
   conflicts
+}
+
+pub fn normalize_account_timezone(value: &str) -> Result<Option<String>, String> {
+  let value = value.trim();
+  if value.is_empty() { return Ok(None); }
+  if value.len() > 96 || !value.bytes().all(|byte| byte.is_ascii_alphanumeric() || b"/_+-".contains(&byte))
+    || (value != "UTC" && value != "GMT" && (!value.contains('/') || value.split('/').any(str::is_empty))) {
+    return Err("请输入有效的 IANA 时区，例如 Asia/Shanghai".into());
+  }
+  Ok(Some(value.to_string()))
 }
 
 pub fn normalize_account_group(value: &str) -> Result<Option<String>, String> {
@@ -404,6 +427,8 @@ fn migrate_from_value(root: Value) -> Result<(AccountsStoreFile, bool), String> 
         uuid,
         alias,
         group,
+        last_muse_thread: item_obj.get("lastMuseThread").and_then(Value::as_str).and_then(|value| Uuid::parse_str(value).ok()),
+        timezone: item_obj.get("timezone").and_then(Value::as_str).and_then(|value| normalize_account_timezone(value).ok()).flatten(),
         created_at_ms,
         auto_alias,
         avatar_url,
@@ -416,6 +441,10 @@ fn migrate_from_value(root: Value) -> Result<(AccountsStoreFile, bool), String> 
         auth_state,
         has_unread_reply: false,
         last_task_reply_at_ms: item_obj.get("lastTaskReplyAtMs").and_then(Value::as_u64),
+        task_notifications: item_obj.get("taskNotifications").and_then(Value::as_bool).unwrap_or(false),
+        task_notice_keys: item_obj.get("taskNoticeKeys")
+          .and_then(|value| serde_json::from_value(value.clone()).ok()).unwrap_or_default(),
+        pending_approval_count: None,
         proxy,
       });
     }
@@ -456,6 +485,7 @@ fn migrate_from_value(root: Value) -> Result<(AccountsStoreFile, bool), String> 
       last_committed,
       pending_cleanup,
       approval_attempts,
+      restored_proxy_pool: obj.get("restoredProxyPool").and_then(|value| serde_json::from_value(value.clone()).ok()).unwrap_or_default(),
     },
     is_legacy,
   ))

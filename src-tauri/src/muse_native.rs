@@ -1318,6 +1318,8 @@ pub struct WatchProbe {
   pub parse_errors: u64,
   pub type_counts: std::collections::BTreeMap<String, u64>,
   pub error: Option<String>,
+  #[serde(skip)]
+  pub completed_ids: Vec<String>,
 }
 
 pub async fn watch_probe(
@@ -1364,6 +1366,7 @@ pub async fn watch_probe(
         non_event: 0,
         parse_errors: 0,
         type_counts: Default::default(),
+        completed_ids: Vec::new(),
         error: Some("该账号在 Spike App 里还没有 muse.ai 登录态".to_string()),
       });
     }
@@ -1382,6 +1385,7 @@ pub async fn watch_probe(
           non_event: 0,
           parse_errors: 0,
           type_counts: Default::default(),
+        completed_ids: Vec::new(),
           error: Some(e.to_string()),
         });
       }
@@ -1402,6 +1406,7 @@ pub async fn watch_probe(
           non_event: 0,
           parse_errors: 0,
           type_counts: Default::default(),
+        completed_ids: Vec::new(),
           error: Some(e.to_string()),
         });
       }
@@ -1461,6 +1466,7 @@ pub async fn watch_probe(
       non_event,
       parse_errors,
       type_counts,
+      completed_ids: tracker.live_completed().cloned().collect(),
       error,
     })
   }

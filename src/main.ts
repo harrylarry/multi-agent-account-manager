@@ -16,13 +16,13 @@ import type {
 type ModalMode =
   | { kind: "none" }
   | { kind: "add"; providerId: ProviderId; draft: string }
-  | { kind: "rename"; account: AccountRecord; draft: string; groupDraft: string }
+  | { kind: "rename"; account: AccountRecord; draft: string; groupDraft: string; timezoneDraft: string }
   | { kind: "remove"; account: AccountRecord }
   | { kind: "tasks"; account: AccountRecord; checking: boolean; note: string; quotaChecking: boolean }
-  | { kind: "backup"; busy: boolean; encrypted: string; fileName: string; preview: BackupPreview | null; message: string; mode: BackupMode; includeGroups: boolean; includeProxy: boolean }
+  | { kind: "backup"; busy: boolean; encrypted: string; fileName: string; preview: BackupPreview | null; message: string; mode: BackupMode; includeGroups: boolean; includeProxy: boolean; expiryDays: number }
   | { kind: "proxyPool"; account: AccountRecord; data: ProxyPoolView | null; setting: SpikeProxySettingView | null; busy: boolean; message: string }
   | { kind: "sessions"; account: AccountRecord; loading: boolean; items: MuseSession[] | null; error: string }
-  | { kind: "cookies"; account: AccountRecord; busy: boolean; preview: CookiePreview | null; message: string; imported: boolean }
+  | { kind: "cookies"; account: AccountRecord; busy: boolean; preview: CookiePreview | null; message: string; imported: boolean; stored: Pick<CookiePreview, "count" | "nextExpiry"> | null }
   | { kind: "approvals"; account: AccountRecord; loading: boolean; result: SpikeApprovalsResult | null; fetchedAt: number | null; decisionMessage: string }
   | { kind: "update" }
   // 应用内确认框（替代 window.confirm）。WKWebView 的 UIDelegate 没有
@@ -49,11 +49,12 @@ interface BackupPreview {
   added: number;
   existing: number;
   conflicts: string[];
+  proxyPoolCount: number;
   checksum: string;
 }
 
 interface ProxyPoolView {
-  entries: { id: string; endpoint: string; requiresAuth: boolean; sourceId: string | null }[];
+  entries: { id: string; endpoint: string; requiresAuth: boolean; missingCredentials?: boolean; sourceId: string | null }[];
   sources: { id: string; host: string; refreshedAt: number }[];
 }
 
@@ -1070,6 +1071,41 @@ async function callCommand(
 // Batch-1: silent sync triggers (iOS). Fire-and-forget: the Rust side
 // throttles to one sync per 30s and skips the currently open account
 // (the foreground probe already covers it).
+let foregroundTaskIndex = 0;
+let foregroundTaskBusy = false;
+let foregroundTaskTimer: number | null = null;
+const taskRetryAt = new Map<string, number>();
+
+async function refreshForegroundTask(): Promise<void> {
+  if (!snapshot || document.hidden || !navigator.onLine || foregroundTaskBusy || (modal.kind === "tasks" && modal.checking)) return;
+  const accounts = snapshot.accounts.filter((account) =>
+    account.taskNotifications && account.authState === "authenticated"
+      && Date.now() >= (taskRetryAt.get(`${account.providerId}:${account.uuid}`) ?? 0)
+  );
+  if (!accounts.length) return;
+  const account = accounts[foregroundTaskIndex++ % accounts.length];
+  foregroundTaskBusy = true;
+  const key = `${account.providerId}:${account.uuid}`;
+  try {
+    const result = await invoke<TaskObservation>("observe_account_tasks", {
+      uuid: account.uuid, providerId: account.providerId, automatic: true, timezone: Intl.DateTimeFormat().resolvedOptions().timeZone || "UTC",
+    });
+    const previous = latestTaskObservations.get(key);
+    if (!result.observedAtMs) {
+      result.observedAtMs = previous?.observedAtMs ?? null;
+      result.source = previous?.source ?? null;
+    }
+    latestTaskObservations.set(key, result);
+    taskRetryAt.set(key, Date.now() + (result.activity === "working" ? 15_000 :
+      result.activity === "unknown" ? 180_000 : 60_000));
+    if (modal.kind === "tasks" && modal.account.uuid === account.uuid) render();
+  } catch {
+    taskRetryAt.set(key, Date.now() + 120_000);
+  } finally {
+    foregroundTaskBusy = false;
+  }
+}
+
 let lastProxyPoolRefresh = 0;
 
 function triggerAutoSync(): void {
@@ -2405,6 +2441,14 @@ async function loadAccountApprovals(view: Extract<ModalMode, { kind: "approvals"
   }
 }
 
+function formatAccountClock(ms: number, timezone?: string): string {
+  try {
+    return new Date(ms).toLocaleString(undefined, { timeZone: timezone });
+  } catch {
+    return new Date(ms).toLocaleString();
+  }
+}
+
 function renderTasks(view: Extract<ModalMode, { kind: "tasks" }>): string {
   const { account, checking, note } = view;
   const current = snapshot?.accounts.find((entry) => entry.uuid === account.uuid && entry.providerId === account.providerId);
@@ -2419,6 +2463,7 @@ function renderTasks(view: Extract<ModalMode, { kind: "tasks" }>): string {
         <div class="modal-title" id="account-task-title">任务 · ${escapeHtml(account.alias)}</div>
         <div role="status">${checking ? "正在检测…" : escapeHtml(status[observation?.activity ?? "unknown"])}</div>
         ${observation?.observedAtMs ? `<div class="modal-desc">最近一次成功检测 ${new Date(observation.observedAtMs).toLocaleString()} · ${observation.source === "native" ? "原生" : "停驻页面"}</div>` : ""}
+        ${current?.pendingApprovalCount != null ? `<div class="modal-desc">待审批 ${current.pendingApprovalCount} 项</div>` : ""}
         ${recent ? `<div class="modal-desc">最近发现回复 ${new Date(recent).toLocaleString()}</div>` : ""}
         ${note ? `<div class="modal-desc">${escapeHtml(note)}</div>` : ""}
         ${current?.quotaObservation ? (() => {
@@ -2426,12 +2471,14 @@ function renderTasks(view: Extract<ModalMode, { kind: "tasks" }>): string {
           const stale = quota.stale || Date.now() - quota.checkedAtMs > 10 * 60_000
             || (quota.resetsAtMs !== null && Date.now() >= quota.resetsAtMs);
           return `<div class="modal-desc">额度 ${stale ? "已过期" : "已同步"} · ${quota.source === "native" ? "原生" : "网页"} · ${new Date(quota.checkedAtMs).toLocaleString()}
-            ${quota.resetsAtMs ? `<div>额度重置 ${new Date(quota.resetsAtMs).toLocaleString()}</div>` : ""}</div>`;
+            ${quota.resetsAtMs ? `<div>额度重置 ${formatAccountClock(quota.resetsAtMs, account.timezone)}</div>` : ""}</div>`;
         })() : ""}
-        <div class="modal-desc">应用在前台时可检测。回前台后会补查停驻页面。</div>
+        <div class="modal-desc">自动检测在前台运行，低电量模式下暂停。回前台后会补查停驻页面。</div>
+        <label class="proxy-pool-actions"><input id="account-task-notifications" type="checkbox" ${current?.taskNotifications ? "checked" : ""}/> 监测并在系统允许时提醒</label>
         <div class="modal-footer">
           <button id="modal-cancel-btn" class="btn" type="button">关闭</button>
           ${account.providerId === "muse" ? `<button id="account-quota-refresh" class="btn" type="button" ${view.quotaChecking ? "disabled" : ""}>刷新额度</button>` : ""}
+          ${account.providerId === "hark" ? `<button id="account-task-open" class="btn" type="button">打开会话查看审批</button>` : ""}
           <button id="account-task-refresh" class="btn primary" type="button" ${checking ? "disabled" : ""}>刷新</button>
         </div>
       </div>
@@ -2477,20 +2524,26 @@ function renderAccountBackup(view: Extract<ModalMode, { kind: "backup" }>): stri
           <label for="backup-mode">备份范围</label>
           <select id="backup-mode" class="modal-input" ${disabled}>
             <option value="light" ${mode === "light" ? "selected" : ""}>轻量（账号、备注及分组）</option>
-            <option value="full" ${mode === "full" ? "selected" : ""}>全量（含账号代理端点）</option>
+            <option value="full" ${mode === "full" ? "selected" : ""}>全量（含代理池及账号代理端点）</option>
             <option value="custom" ${mode === "custom" ? "selected" : ""}>自定义</option>
           </select>
           ${mode === "custom" ? `<div class="proxy-pool-actions">
             <label><input id="backup-include-groups" type="checkbox" ${includeGroups ? "checked" : ""} ${disabled} />分组</label>
             <label><input id="backup-include-proxy" type="checkbox" ${includeProxy ? "checked" : ""} ${disabled} />账号代理端点</label>
           </div>` : ""}
+          <label for="backup-expiry">导出有效期</label>
+          <select id="backup-expiry" class="modal-input" ${disabled}>
+            ${[[0, "长期保留"], [1, "1 天"], [7, "7 天"], [30, "30 天"]].map(([days, title]) =>
+              `<option value="${days}" ${view.expiryDays === days ? "selected" : ""}>${title}</option>`
+            ).join("")}
+          </select>
           <label for="backup-file">选择加密备份以恢复</label>
           <input id="backup-file" type="file" class="modal-input" accept=".maambackup" ${disabled} />
           ${fileName ? `<div>${escapeHtml(fileName)}</div>` : ""}
           <label for="backup-password">${preview ? "再次输入备份口令确认恢复" : "备份口令（至少 8 字符）"}</label>
           <input id="backup-password" type="password" autocomplete="off" class="modal-input" ${disabled} />
           ${preview ? `<div class="approval-items">
-            <div>新增 ${preview.added} · 已有 ${preview.existing}</div>
+            <div>新增 ${preview.added} · 已有 ${preview.existing} · 代理池 ${preview.proxyPoolCount} 条</div>
             ${preview.conflicts.map((conflict) => `<div>冲突 · ${escapeHtml(conflict)}</div>`).join("")}
           </div>` : ""}
         </div>
@@ -2526,7 +2579,7 @@ async function accountBackupAction(view: Extract<ModalMode, { kind: "backup" }>,
   try {
     if (action === "export") {
       const shared = await invoke<boolean>("export_account_backup", {
-        password, includeGroups: view.mode !== "custom" || view.includeGroups,
+        password, expiryDays: view.expiryDays, includeGroups: view.mode !== "custom" || view.includeGroups,
         includeProxyEndpoints: view.mode === "full" || (view.mode === "custom" && view.includeProxy),
       });
       view.message = shared ? "备份已导出。" : "已取消导出。";
@@ -2571,8 +2624,8 @@ function renderProxyPool(view: Extract<ModalMode, { kind: "proxyPool" }>): strin
             <div>${action("刷新", "refresh", source.id)}${action("删除订阅", "remove-source", source.id)}</div>
           </div>`).join("") ?? ""}
           ${data?.entries.map((entry) => `<div class="proxy-pool-row">
-            <div>${escapeHtml(entry.endpoint)}${entry.requiresAuth ? "<small>需要认证</small>" : ""}</div>
-            <div>${action("用此代理", "apply", entry.id)}${entry.sourceId ? "" : action("移除", "remove", entry.id)}</div>
+            <div>${escapeHtml(entry.endpoint)}${entry.missingCredentials ? "<small>待补认证</small>" : entry.requiresAuth ? "<small>需要认证</small>" : ""}</div>
+            <div>${entry.missingCredentials ? "" : action("用此代理", "apply", entry.id)}${entry.sourceId ? "" : action("移除", "remove", entry.id)}</div>
           </div>`).join("") ?? ""}
         </div>
         ${message ? `<div role="status">${escapeHtml(message)}</div>` : ""}
@@ -2648,7 +2701,7 @@ function renderSessionsModal(view: Extract<ModalMode, { kind: "sessions" }>): st
   const { account, loading, items, error } = view;
   const rows = items?.map((item) => `
     <button type="button" class="muse-thread-row" data-muse-thread="${escapeHtml(item.id)}">
-      <span>${escapeHtml(item.title)}</span>
+      <span>${escapeHtml(item.title)}${item.id === account.lastMuseThread ? " · 上次打开" : ""}</span>
       <small>${item.archived ? "已归档 · " : item.pinned ? "已置顶 · " : ""}${item.updatedAtMs ? new Date(item.updatedAtMs).toLocaleString() : ""}</small>
     </button>`).join("");
   return `
@@ -2656,6 +2709,7 @@ function renderSessionsModal(view: Extract<ModalMode, { kind: "sessions" }>): st
       <div class="modal-card">
         <div class="modal-title" id="muse-sessions-title">会话 · ${escapeHtml(account.alias)}</div>
         ${rows ? `<div class="approval-items">${rows}</div>` : `<div role="status">${escapeHtml(loading ? "正在读取会话…" : error || "该账号没有会话。")}</div>`}
+        ${error && account.lastMuseThread ? `<button type="button" class="muse-thread-row" data-muse-thread="${escapeHtml(account.lastMuseThread)}">重新打开上次会话</button>` : ""}
         <div class="modal-footer">
           <button id="modal-cancel-btn" type="button" class="btn">关闭</button>
           <button id="muse-sessions-refresh" type="button" class="btn" ${loading ? "disabled" : ""}>刷新</button>
@@ -2681,12 +2735,14 @@ async function loadMuseSessions(view: Extract<ModalMode, { kind: "sessions" }>):
 }
 
 function renderCookieModal(view: Extract<ModalMode, { kind: "cookies" }>): string {
-  const { account, busy, preview, message, imported } = view;
+  const { account, busy, preview, message, imported, stored } = view;
   return `
     <div class="inline-modal" role="dialog" aria-modal="true" aria-labelledby="cookie-title">
       <div class="modal-card">
         <div class="modal-title" id="cookie-title">登录恢复 · ${escapeHtml(account.alias)}</div>
         <div class="modal-desc">导入你自己的 JSON、Netscape 或 Cookie 请求头。Cookie 可用于登录，请勿分享。</div>
+        <div class="modal-desc">已记录的登录状态 ${account.authState === "authenticated" ? "已登录" : account.authState === "logged_out" ? "需登录" : "未验证"}。</div>
+        <div class="modal-desc">${stored ? `本机会话有 ${stored.count} 条 Cookie · 最早已知到期 ${stored.nextExpiry ? new Date(stored.nextExpiry * 1000).toLocaleString() : "未提供"}` : "本机 Cookie 状态暂不可用。"}</div>
         <label for="account-cookie-input">Cookie</label>
         <textarea id="account-cookie-input" class="modal-input account-cookie-input" spellcheck="false" autocomplete="off" autocapitalize="off" ${busy ? "disabled" : ""}></textarea>
         <div id="account-cookie-preview" role="status">${preview ? `
@@ -2827,6 +2883,8 @@ function renderModal(provider: ProviderInfo): string {
           <input id="modal-alias-input" class="modal-input" maxlength="60" placeholder="输入备注名称" value="${escapeHtml(modal.draft)}" />
           <label for="modal-group-input">分组</label>
           <input id="modal-group-input" class="modal-input" maxlength="32" placeholder="留空为未分组" value="${escapeHtml(modal.groupDraft)}" />
+          ${snapshot?.platform === "ios" ? `<label for="modal-timezone-input">账号时区</label>
+            <input id="modal-timezone-input" class="modal-input" maxlength="96" placeholder="留空跟随系统" value="${escapeHtml(modal.timezoneDraft)}" />` : ""}
           <div class="modal-footer">
             ${snapshot?.platform === "ios" && modal.account.authState === "authenticated" ? '<button id="account-task-btn" class="btn" type="button">任务</button>' : ""}
             ${snapshot?.platform === "ios" ? '<button id="account-proxy-pool" class="btn" type="button">代理池</button>' : ""}
@@ -3669,7 +3727,7 @@ function bindDelegatedEvents(): void {
       return;
     }
     const thread = target.closest<HTMLElement>("[data-muse-thread]")?.dataset.museThread;
-    if (thread && modal.kind === "sessions" && modal.items?.some((item) => item.id === thread)) {
+    if (thread && modal.kind === "sessions" && (modal.items?.some((item) => item.id === thread) || modal.account.lastMuseThread === thread)) {
       const { providerId, uuid } = modal.account;
       await setModal({ kind: "none" });
       await callCommand("open_muse_thread", { uuid, threadId: thread }, { providerId, uuid });
@@ -3679,7 +3737,20 @@ function bindDelegatedEvents(): void {
     if (cookieButton) {
       if (modal.kind !== "none" || reorderMode) return;
       const account = snapshot.accounts.find((entry) => entry.providerId === provider.id && entry.uuid === cookieButton.dataset.cookiesUuid);
-      if (account) await setModal({ kind: "cookies", account, busy: false, preview: null, message: "", imported: false });
+      if (account) {
+        const view: Extract<ModalMode, { kind: "cookies" }> = {
+          kind: "cookies", account, busy: true, preview: null, message: "", imported: false, stored: null,
+        };
+        await setModal(view);
+        try {
+          view.stored = await invoke("inspect_account_cookies", { uuid: account.uuid, providerId: account.providerId });
+        } catch {
+          // Import remains available when the existing store cannot be read.
+        } finally {
+          view.busy = false;
+          if ((modal as ModalMode) === view) render();
+        }
+      }
       return;
     }
     const approvalButton = target.closest<HTMLElement>("[data-approvals-uuid]");
@@ -3707,6 +3778,7 @@ function bindDelegatedEvents(): void {
           account: acc,
           draft: acc.alias,
           groupDraft: acc.group ?? "",
+          timezoneDraft: acc.timezone ?? "",
         });
       }
       return;
@@ -3952,6 +4024,13 @@ function bindDelegatedEvents(): void {
       case "account-task-refresh":
         if (modal.kind === "tasks") await checkAccountTasks(modal);
         break;
+      case "account-task-open":
+        if (modal.kind === "tasks") {
+          const { providerId, uuid } = modal.account;
+          await setModal({ kind: "none" });
+          await callCommand("switch_account", { providerId, uuid }, { providerId, uuid });
+        }
+        break;
       case "account-quota-refresh":
         if (modal.kind === "tasks" && !modal.quotaChecking) {
           const view = modal;
@@ -3974,7 +4053,7 @@ function bindDelegatedEvents(): void {
       case "account-backup-btn":
         if (modal.kind === "none") await setModal({
           kind: "backup", busy: false, encrypted: "", fileName: "", preview: null, message: "",
-          mode: "light", includeGroups: true, includeProxy: false,
+          mode: "light", includeGroups: true, includeProxy: false, expiryDays: 0,
         });
         break;
       case "backup-export":
@@ -4050,12 +4129,24 @@ function bindDelegatedEvents(): void {
         } else if (currentModal.kind === "rename") {
           const alias = currentModal.draft.trim();
           if (!alias) break;
+          const timezone = currentModal.timezoneDraft.trim();
+          if (timezone) {
+            try {
+              new Intl.DateTimeFormat(undefined, { timeZone: timezone });
+            } catch {
+              const input = document.querySelector<HTMLInputElement>("#modal-timezone-input");
+              input?.setCustomValidity("请输入有效的 IANA 时区，例如 Asia/Shanghai");
+              input?.reportValidity();
+              break;
+            }
+          }
           await setModal({ kind: "none" });
           await callCommand("rename_account", {
             providerId: currentModal.account.providerId,
             uuid: currentModal.account.uuid,
             alias,
             group: currentModal.groupDraft.trim(),
+            timezone: snapshot?.platform === "ios" ? timezone : null,
           });
         } else if (currentModal.kind === "remove") {
           await setModal({ kind: "none" });
@@ -4134,11 +4225,31 @@ function bindDelegatedEvents(): void {
 
   root.addEventListener("change", async (ev) => {
     const input = ev.target as HTMLInputElement;
+    if (input.id === "account-task-notifications" && modal.kind === "tasks") {
+      const view = modal;
+      input.disabled = true;
+      try {
+        snapshot = await invoke<ManagerSnapshot>("set_account_task_notifications", {
+          uuid: view.account.uuid, providerId: view.account.providerId, enabled: input.checked,
+        });
+        view.note = "";
+        if (input.checked) void checkAccountTasks(view);
+      } catch (error) {
+        view.note = String(error);
+        input.checked = !input.checked;
+      } finally {
+        input.disabled = false;
+        if (modal === view) render();
+      }
+      return;
+    }
     if (modal.kind === "backup") {
       const view = modal;
       if (input.id === "backup-mode") {
         view.mode = input.value as BackupMode;
         render();
+      } else if (input.id === "backup-expiry") {
+        view.expiryDays = Number(input.value);
       } else if (input.id === "backup-include-groups") {
         view.includeGroups = input.checked;
       } else if (input.id === "backup-include-proxy") {
@@ -4188,6 +4299,11 @@ function bindDelegatedEvents(): void {
       applyAccountFilter(snapshot, provider);
       return;
     }
+    if (input.id === "modal-timezone-input" && modal.kind === "rename") {
+      input.setCustomValidity("");
+      modal.timezoneDraft = input.value;
+      return;
+    }
     if (input.id === "modal-group-input" && modal.kind === "rename") {
       modal.groupDraft = input.value;
       return;
@@ -4208,7 +4324,7 @@ function bindDelegatedEvents(): void {
   });
   root.addEventListener("keydown", async (ev) => {
     const input = ev.target as HTMLElement;
-    if (input.id !== "modal-alias-input" && input.id !== "modal-group-input") return;
+    if (!["modal-alias-input", "modal-group-input", "modal-timezone-input"].includes(input.id)) return;
     if (ev.key === "Enter") {
       ev.preventDefault();
       document.querySelector<HTMLButtonElement>("#modal-confirm-btn")?.click();
@@ -4364,6 +4480,13 @@ async function bootstrap(): Promise<void> {
   // Batch-1: silent sync on app entry and whenever the app becomes
   // active again (foreground / focus). No periodic background sync.
   triggerAutoSync();
+  if (snapshot.platform === "ios") {
+    foregroundTaskTimer = window.setInterval(() => void refreshForegroundTask(), 15_000);
+    window.addEventListener("pagehide", () => {
+      if (foregroundTaskTimer !== null) window.clearInterval(foregroundTaskTimer);
+    }, { once: true });
+    void refreshForegroundTask();
+  }
   document.addEventListener("visibilitychange", () => {
     if (!document.hidden) {
       triggerAutoSync();
@@ -4371,6 +4494,7 @@ async function bootstrap(): Promise<void> {
       // 界面上的秒数是旧的，必须以真实快照为准。
       if (spikeLive?.running) void refreshSpikeLive();
       if (modal.kind === "tasks") void checkAccountTasks(modal);
+      else void refreshForegroundTask();
     }
   });
   window.addEventListener("focus", () => triggerAutoSync());

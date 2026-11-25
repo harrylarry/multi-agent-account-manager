@@ -34,6 +34,8 @@ export interface AccountRecord {
   uuid: string;
   alias: string;
   group?: string;
+  timezone?: string;
+  lastMuseThread?: string;
   createdAtMs: number;
   autoAlias: boolean;
   avatarUrl: string | null;
@@ -47,6 +49,8 @@ export interface AccountRecord {
   // pre-0.1.15 snapshots don't carry it.
   hasUnreadReply?: boolean;
   lastTaskReplyAtMs?: number | null;
+  taskNotifications?: boolean;
+  pendingApprovalCount?: number | null;
 }
 
 export interface ConflictItem {

@@ -65,8 +65,9 @@ async fn rename_account(
   uuid: String,
   alias: String,
   group: Option<String>,
+  timezone: Option<String>,
 ) -> Result<ManagerSnapshot, String> {
-  mgr.rename_account(&app, &provider_id, &uuid, &alias, group.as_deref()).await
+  mgr.rename_account(&app, &provider_id, &uuid, &alias, group.as_deref(), timezone.as_deref()).await
 }
 
 #[tauri::command]
@@ -223,6 +224,7 @@ async fn observe_account_tasks(
   provider_id: String,
   uuid: String,
   timezone: String,
+  automatic: Option<bool>,
 ) -> Result<serde_json::Value, String> {
   #[cfg(target_os = "ios")]
   {
@@ -236,23 +238,55 @@ async fn observe_account_tasks(
       || snapshot.pending_cleanup.iter().any(|key| key.uuid == uuid) {
       return Err("请先处理账号归属或清理状态".into());
     }
+    let timezone = account.timezone.as_deref().unwrap_or(&timezone);
     if timezone.is_empty() || timezone.len() > 96
       || !timezone.bytes().all(|b| b.is_ascii_alphanumeric() || b"/_+-".contains(&b)) {
       return Err("系统时区格式无效".into());
     }
+    if automatic.unwrap_or(false)
+      && (!account.task_notifications || !platform::ios::automatic_task_polling_available(&app).await?)
+    {
+      return Err("自动任务检测暂缓".into());
+    }
     let native = async {
       match provider {
-        providers::ProviderId::Muse => muse_native::watch_probe(&app, "muse", &uuid, 5, account.proxy.as_ref()).await
-          .ok().filter(|probe| probe.ok && probe.status.is_some_and(|status| (200..300).contains(&status)))
-          .and_then(|probe| probe.summary.activity),
-        providers::ProviderId::Hark => hark_native::diagnose(&app, &uuid, account.proxy.as_ref(), &timezone).await.task_status(),
+        providers::ProviderId::Muse => {
+          let probe = muse_native::watch_probe(&app, "muse", &uuid, 5, account.proxy.as_ref()).await
+            .ok().filter(|probe| probe.status.is_some_and(|status| (200..300).contains(&status)));
+          probe.map_or((None, Vec::new()), |probe| {
+            (probe.ok.then_some(probe.summary.activity).flatten(), probe.completed_ids)
+          })
+        }
+        providers::ProviderId::Hark => {
+          let probe = hark_native::diagnose(&app, &uuid, account.proxy.as_ref(), timezone).await;
+          (probe.task_status(), probe.completed_ids)
+        }
       }
     };
-    let native = tokio::select! {
+    let approval_poll = async {
+      if account.task_notifications && provider == providers::ProviderId::Muse {
+        muse_native::approvals_probe(&app, "muse", &uuid, account.proxy.as_ref()).await
+          .ok().filter(|result| result.ok).map(|result| {
+            let now = storage::now_ms() as i64;
+            result.items.into_iter().filter(|item| {
+              item.status == "pending" && (item.expires_at_ms == 0 || item.expires_at_ms > now)
+            }).collect::<Vec<_>>()
+          })
+      } else {
+        None
+      }
+    };
+    if token.is_cancelled() {
+      return Err("账号出站配置已变化，已停止检测".into());
+    }
+    let ((native, completed), approvals) = tokio::select! {
       biased;
       _ = token.cancelled() => return Err("账号出站配置已变化，已停止检测".into()),
-      status = tokio::time::timeout(std::time::Duration::from_secs(30), native) => status.ok().flatten(),
+      status = tokio::time::timeout(std::time::Duration::from_secs(32), async {
+        tokio::join!(native, approval_poll)
+      }) => status.unwrap_or_default(),
     };
+    mgr.record_task_observations(&app, provider, &uuid, &completed, approvals.as_deref()).await?;
     if let Some(activity) = native {
       return Ok(serde_json::json!({ "activity": activity, "source": "native", "observedAtMs": storage::now_ms() }));
     }
@@ -264,6 +298,34 @@ async fn observe_account_tasks(
       }
     }
     Ok(serde_json::json!({ "activity": "unknown", "source": null, "observedAtMs": null }))
+  }
+  #[cfg(not(target_os = "ios"))]
+  {
+    Err("此功能需要 iOS".into())
+  }
+}
+
+#[tauri::command]
+#[cfg_attr(not(target_os = "ios"), allow(unused_variables))]
+async fn set_account_task_notifications(
+  app: AppHandle,
+  mgr: State<'_, Arc<SessionManager>>,
+  provider_id: String,
+  uuid: String,
+  enabled: bool,
+) -> Result<ManagerSnapshot, String> {
+  #[cfg(target_os = "ios")]
+  {
+    let provider = providers::ProviderId::parse(&provider_id).ok_or("服务标识无效")?;
+    let uuid = storage::normalize_uuid(&uuid).ok_or("账号标识无效")?;
+    let snapshot = mgr.get_snapshot().await;
+    if !snapshot.accounts.iter().any(|account| account.provider_id == provider && account.uuid == uuid) {
+      return Err("账号不存在".into());
+    }
+    if enabled {
+      let _ = platform::ios::task_notification_permission(&app).await;
+    }
+    mgr.set_task_notifications(&app, provider, &uuid, enabled).await
   }
   #[cfg(not(target_os = "ios"))]
   {
@@ -444,7 +506,7 @@ async fn transfer_account_cookies(
     if cookies.is_some() {
       cancel.cancel_account(&uuid);
     }
-    mgr.with_cookie_profile(&app, provider, &uuid, cookies.as_deref()).await
+    Ok(mgr.with_cookie_profile(&app, provider, &uuid, cookies.as_deref(), false).await?.count)
   }
   #[cfg(not(target_os = "ios"))]
   {
@@ -526,14 +588,30 @@ async fn open_muse_thread(
 async fn export_account_backup(
   app: AppHandle,
   mgr: State<'_, Arc<SessionManager>>,
+  gate: State<'_, proxy_pool::ProxyPoolGate>,
   password: String,
   include_groups: bool,
   include_proxy_endpoints: bool,
+  expiry_days: Option<u8>,
 ) -> Result<bool, String> {
   #[cfg(target_os = "ios")]
   {
     let snapshot = mgr.get_snapshot().await;
-    let backup = account_backup::from_accounts(&snapshot.accounts, include_groups, include_proxy_endpoints);
+    let mut pool = Vec::new();
+    if include_proxy_endpoints {
+      let _guard = gate.0.lock().await;
+      let dir = app.path().app_data_dir().map_err(|_| "无法读取应用目录")?;
+      pool = proxy_pool::ProxyPool::read(&secrets::Secrets::new(&dir))?.backup_metadata()?;
+      for restored in mgr.restored_proxy_metadata().await {
+        if !pool.contains(&restored) { pool.push(restored); }
+      }
+    }
+    let expiration = match expiry_days {
+      None | Some(0) => None,
+      Some(days @ (1 | 7 | 30)) => Some(storage::now_ms() + u64::from(days) * 86_400_000),
+      _ => return Err("备份有效期无效".into()),
+    };
+    let backup = account_backup::from_accounts(&snapshot.accounts, include_groups, include_proxy_endpoints, pool, expiration);
     let password = zeroize::Zeroizing::new(password);
     let encrypted = tokio::task::spawn_blocking(move || account_backup::encrypt(&backup, &password))
       .await.map_err(|_| "备份加密操作失败".to_string())??;
@@ -541,7 +619,7 @@ async fn export_account_backup(
   }
   #[cfg(not(target_os = "ios"))]
   {
-    let _ = (app, mgr, password, include_groups, include_proxy_endpoints);
+    let _ = (app, mgr, gate, password, include_groups, include_proxy_endpoints, expiry_days);
     Err("此操作仅支持 iOS".into())
   }
 }
@@ -573,6 +651,27 @@ async fn restore_account_backup(
   mgr.restore_account_backup(&app, backup, overwrite, &preview_checksum).await
 }
 
+#[tauri::command]
+#[cfg_attr(not(target_os = "ios"), allow(unused_variables))]
+async fn inspect_account_cookies(
+  app: AppHandle,
+  mgr: State<'_, Arc<SessionManager>>,
+  provider_id: String,
+  uuid: String,
+) -> Result<serde_json::Value, String> {
+  #[cfg(target_os = "ios")]
+  {
+    let provider = providers::ProviderId::parse(&provider_id).ok_or("服务标识无效")?;
+    let uuid = storage::normalize_uuid(&uuid).ok_or("账号标识无效")?;
+    let info = mgr.with_cookie_profile(&app, provider, &uuid, None, true).await?;
+    Ok(serde_json::json!({ "count": info.count, "nextExpiry": info.next_expiry }))
+  }
+  #[cfg(not(target_os = "ios"))]
+  {
+    Err("此操作仅支持 iOS".into())
+  }
+}
+
 /// B3：只读拉一次额度（Server Action 冷发现 + 重试），失败时带每步诊断。
 #[derive(serde::Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -596,10 +695,20 @@ async fn muse_native_quota_probe(
   }
   // 额度请求也属于账号出站流量：启用代理的账号必须经代理，解析失败即失败。
   let uuid = storage::normalize_uuid(&uuid).ok_or("账号标识无效")?;
-  let setting = account_proxy_setting(&mgr, &provider_id, &uuid).await;
-  let egress = match egress::resolve_for_app(&app, setting.as_ref()) {
+  let snapshot = mgr.get_snapshot().await;
+  let account = snapshot.accounts.iter().find(|account| {
+    account.provider_id == providers::ProviderId::Muse && account.uuid == uuid
+      && account.auth_state == storage::AuthState::Authenticated
+  }).ok_or("请先登录该 Muse 账号")?;
+  if snapshot.conflicts.iter().any(|entry| entry.uuid == uuid)
+    || snapshot.pending_cleanup.iter().any(|key| key.uuid == uuid) {
+    return Err("请先处理账号归属或清理状态".into());
+  }
+  let setting = account.proxy.as_ref();
+  let egress = match egress::resolve_for_app(&app, setting) {
     Ok(e) => e,
     Err(e) => {
+      mgr.record_native_quota(&app, &uuid, None).await?;
       return Ok(QuotaProbe {
         ok: false,
         quota: None,
@@ -611,6 +720,7 @@ async fn muse_native_quota_probe(
   let client = match egress.http_client(std::time::Duration::from_secs(15), false) {
     Ok(c) => c,
     Err(e) => {
+      mgr.record_native_quota(&app, &uuid, None).await?;
       return Ok(QuotaProbe {
         ok: false,
         quota: None,
@@ -620,8 +730,9 @@ async fn muse_native_quota_probe(
     }
   };
   let cookie = match muse_native::cookie_header_for(&app, &uuid).await {
-    Ok(c) => c,
+    Ok(c) => zeroize::Zeroizing::new(c),
     Err(e) => {
+      mgr.record_native_quota(&app, &uuid, None).await?;
       return Ok(QuotaProbe {
         ok: false,
         quota: None,
@@ -930,6 +1041,7 @@ fn uri_userinfo(uri: &str) -> Option<&str> {
 async fn manage_proxy_pool(
   app: AppHandle,
   gate: State<'_, proxy_pool::ProxyPoolGate>,
+  mgr: State<'_, Arc<SessionManager>>,
   action: String,
   input: Option<String>,
   entry_id: Option<uuid::Uuid>,
@@ -953,12 +1065,20 @@ async fn manage_proxy_pool(
       if pool.refresh(entry_id).await? { pool.save(&secrets)?; }
     }
     "remove" => {
-      pool.remove(entry_id.ok_or("缺少代理标识")?);
-      pool.save(&secrets)?;
+      let id = entry_id.ok_or("缺少代理标识")?;
+      let restored = mgr.restored_proxy_metadata().await;
+      if restored.iter().any(|entry| proxy_pool::restored_entry_id(entry) == id) {
+        mgr.remove_restored_proxy_metadata(id).await?;
+      } else {
+        pool.remove(id);
+        pool.save(&secrets)?;
+      }
     }
     _ => return Err("未知代理池操作".into()),
   }
-  pool.view()
+  let mut view = pool.view()?;
+  proxy_pool::ProxyPool::push_restored(&mut view, &mgr.restored_proxy_metadata().await);
+  Ok(view)
 }
 
 #[tauri::command]
@@ -975,7 +1095,18 @@ async fn apply_proxy_pool_entry(
     let _guard = gate.0.lock().await;
     let dir = app.path().app_data_dir().map_err(|_| "无法读取应用目录")?;
     let secrets = secrets::Secrets::new(&dir);
-    proxy_pool::ProxyPool::read(&secrets)?.selected(entry_id)?
+    let pool = proxy_pool::ProxyPool::read(&secrets)?;
+    match pool.selected(entry_id) {
+      Ok(entry) => entry,
+      Err(original) => {
+        let restored = mgr.restored_proxy_metadata().await.into_iter()
+          .find(|entry| proxy_pool::restored_entry_id(entry) == entry_id).ok_or(original)?;
+        if restored.requires_auth {
+          return Err("导入完整的代理认证信息后才能使用".into());
+        }
+        proxy_pool::ApplyEntry { endpoint: restored.endpoint, username: None, password: None }
+      }
+    }
   };
   muse_native_set_account_proxy(app, provider_id, uuid, entry.endpoint, entry.username, entry.password, true, mgr, cancel).await
 }
@@ -1371,6 +1502,7 @@ pub fn run() {
       preview_account_backup,
       restore_account_backup,
       transfer_account_cookies,
+      inspect_account_cookies,
       list_muse_sessions,
       open_muse_thread,
       spike_ios_quota_sync_probe,
@@ -1381,6 +1513,7 @@ pub fn run() {
       muse_native_diagnose,
       muse_native_watch_probe,
       observe_account_tasks,
+      set_account_task_notifications,
       hark_native_watch_probe,
       muse_native_approvals_probe,
       decide_muse_approval,

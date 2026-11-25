@@ -32,6 +32,7 @@ struct SyncTracker {
   states: HashMap<String, Option<JobState>>,
   summary: SyncSummary,
   saw_snapshot: bool,
+  completed_ids: Vec<String>,
 }
 
 #[cfg(any(target_os = "ios", test))]
@@ -63,7 +64,10 @@ impl SyncTracker {
     }
     match state {
       JobState::Running => self.summary.running += 1,
-      JobState::Completed => self.summary.completed += 1,
+      JobState::Completed => {
+        self.summary.completed += 1;
+        self.completed_ids.push(id.to_string());
+      }
       JobState::Failed => self.summary.failed += 1,
     }
   }
@@ -179,6 +183,8 @@ pub struct HarkProbe {
   poll_frames: usize,
   summary: SyncSummary,
   error: Option<String>,
+  #[serde(skip)]
+  pub completed_ids: Vec<String>,
 }
 
 #[cfg(target_os = "ios")]
@@ -347,6 +353,7 @@ async fn run_probe(
   tracker.summary.known_messages = tracker.states.values().filter(|state| state.is_some()).count();
   tracker.summary.running_now = tracker.states.values().filter(|state| **state == Some(JobState::Running)).count();
   result.summary = tracker.summary;
+  result.completed_ids = tracker.completed_ids;
   result
 }
 

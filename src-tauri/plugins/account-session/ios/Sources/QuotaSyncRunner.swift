@@ -25,6 +25,7 @@ enum QuotaSyncRunner {
     let providerId: String
     let uuid: String
     let entryUrl: String
+    let timezone: String?
   }
 
   struct SyncResult {
@@ -208,6 +209,7 @@ enum QuotaSyncRunner {
       }
       config.defaultWebpagePreferences.allowsContentJavaScript = true
       config.preferences.javaScriptCanOpenWindowsAutomatically = false
+      AccountTimeZone.install(target.timezone, into: config)
       config.userContentController.addUserScript(
         WKUserScript(
           source: "window.__maamRequireFreshQuota = true;\n" + Scripts.quotaHookInitScript,
