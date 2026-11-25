@@ -4,7 +4,7 @@
 
 ## Phase 0 技术 Spike
 
-开发分支为 `spike/native-methods`。最新 Spike 候选 0.1.26 来自 `d32511e6581eb6fed1359224e8ed904890441f34`，包含 VM 租约观测、连接与发送探针取消及账号组织。[候选与真机步骤](../acceptance/iphone-acceptance.md#vm-租约后台连接与账号组织)
+开发分支为 `spike/native-methods`。最新 Spike 候选 0.1.26 来自 `bda84e747d5b9e8f6b043a341e77f3238f2cfceb`，包含 Muse 账号只读审批与回前台补查。[候选和步骤](../acceptance/iphone-acceptance.md#muse-账号审批与回前台补查)
 
 | 切片 | 已核对证据 | 待验收 |
 | --- | --- | --- |
@@ -76,4 +76,6 @@
 
 `d32511e` 获得 iPhone 回执。Noise、Ping、订阅和单次发送 ACK 回归通过。两次 standard 租约都返回 assigned，到期与 TTL 缺失。后台窗口结束时有 475 秒观测空窗，不能据此确认远端连接持续或断开。另开一轮确认手动停止为 cancelled。账号分组持久化、Hark 及真实待审批样本仍待验收。[真机回执](../acceptance/iphone-acceptance.md#d32511e-真机回执utc8)
 
-后台 475 秒实测空窗确认该场景不能依赖常驻 WSS 提供实时提醒。后续产品路径采用回前台补查和现有红点。本批在 iOS 恢复 active 时立即与延迟复查停驻 Muse 页面，丢弃生命周期切换前发起的旧检查。iOS 账号列表加入 Muse 只读审批，服务端空列表与无法判定分别显示。原生审批决策继续等可核对的写协议及实际待审批样本。
+该轮后台实时监测验收为 `FAIL`。475 秒实测空窗确认该场景不能依赖常驻 WSS 提供实时提醒。后续产品路径采用回前台补查和现有红点。本批在 iOS 恢复 active 时立即与延迟复查停驻 Muse 页面，丢弃生命周期切换前发起的旧检查。iOS 账号列表加入 Muse 只读审批，服务端空列表与无法判定分别显示。原生审批决策继续等可核对的写协议及实际待审批样本。
+
+`bda84e7` 已通过 [Quick checks](https://github.com/harrylarry/multi-agent-account-manager/actions/runs/45631020421) 和 [iOS Xcode 打包](https://github.com/harrylarry/multi-agent-account-manager/actions/runs/45631028431)，IPA 已下载校验。主 crate 62 项、muse-native 109 项和嵌入 JS 13 项本地测试通过。WebKit 两个移动端视口用模拟响应验证了审批详情、过期、账号隔离、空列表和未知响应。两项产品功能仍需 iPhone 复测。
