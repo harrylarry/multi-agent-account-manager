@@ -1210,7 +1210,7 @@ function spikeDiagInnerHtml(accountUuid: string | undefined = pickWatchAccount()
     const progress = spikeFingerprintProgress;
     const phase: Record<string, string> = {
       cookies: "读取测试账号登录态", reference_bank: "加载参考库", session: "建立并核对隔离会话",
-      register_route: "注册临时节点与推送能力",
+      register_route: "注册隔离探针的推送能力",
       stream_delta: "已收到实时文本增量，等待流内结束",
       subscribe: "等待事件订阅就绪", sending: "发送探针", collecting: "采集完整回复", scoring: "本地评分",
     };

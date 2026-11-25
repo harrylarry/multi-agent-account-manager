@@ -1017,21 +1017,18 @@ mod tests {
     let peer = tokio::spawn(async move {
       let mut cipher = CipherState::new(Some([2; 32]));
       let mut inbound = CipherState::new(Some([1; 32]));
-      let (path, node) = decode_test_request(&mut inbound, server.next().await.unwrap().unwrap());
-      assert_eq!(path, "/api/nodes/register");
-      let node_id = node["node_id"].as_str().unwrap();
-      assert!(uuid::Uuid::parse_str(node_id).is_ok());
-      server.send(response(&mut cipher, 1, b"{\"ok\":true}", true)).await.unwrap();
       let (path, caps) = decode_test_request(&mut inbound, server.next().await.unwrap().unwrap());
       assert_eq!(path, "/client/register-capabilities");
-      assert_eq!(caps["client_id"], node_id);
-      server.send(response(&mut cipher, 2, b"{\"ok\":true}", true)).await.unwrap();
+      let node_id = caps["client_id"].as_str().unwrap();
+      assert!(uuid::Uuid::parse_str(node_id).is_ok());
+      assert_eq!(caps["capabilities"]["device_commands"], serde_json::json!({}));
+      server.send(response(&mut cipher, 1, b"{\"ok\":true}", true)).await.unwrap();
       let (path, subscribe) = decode_test_request(&mut inbound, server.next().await.unwrap().unwrap());
       assert_eq!(path, "/chat/subscribe");
       assert_eq!(subscribe["session_id"], "new");
       assert!(subscribe["capabilities"].as_array().unwrap().iter().any(|v| v == "delta_stream"));
       server
-        .send(response(&mut cipher, 3, b"{\"type\":\"res\"}\n", false))
+        .send(response(&mut cipher, 2, b"{\"type\":\"res\"}\n", false))
         .await
         .unwrap();
       let (path, send) = decode_test_request(&mut inbound, server.next().await.unwrap().unwrap());
@@ -1050,7 +1047,7 @@ mod tests {
       server
         .send(response(
           &mut cipher,
-          3,
+          2,
           b"{\"type\":\"event\",\"event\":\"message.user\"}\n",
           false,
         ))
@@ -1059,14 +1056,14 @@ mod tests {
       server
         .send(response(
           &mut cipher,
-          4,
+          3,
           b"{\"type\":\"event\",\"event\":\"delta.message_start\"}\n{\"message_id\":\"accepted\",\"session_id\":\"new\"}\n",
           false,
         ))
         .await
         .unwrap();
       server.send(response(
-        &mut cipher, 4, b"{\"type\":\"event\",\"event\":\"delta.text_append\"}\n", true,
+        &mut cipher, 3, b"{\"type\":\"event\",\"event\":\"delta.text_append\"}\n", true,
       )).await.unwrap();
     });
 
@@ -1087,8 +1084,8 @@ mod tests {
     assert!(sub.last_line_from_send());
     assert!(!sub.stream_ended());
     let trace = sub.take_chat_wire_trace().join("\n");
-    assert!(trace.contains("chat.subscribe 3 response subscription"));
-    assert!(trace.contains("chat.stream 4 response send"));
+    assert!(trace.contains("chat.subscribe 2 response subscription"));
+    assert!(trace.contains("chat.stream 3 response send"));
     assert!(trace.contains("unknown 99 response unknown 0 true 200 delta.message_done"));
     assert!(!trace.contains("wrong"));
     peer.await.unwrap();
@@ -1096,28 +1093,24 @@ mod tests {
 
   #[tokio::test]
   async fn rejected_probe_registration_stops_before_subscription() {
-    for rejected_at in [1, 2] {
-      let (client, mut server) = test_connection().await;
-      let peer = tokio::spawn(async move {
-        let mut cipher = CipherState::new(Some([2; 32]));
-        for id in 1..=rejected_at {
-          assert!(server.next().await.unwrap().unwrap().is_binary());
-          let message = if id == rejected_at {
-            response_status(&mut cipher, id, 400, br#"{"ok":false,"error":{"code":"invalid_params","message":"Unknown value for platform: synthetic-secret"}}"#, true)
-          } else {
-            response(&mut cipher, id, b"{}", true)
-          };
-          server.send(message).await.unwrap();
-        }
-        assert!(!matches!(server.next().await, Some(Ok(Message::Binary(_)))));
-      });
-      let route = IsolatedProbeRoute::new("isolated".to_string());
-      let failure = route.subscribe(client, "0.1.26").await.err().unwrap();
-      assert_eq!(failure.phase, if rejected_at == 1 { "node_registration" } else { "capability_registration" });
-      assert!(matches!(failure.error, GatewayError::Http(400)));
-      assert_eq!(failure.rejection.as_deref(), Some("invalid_params · platform"));
-      peer.await.unwrap();
-    }
+    let (client, mut server) = test_connection().await;
+    let peer = tokio::spawn(async move {
+      let mut cipher = CipherState::new(Some([2; 32]));
+      assert!(server.next().await.unwrap().unwrap().is_binary());
+      let message = response_status(
+        &mut cipher, 1, 400,
+        br#"{"ok":false,"error":{"code":"invalid_params","message":"Unknown value for platform: synthetic-secret"}}"#,
+        true,
+      );
+      server.send(message).await.unwrap();
+      assert!(!matches!(server.next().await, Some(Ok(Message::Binary(_)))));
+    });
+    let route = IsolatedProbeRoute::new("isolated".to_string());
+    let failure = route.subscribe(client, "0.1.26").await.err().unwrap();
+    assert_eq!(failure.phase, "capability_registration");
+    assert!(matches!(failure.error, GatewayError::Http(400)));
+    assert_eq!(failure.rejection.as_deref(), Some("invalid_params · platform"));
+    peer.await.unwrap();
   }
 
   #[test]

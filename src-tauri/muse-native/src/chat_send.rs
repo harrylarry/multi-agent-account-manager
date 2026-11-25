@@ -368,12 +368,6 @@ impl IsolatedProbeRoute {
     version: &str,
   ) -> Result<Subscription<S>, ProbeRouteError> {
     let name = "Dinghao Spike";
-    let node = daemon_post("/api/nodes/register", json!({
-      "node_id": self.node_id,
-      "display_name": name,
-      "platform": "ios",
-      "commands_v2": {},
-    }));
     let capabilities = daemon_post("/client/register-capabilities", json!({
       "client_id": self.node_id,
       "platform": "web",
@@ -386,14 +380,13 @@ impl IsolatedProbeRoute {
         },
       },
     }));
-    for (phase, request) in [("node_registration", node), ("capability_registration", capabilities)] {
-      let (status, body) = gateway
-        .request(request)
-        .await
-        .map_err(|error| ProbeRouteError { phase, error, rejection: None })?;
-      if let Err(error) = registration_ack(status, &body) {
-        return Err(ProbeRouteError { phase, error, rejection: registration_rejection(&body) });
-      }
+    let phase = "capability_registration";
+    let (status, body) = gateway
+      .request(capabilities)
+      .await
+      .map_err(|error| ProbeRouteError { phase, error, rejection: None })?;
+    if let Err(error) = registration_ack(status, &body) {
+      return Err(ProbeRouteError { phase, error, rejection: registration_rejection(&body) });
     }
     // The registered connection supplies the node identity; the subscribe body scopes its events.
     gateway

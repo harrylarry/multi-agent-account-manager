@@ -627,7 +627,7 @@ pub async fn fingerprint_probe(
     let session_id = route.session_id();
     progress("register_route", 0, 0, 0);
     let mut subscription = tokio::select! {
-      res = tokio::time::timeout(Duration::from_secs(45), gateway.subscribe_isolated_probe(&route)) => match res {
+      res = tokio::time::timeout(Duration::from_secs(25), gateway.subscribe_isolated_probe(&route)) => match res {
         Ok(Ok(subscription)) => subscription,
         Ok(Err(failure)) => {
           let mut status = safe_gateway_status(&failure.error);
@@ -637,7 +637,7 @@ pub async fn fingerprint_probe(
           }
           return FingerprintProbe::fail(failure.phase, "indeterminate", status);
         }
-        Err(_) => return FingerprintProbe::fail("register_route", "indeterminate", "注册临时节点或建立隔离订阅超时"),
+        Err(_) => return FingerprintProbe::fail("register_route", "indeterminate", "注册推送能力或建立隔离订阅超时"),
       },
       _ = cancel_token.cancelled() => return FingerprintProbe::fail("cancelled", "indeterminate", "用户取消"),
     };
