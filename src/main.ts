@@ -313,6 +313,7 @@ interface SpikeTraceEntry {
 const spikeTraceEntries: SpikeTraceEntry[] = [];
 // 中性提示（用户取消、已在运行等），与红色错误区分。
 let spikeNotice: string | null = null;
+let spikeWorkspaceOpen = false;
 let spikeDiagnoseError: string | null = null;
 // 是否 Spike 版（bundle id 门控）：只决定顶栏徽章显不显示；诊断区不门控。
 let isSpikeBuild = false;
@@ -1251,9 +1252,14 @@ function spikeDiagInnerHtml(accountUuid: string | undefined = pickWatchAccount()
     fingerprintHtml = `
       <div class="spike-diag-result ${cls}">
         <div>${f.ok ? "✓" : "■"} 指纹探针：${escapeHtml(verdictLabel[f.verdict] ?? f.verdict)}（阶段 ${escapeHtml(f.phase)}）</div>
-        <div>进入网络写入 ${f.probesSent}/3　发送确认 ${f.probesConfirmed ?? 0}　采到样本 ${f.samplesCollected}　参与评分 ${r?.usedSamples ?? 0}/${r?.requiredSamples ?? 3}</div>
-        ${sendsHtml ? `<div class="hint">${sendsHtml}</div>` : ""}
-        ${wireTrace ? `<details><summary>解密后流诊断</summary><button id="spike-wire-copy-btn" class="mini-btn" type="button">复制脱敏流诊断</button><pre id="spike-wire-trace" style="white-space: pre-wrap; overflow-wrap: anywhere">${escapeHtml(wireTrace)}</pre></details>` : ""}
+        <dl class="spike-metrics">
+          <div><dt>进入网络写入</dt><dd>${f.probesSent}/3</dd></div>
+          <div><dt>发送确认</dt><dd>${f.probesConfirmed ?? 0}</dd></div>
+          <div><dt>采到样本</dt><dd>${f.samplesCollected}</dd></div>
+          <div><dt>参与评分</dt><dd>${r?.usedSamples ?? 0}/${r?.requiredSamples ?? 3}</dd></div>
+        </dl>
+        ${sendsHtml ? `<details class="spike-wire-details" data-spike-section="fingerprint-rounds"><summary>查看逐条探针结果</summary><div class="hint">${sendsHtml}</div></details>` : ""}
+        ${wireTrace ? `<details class="spike-wire-details" data-spike-section="wire"><summary>查看流诊断日志</summary><pre id="spike-wire-trace">${escapeHtml(wireTrace)}</pre></details>` : ""}
         ${r && r.prediction ? `<div>候选首位：${escapeHtml(r.predictionName || r.prediction)}　家族 ${escapeHtml(r.familyPredictionName || r.familyPrediction)}</div>` : ""}
         ${r?.calibrated && r.probability != null ? `<div>校准置信度：${(r.probability * 100).toFixed(1)}%（${escapeHtml(r.probabilityStatus)}，闭集参考）</div>` : ""}
         ${candHtml ? `<div>${candHtml}</div>` : ""}
@@ -1267,58 +1273,105 @@ function spikeDiagInnerHtml(accountUuid: string | undefined = pickWatchAccount()
     fingerprintHtml = `<div class="spike-diag-result fail">指纹探针错误：${escapeHtml(spikeFingerprintError)}</div>`;
   }
   return `
-    <div class="spike-diag-header">
-      <span class="spike-diag-title">原生诊断（Spike）</span>
-      <button id="spike-diagnose-btn" class="mini-btn" type="button" ${spikeDiagnoseRunning ? "disabled" : ""}>${btnLabel}</button>
-      <button id="spike-watch-btn" class="mini-btn" type="button" ${spikeWatchRunning ? "disabled" : ""}>${spikeWatchRunning ? "订阅中…" : "订阅探针 15s"}</button>
-      <button id="spike-approvals-btn" class="mini-btn" type="button" ${spikeApprovalsRunning ? "disabled" : ""}>${spikeApprovalsRunning ? "查询中…" : "审批探针"}</button>
-      <button id="spike-quota-btn" class="mini-btn" type="button" ${spikeQuotaRunning ? "disabled" : ""}>${spikeQuotaRunning ? "查询中…" : "额度探针"}</button>
-      <button id="spike-send-btn" class="mini-btn" type="button" ${spikeSendRunning ? "disabled" : ""}>${spikeSendRunning ? "发送中…" : "发送探针"}</button>
-      <button id="spike-live-btn" class="mini-btn" type="button" ${spikeLive?.running ? "disabled" : ""}>${spikeLive?.running ? "存活中…" : "存活探针 5min"}</button>
-      <button id="spike-lease-btn" class="mini-btn" type="button" ${spikeLeaseRunning ? "disabled" : ""}>${spikeLeaseRunning ? "观测中…" : "租约探针"}</button>
-      <button id="spike-fingerprint-btn" class="mini-btn" type="button" ${spikeFingerprintRunning ? "disabled" : ""}>${spikeFingerprintRunning ? "检测中…" : "指纹探针 3 条"}</button>
-      <button id="spike-proxy-btn" class="mini-btn" type="button" ${spikeProxyRunning ? "disabled" : ""}>${spikeProxyRunning ? "验证中…" : "代理探针（用已保存配置）"}</button>
-      <button id="spike-proxy-connectivity-btn" class="mini-btn" type="button" ${spikeProxyRunning ? "disabled" : ""}>检测代理连通性</button>
-      <button id="spike-stop-btn" class="mini-btn" type="button">停止</button>
-      <button id="spike-copy-btn" class="mini-btn" type="button">复制结果</button>
-    </div>
-    <div class="spike-trace" id="spike-front-trace" ${spikeTraceEntries.length ? "" : "hidden"}>${spikeTraceLinesHtml()}</div>
-    <div class="spike-diag-proxy-row">
-      <label>代理 URI（不含密码）：</label>
-      <input id="spike-proxy-uri" type="text" placeholder="socks5://host:1080" value="${escapeHtml(proxyAccount.uri)}" />
-      <input id="spike-proxy-user" type="text" placeholder="用户名（可选）" value="${escapeHtml(proxyAccount.username)}" />
-      <input id="spike-proxy-pass" type="password" placeholder="密码（仅存 Keychain）" />
-      <button id="spike-proxy-save-btn" class="mini-btn" type="button" ${spikeProxyBusy ? "disabled" : ""}>保存为账号代理</button>
-      <button id="spike-proxy-clear-btn" class="mini-btn" type="button" ${spikeProxyBusy ? "disabled" : ""}>清除</button>
-      <span class="hint">口令只写入系统 Keychain；失败即阻断，不回退直连。</span>
-    </div>
     ${spikeNotice ? `<div class="spike-notice">${escapeHtml(spikeNotice)}</div>` : ""}
-    ${resultHtml}
-    ${watchHtml}
-    ${approvalsHtml}
-    ${quotaHtml}
-    ${sendHtml}
-    ${liveHtml}
-    ${leaseHtml}
-    ${fingerprintHtml}
-    ${proxyHtml}`;
+    <section class="spike-panel" aria-labelledby="spike-fingerprint-title">
+      <h3 id="spike-fingerprint-title">指纹与实时接收</h3>
+      <div class="spike-actions">
+        <button id="spike-fingerprint-btn" class="mini-btn spike-primary" type="button" ${spikeFingerprintRunning ? "disabled" : ""}>${spikeFingerprintRunning ? "检测中…" : "指纹探针 3 条"}</button>
+        ${spikeFingerprintRunning || spikeProxyRunning || spikeWatchRunning || spikeSendRunning || spikeLeaseRunning || spikeLive?.running ? `<button id="spike-stop-btn" class="mini-btn" type="button">停止</button>` : ""}
+      </div>
+      ${fingerprintHtml}
+    </section>
+    <details class="spike-panel" data-spike-section="connection">
+      <summary>连接与消息测试</summary>
+      <div class="spike-actions">
+        <button id="spike-diagnose-btn" class="mini-btn" type="button" ${spikeDiagnoseRunning ? "disabled" : ""}>${btnLabel}</button>
+        <button id="spike-watch-btn" class="mini-btn" type="button" ${spikeWatchRunning ? "disabled" : ""}>${spikeWatchRunning ? "订阅中…" : "订阅 15 秒"}</button>
+        <button id="spike-send-btn" class="mini-btn" type="button" ${spikeSendRunning ? "disabled" : ""}>${spikeSendRunning ? "发送中…" : "发送探针"}</button>
+        <button id="spike-live-btn" class="mini-btn" type="button" ${spikeLive?.running ? "disabled" : ""}>${spikeLive?.running ? "存活中…" : "存活 5 分钟"}</button>
+        <button id="spike-lease-btn" class="mini-btn" type="button" ${spikeLeaseRunning ? "disabled" : ""}>${spikeLeaseRunning ? "观测中…" : "租约探针"}</button>
+      </div>
+      ${resultHtml}${watchHtml}${sendHtml}${liveHtml}${leaseHtml}
+    </details>
+    <details class="spike-panel" data-spike-section="account">
+      <summary>额度与审批</summary>
+      <div class="spike-actions">
+        <button id="spike-quota-btn" class="mini-btn" type="button" ${spikeQuotaRunning ? "disabled" : ""}>${spikeQuotaRunning ? "查询中…" : "查询额度"}</button>
+        <button id="spike-approvals-btn" class="mini-btn" type="button" ${spikeApprovalsRunning ? "disabled" : ""}>${spikeApprovalsRunning ? "查询中…" : "查询审批"}</button>
+      </div>
+      ${quotaHtml}${approvalsHtml}
+    </details>
+    <details class="spike-panel" data-spike-section="proxy">
+      <summary>账号代理</summary>
+      <div class="spike-proxy-fields">
+        <label for="spike-proxy-uri">代理 URI（不含密码）</label>
+        <input id="spike-proxy-uri" type="text" placeholder="socks5://host:1080" value="${escapeHtml(proxyAccount.uri)}" />
+        <label for="spike-proxy-user">用户名（可选）</label>
+        <input id="spike-proxy-user" type="text" value="${escapeHtml(proxyAccount.username)}" />
+        <label for="spike-proxy-pass">密码（仅存 Keychain）</label>
+        <input id="spike-proxy-pass" type="password" />
+      </div>
+      <div class="spike-actions">
+        <button id="spike-proxy-save-btn" class="mini-btn" type="button" ${spikeProxyBusy ? "disabled" : ""}>保存代理</button>
+        <button id="spike-proxy-clear-btn" class="mini-btn" type="button" ${spikeProxyBusy ? "disabled" : ""}>清除代理</button>
+        <button id="spike-proxy-btn" class="mini-btn" type="button" ${spikeProxyRunning ? "disabled" : ""}>${spikeProxyRunning ? "验证中…" : "验证原生代理"}</button>
+        <button id="spike-proxy-connectivity-btn" class="mini-btn" type="button" ${spikeProxyRunning ? "disabled" : ""}>检测连通性</button>
+      </div>
+      ${proxyHtml}
+    </details>
+    <details class="spike-panel" data-spike-section="activity">
+      <summary>运行记录</summary>
+      <div class="spike-trace" id="spike-front-trace" ${spikeTraceEntries.length ? "" : "hidden"}>${spikeTraceLinesHtml()}</div>
+    </details>`;
 }
 
 function syncSpikeDiag(): void {
-  const el = document.querySelector<HTMLElement>(".spike-diag");
+  const el = document.querySelector<HTMLElement>("#spike-workspace .spike-diag");
   if (!el) return;
   const accountUuid = pickWatchAccount()?.uuid;
   const state = accountUuid ? spikeProxyAccount(accountUuid) : null;
   const staysOnAccount = state && el.dataset.accountUuid === accountUuid;
+  const scroller = el.closest<HTMLElement>(".spike-scroll");
+  const scrollTop = scroller?.scrollTop ?? 0;
+  const openSections = new Set(Array.from(el.querySelectorAll<HTMLDetailsElement>("details[open]"), (section) => section.dataset.spikeSection));
+  const focused = document.activeElement;
+  const focusedInput = staysOnAccount && focused instanceof HTMLInputElement && el.contains(focused) ? focused : null;
+  const selection = focusedInput ? [focusedInput.selectionStart, focusedInput.selectionEnd] : null;
   const previousPassword = staysOnAccount && !state.clearPassword
     ? el.querySelector<HTMLInputElement>("#spike-proxy-pass")?.value
     : null;
   el.dataset.accountUuid = accountUuid ?? "";
   el.innerHTML = spikeDiagInnerHtml(accountUuid);
+  el.querySelectorAll<HTMLDetailsElement>("details[data-spike-section]").forEach((section) => {
+    section.open = openSections.has(section.dataset.spikeSection);
+  });
   const password = el.querySelector<HTMLInputElement>("#spike-proxy-pass");
   if (password && previousPassword) password.value = previousPassword;
+  if (focusedInput) {
+    const replacement = document.getElementById(focusedInput.id);
+    if (replacement instanceof HTMLInputElement) {
+      replacement.focus({ preventScroll: true });
+      replacement.setSelectionRange(selection?.[0] ?? 0, selection?.[1] ?? 0);
+    }
+  }
+  if (scroller) scroller.scrollTop = scrollTop;
+  const wireCopy = document.querySelector<HTMLButtonElement>("#spike-wire-copy-btn");
+  if (wireCopy) wireCopy.disabled = !el.querySelector("#spike-wire-trace");
+  const accountLabel = document.getElementById("spike-workspace-account");
+  if (accountLabel) accountLabel.textContent = pickWatchAccount()?.alias ?? "未登录 Muse 账号";
   if (state) state.clearPassword = false;
   syncDiagProxyView();
+}
+
+function setSpikeWorkspaceOpen(open: boolean): void {
+  const workspace = document.getElementById("spike-workspace");
+  const accounts = document.getElementById("spike-account-view");
+  if (!workspace || !accounts) return;
+  spikeWorkspaceOpen = open;
+  workspace.hidden = !open;
+  accounts.hidden = open;
+  if (open) syncDiagProxyView();
+  document.getElementById(open ? "spike-workspace-title" : "spike-open-btn")?.focus({ preventScroll: true });
 }
 
 function ensureProxyView(acc: AccountRecord, refresh = false): Promise<SpikeProxySettingView | null> {
@@ -2314,11 +2367,27 @@ function renderMiddleContent(state: ManagerSnapshot, provider: ProviderInfo): st
   }
 
   // Spike 原生诊断区：Muse 页显示（本分支即 Spike 分支）。
-  const diagAccountUuid = pickWatchAccount()?.uuid;
-  const spikeDiagHtml =
-    provider.id === "muse"
-      ? `<div class="spike-diag" data-account-uuid="${escapeHtml(diagAccountUuid ?? "")}">${spikeDiagInnerHtml(diagAccountUuid)}</div>`
-      : provider.id === "hark" && isSpikeBuild ? harkProbeHtml() : "";
+  const diagAccount = pickWatchAccount();
+  const museDiagnostics = provider.id === "muse";
+  const spikeDiagHtml = museDiagnostics ? `
+    <section id="spike-workspace" class="spike-workspace" aria-labelledby="spike-workspace-title" ${spikeWorkspaceOpen ? "" : "hidden"}>
+      <header class="spike-toolbar">
+        <div class="spike-toolbar-title">
+          <button id="spike-back-btn" class="mini-btn" type="button">返回</button>
+          <div>
+            <h2 id="spike-workspace-title" tabindex="-1">原生诊断（Spike）</h2>
+            <div id="spike-workspace-account">${escapeHtml(diagAccount?.alias ?? "未登录 Muse 账号")}</div>
+          </div>
+        </div>
+        <div class="spike-actions">
+          <button id="spike-copy-btn" class="mini-btn" type="button">复制结果摘要</button>
+          <button id="spike-wire-copy-btn" class="mini-btn" type="button" ${spikeFingerprint?.wireTrace?.length ? "" : "disabled"}>复制脱敏流诊断</button>
+        </div>
+      </header>
+      <div class="spike-scroll" tabindex="0" role="region" aria-label="诊断内容">
+        <div class="spike-diag" data-account-uuid="${escapeHtml(diagAccount?.uuid ?? "")}">${spikeDiagInnerHtml(diagAccount?.uuid)}</div>
+      </div>
+    </section>` : provider.id === "hark" && isSpikeBuild ? harkProbeHtml() : "";
 
   // Spike 顶栏标识（0.1.22）：只在 Spike 版显示（bundle id 门控）。
   const spikeBadgeHtml =
@@ -2327,6 +2396,7 @@ function renderMiddleContent(state: ManagerSnapshot, provider: ProviderInfo): st
       : "";
 
   return `
+    ${museDiagnostics ? `<div id="spike-account-view" class="spike-account-view" ${spikeWorkspaceOpen ? "hidden" : ""}>` : ""}
     <div class="column-header">
       <div class="provider-title-wrap">
         <span class="provider-title">${escapeHtml(provider.name)}</span>
@@ -2339,11 +2409,12 @@ function renderMiddleContent(state: ManagerSnapshot, provider: ProviderInfo): st
               : ""
         }
       </div>
-      <div class="header-actions">${headerBtnHtml}</div>
+      <div class="header-actions">${museDiagnostics ? `<button id="spike-open-btn" class="mini-btn" type="button">诊断</button>` : ""}${headerBtnHtml}</div>
     </div>
     ${noticeHtml}
     ${conflictsHtml}
     <div class="account-list${inReorder ? " reorder-mode" : ""}">${listBody}</div>
+    ${museDiagnostics ? `</div>` : ""}
     ${spikeDiagHtml}
     <!-- 0.1.21: the modal lives in its own overlay container and is
          filled by renderModalRoot(), not by this template — opening or
@@ -2696,6 +2767,13 @@ function render(): void {
     // modal open/close and update checks take this path, so the list
     // is never rebuilt for them.
     patchRows(snapshot, provider);
+    const diag = document.querySelector<HTMLElement>("#spike-workspace .spike-diag");
+    if (diag) {
+      const account = pickWatchAccount();
+      if (diag.dataset.accountUuid !== (account?.uuid ?? "")) syncSpikeDiag();
+      const label = document.getElementById("spike-workspace-account");
+      if (label) label.textContent = account?.alias ?? "未登录 Muse 账号";
+    }
     renderModalRoot(provider);
     syncUpdateButton();
     return;
@@ -2704,6 +2782,8 @@ function render(): void {
   // under the finger; the drag-end handler re-renders with the latest
   // snapshot.
   if (dragActive) return;
+  const spikeScrollTop = root.querySelector<HTMLElement>(".spike-scroll")?.scrollTop ?? 0;
+  const spikeSections = Array.from(root.querySelectorAll<HTMLDetailsElement>("#spike-workspace details[open]"), (section) => section.dataset.spikeSection);
   lastStructuralSig = sig;
 
   const isMobile = isMobilePlatform(snapshot.platform);
@@ -2773,6 +2853,11 @@ function render(): void {
   // the new mount and writes the modal HTML into it.
   renderModalRoot(provider);
   seedPatchState(snapshot, provider);
+  root.querySelectorAll<HTMLDetailsElement>("#spike-workspace details[data-spike-section]").forEach((section) => {
+    section.open = spikeSections.includes(section.dataset.spikeSection);
+  });
+  const spikeScroller = root.querySelector<HTMLElement>(".spike-scroll");
+  if (spikeScroller) spikeScroller.scrollTop = spikeScrollTop;
 }
 
 // 0.1.9 event delegation: listeners are bound ONCE on #app at bootstrap
@@ -2943,6 +3028,10 @@ function bindDelegatedEvents(): void {
       return;
     }
     // Spike 原生诊断按钮（只在 Spike 版的 Muse 页存在）。
+    if (target.closest("#spike-open-btn, #spike-back-btn")) {
+      setSpikeWorkspaceOpen(Boolean(target.closest("#spike-open-btn")));
+      return;
+    }
     const diagBtn = target.closest<HTMLElement>("#spike-diagnose-btn");
     if (diagBtn) {
       await runSpikeDiagnose();
@@ -3013,32 +3102,46 @@ function bindDelegatedEvents(): void {
     }
     const copyBtn = target.closest<HTMLElement>("#spike-copy-btn, #spike-wire-copy-btn");
     if (copyBtn) {
-      // 只复制诊断内容：克隆后剔除按钮，避免把「运行诊断/额度探针…」写进剪贴板。
-      const el = document.querySelector<HTMLElement>(".spike-diag");
+      const el = document.querySelector<HTMLElement>("#spike-workspace .spike-diag");
       const wireOnly = copyBtn.id === "spike-wire-copy-btn";
       let text = el?.querySelector("#spike-wire-trace")?.textContent ?? "";
       if (el && !wireOnly) {
-        const clone = el.cloneNode(true) as HTMLElement;
-        clone.querySelectorAll("button, #spike-wire-trace").forEach((b) => b.remove());
-        text = (clone.innerText || "")
+        const sections = el.querySelectorAll(".spike-diag-result, .spike-notice, #spike-front-trace:not([hidden])");
+        text = ["原生诊断（Spike）", ...Array.from(sections, (section) => {
+          const clone = section.cloneNode(true) as HTMLElement;
+          clone.querySelectorAll("[data-spike-section=wire]").forEach((details) => details.remove());
+          clone.querySelectorAll("dt").forEach((term) => term.append(" "));
+          clone.querySelectorAll("div, summary").forEach((line) => line.append("\n"));
+          return clone.textContent ?? "";
+        })].join("\n")
           .split("\n")
           .map((l) => l.trim())
           .filter((l) => l.length > 0)
           .join("\n");
       }
+      let copied = true;
       try {
         await navigator.clipboard.writeText(text);
       } catch {
         const ta = document.createElement("textarea");
         ta.value = text;
+        ta.readOnly = true;
+        ta.style.position = "fixed";
+        ta.style.opacity = "0";
         document.body.appendChild(ta);
         ta.select();
-        document.execCommand("copy");
-        ta.remove();
+        try {
+          copied = document.execCommand("copy");
+        } catch {
+          copied = false;
+        } finally {
+          ta.remove();
+          copyBtn.focus({ preventScroll: true });
+        }
       }
-      copyBtn.textContent = "已复制";
+      copyBtn.textContent = copied ? "已复制" : "复制失败";
       setTimeout(() => {
-        copyBtn.textContent = wireOnly ? "复制脱敏流诊断" : "复制结果";
+        copyBtn.textContent = wireOnly ? "复制脱敏流诊断" : "复制结果摘要";
       }, 1200);
       return;
     }

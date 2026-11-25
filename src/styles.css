@@ -223,6 +223,7 @@ body,
   display: flex;
   flex-direction: column;
   position: relative;
+  min-height: 0;
 }
 
 .mobile-shell {
@@ -1596,16 +1597,166 @@ body,
   border-radius: 8px;
   background: var(--stage-bg);
 }
-.spike-diag-header {
+.spike-account-view,
+.spike-workspace {
+  display: flex;
+  flex: 1;
+  flex-direction: column;
+  min-height: 0;
+  min-width: 0;
+}
+.spike-account-view[hidden],
+.spike-workspace[hidden] {
+  display: none;
+}
+.spike-workspace {
+  background: var(--stage-bg);
+}
+.spike-toolbar {
+  flex-shrink: 0;
+  display: grid;
+  gap: 10px;
+  padding: 10px 14px;
+  background: var(--list-bg);
+  border-bottom: 1px solid var(--border);
+}
+.spike-toolbar-title {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+}
+.spike-toolbar-title > div {
+  min-width: 0;
+}
+.spike-toolbar h2 {
+  font-size: 16px;
+  line-height: 1.4;
+}
+#spike-workspace-account {
+  color: var(--text-sub);
+  font-size: 12px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.spike-scroll {
+  flex: 1;
+  min-height: 0;
+  overflow-y: auto;
+  overscroll-behavior-y: contain;
+  -webkit-overflow-scrolling: touch;
+  padding: 12px 14px 24px;
+}
+.spike-workspace .spike-diag {
+  display: grid;
+  gap: 10px;
+  margin: 0;
+  padding: 0;
+  border: 0;
+  background: transparent;
+}
+.spike-panel {
+  min-width: 0;
+  padding: 12px;
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  background: var(--list-bg);
+}
+.spike-panel h3,
+.spike-panel > summary {
+  font-size: 14px;
+  font-weight: 600;
+}
+.spike-panel summary {
+  cursor: pointer;
+}
+.spike-panel > summary {
+  line-height: 24px;
+}
+.spike-actions {
   display: flex;
   flex-wrap: wrap;
-  align-items: center;
-  gap: 6px;
+  gap: 8px;
 }
-.spike-diag-title {
-  flex: 1 0 100%;
-  font-size: 13px;
+.spike-toolbar .spike-actions {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+}
+#spike-wire-copy-btn:not(:disabled) {
+  color: var(--primary-hover);
+  background: var(--primary-soft);
+}
+.spike-panel .spike-actions {
+  margin-top: 10px;
+}
+.spike-workspace .mini-btn {
+  min-height: 44px;
+  padding: 0 12px;
+  border-radius: 8px;
+  white-space: normal;
+}
+.spike-workspace .spike-primary {
+  color: white;
+  background: var(--primary);
+  border-color: var(--primary);
+}
+.spike-workspace .spike-primary:not(:disabled):hover {
+  background: var(--primary-hover);
+  color: white;
+}
+.spike-proxy-fields {
+  display: grid;
+  gap: 5px;
+  margin-top: 10px;
+}
+.spike-proxy-fields label {
+  color: var(--text-sub);
+  font-size: 12px;
+}
+.spike-proxy-fields input {
+  width: 100%;
+  min-width: 0;
+  min-height: 44px;
+  padding: 8px 10px;
+  margin-bottom: 5px;
+  border: 1px solid var(--border-strong);
+  border-radius: 8px;
+  background: var(--list-bg);
+  color: var(--text-main);
+  font: inherit;
+  font-size: 16px;
+}
+.spike-wire-details {
+  margin: 8px 0;
+  color: var(--text-main);
+}
+.spike-metrics {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 6px;
+  margin: 8px 0;
+}
+.spike-metrics > div {
+  padding: 6px 8px;
+  border-radius: 6px;
+  background: var(--stage-bg);
+}
+.spike-metrics dt {
+  color: var(--text-sub);
+  font-size: 11px;
+}
+.spike-metrics dd {
   font-weight: 600;
+  font-variant-numeric: tabular-nums;
+}
+#spike-wire-trace {
+  margin-top: 5px;
+  padding: 8px;
+  border-radius: 6px;
+  background: var(--stage-bg);
+  font: 11px/1.6 ui-monospace, monospace;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
 }
 .spike-diag-result {
   margin-top: 8px;
@@ -1618,6 +1769,17 @@ body,
 }
 .spike-diag-result.fail {
   color: var(--danger);
+}
+.spike-workspace .spike-diag-result {
+  color: var(--text-main);
+  font-size: 13px;
+}
+.spike-workspace .spike-diag-result.ok > div:first-child {
+  color: #08765b;
+  font-weight: 600;
+}
+.spike-workspace .spike-diag-result.fail {
+  color: #a61d2d;
 }
 
 /* Spike 前端阶段记录：真机复测时定位「点击 → 确认 → IPC → 返回」停在哪一步。 */
@@ -1646,6 +1808,14 @@ body,
 .spike-diag * {
   user-select: text;
   -webkit-user-select: text;
+}
+.spike-workspace button,
+.spike-workspace summary {
+  user-select: none;
+  -webkit-user-select: none;
+}
+.mobile-shell #spike-open-btn {
+  min-height: 44px;
 }
 
 /* Spike 顶栏标识（0.1.22）：Spike 分支的 Muse 页标题旁显示。 */
