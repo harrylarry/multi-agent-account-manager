@@ -170,7 +170,11 @@ class AccountSessionPlugin: Plugin {
       }
     }
     if let interruption {
-      channel.send(["reason": interruption])
+      do {
+        try channel.send(["reason": interruption])
+      } catch {
+        NSLog("Fingerprint interruption could not be delivered")
+      }
     }
   }
 
