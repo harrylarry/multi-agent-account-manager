@@ -959,32 +959,43 @@ async fn write_frames<K: FrameSink>(
 #[cfg(test)]
 mod tests {
   use super::*;
+  use crate::chat_send::{send_on_subscription, IsolatedProbeRoute};
+  use crate::noise::CipherState;
+  use tokio::io::DuplexStream;
+  use tokio_tungstenite::tungstenite::protocol::Role;
 
-  #[tokio::test]
-  async fn subscription_routes_interleaved_ack_and_events_by_noise_stream() {
-    use crate::chat_send::send_on_subscription;
-    use crate::collect::subscription_request;
-    use crate::noise::CipherState;
-    use tokio_tungstenite::tungstenite::protocol::Role;
+  fn response(cipher: &mut CipherState, id: u64, body: &[u8], ended: bool) -> Message {
+    let mut r = PbWriter::new();
+    r.uint(1, 200).bytes(3, body).bool(4, ended);
+    let mut stream = PbWriter::new();
+    stream.uint(1, id).bytes(3, &r.finish());
+    let mut service = PbWriter::new();
+    service.bytes(1, &stream.finish());
+    let mut frame = PbWriter::new();
+    frame
+      .uint(1, id)
+      .uint(2, 0)
+      .uint(3, 1)
+      .bytes(4, &service.finish());
+    Message::Binary(cipher.encrypt_with_ad(&[], &frame.finish()).unwrap().into())
+  }
 
-    fn response(cipher: &mut CipherState, id: u64, body: &[u8], ended: bool) -> Message {
-      let mut r = PbWriter::new();
-      r.uint(1, 200).bytes(3, body).bool(4, ended);
-      let mut stream = PbWriter::new();
-      stream.uint(1, id).bytes(3, &r.finish());
-      let mut service = PbWriter::new();
-      service.bytes(1, &stream.finish());
-      let mut frame = PbWriter::new();
-      frame
-        .uint(1, id)
-        .uint(2, 0)
-        .uint(3, 1)
-        .bytes(4, &service.finish());
-      Message::Binary(cipher.encrypt_with_ad(&[], &frame.finish()).unwrap().into())
+  fn decode_test_request(cipher: &mut CipherState, message: Message) -> (String, serde_json::Value) {
+    fn nested(fields: &[crate::protobuf::PbField], index: u32) -> Vec<crate::protobuf::PbField> {
+      pb_decode(pb_get(fields, index).unwrap().bytes.as_deref().unwrap()).unwrap()
     }
+    let Message::Binary(ciphertext) = message else { panic!("expected Noise frame") };
+    let plaintext = cipher.decrypt_with_ad(&[], &ciphertext).unwrap();
+    let envelope = nested(&pb_decode(&plaintext).unwrap(), 4);
+    let request = nested(&nested(&envelope, 2), 2);
+    let path = String::from_utf8(pb_get(&request, 2).unwrap().bytes.clone().unwrap()).unwrap();
+    let body = serde_json::from_slice(pb_get(&request, 4).unwrap().bytes.as_deref().unwrap()).unwrap();
+    (path, body)
+  }
 
+  async fn test_connection() -> (ConnectedGateway<DuplexStream>, WebSocketStream<DuplexStream>) {
     let (client, server) = tokio::io::duplex(8192);
-    let mut server = WebSocketStream::from_raw_socket(server, Role::Server, None).await;
+    let server = WebSocketStream::from_raw_socket(server, Role::Server, None).await;
     let client = ConnectedGateway {
       ws: WebSocketStream::from_raw_socket(client, Role::Client, None).await,
       transport: NoiseTransport::new(
@@ -992,14 +1003,37 @@ mod tests {
         CipherState::new(Some([2; 32])),
       ),
     };
+    (client, server)
+  }
+
+  #[tokio::test]
+  async fn subscription_routes_interleaved_ack_and_events_by_noise_stream() {
+    let (client, mut server) = test_connection().await;
+    let route = IsolatedProbeRoute::new("new".to_string());
     let peer = tokio::spawn(async move {
       let mut cipher = CipherState::new(Some([2; 32]));
-      assert!(server.next().await.unwrap().unwrap().is_binary());
+      let mut inbound = CipherState::new(Some([1; 32]));
+      let (path, node) = decode_test_request(&mut inbound, server.next().await.unwrap().unwrap());
+      assert_eq!(path, "/api/nodes/register");
+      let node_id = node["node_id"].as_str().unwrap();
+      assert!(uuid::Uuid::parse_str(node_id).is_ok());
+      server.send(response(&mut cipher, 1, b"{\"ok\":true}", true)).await.unwrap();
+      let (path, caps) = decode_test_request(&mut inbound, server.next().await.unwrap().unwrap());
+      assert_eq!(path, "/client/register-capabilities");
+      assert_eq!(caps["client_id"], node_id);
+      server.send(response(&mut cipher, 2, b"{\"ok\":true}", true)).await.unwrap();
+      let (path, subscribe) = decode_test_request(&mut inbound, server.next().await.unwrap().unwrap());
+      assert_eq!(path, "/chat/subscribe");
+      assert_eq!(subscribe["session_id"], "new");
+      assert!(subscribe["capabilities"].as_array().unwrap().iter().any(|v| v == "delta_stream"));
       server
-        .send(response(&mut cipher, 1, b"{\"type\":\"res\"}\n", false))
+        .send(response(&mut cipher, 3, b"{\"type\":\"res\"}\n", false))
         .await
         .unwrap();
-      assert!(server.next().await.unwrap().unwrap().is_binary());
+      let (path, send) = decode_test_request(&mut inbound, server.next().await.unwrap().unwrap());
+      assert_eq!(path, "/chat/stream");
+      assert_eq!(send["node_id"], node_id);
+      assert_eq!(send["session_id"], "new");
       server
         .send(response(
           &mut cipher,
@@ -1012,7 +1046,7 @@ mod tests {
       server
         .send(response(
           &mut cipher,
-          1,
+          3,
           b"{\"type\":\"event\",\"event\":\"message.user\"}\n",
           false,
         ))
@@ -1021,23 +1055,23 @@ mod tests {
       server
         .send(response(
           &mut cipher,
-          2,
+          4,
           b"{\"type\":\"event\",\"event\":\"delta.message_start\"}\n{\"message_id\":\"accepted\",\"session_id\":\"new\"}\n",
           false,
         ))
         .await
         .unwrap();
       server.send(response(
-        &mut cipher, 2, b"{\"type\":\"event\",\"event\":\"delta.text_append\"}\n", true,
+        &mut cipher, 4, b"{\"type\":\"event\",\"event\":\"delta.text_append\"}\n", true,
       )).await.unwrap();
     });
 
-    let mut sub = client.subscribe(subscription_request()).await.unwrap();
+    let mut sub = route.subscribe(client, "0.1.26").await.unwrap();
     sub.enable_chat_wire_trace();
     let wait = Duration::from_secs(1);
     sub.wait_ready(wait).await.unwrap();
     let (_tx, mut rx) = watch::channel(false);
-    let sent = send_on_subscription(&mut sub, "test", "new", wait, &mut rx).await;
+    let sent = send_on_subscription(&mut sub, "test", &route, wait, &mut rx).await;
     assert!(sent.on_wire);
     assert_eq!(sent.outcome.unwrap().message_id, "accepted");
     assert!(sub.next_line(wait).await.unwrap().unwrap().contains("delta.message_start"));
@@ -1049,11 +1083,32 @@ mod tests {
     assert!(sub.last_line_from_send());
     assert!(!sub.stream_ended());
     let trace = sub.take_chat_wire_trace().join("\n");
-    assert!(trace.contains("chat.subscribe 1 response subscription"));
-    assert!(trace.contains("chat.stream 2 response send"));
+    assert!(trace.contains("chat.subscribe 3 response subscription"));
+    assert!(trace.contains("chat.stream 4 response send"));
     assert!(trace.contains("unknown 99 response unknown 0 true 200 delta.message_done"));
     assert!(!trace.contains("wrong"));
     peer.await.unwrap();
+  }
+
+  #[tokio::test]
+  async fn rejected_probe_registration_stops_before_subscription() {
+    for rejected_at in [1, 2] {
+      let (client, mut server) = test_connection().await;
+      let peer = tokio::spawn(async move {
+        let mut cipher = CipherState::new(Some([2; 32]));
+        for id in 1..=rejected_at {
+          assert!(server.next().await.unwrap().unwrap().is_binary());
+          let body = if id == rejected_at { b"{\"ok\":false}".as_slice() } else { b"{}" };
+          server.send(response(&mut cipher, id, body, true)).await.unwrap();
+        }
+        assert!(!matches!(server.next().await, Some(Ok(Message::Binary(_)))));
+      });
+      let route = IsolatedProbeRoute::new("isolated".to_string());
+      let failure = route.subscribe(client, "0.1.26").await.err().unwrap();
+      assert_eq!(failure.phase, if rejected_at == 1 { "node_registration" } else { "capability_registration" });
+      assert!(matches!(failure.error, GatewayError::Protocol(_)));
+      peer.await.unwrap();
+    }
   }
 
   #[test]

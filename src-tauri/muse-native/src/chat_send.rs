@@ -30,6 +30,7 @@ use serde_json::{json, Value};
 use std::time::Duration;
 use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::sync::watch;
+use uuid::Uuid;
 
 /// 网页端广告的能力，`delta_stream` 决定服务端是否推文本增量。
 pub const CHAT_CAPABILITIES: &[&str] = &[
@@ -317,22 +318,103 @@ where
     .outcome
 }
 
-/// 与 [`send_message`] 相同，但额外报告「请求是否已经写到线上」，并允许在
-/// 写入阶段与等 ack 阶段被 `cancel` 中断。
-fn chat_stream_request(text: &str, node_id: &str, session_id: Option<&str>) -> HttpRequest {
-  let params = build_params(text, node_id, session_id);
+fn daemon_post(path: &str, params: Value) -> HttpRequest {
   HttpRequest {
     service: Service::Daemon,
     verb: "POST".to_string(),
-    path: "/chat/stream".to_string(),
+    path: path.to_string(),
     headers: vec![
       ("Content-Type".to_string(), "application/json".to_string()),
       ("x-request-id".to_string(), uuid::Uuid::new_v4().to_string()),
       ("x-app-id".to_string(), "hatch-web".to_string()),
       ("Accept-Language".to_string(), "en-US".to_string()),
     ],
-    body: serde_json::to_vec(&params).unwrap_or_default(),
+    body: params.to_string().into_bytes(),
   }
+}
+
+fn chat_stream_request(text: &str, node_id: &str, session_id: Option<&str>) -> HttpRequest {
+  daemon_post("/chat/stream", build_params(text, node_id, session_id))
+}
+
+/// One temporary identity for an already verified isolated session. It is not persisted.
+pub struct IsolatedProbeRoute {
+  node_id: String,
+  session_id: String,
+}
+
+#[derive(Debug)]
+pub struct ProbeRouteError {
+  pub phase: &'static str,
+  pub error: GatewayError,
+}
+
+impl IsolatedProbeRoute {
+  pub fn new(session_id: String) -> Self {
+    Self {
+      node_id: Uuid::new_v4().to_string(),
+      session_id,
+    }
+  }
+
+  pub fn session_id(&self) -> &str {
+    &self.session_id
+  }
+
+  pub async fn subscribe<S: AsyncRead + AsyncWrite + Unpin>(
+    &self,
+    mut gateway: ConnectedGateway<S>,
+    version: &str,
+  ) -> Result<Subscription<S>, ProbeRouteError> {
+    let name = "Dinghao Spike";
+    let node = daemon_post("/api/nodes/register", json!({
+      "node_id": self.node_id,
+      "display_name": name,
+      "platform": "ios",
+      "commands_v2": {},
+    }));
+    let capabilities = daemon_post("/client/register-capabilities", json!({
+      "client_id": self.node_id,
+      "platform": "web",
+      "display_name": name,
+      "version": version,
+      "capabilities": {
+        "data_sources": {}, "device_commands": {}, "hatch_app_commands": {},
+        "rendering": {
+          "supported_presentations": [], "supported_inline_presentations": [], "supported_text_entities": [],
+        },
+      },
+    }));
+    for (phase, request) in [("node_registration", node), ("capability_registration", capabilities)] {
+      let (status, body) = gateway
+        .request(request)
+        .await
+        .map_err(|error| ProbeRouteError { phase, error })?;
+      registration_ack(status, &body).map_err(|error| ProbeRouteError { phase, error })?;
+    }
+    // The registered connection supplies the node identity; the subscribe body scopes its events.
+    gateway
+      .subscribe(crate::collect::isolated_subscription_request(&self.session_id))
+      .await
+      .map_err(|error| ProbeRouteError { phase: "subscribe", error })
+  }
+}
+
+fn registration_ack(status: u16, body: &[u8]) -> Result<(), GatewayError> {
+  if !(200..300).contains(&status) {
+    return Err(GatewayError::Http(status));
+  }
+  if body.iter().all(u8::is_ascii_whitespace) {
+    return Ok(());
+  }
+  let value = serde_json::from_slice::<Value>(body).unwrap_or(Value::Null);
+  let accepted = |row: &Value| {
+    row["ok"] != false && row["success"] != false && row["error"].is_null()
+  };
+  if value.is_object() && accepted(&value) && accepted(&value["result"]) {
+    return Ok(());
+  }
+  Err(GatewayError::Protocol("probe route registration rejected".to_string()))
 }
 
 pub async fn send_message_tracked<S>(
@@ -375,11 +457,11 @@ where
 pub async fn send_on_subscription<S: AsyncRead + AsyncWrite + Unpin>(
   subscription: &mut Subscription<S>,
   text: &str,
-  session_id: &str,
+  route: &IsolatedProbeRoute,
   timeout: Duration,
   cancel: &mut watch::Receiver<bool>,
 ) -> SendAttemptResult {
-  let req = chat_stream_request(text, "", Some(session_id));
+  let req = chat_stream_request(text, &route.node_id, Some(route.session_id()));
   let (on_wire, wrote_frames, response) = subscription.open_parallel(req, Some(cancel)).await;
   let outcome = match response {
     Ok(mut source) => {

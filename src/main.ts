@@ -1210,6 +1210,8 @@ function spikeDiagInnerHtml(accountUuid: string | undefined = pickWatchAccount()
     const progress = spikeFingerprintProgress;
     const phase: Record<string, string> = {
       cookies: "读取测试账号登录态", reference_bank: "加载参考库", session: "建立并核对隔离会话",
+      register_route: "注册临时节点与推送能力",
+      stream_delta: "已收到实时文本增量，等待流内结束",
       subscribe: "等待事件订阅就绪", sending: "发送探针", collecting: "采集完整回复", scoring: "本地评分",
     };
     fingerprintHtml = `<div class="spike-diag-result" role="status">${escapeHtml(phase[progress.phase] ?? progress.phase)}${progress.probe ? ` ${progress.probe}/3` : ""}　发送确认 ${progress.confirmed}　有效样本 ${progress.samples}</div>`;
@@ -1592,7 +1594,7 @@ async function runSpikeFingerprint(): Promise<void> {
   syncSpikeDiag();
   const watchdog = window.setTimeout(() => {
     void cancelSpikeProbe(task);
-  }, 510_000);
+  }, 570_000);
   try {
     spikeFingerprint = await invoke<SpikeFingerprintProbe>("muse_native_fingerprint_probe", {
       providerId: "muse",

@@ -73,9 +73,20 @@ impl StreamEventCounts {
 
 /// 构造 `chat.subscribe` 请求（供直连与代理两条路径复用）。
 pub fn subscription_request() -> HttpRequest {
-  let body = serde_json::json!({ "capabilities": SUBSCRIBE_CAPABILITIES })
-    .to_string()
-    .into_bytes();
+  let body = serde_json::json!({ "capabilities": SUBSCRIBE_CAPABILITIES });
+  subscription_with_body(body)
+}
+
+pub(crate) fn isolated_subscription_request(session_id: &str) -> HttpRequest {
+  subscription_with_body(serde_json::json!({
+    "session_id": session_id,
+    "after_stream_seq": 0,
+    "after_chat_event_seq": 0,
+    "capabilities": SUBSCRIBE_CAPABILITIES,
+  }))
+}
+
+fn subscription_with_body(body: Value) -> HttpRequest {
   HttpRequest {
     service: Service::Daemon,
     verb: "POST".to_string(),
@@ -86,7 +97,7 @@ pub fn subscription_request() -> HttpRequest {
       ("x-app-id".to_string(), "hatch-web".to_string()),
       ("Accept-Language".to_string(), "en-US".to_string()),
     ],
-    body,
+    body: body.to_string().into_bytes(),
   }
 }
 
@@ -273,6 +284,7 @@ pub async fn collect_text<L: LineSource>(
   session_id: &str,
   total: Duration,
   per_line: Duration,
+  mut on_first_delta: impl FnMut(),
 ) -> Collected {
   use tokio::time::{timeout_at, Instant};
   let started = Instant::now();
@@ -428,9 +440,10 @@ pub async fn collect_text<L: LineSource>(
         if let Some(text) = text_field(&[payload, &root], &["text"]) {
           message.text.push_str(text);
           out.text_deltas += 1;
-          out
-            .first_matched_delta_ms
-            .get_or_insert_with(|| started.elapsed().as_millis() as u64);
+          if out.first_matched_delta_ms.is_none() {
+            out.first_matched_delta_ms = Some(started.elapsed().as_millis() as u64);
+            on_first_delta();
+          }
         }
       }
       "delta.message_done" | "message.assistant" => {
@@ -551,18 +564,21 @@ mod tests {
     src
       .0
       .push_front(Err(GatewayError::Timeout("subscription read")));
+    let mut live_notifications = 0;
     let result = collect_text(
       &mut src,
       &ack(),
       "test-session",
       Duration::from_secs(2),
       Duration::from_millis(100),
+      || live_notifications += 1,
     )
     .await;
     assert!(result.done);
     assert_eq!(result.ended_by, "done");
     assert_eq!(result.text, "one two");
     assert_eq!(result.text_deltas, 2);
+    assert_eq!(live_notifications, 1);
     assert_eq!(result.subscription_events.delta, 3);
     assert!(result.first_matched_delta_ms.is_some());
     assert!(result.read_timeouts > 0);
@@ -580,6 +596,7 @@ mod tests {
       "test-session",
       Duration::from_millis(20),
       Duration::from_millis(5),
+      || panic!("completion must not emit a live delta notification"),
     )
     .await;
     assert!(!result.done);
@@ -603,6 +620,7 @@ mod tests {
         "test-session",
         Duration::from_secs(1),
         Duration::from_secs(1),
+        || panic!("a failed read cannot produce a live delta"),
       )
       .await;
       assert!(!result.done);

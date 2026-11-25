@@ -608,16 +608,29 @@ pub async fn fingerprint_probe(
 
     progress("session", 0, 0, 0);
     let setup = async {
-      let mut gateway = egress.connect(&cookies).await.map_err(|e| e.to_string())?;
+      let mut gateway = egress.connect(&cookies).await.map_err(|error| match error {
+        crate::egress::EgressError::Gateway(error) => safe_gateway_status(&error),
+        _ => "无法建立测试账号的出站连接".to_string(),
+      })?;
       let session_id = allocate_isolated_session(&mut gateway).await?;
-      let sub = gateway.subscribe().await.map_err(|e| e.to_string())?;
-      Ok::<_, String>((sub, session_id))
+      Ok::<_, String>((gateway, session_id))
     };
-    let (mut subscription, session_id) = tokio::select! {
+    let (gateway, session_id) = tokio::select! {
       res = tokio::time::timeout(Duration::from_secs(60), setup) => match res {
         Ok(Ok(s)) => s,
         Ok(Err(e)) => return FingerprintProbe::fail("session", "indeterminate", e),
         Err(_) => return FingerprintProbe::fail("session", "indeterminate", "建立或验证隔离会话超时"),
+      },
+      _ = cancel_token.cancelled() => return FingerprintProbe::fail("cancelled", "indeterminate", "用户取消"),
+    };
+    let route = muse_native_client::chat_send::IsolatedProbeRoute::new(session_id);
+    let session_id = route.session_id();
+    progress("register_route", 0, 0, 0);
+    let mut subscription = tokio::select! {
+      res = tokio::time::timeout(Duration::from_secs(45), gateway.subscribe_isolated_probe(&route)) => match res {
+        Ok(Ok(subscription)) => subscription,
+        Ok(Err(failure)) => return FingerprintProbe::fail(failure.phase, "indeterminate", safe_gateway_status(&failure.error)),
+        Err(_) => return FingerprintProbe::fail("register_route", "indeterminate", "注册临时节点或建立隔离订阅超时"),
       },
       _ = cancel_token.cancelled() => return FingerprintProbe::fail("cancelled", "indeterminate", "用户取消"),
     };
@@ -666,7 +679,7 @@ pub async fn fingerprint_probe(
       let tracked = subscription
         .send_on_subscription(
           &probe.prompt,
-          &session_id,
+          &route,
           Duration::from_secs(30),
           cancel_token.receiver(),
         )
@@ -685,21 +698,22 @@ pub async fn fingerprint_probe(
           ledger.confirm(&send_id);
           record.send_status = "CONFIRMED".to_string();
           probes_confirmed += 1;
-          if ack.session_id.as_deref() != Some(session_id.as_str())
+          if ack.session_id.as_deref() != Some(session_id)
             || !seen_receipts.insert(ack.message_id.clone())
           {
             record.error =
               Some("发送已确认，但 ACK 无法确认本轮属于新建隔离会话，后续发送已停止".to_string());
           } else {
             progress("collecting", index + 1, probes_confirmed, samples.len());
+            let on_first_delta = || progress("stream_delta", index + 1, probes_confirmed, samples.len());
             let collected = tokio::select! {
-              c = subscription.collect(&ack, &session_id, Duration::from_secs(90), Duration::from_secs(10)) => Some(c),
+              c = subscription.collect(&ack, session_id, Duration::from_secs(90), Duration::from_secs(10), on_first_delta) => Some(c),
               _ = cancel_token.cancelled() => None,
             };
             match collected {
               Some(mut c) => {
                 if !c.done && c.ended_by == "timeout" {
-                  let recovery = read_fingerprint_history(&egress, &cookies, &session_id, &ack.message_id);
+                  let recovery = read_fingerprint_history(&egress, &cookies, session_id, &ack.message_id);
                   tokio::select! {
                     result = tokio::time::timeout(Duration::from_secs(18), recovery) => {
                       match result {
@@ -802,7 +816,7 @@ pub async fn fingerprint_probe(
       samples_collected,
       sends,
       wire_trace,
-      session_id: Some(session_id),
+      session_id: Some(session_id.to_string()),
       error: first_error,
     }
   }

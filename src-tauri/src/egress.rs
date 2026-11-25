@@ -23,7 +23,7 @@
 
 use crate::secrets::Secrets;
 use crate::storage::ProxySetting;
-use muse_native_client::chat_send::{self, Ack, SendAttemptResult};
+use muse_native_client::chat_send::{self, Ack, IsolatedProbeRoute, ProbeRouteError, SendAttemptResult};
 use muse_native_client::collect::{collect_text, subscription_request, Collected};
 use muse_native_client::control_plane::ControlPlaneFetch;
 use muse_native_client::cookie::SessionCookies;
@@ -259,6 +259,17 @@ impl AccountGateway {
       AccountGateway::Proxied(g) => Ok(AccountSubscription::Proxied(g.subscribe(req).await?)),
     }
   }
+
+  pub async fn subscribe_isolated_probe(
+    self,
+    route: &IsolatedProbeRoute,
+  ) -> Result<AccountSubscription, ProbeRouteError> {
+    let version = env!("CARGO_PKG_VERSION");
+    match self {
+      Self::Direct(g) => route.subscribe(g, version).await.map(AccountSubscription::Direct),
+      Self::Proxied(g) => route.subscribe(g, version).await.map(AccountSubscription::Proxied),
+    }
+  }
 }
 
 pub enum AccountSubscription {
@@ -291,16 +302,16 @@ impl AccountSubscription {
   pub async fn send_on_subscription(
     &mut self,
     text: &str,
-    session_id: &str,
+    route: &IsolatedProbeRoute,
     timeout: Duration,
     cancel: &mut tokio::sync::watch::Receiver<bool>,
   ) -> SendAttemptResult {
     match self {
       Self::Direct(s) => {
-        chat_send::send_on_subscription(s, text, session_id, timeout, cancel).await
+        chat_send::send_on_subscription(s, text, route, timeout, cancel).await
       }
       Self::Proxied(s) => {
-        chat_send::send_on_subscription(s, text, session_id, timeout, cancel).await
+        chat_send::send_on_subscription(s, text, route, timeout, cancel).await
       }
     }
   }
@@ -328,10 +339,11 @@ impl AccountSubscription {
     session_id: &str,
     total: Duration,
     per_line: Duration,
+    on_first_delta: impl FnMut(),
   ) -> Collected {
     match self {
-      AccountSubscription::Direct(s) => collect_text(s, ack, session_id, total, per_line).await,
-      AccountSubscription::Proxied(s) => collect_text(s, ack, session_id, total, per_line).await,
+      AccountSubscription::Direct(s) => collect_text(s, ack, session_id, total, per_line, on_first_delta).await,
+      AccountSubscription::Proxied(s) => collect_text(s, ack, session_id, total, per_line, on_first_delta).await,
     }
   }
 }
