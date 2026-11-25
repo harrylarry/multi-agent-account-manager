@@ -7,6 +7,8 @@ mod hark_native;
 mod probe_cancel;
 mod proxy_pool;
 mod rooms;
+#[cfg(target_os = "ios")]
+mod room_dispatch;
 mod webview_proxy;
 mod providers;
 mod quota;
@@ -63,13 +65,54 @@ async fn add_account(
 #[tauri::command]
 async fn manage_rooms(
   app: AppHandle, mgr: State<'_, Arc<SessionManager>>, gate: State<'_, rooms::RoomGate>, command: rooms::Command,
+  cancel: State<'_, Arc<probe_cancel::ProbeCancel>>,
 ) -> Result<rooms::RoomBook, String> {
+  let interrupt = match &command { rooms::Command::Stop { id, .. } | rooms::Command::Interrupt { id } => Some(*id), _ => None };
   let mut initialized = gate.0.lock().await;
   let dir = app.path().app_data_dir().map_err(|_| "无法读取应用目录")?;
   let snapshot = mgr.get_snapshot().await;
   let result = rooms::apply(&dir.join("rooms-v1.json"), command, &snapshot.accounts, !*initialized);
-  if result.is_ok() { *initialized = true; }
+  if let Ok(book) = &result {
+    *initialized = true;
+    if let Some((account, task)) = interrupt.and_then(|id| book.cancellation_target(id)) {
+      cancel.cancel_task(&account, task);
+    }
+  }
   result
+}
+
+#[tauri::command]
+#[cfg_attr(not(target_os = "ios"), allow(unused_variables))]
+async fn run_solo_room(
+  app: AppHandle, mgr: State<'_, Arc<SessionManager>>, gate: State<'_, rooms::RoomGate>,
+  ledger: State<'_, Arc<send_ledger::SendLedger>>, cancel: State<'_, Arc<probe_cancel::ProbeCancel>>,
+  id: uuid::Uuid, revision: u64, recover: bool,
+) -> Result<rooms::RoomBook, String> {
+  #[cfg(target_os = "ios")]
+  {
+    let dir = app.path().app_data_dir().map_err(|_| "无法读取应用目录")?;
+    let path = dir.join("rooms-v1.json");
+    let proxy_guard = mgr.proxy_write_lock.lock().await;
+    let mut initialized = gate.0.lock().await;
+    let snapshot = mgr.get_snapshot().await;
+    if !*initialized {
+      rooms::apply(&path, rooms::Command::List, &snapshot.accounts, true)?;
+      *initialized = true;
+    }
+    let allowed: Vec<_> = snapshot.accounts.into_iter().filter(|account| {
+      !snapshot.conflicts.iter().any(|conflict| conflict.uuid == account.uuid)
+        && !snapshot.pending_cleanup.iter().any(|key| key.uuid == account.uuid)
+    }).collect();
+    let dispatch = rooms::begin_dispatch(&path, id, revision, &allowed, recover)?;
+    let account = allowed.iter().find(|account| account.uuid == dispatch.attempt.account_uuid
+      && account.provider_id == providers::ProviderId::Muse).ok_or("账号不存在")?;
+    let (token, _cancel_guard) = cancel.register_task(&account.uuid, "room", dispatch.attempt.id);
+    drop(initialized);
+    drop(proxy_guard);
+    Box::pin(room_dispatch::run(&app, &gate, &ledger, &path, &dispatch, account.proxy.as_ref(), token, recover)).await
+  }
+  #[cfg(not(target_os = "ios"))]
+  { Err("房间真实派发需要 iOS".into()) }
 }
 
 #[tauri::command]
@@ -882,9 +925,20 @@ async fn muse_native_fingerprint_probe(
   if provider_id != "muse" {
     return Err("指纹探针只支持 Muse 账号".to_string());
   }
+  let uuid = storage::normalize_uuid(&uuid).ok_or("账号标识无效")?;
   let task_id = uuid::Uuid::parse_str(&task_id).map_err(|_| "指纹任务标识无效".to_string())?;
+  let proxy_guard = mgr.proxy_write_lock.lock().await;
+  let snapshot = mgr.get_snapshot().await;
+  let matching = snapshot.accounts.iter().find(|account| account.uuid == uuid
+    && account.provider_id == providers::ProviderId::Muse && account.auth_state == storage::AuthState::Authenticated)
+    .ok_or("请先登录该 Muse 账号")?;
+  if snapshot.conflicts.iter().any(|item| item.uuid == uuid)
+    || snapshot.pending_cleanup.iter().any(|key| key.uuid == uuid) {
+    return Err("请先处理账号归属或清理状态".into());
+  }
   let (token, _guard) = cancel.register_task(&uuid, "fingerprint", task_id);
-  let setting = account_proxy_setting(&mgr, &provider_id, &uuid).await;
+  let setting = matching.proxy.clone();
+  drop(proxy_guard);
   let dir = app.path().app_data_dir().map_err(|e| e.to_string())?;
   let secrets = secrets::Secrets::new(&dir);
   #[cfg(target_os = "ios")]
@@ -914,7 +968,7 @@ async fn muse_native_fingerprint_probe(
     (guard, reason)
   };
 
-  let result = muse_native::fingerprint_probe(
+  let result = Box::pin(muse_native::fingerprint_probe(
     &app,
     &ledger,
     &uuid,
@@ -922,7 +976,7 @@ async fn muse_native_fingerprint_probe(
     setting.as_ref(),
     &secrets,
     token,
-  ).await;
+  )).await;
   #[cfg(target_os = "ios")]
   let result = {
     let mut result = result;
@@ -940,6 +994,21 @@ async fn muse_native_fingerprint_probe(
     }
     result
   };
+  let scored = result.result.as_ref();
+  let entry = storage::FingerprintRecord {
+    task_id, recorded_at_ms: storage::now_ms(), verdict: result.verdict.clone(),
+    model: scored.filter(|record| !record.prediction.is_empty()).map(|record| record.prediction.clone()),
+    family: scored.filter(|record| !record.family_prediction.is_empty()).map(|record| record.family_prediction.clone()),
+    probability_ppm: scored.filter(|record| record.identification && record.calibrated)
+      .and_then(|record| record.probability).filter(|p| (0.0..=1.0).contains(p))
+      .map(|p| (p * 1_000_000.0).round() as u32),
+    valid_samples: scored.map_or(0, |record| record.used_samples),
+    reference_built_at: scored.filter(|record| !record.reference_built_at.is_empty()).map(|record| record.reference_built_at.clone()),
+    reference_sha256: scored.and_then(|record| record.reference_sha256.clone()),
+    method: scored.filter(|record| !record.method.is_empty()).map(|record| record.method.clone()),
+  };
+  mgr.archive_muse_fingerprint(&app, &uuid, entry).await
+    .map_err(|_| "检测已结束，但账号指纹记录未能保存".to_string())?;
   Ok(result)
 }
 
@@ -1557,6 +1626,7 @@ pub fn run() {
       select_provider,
       add_account,
       manage_rooms,
+      run_solo_room,
       rename_account,
       remove_account,
       switch_account,

@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-run-solo-room"
+description = "Enables the run_solo_room command without any pre-configured scope."
+commands.allow = ["run_solo_room"]
+
+[[permission]]
+identifier = "deny-run-solo-room"
+description = "Denies the run_solo_room command without any pre-configured scope."
+commands.deny = ["run_solo_room"]

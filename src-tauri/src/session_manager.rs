@@ -1128,7 +1128,7 @@ impl SessionManager {
       updated.accounts.push(AccountRecord {
         provider_id: saved.provider_id, uuid: saved.uuid, alias: saved.alias,
         group: saved.group, timezone: saved.timezone, last_muse_thread: saved.last_muse_thread,
-        created_at_ms: saved.created_at_ms, auto_alias: false,
+        created_at_ms: saved.created_at_ms, fingerprint_history: Vec::new(), auto_alias: false,
         avatar_url: None, quota_text: None, quota_percent: None, quota_detail: None, quota_observation: None,
         auth_state: AuthState::Unknown, has_unread_reply: false, last_task_reply_at_ms: None,
         muse_unread_counts: Default::default(), muse_unread_status: None,
@@ -1930,6 +1930,7 @@ impl SessionManager {
         timezone: None,
         last_muse_thread: None,
         created_at_ms: now_ms(),
+        fingerprint_history: Vec::new(),
         auto_alias,
         avatar_url: None,
         quota_text: None,
@@ -2174,6 +2175,28 @@ impl SessionManager {
     }
     save_store_atomic(&locked.store_path, &locked.store)?;
     Ok(Self::snapshot_from_locked(&locked))
+  }
+
+  pub async fn archive_muse_fingerprint(
+    &self, app: &AppHandle, uuid: &str, entry: crate::storage::FingerprintRecord,
+  ) -> Result<(), String> {
+    let mut locked = self.inner.lock().await;
+    let index = locked.store.accounts.iter().position(|account| {
+      account.provider_id == ProviderId::Muse && account.uuid == uuid
+    }).ok_or("原 Muse 账号已经移除")?;
+    let history = &mut locked.store.accounts[index].fingerprint_history;
+    if history.iter().any(|record| record.task_id == entry.task_id) { return Ok(()); }
+    let previous = history.clone();
+    history.insert(0, entry);
+    history.truncate(12);
+    if let Err(error) = save_store_atomic(&locked.store_path, &locked.store) {
+      locked.store.accounts[index].fingerprint_history = previous;
+      return Err(error);
+    }
+    let snapshot = Self::snapshot_from_locked(&locked);
+    drop(locked);
+    self.emit_snapshot(app, &snapshot);
+    Ok(())
   }
 
   pub async fn dismiss_notice(&self) -> ManagerSnapshot {

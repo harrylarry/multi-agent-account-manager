@@ -859,7 +859,7 @@ pub async fn fingerprint_probe(
 }
 
 #[cfg(not(target_os = "android"))]
-async fn allocate_isolated_session(
+pub(crate) async fn allocate_isolated_session(
   gateway: &mut crate::egress::AccountGateway,
 ) -> Result<String, String> {
   use muse_native_client::chat_send::{
@@ -893,7 +893,7 @@ async fn allocate_isolated_session(
 }
 
 #[cfg(not(target_os = "android"))]
-async fn read_fingerprint_history(
+pub(crate) async fn read_fingerprint_history(
   egress: &crate::egress::AccountEgress,
   cookies: &SessionCookies,
   session_id: &str,
@@ -1808,7 +1808,7 @@ fn report_connect_error(e: GatewayError) -> SpikeDiagnose {
 }
 
 #[cfg(target_os = "ios")]
-async fn fetch_session_cookies(app: &AppHandle, uuid: &str) -> Result<SessionCookies, String> {
+pub(crate) async fn fetch_session_cookies(app: &AppHandle, uuid: &str) -> Result<SessionCookies, String> {
   use muse_native_client::cookie::SessionCookie;
   let entries = crate::platform::ios::get_session_cookies(app, uuid).await?;
   Ok(SessionCookies {

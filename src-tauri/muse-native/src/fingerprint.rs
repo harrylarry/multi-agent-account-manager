@@ -160,6 +160,7 @@ pub struct FingerprintResult {
   pub evidence_reason: String,
   /// 参考库构建标识（built_at），随结果存档以便追溯。
   pub reference_built_at: String,
+  pub reference_sha256: Option<String>,
   pub method: String,
   /// 每条样本的解析诊断，不含正文。
   pub samples: Vec<SampleCheck>,
@@ -184,6 +185,7 @@ impl FingerprintResult {
       evidence_label: "Not enough valid samples".to_string(),
       evidence_reason: reason.into(),
       reference_built_at,
+      reference_sha256: None,
       method: String::new(),
       samples: Vec::new(),
     }
@@ -254,6 +256,7 @@ pub fn interpret(analysis: &Analysis, samples: &[SampleCheck], reference_built_a
     evidence_label: analysis.evidence.label.clone(),
     evidence_reason: analysis.evidence.reason.clone(),
     reference_built_at: reference_built_at.to_string(),
+    reference_sha256: Some(analysis.model_version.base_sha256.clone()),
     method: analysis.method.clone(),
     samples: samples.to_vec(),
   }

@@ -1792,7 +1792,7 @@ async function runSpikeSend(): Promise<void> {
 
 // #18 模型指纹：只应对已授权的**非主力测试账号**手动触发。探针内容是
 // 无语义整数计数（不含隐私），发往隔离会话；3 条样本不足则显示不可判定。
-async function runSpikeFingerprint(): Promise<void> {
+async function runSpikeFingerprint(view?: Extract<ModalMode, { kind: "tasks" }>): Promise<void> {
   if (!snapshot) return;
   if (spikeFingerprintRunning) {
     spikeNotice = "指纹探针正在运行，请等待结果或点「停止」。";
@@ -1800,7 +1800,7 @@ async function runSpikeFingerprint(): Promise<void> {
     return;
   }
   spikeNotice = null;
-  const acc = pickWatchAccount();
+  const acc = view?.account ?? pickWatchAccount();
   if (!acc) {
     spikeFingerprint = null;
     spikeFingerprintError = "没有已登录的 Muse 账号。";
@@ -1822,6 +1822,7 @@ async function runSpikeFingerprint(): Promise<void> {
   if (!confirmed) {
     spikeNotice = "已取消指纹探针：没有发送任何请求。";
     syncSpikeDiag();
+    if (view) await setModal(view);
     return;
   }
   const task = { accountUuid: acc.uuid, taskId: createSpikeTaskId() };
@@ -1830,6 +1831,7 @@ async function runSpikeFingerprint(): Promise<void> {
   spikeFingerprintRunning = true;
   spikeFingerprint = null;
   spikeFingerprintError = null;
+  if (view) await setModal(view);
   spikeTrace("指纹探针", "调用后端", "muse_native_fingerprint_probe");
   syncSpikeDiag();
   const watchdog = window.setTimeout(() => {
@@ -1852,6 +1854,7 @@ async function runSpikeFingerprint(): Promise<void> {
     spikeFingerprintTask = null;
     spikeFingerprintProgress = null;
     syncSpikeDiag();
+    if (view && modal === view) render();
   }
 }
 
@@ -2517,6 +2520,8 @@ function renderTasks(view: Extract<ModalMode, { kind: "tasks" }>): string {
     working: "任务进行中", idle: "未见任务正在生成", approval: "等待审批", unknown: "暂不可判定",
   };
   const recent = current?.lastTaskReplyAtMs;
+  const fingerprintRunning = spikeFingerprintTask?.accountUuid === account.uuid;
+  const records = current?.fingerprintHistory ?? [];
   const unreadStatus: Record<string, string> = {
     unread: "Muse 返回未读", zero: "服务已返回未读计数，本次为零",
     unavailable: "本次未收到未读计数", network_or_protocol: "未读查询失败", timeout: "未读查询超时",
@@ -2536,6 +2541,19 @@ function renderTasks(view: Extract<ModalMode, { kind: "tasks" }>): string {
         ${current?.museUnreadStatus ? `<div class="modal-desc">回前台补查 · ${unreadStatus[current.museUnreadStatus] ?? "暂不可判定"}</div>` : ""}
         ${account.providerId === "muse" && isSpikeBuild ? `<div class="modal-desc" id="badge-timing-line" style="user-select:text;-webkit-user-select:text">${escapeHtml(badgeTimingLine(account.uuid))}</div>` : ""}
         ${note ? `<div class="modal-desc">${escapeHtml(note)}</div>` : ""}
+        ${account.providerId === "muse" ? `
+          <details class="hark-reply" ${fingerprintRunning ? "open" : ""}><summary>模型指纹 ${records.length ? "· " + escapeHtml(records[0].model ?? "不可判定") : ""}</summary>
+            <div class="modal-desc">在隔离会话里发送三条探针并消耗该账号额度。结果是本地参考库候选。</div>
+            ${fingerprintRunning ? `<div role="status">检测中 · 已取得 ${spikeFingerprintProgress?.samples ?? 0}/3 条样本</div>` : ""}
+            ${records.map((record) => `<div class="modal-desc">${new Date(record.recordedAtMs).toLocaleString()} ·
+              ${escapeHtml(record.model ?? "不可判定")} · ${record.validSamples}/3 条
+              ${record.probabilityPpm != null ? ` · ${(record.probabilityPpm / 10000).toFixed(1)}%` : ""}
+              ${record.referenceBuiltAt ? `<div>参考库 ${escapeHtml(record.referenceBuiltAt)}${record.referenceSha256 ? ` · ${escapeHtml(record.referenceSha256.slice(0, 12))}` : ""}</div>` : ""}
+            </div>`).join("")}
+          </details>
+          ${fingerprintRunning ? '<button id="account-fingerprint-stop" class="btn" type="button">停止检测</button>' :
+            `<button id="account-fingerprint-start" class="btn" type="button" ${spikeFingerprintRunning ? "disabled" : ""}>手动检测模型</button>`}
+        ` : ""}
         ${current?.quotaObservation ? (() => {
           const quota = current.quotaObservation;
           const stale = quota.stale || Date.now() - quota.checkedAtMs > 10 * 60_000
@@ -3007,22 +3025,50 @@ async function submitNewAccount(view: Extract<ModalMode, { kind: "add" }>, previ
   }
 }
 
-async function updateRooms(view: RoomsView, command: object): Promise<void> {
-  if (modal !== view || view.busy) return;
+async function updateRooms(view: RoomsView, command: { action?: string; id?: string; revision?: number }): Promise<void> {
+  if (modal !== view) return;
+  if (command.action === "interrupt") {
+    try {
+      view.book = await invoke<RoomBook>("manage_rooms", { command: { action: "interrupt", id: command.id } });
+      view.runningRoomId = undefined;
+      if (modal === view) render();
+    } catch (error) {
+      const line = document.getElementById("room-result");
+      if (line) line.textContent = String(error);
+    }
+    return;
+  }
+  if (view.busy) return;
+  const run = command.action === "dispatch" || command.action === "recover";
   view.busy = true;
   view.error = "";
+  if (run) {
+    view.runningRoomId = command.id;
+    render();
+    if (command.id) document.querySelector<HTMLElement>(`[data-room-panel="${CSS.escape(command.id)}"]`)?.setAttribute("open", "");
+  }
   const status = document.getElementById("room-result");
   if (status) status.textContent = "正在保存或读取…";
   try {
-    view.book = await invoke<RoomBook>("manage_rooms", { command });
+    view.book = run ? await invoke<RoomBook>("run_solo_room", {
+      id: command.id, revision: command.revision, recover: command.action === "recover",
+    }) : await invoke<RoomBook>("manage_rooms", { command });
     if (status) status.textContent = "";
   } catch (error) {
     view.error = String(error);
+    if (run) {
+      try { view.book = await invoke<RoomBook>("manage_rooms", { command: { action: "list" } }); }
+      catch { /* Keep the previous view and the original error. */ }
+    }
   } finally {
     view.busy = false;
+    view.runningRoomId = undefined;
     if (modal === view) {
-      if (view.error && status && view.book) status.textContent = view.error;
-      else render();
+      if (view.error && status && view.book && !run) status.textContent = view.error;
+      else {
+        render();
+        if (command.id) document.querySelector<HTMLElement>(`[data-room-panel="${CSS.escape(command.id)}"]`)?.setAttribute("open", "");
+      }
     }
   }
 }
@@ -4184,6 +4230,13 @@ function bindDelegatedEvents(): void {
 
     const roomAction = target.closest<HTMLElement>("[data-room-action]");
     if (roomAction && modal.kind === "rooms") {
+      if (roomAction.dataset.roomAction === "open_source" && roomAction.dataset.roomAccount && roomAction.dataset.roomSession) {
+        const uuid = roomAction.dataset.roomAccount;
+        const threadId = roomAction.dataset.roomSession;
+        await setModal({ kind: "none" });
+        await callCommand("open_muse_thread", { uuid, threadId }, { providerId: "muse", uuid });
+        return;
+      }
       await updateRooms(modal, roomCommand(roomAction));
       return;
     }
@@ -4250,6 +4303,14 @@ function bindDelegatedEvents(): void {
           const { providerId, uuid } = modal.account;
           await setModal({ kind: "none" });
           await callCommand("switch_account", { providerId, uuid }, { providerId, uuid });
+        }
+        break;
+      case "account-fingerprint-start":
+        if (modal.kind === "tasks" && modal.account.providerId === "muse") await runSpikeFingerprint(modal);
+        break;
+      case "account-fingerprint-stop":
+        if (modal.kind === "tasks" && spikeFingerprintTask?.accountUuid === modal.account.uuid) {
+          await cancelSpikeProbe(spikeFingerprintTask);
         }
         break;
       case "hark-replies-open":
@@ -4604,6 +4665,7 @@ async function bootstrap(): Promise<void> {
     if (payload.taskId !== spikeFingerprintTask?.taskId || payload.accountUuid !== spikeFingerprintTask.accountUuid) return;
     spikeFingerprintProgress = payload;
     syncSpikeDiag();
+    if (modal.kind === "tasks" && modal.account.uuid === payload.accountUuid) render();
   });
 
   await listen<ManagerSnapshot>("manager-state-changed", (event) => {

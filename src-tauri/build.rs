@@ -7,6 +7,7 @@ const APP_COMMANDS: &[&str] = &[
   "select_provider",
   "add_account",
   "manage_rooms",
+  "run_solo_room",
   "rename_account",
   "remove_account",
   "reorder_accounts",

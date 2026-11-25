@@ -176,6 +176,8 @@ pub struct AccountRecord {
   #[serde(default, skip_serializing_if = "Option::is_none")]
   pub last_muse_thread: Option<Uuid>,
   pub created_at_ms: u64,
+  #[serde(default, skip_serializing_if = "Vec::is_empty")]
+  pub fingerprint_history: Vec<FingerprintRecord>,
   #[serde(default)]
   pub auto_alias: bool,
   #[serde(default)]
@@ -210,6 +212,22 @@ pub struct AccountRecord {
   #[serde(default)]
   pub proxy: Option<ProxySetting>,
 }
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct FingerprintRecord {
+  pub task_id: Uuid,
+  pub recorded_at_ms: u64,
+  pub verdict: String,
+  pub model: Option<String>,
+  pub family: Option<String>,
+  pub probability_ppm: Option<u32>,
+  pub valid_samples: usize,
+  pub reference_built_at: Option<String>,
+  pub reference_sha256: Option<String>,
+  pub method: Option<String>,
+}
+
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -436,6 +454,9 @@ fn migrate_from_value(root: Value) -> Result<(AccountsStoreFile, bool), String> 
         last_muse_thread: item_obj.get("lastMuseThread").and_then(Value::as_str).and_then(|value| Uuid::parse_str(value).ok()),
         timezone: item_obj.get("timezone").and_then(Value::as_str).and_then(|value| normalize_account_timezone(value).ok()).flatten(),
         created_at_ms,
+        fingerprint_history: item_obj.get("fingerprintHistory")
+          .and_then(|value| serde_json::from_value::<Vec<FingerprintRecord>>(value.clone()).ok())
+          .unwrap_or_default().into_iter().take(12).collect(),
         auto_alias,
         avatar_url,
         quota_text,

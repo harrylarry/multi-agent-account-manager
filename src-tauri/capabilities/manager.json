@@ -16,6 +16,7 @@
     "allow-select-provider",
     "allow-add-account",
     "allow-manage-rooms",
+    "allow-run-solo-room",
     "allow-rename-account",
     "allow-remove-account",
     "allow-reorder-accounts",

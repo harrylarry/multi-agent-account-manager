@@ -30,6 +30,11 @@ export interface QuotaDetail {
 }
 
 export interface AccountRecord {
+  fingerprintHistory?: {
+    taskId: string; recordedAtMs: number; verdict: string; model: string | null; family: string | null;
+    probabilityPpm: number | null; validSamples: number; referenceBuiltAt: string | null;
+    referenceSha256: string | null; method: string | null;
+  }[];
   providerId: ProviderId;
   uuid: string;
   alias: string;

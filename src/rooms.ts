@@ -11,15 +11,19 @@ const phaseNames: Record<string, string> = {
   needs_user: "等待裁决", needs_reconciliation: "等待核对远端状态", failed: "失败",
 };
 
-interface Template { id: string; title: string; version: number; minParticipants: number }
+interface Template { id: string; title: string; version: number; minParticipants: number; flow: string }
+interface Attempt { accountUuid: string; status: string; sessionId: string | null; userMessageId: string | null;
+  delivery: { kind: string; text: string; capturedAtMs: number; source: string; sha256: string } | null }
 interface Room {
   id: string; revision: number; phase: string; rounds: number; returned: number;
   draft: { name: string; goal: string; roundLimit: number; members: { uuid: string; roles: string[] }[] };
   template: Template;
   steps: { phase: string; atMs: number }[];
+  attempts: Attempt[];
+  approvedAtMs: number | null;
 }
 export interface RoomBook { templates: Template[]; rooms: Room[] }
-export interface RoomsView { kind: "rooms"; book: RoomBook | null; busy: boolean; error: string }
+export interface RoomsView { kind: "rooms"; book: RoomBook | null; busy: boolean; error: string; runningRoomId?: string }
 
 export function renderRooms(view: RoomsView, accounts: AccountRecord[], esc: (text: string) => string): string {
   const muse = accounts.filter((account) => account.providerId === "muse");
@@ -28,22 +32,43 @@ export function renderRooms(view: RoomsView, accounts: AccountRecord[], esc: (te
     <div class="inline-modal" role="dialog" aria-modal="true" aria-labelledby="rooms-title">
       <div class="modal-card proxy-pool-modal">
         <div class="modal-title" id="rooms-title">协作房间</div>
-        <div class="modal-desc">本版用于建房、核对角色和保存计划。任务发送将在下一阶段接入。</div>
+        <div class="modal-desc">「单账号任务」在独立 Muse 会话中真实发送一轮。回收的文字交付由你确认定稿；其他模板保留各自的角色与流程。</div>
         <div class="proxy-pool-body">
-          ${view.book?.rooms.map((room) => `
-            <details class="hark-reply">
+          ${view.book?.rooms.map((room) => {
+            const attempt = room.attempts?.at(-1);
+            const running = view.runningRoomId === room.id || ["dispatching","waiting_reply"].includes(room.phase);
+            const actions = running ? [["interrupt", "停止本轮"]] :
+              room.phase === "created" ? [["prepare", "校验并准备"]] :
+              room.phase === "planning" ? [...(room.template.flow === "solo" ? [["dispatch","真实派发一轮"]] : []), ["pause", "暂停"], ["stop", "停止"]] :
+              room.phase === "paused" ? [["resume", "继续准备"], ["stop", "停止"]] :
+              room.phase === "needs_reconciliation" ? [...(attempt?.userMessageId ? [["recover","只读回收回复"]] : []), ["abandon","结束房间"]] :
+              room.phase === "pending_confirmation" ? [["confirm","确认文字定稿"], ["rework","要求返工"]] : [];
+            return `
+            <details class="hark-reply" data-room-panel="${room.id}">
               <summary>${esc(room.draft.name)} · ${phaseNames[room.phase] ?? esc(room.phase)} · ${room.rounds}/${room.draft.roundLimit} 轮</summary>
               <div class="hark-reply-text">${esc(room.draft.goal)}</div>
               <div class="modal-desc">${esc(room.template.title)} · v${room.template.version}</div>
               ${room.draft.members.map((member) => `<div>${esc(muse.find((account) => account.uuid === member.uuid)?.alias ?? "已移除成员")} · ${member.roles.map((role) => roles.find(([id]) => id === role)?.[1] ?? "").join("、")}</div>`).join("")}
               <div class="modal-desc">${room.steps.map((step) => phaseNames[step.phase]).join(" → ")}</div>
+              ${running ? '<div role="status">本轮进行中，正在等待发送确认或回复。</div>' : ""}
+              ${room.attempts?.map((step, index) => step.delivery ? `<details><summary>第 ${index + 1} 次派发 · 文字交付</summary>
+                <div class="hark-reply-text">${esc(step.delivery.text)}</div>
+                <div class="modal-desc">${esc(muse.find((account) => account.uuid === step.accountUuid)?.alias ?? "原账号")}
+                  · ${step.delivery.source === "history" ? "会话历史" : "实时订阅"} · ${new Date(step.delivery.capturedAtMs).toLocaleString()}</div>
+                <div class="modal-desc" style="overflow-wrap:anywhere">SHA-256 ${esc(step.delivery.sha256)}</div>
+              </details>` : "").join("") ?? ""}
+              ${attempt?.sessionId ? `<button type="button" class="btn" data-room-action="open_source"
+                data-room-account="${esc(attempt.accountUuid)}" data-room-session="${esc(attempt.sessionId)}">打开原隔离会话</button>` : ""}
+              ${room.phase === "needs_reconciliation" ? '<div class="modal-desc">本轮结果需要核对。可以查看原会话或结束房间。</div>' : ""}
+              ${attempt?.status === "not_sent" ? '<div class="modal-desc">没有发出任务。请检查账号登录、代理和当前发送占用。</div>' : ""}
+              ${room.phase === "pending_confirmation" ? `<label for="rework-${room.id}">返工要求</label>
+                <textarea id="rework-${room.id}" class="modal-input" maxlength="4000"></textarea>` : ""}
+              ${room.approvedAtMs ? `<div class="modal-desc">用户已确认 · ${new Date(room.approvedAtMs).toLocaleString()}</div>` : ""}
               <div class="proxy-pool-actions">
-                ${(room.phase === "created" ? [["prepare", "校验并准备"]] :
-                  room.phase === "planning" ? [["pause", "暂停"], ["stop", "停止"]] :
-                  room.phase === "paused" ? [["resume", "继续准备"], ["stop", "停止"]] : [])
-                  .map(([action, label]) => `<button type="button" class="btn" data-room-action="${action}" data-room-id="${room.id}" data-room-revision="${room.revision}">${label}</button>`).join("")}
+                ${actions.map(([action, label]) => `<button type="button" class="btn" data-room-action="${action}" data-room-id="${room.id}" data-room-revision="${room.revision}">${label}</button>`).join("")}
               </div>
-            </details>`).join("") ?? ""}
+            </details>`;
+          }).join("") ?? ""}
           ${view.book ? `
             <details class="hark-reply"><summary>新增房间</summary>
               <label for="room-name">房间名称</label><input id="room-name" class="modal-input" maxlength="80">
@@ -58,7 +83,7 @@ export function renderRooms(view: RoomsView, accounts: AccountRecord[], esc: (te
             <details class="hark-reply"><summary>自定义模板</summary>
               <label for="room-template-title">模板名称</label><input id="room-template-title" class="modal-input" maxlength="60">
               <label for="room-template-base">基础流程</label><select id="room-template-base" class="modal-input">${options}</select>
-              <label for="room-template-min">至少几人</label><input id="room-template-min" class="modal-input" type="number" min="2" max="12" value="2">
+              <label for="room-template-min">至少几人</label><input id="room-template-min" class="modal-input" type="number" min="1" max="12" value="2">
               <button type="button" class="btn" data-room-action="save_template">保存模板</button>
             </details>` : ""}
         </div>
@@ -68,7 +93,7 @@ export function renderRooms(view: RoomsView, accounts: AccountRecord[], esc: (te
     </div>`;
 }
 
-export function roomCommand(button: HTMLElement): object {
+export function roomCommand(button: HTMLElement): { action?: string; id?: string; revision?: number; [key: string]: unknown } {
   const action = button.dataset.roomAction;
   const value = (id: string) => document.querySelector<HTMLInputElement | HTMLTextAreaElement | HTMLSelectElement>(`#${id}`)?.value ?? "";
   if (action === "create") {
@@ -81,5 +106,6 @@ export function roomCommand(button: HTMLElement): object {
   }
   if (action === "save_template") return { action, title: value("room-template-title"),
     baseId: value("room-template-base"), minParticipants: Number(value("room-template-min")) };
-  return { action, id: button.dataset.roomId, revision: Number(button.dataset.roomRevision) };
+  return { action, id: button.dataset.roomId, revision: Number(button.dataset.roomRevision),
+    ...(action === "rework" ? { note: value(`rework-${button.dataset.roomId}`) } : {}) };
 }

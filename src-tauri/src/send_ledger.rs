@@ -55,6 +55,7 @@ pub enum SendStatus {
 pub enum SendKind {
   Message,
   FingerprintProbe,
+  RoomMessage,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -363,6 +364,12 @@ impl SendLedger {
     conversation_id: &str,
     text: &str,
   ) -> Result<String, SendError> {
+    self.begin_mission_attempt(mission_id, account_uuid, conversation_id, text, SendKind::FingerprintProbe)
+  }
+
+  fn begin_mission_attempt(
+    &self, mission_id: &str, account_uuid: &str, conversation_id: &str, text: &str, kind: SendKind,
+  ) -> Result<String, SendError> {
     self.commit(|st| {
       let belongs = st
         .missions
@@ -377,7 +384,7 @@ impl SendLedger {
         account_uuid,
         conversation_id,
         text,
-        SendKind::FingerprintProbe,
+        kind,
         Some(mission_id.to_string()),
       )
     })
@@ -402,7 +409,7 @@ impl SendLedger {
       send_id: send_id.clone(),
       account_uuid: account_uuid.to_string(),
       conversation_id: conversation_id.to_string(),
-      digest: digest_of(text),
+      digest: if kind == SendKind::RoomMessage { text.to_owned() } else { digest_of(text) },
       started_at_ms: now_ms(),
       status: SendStatus::Prepared,
       error: None,
@@ -617,6 +624,10 @@ pub struct MissionGuard<'a> {
 }
 
 impl<'a> MissionGuard<'a> {
+  #[cfg(target_os = "ios")]
+  pub fn begin_room_send(&self, conversation_id: &str, digest: &str) -> Result<String, SendError> {
+    self.ledger.begin_mission_attempt(&self.mission_id, &self.account_uuid, conversation_id, digest, SendKind::RoomMessage)
+  }
   #[allow(dead_code)] // 调用方目前只用 begin_probe，保留 id 读取供诊断
   pub fn mission_id(&self) -> &str {
     &self.mission_id
