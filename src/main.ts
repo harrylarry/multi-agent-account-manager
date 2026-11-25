@@ -165,7 +165,10 @@ function formatStreamEventCounts(label: string, counts: SpikeStreamEventCounts):
 
 function formatUnmatchedEvents(diagnostics: NonNullable<SpikeFingerprintSendRecord["diagnostics"]>): string {
   if (!diagnostics.unmatchedEvents) return "";
-  return `<div class="hint">未关联明细 · 本轮范围外 ${diagnostics.outsideTurnEvents} · 标识冲突 ${diagnostics.conflictingEvents} · 缺助手标识 ${diagnostics.missingMessageIdEvents} · 缺关联依据 ${diagnostics.unlinkedEvents}</div>`;
+  const conflicts = diagnostics.conflictingEvents
+    ? `（会话 ${diagnostics.sessionConflicts} · 明确回复指向 ${diagnostics.userLinkConflicts} · 轮次或任务 ${diagnostics.turnTaskConflicts} · 父消息 ${diagnostics.parentConflicts}）`
+    : "";
+  return `<div class="hint">未关联明细 · 本轮范围外 ${diagnostics.outsideTurnEvents} · 标识冲突 ${diagnostics.conflictingEvents}${conflicts} · 缺助手标识 ${diagnostics.missingMessageIdEvents} · 缺关联依据 ${diagnostics.unlinkedEvents}</div>`;
 }
 
 function formatMessageTiming(diagnostics: NonNullable<SpikeFingerprintSendRecord["diagnostics"]>): string {
@@ -184,6 +187,8 @@ interface SpikeFingerprintSendRecord {
     firstDeltaToMessageDoneMs: number | null;
     parseErrors: number; unmatchedEvents: number; sawUser: boolean;
     outsideTurnEvents: number; conflictingEvents: number;
+    sessionConflicts: number; userLinkConflicts: number;
+    turnTaskConflicts: number; parentConflicts: number;
     missingMessageIdEvents: number; unlinkedEvents: number;
     assistantMessages: number; sawIdle: boolean;
   } | null;

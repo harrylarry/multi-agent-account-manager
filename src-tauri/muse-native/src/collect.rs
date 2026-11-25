@@ -44,6 +44,10 @@ pub struct Collected {
   pub unmatched_events: u64,
   pub outside_turn_events: u64,
   pub conflicting_events: u64,
+  pub session_conflicts: u64,
+  pub user_link_conflicts: u64,
+  pub turn_task_conflicts: u64,
+  pub parent_conflicts: u64,
   pub missing_message_id_events: u64,
   pub unlinked_events: u64,
   pub saw_user: bool,
@@ -376,10 +380,8 @@ pub async fn collect_text<L: LineSource>(
       &root["chat_context"],
       &payload["message"],
     ];
-    let session = text_field(
-      &contexts,
-      &["session_id", "sessionId", "thread_id", "threadId"],
-    );
+    let session_keys = ["session_id", "sessionId", "thread_id", "threadId"];
+    let session = text_field(&contexts, &session_keys);
     let event_turn = text_field(&contexts, &["turn_id"]);
     let event_task = text_field(&contexts, &["task_id"]);
     let parent = text_field(
@@ -393,6 +395,7 @@ pub async fn collect_text<L: LineSource>(
     if session.is_some_and(|id| id != session_id) {
       out.unmatched_events += 1;
       out.conflicting_events += 1;
+      out.session_conflicts += 1;
       continue;
     }
     let before_user = event_time_ms(&root, payload)
@@ -419,12 +422,42 @@ pub async fn collect_text<L: LineSource>(
       continue;
     }
     let scoped_current = scoped_user_seen && !from_send && !before_user;
-    if event_turn.zip(turn.as_deref()).is_some_and(|(a, b)| a != b)
-      || event_task.zip(task.as_deref()).is_some_and(|(a, b)| a != b)
-      || parent.is_some_and(|id| id != ack.message_id)
-    {
+    let assistant_id = [
+      &root["assistant_message_id"], &payload["assistant_message_id"], &root["message_id"],
+      &payload["message_id"], &payload["message"]["message_id"], &payload["message"]["id"],
+    ].into_iter().filter_map(Value::as_str).find(|id| !id.is_empty() && *id != ack.message_id);
+    // An already-bound assistant can use different child-task metadata on its deltas.
+    // Keep explicit user and reply links strict even for that assistant's active scoped stream.
+    let bound_delta = event == "delta.text_append" && scoped_current
+      && assistant_id.is_some_and(|id| messages.get(id).is_some_and(|message| !message.done));
+    if bound_delta && contexts.iter().any(|context| {
+      text_field(&[*context], &session_keys).is_some_and(|id| id != session_id)
+    }) {
       out.unmatched_events += 1;
       out.conflicting_events += 1;
+      out.session_conflicts += 1;
+      continue;
+    }
+    let explicit_link_conflict = bound_delta && contexts.iter().any(|context| {
+      text_field(&[*context], &["user_message_id"]).is_some_and(|id| id != ack.message_id)
+        || ["reply_to_message_id", "parent_message_id"].iter().any(|key| {
+          text_field(&[*context], &[*key])
+            .is_some_and(|id| id != ack.message_id && !messages.contains_key(id))
+        })
+    });
+    let different_turn_or_task = event_turn.zip(turn.as_deref()).is_some_and(|(a, b)| a != b)
+      || event_task.zip(task.as_deref()).is_some_and(|(a, b)| a != b);
+    let different_parent = parent.is_some_and(|id| id != ack.message_id);
+    if explicit_link_conflict || (!bound_delta && (different_turn_or_task || different_parent)) {
+      out.unmatched_events += 1;
+      out.conflicting_events += 1;
+      if explicit_link_conflict {
+        out.user_link_conflicts += 1;
+      } else if different_turn_or_task {
+        out.turn_task_conflicts += 1;
+      } else {
+        out.parent_conflicts += 1;
+      }
       continue;
     }
     if event == "agent.status" {
@@ -453,9 +486,7 @@ pub async fn collect_text<L: LineSource>(
     ) {
       continue;
     }
-    let Some(id) = [&root["assistant_message_id"], &payload["assistant_message_id"], &root["message_id"],
-      &payload["message_id"], &payload["message"]["message_id"], &payload["message"]["id"]]
-      .into_iter().filter_map(Value::as_str).find(|id| !id.is_empty() && *id != ack.message_id) else {
+    let Some(id) = assistant_id else {
       out.unmatched_events += 1;
       out.missing_message_id_events += 1;
       continue;
@@ -488,7 +519,9 @@ pub async fn collect_text<L: LineSource>(
       out.unlinked_events += 1;
       continue;
     }
-    if let Some(seq) = root["seq"].as_u64().filter(|seq| *seq > 0) {
+    let sequence = [&root["stream_seq"], &payload["stream_seq"], &root["seq"]]
+      .into_iter().find_map(|value| value.as_u64().filter(|seq| *seq > 0));
+    if let Some(seq) = sequence {
       if !seen.insert((event.to_string(), id.to_string(), seq)) {
         continue;
       }
@@ -676,6 +709,30 @@ mod tests {
       assert!(result.text.is_empty());
       assert_eq!(result.text_deltas, 0);
     }
+  }
+
+  #[tokio::test]
+  async fn scoped_deltas_follow_the_bound_assistant_without_ignoring_foreign_links() {
+    let mut source = lines(&[
+      r#"{"type":"event","event":"message.user","message_id":"user-1","payload":{"turn_id":"turn","task_id":"main"}}"#,
+      r#"{"type":"event","event":"delta.message_start","message_id":"assistant"}"#,
+      r#"{"type":"event","event":"delta.text_append","message_id":"assistant","seq":42,"stream_seq":1,"payload":{"turn_id":"child-turn","task_id":"child-task","parent_message_id":"assistant","text":"step "}}"#,
+      r#"{"type":"event","event":"delta.text_append","message_id":"assistant","seq":43,"stream_seq":1,"payload":{"parent_message_id":"assistant","text":"duplicate"}}"#,
+      r#"{"type":"event","event":"delta.text_append","message_id":"assistant","seq":42,"payload":{"stream_seq":2,"task_id":"child-task","text":"two"}}"#,
+      r#"{"type":"event","event":"delta.text_append","message_id":"assistant","payload":{"session_id":"other-session","text":"foreign"}}"#,
+      r#"{"type":"event","event":"delta.text_append","message_id":"assistant","session_id":"test-session","payload":{"chat_context":{"session_id":"other-session"},"text":"foreign"}}"#,
+      r#"{"type":"event","event":"delta.text_append","message_id":"assistant","payload":{"user_message_id":"other-user","text":"foreign"}}"#,
+      r#"{"type":"event","event":"delta.text_append","message_id":"assistant","payload":{"parent_message_id":"other-user","text":"foreign"}}"#,
+      r#"{"type":"event","event":"delta.text_append","message_id":"new-unbound","payload":{"turn_id":"other-turn","text":"foreign"}}"#,
+      r#"{"type":"event","event":"delta.message_done","message_id":"assistant"}"#,
+      r#"{"type":"event","event":"agent.status","payload":{"activity_code":"idle"}}"#,
+    ]);
+    source.1 = true;
+    let result = collect_text(&mut source, &ack(), "test-session", Duration::from_secs(2), Duration::from_millis(50), || {}).await;
+    assert_eq!(result.ended_by, "done");
+    assert_eq!(result.text, "step two");
+    assert_eq!(result.text_deltas, 2);
+    assert_eq!((result.session_conflicts, result.user_link_conflicts, result.turn_task_conflicts), (2, 2, 1));
   }
 
   #[tokio::test]
