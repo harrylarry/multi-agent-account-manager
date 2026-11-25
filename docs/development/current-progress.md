@@ -4,7 +4,7 @@
 
 ## Phase 0 技术 Spike
 
-开发分支为 `spike/native-methods`。最新 Spike 候选 0.1.26 来自 `bda84e747d5b9e8f6b043a341e77f3238f2cfceb`，包含 Muse 账号只读审批与回前台补查。[候选和步骤](../acceptance/iphone-acceptance.md#muse-账号审批与回前台补查)
+开发分支为 `spike/native-methods`。v2.2 A–C 联合验收候选 0.1.26 的代码提交为 `815cffab61309f12df1411f22386250643486e12`，交付在 PR #16。[候选和步骤](../acceptance/iphone-acceptance.md#v22-ac-联合验收)
 
 | 切片 | 已核对证据 | 待验收 |
 | --- | --- | --- |
@@ -16,9 +16,21 @@
 
 0.1.25 的 [Quick checks](https://github.com/harrylarry/multi-agent-account-manager/actions/runs/45389037648)、[Xcode 打包](https://github.com/harrylarry/multi-agent-account-manager/actions/runs/45389039398)和 [Hark Quick checks](https://github.com/harrylarry/multi-agent-account-manager/actions/runs/45390431182)均有对应提交。真机结果需记录对应包和测试环境。
 
+## v2.2 A–C 联合交付
+
+| 切片 | 代码与本地证据 | 新候选 iPhone 门禁 |
+| --- | --- | --- |
+| A · Cookie 与登录恢复 | `529564c` 完成三格式解析、账号绑定、导入预览、写入核验和回滚、本机限时导出及重新打开验证。UI 和存储回归包含分组、搜索和排序。 | Cookie 过期或拒绝后的原会话、跨账号、重启与剪贴板到期 `UNVERIFIED`。 |
+| B · 任务、审批与代理池 | `757fccd`、`4662396`、`815cffa` 完成任务检测与前台补查、失败保持未知、两次稳定采样、完成和待审批去重、审批提交前复查和台账、账号代理池与测速。 | 真实待审批项及写操作、通知系统权限、回前台红点、订阅失败与代理交叉隔离 `UNVERIFIED`。iOS 挂起和强退期间的实时提醒继续受系统执行条件限制。 |
+| C · 会话、Hark 与数据 | `aabd2e5` 完成 Muse 会话列表和账户内打开。后续提交接通最近会话绑定、网页及原生额度时效、账号时区、Hark 任务状态和 WebView 审批入口、AES-256-GCM 备份预览与恢复。 | Muse 跨账号会话、Hark 登录/断流/审批、加密文件分享和恢复 `UNVERIFIED`。需要可用的 Hark 账号及真实审批样本。 |
+
+Windows 主 crate 67 项、muse-native 110 项、嵌入脚本 13 项与构建检查通过。Edge 和 WebKit 在 320×568、390×844 测试登录预览、会话选择、分组、代理池、审批确认与备份流程。另验证时区覆盖和 5 秒任务采样间隔。macOS CI 已通过 iOS Rust target、Swift 插件编译与宿主测试。`CI_PASSED`。[Quick checks](https://github.com/harrylarry/multi-agent-account-manager/actions/runs/45646195238)
+
+同一 SHA 的 Xcode IPA 构建通过，ZIP 与 GitHub SHA-256 一致。已核验内部 IPA、Spike Bundle ID 和 iOS 17.0 最低版本。真机按联合清单保留逐项 `UNVERIFIED`。[iOS 打包](https://github.com/harrylarry/multi-agent-account-manager/actions/runs/45646166968) · [验收包及校验值](../acceptance/iphone-acceptance.md#v22-ac-联合验收)
+
 ## 下一步
 
-当前开发与上游适配顺序见[执行计划 v2.2](development-plan-v2.2.md)。下一批启动 iOS Cookie 导入、登录失效与异常恢复，已有审批和回前台补查合并进入候选回归。以下保留历史验证时间线。
+按联合验收清单收集 A–C 的真机证据。有授权的 Hark 账号及真实待审批项时同步验收。房间与指纹产品化按 [执行计划 v2.2](development-plan-v2.2.md)进入后续批次。以下保留历史验证时间线。
 
 实时流式专项包 `8f50c91` 的 CI 与 Xcode 打包通过。本次 iPhone 专项实测中，实时增量与流内结束验收均未通过。三条均为零关联文本增量，最终由历史恢复完成。下一轮按发送流和订阅流分别记录匹配前的事件类型计数，以区分未观测到文本事件与关联失败。[下载与步骤](../acceptance/iphone-acceptance.md#实时增量专项复测)
 
@@ -83,3 +95,5 @@
 `bda84e7` 已通过 [Quick checks](https://github.com/harrylarry/multi-agent-account-manager/actions/runs/45631020421) 和 [iOS Xcode 打包](https://github.com/harrylarry/multi-agent-account-manager/actions/runs/45631028431)，IPA 已下载校验。主 crate 62 项、muse-native 109 项和嵌入 JS 13 项本地测试通过。WebKit 两个移动端视口用模拟响应验证了审批详情、过期、账号隔离、空列表和未知响应。两项产品功能仍需 iPhone 复测。
 
 进入 v2.2 批次 A。iOS 账号列表加入 Cookie 三格式预览、范围校验、写入核验与失败回滚、本机限时剪贴板导出，以及写入后打开原账号验证登录。审批、回前台补查及分组持久化纳入同一候选包。会话、代理池、任务与加密备份沿 v2.2 继续。
+
+`529564c` 登录恢复首包已通过 [Quick checks](https://github.com/harrylarry/multi-agent-account-manager/actions/runs/45635918943) 和 [Xcode](https://github.com/harrylarry/multi-agent-account-manager/actions/runs/45635923405)，已下载校验。WebKit 使用模拟 IPC 验证了预览失效、导出确认及指定账号绑定。`aabd2e5` 新增 Muse 会话列表和经该账号 WebView 打开指定线程，本地 64 项 Rust 测试、前端构建和移动视口模拟交互通过，CI 与联合包待完成。代理池、产品级任务事件与通知、持久会话绑定、Hark 与加密备份仍在 v2.2 开发范围内。[验收步骤](../acceptance/iphone-acceptance.md#ios-账号登录恢复联合验收)
