@@ -107,6 +107,7 @@ enum RecentAccountPages {
     /// whenever the account is re-parked.
     let alias: String
     let timezone: String?
+    let parkedAtMs: Int64
   }
 
   // Park-ordered (oldest first = least recently active); eviction takes
@@ -169,7 +170,8 @@ enum RecentAccountPages {
     if let idx = pages.firstIndex(where: { $0.key == key }) {
       destroy(pages.remove(at: idx).entry.view)
     }
-    pages.append((key: key, entry: Entry(view: view, delegate: delegate, alias: spec.alias, timezone: spec.timezone)))
+    pages.append((key: key, entry: Entry(view: view, delegate: delegate, alias: spec.alias,
+      timezone: spec.timezone, parkedAtMs: Int64(Date().timeIntervalSince1970 * 1000))))
     trim(maxAccountPages)
     if spec.providerId == "muse" {
       view.evaluateJavaScript(TaskWatcher.taskStateScript) { [weak view] result, _ in
@@ -201,6 +203,23 @@ enum RecentAccountPages {
 
   static func dataStore(providerId: String, uuid: String) -> WKWebsiteDataStore? {
     pages.first { $0.key.providerId == providerId && $0.key.uuid == uuid }?.entry.view.configuration.websiteDataStore
+  }
+
+  static func museCatchUpTargets() -> [[String: Any]] {
+    pages.reversed().compactMap { item in
+      guard item.key.providerId == "muse" else { return nil }
+      var target: [String: Any] = ["uuid": item.key.uuid, "parkedAtMs": item.entry.parkedAtMs]
+      if let url = item.entry.view.url, url.scheme == "https",
+         ["muse.ai", "www.muse.ai"].contains(url.host ?? "") {
+        if url.path.isEmpty || url.path == "/" {
+          target["primary"] = true
+        } else if url.pathComponents.count == 3, url.pathComponents[1] == "thread",
+                  let thread = UUID(uuidString: url.pathComponents[2]) {
+          target["threadId"] = thread.uuidString.lowercased()
+        }
+      }
+      return target
+    }
   }
 
   /// Drops every parked page. Used when memory is tight or the active web

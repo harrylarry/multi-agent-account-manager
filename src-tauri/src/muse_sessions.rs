@@ -29,8 +29,13 @@ async fn fetch_list(
   cookies: &muse_native_client::cookie::SessionCookies,
   path: &str,
 ) -> Result<Vec<MuseSession>, String> {
-  use muse_native_client::transport::{HttpRequest, Service};
   let mut gateway = Box::pin(egress.connect(cookies)).await.map_err(|_| "无法连接 Muse 会话网关")?;
+  parse_list(&request(&mut gateway, path).await?)
+}
+
+#[cfg(target_os = "ios")]
+async fn request(gateway: &mut crate::egress::AccountGateway, path: &str) -> Result<Vec<u8>, String> {
+  use muse_native_client::transport::{HttpRequest, Service};
   let (status, body) = gateway.request(HttpRequest {
     service: Service::Daemon,
     verb: "GET".into(),
@@ -40,21 +45,85 @@ async fn fetch_list(
   }).await.map_err(|_| "Muse 会话查询未完成")?;
   if !(200..300).contains(&status) { return Err(format!("会话列表请求失败（HTTP {status}）")); }
   if body.len() > 2 * 1024 * 1024 { return Err("会话列表响应过大".into()); }
-  parse_list(&body)
+  Ok(body)
 }
 
 #[cfg(target_os = "ios")]
 pub async fn fetch_unread(
   egress: &crate::egress::AccountEgress,
   cookies: &muse_native_client::cookie::SessionCookies,
-) -> Result<Option<std::collections::BTreeMap<Uuid, u64>>, String> {
-  let sessions = Box::pin(fetch_list(egress, cookies, "/api/session/list?include_peer_sidechats=true")).await?;
-  if !sessions.iter().any(|session| session.unread_count.is_some()) {
-    return Ok(None);
-  }
-  Ok(Some(sessions.into_iter().filter_map(|session| {
+  thread: Option<Uuid>,
+  primary: bool,
+  parked_at: u64,
+) -> Result<(Option<std::collections::BTreeMap<Uuid, u64>>, Option<String>, &'static str), String> {
+  let mut gateway = Box::pin(egress.connect(cookies)).await.map_err(|_| "无法连接 Muse 会话网关")?;
+  let has_history_target = thread.is_some() || primary;
+  let status = if has_history_target {
+    let mut path = "/chat/history?limit=30&transcript_mode=messages".to_string();
+    if let Some(thread) = thread { path.push_str(&format!("&session_id={thread}")); }
+    match Box::pin(request(&mut gateway, &path)).await {
+      Ok(body) => match completed_since_park(&body, thread, parked_at) {
+        Some(Some(id)) => return Ok((None, Some(id), "history_completed")),
+        Some(None) => "history_no_completion",
+        None => "history_unavailable",
+      },
+      Err(_) => "history_unavailable",
+    }
+  } else { "no_thread" };
+  let list = async {
+    let body = Box::pin(request(&mut gateway, "/api/session/list?include_peer_sidechats=true")).await?;
+    parse_list(&body)
+  };
+  let sessions = match list.await {
+    Ok(sessions) => sessions,
+    Err(_) if has_history_target => return Ok((None, None, status)),
+    Err(error) => return Err(error),
+  };
+  let counts: std::collections::BTreeMap<_, _> = sessions.into_iter().filter_map(|session| {
     session.unread_count.map(|count| (session.id, count))
-  }).collect()))
+  }).collect();
+  Ok(((!counts.is_empty()).then_some(counts), None, status))
+}
+
+#[cfg(any(target_os = "ios", test))]
+fn completed_since_park(body: &[u8], thread: Option<Uuid>, parked_at: u64) -> Option<Option<String>> {
+  let raw: Value = serde_json::from_slice(body).ok()?;
+  if raw["ok"] == false || !raw["error"].is_null() { return None; }
+  let result = raw.get("result").unwrap_or(&raw);
+  let parse_thread = |value: &Value| value.as_str().and_then(|id| Uuid::parse_str(id).ok());
+  let envelope_thread = parse_thread(&result["session_id"]);
+  if matches!((thread, envelope_thread), (Some(expected), Some(actual)) if expected != actual) { return None; }
+  let mut expected = thread.or(envelope_thread);
+  let mut rows: Vec<&Value> = result["chat_events"].as_array()?.iter().collect();
+  rows.sort_by_key(|row| row["seq"].as_u64().unwrap_or(0));
+  let mut current_user = None;
+  let mut completed = None;
+  for row in rows {
+    let payload = &row["payload"];
+    let kind = row["event_name"].as_str();
+    if !matches!(kind, Some("message.user" | "message.assistant")) { continue; }
+    let observed = parse_thread(&payload["session_id"]).or(envelope_thread)?;
+    if expected.is_some_and(|id| id != observed) { return None; }
+    expected = Some(observed);
+    let id = row["message_id"].as_str().filter(|id| !id.is_empty() && id.len() <= 128)?;
+    if kind == Some("message.user") {
+      current_user = Some(id);
+      completed = None;
+      continue;
+    }
+    let Some(user) = current_user else { continue; };
+    let reply_to = row["reply_to_message_id"].as_str().filter(|id| !id.is_empty())
+      .or_else(|| payload["reply_to_message_id"].as_str().filter(|id| !id.is_empty()));
+    if reply_to.is_some_and(|parent| parent != user) || row["visibility"] != "public" || id == user {
+      continue;
+    }
+    if matches!(payload["status"].as_str().or_else(|| row["status"].as_str()), Some("completed" | "complete" | "done" | "finished"))
+      && row["occurred_at_ms"].as_u64().is_some_and(|time| time >= parked_at)
+    {
+      completed = Some(id.to_owned());
+    }
+  }
+  Some(completed)
 }
 
 #[cfg(any(target_os = "ios", test))]
@@ -119,6 +188,30 @@ pub fn parse_list(raw: &[u8]) -> Result<Vec<MuseSession>, String> {
 #[cfg(test)]
 mod tests {
   use super::*;
+
+  #[test]
+  fn history_requires_a_public_completed_reply_in_the_parked_thread_after_leaving() {
+    use serde_json::json;
+    let thread = Uuid::from_u128(1);
+    let mut body = json!({"ok":true,"result":{"chat_events":[
+      {"seq":20, "event_name":"message.assistant", "visibility":"public", "message_id":"a",
+       "reply_to_message_id":"u", "occurred_at_ms":200, "payload":{"session_id":thread,"status":"completed"}},
+      {"seq":19, "event_name":"message.user", "message_id":"u", "payload":{"session_id":thread}},
+    ]}});
+    let parse = |body: &Value, target, time| completed_since_park(&serde_json::to_vec(body).unwrap(), target, time);
+    assert_eq!(parse(&body, Some(thread), 180), Some(Some("a".into())));
+    assert_eq!(parse(&body, None, 180), Some(Some("a".into())));
+    assert_eq!(parse(&body, Some(thread), 201), Some(None));
+    assert_eq!(parse(&body, Some(Uuid::from_u128(2)), 180), None);
+    body["result"]["chat_events"][0]["payload"]["status"] = json!("running");
+    assert_eq!(parse(&body, Some(thread), 180), Some(None));
+    body["result"]["chat_events"][0]["payload"]["status"] = json!("completed");
+    body["result"]["chat_events"][0]["reply_to_message_id"] = json!("other");
+    assert_eq!(parse(&body, Some(thread), 180), Some(None));
+    body["result"]["chat_events"][0]["reply_to_message_id"] = json!("u");
+    body["result"]["chat_events"][0]["visibility"] = json!("private");
+    assert_eq!(parse(&body, Some(thread), 180), Some(None));
+  }
 
   #[test]
   fn catches_new_server_unread_and_deduplicates_repeated_reads() {

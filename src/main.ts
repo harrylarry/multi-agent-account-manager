@@ -43,6 +43,16 @@ interface TaskObservation {
 }
 
 const latestTaskObservations = new Map<string, TaskObservation>();
+const accountTimezoneChoices = [
+  ["", "跟随系统"],
+  ["Asia/Shanghai", "上海"],
+  ["Asia/Singapore", "新加坡"],
+  ["Asia/Tokyo", "东京"],
+  ["Europe/London", "伦敦"],
+  ["America/New_York", "纽约"],
+  ["America/Los_Angeles", "洛杉矶"],
+  ["UTC", "UTC"],
+];
 
 type BackupMode = "light" | "full" | "custom";
 interface BackupPreview {
@@ -2479,6 +2489,10 @@ function renderTasks(view: Extract<ModalMode, { kind: "tasks" }>): string {
   const unreadStatus: Record<string, string> = {
     unread: "Muse 返回未读", zero: "服务已返回未读计数，本次为零",
     unavailable: "本次未收到未读计数", network_or_protocol: "未读查询失败", timeout: "未读查询超时",
+    history_completed: "会话历史确认有新回复",
+    history_no_completion: "会话历史暂未读到本轮的新完成回复",
+    history_unavailable: "暂无法从会话历史确认回复",
+    no_thread: "停驻页未提供可核对的会话，未见未读计数",
   };
   return `
     <div class="inline-modal" role="dialog" aria-modal="true" aria-labelledby="account-task-title">
@@ -2904,6 +2918,8 @@ function renderModal(provider: ProviderInfo): string {
     `;
   }
   if (modal.kind === "rename") {
+    const timezone = modal.timezoneDraft;
+    const customTimezone = !accountTimezoneChoices.some(([value]) => value === timezone);
     return `
       <div class="inline-modal" role="dialog" aria-modal="true">
         <div class="modal-card">
@@ -2912,8 +2928,15 @@ function renderModal(provider: ProviderInfo): string {
           <input id="modal-alias-input" class="modal-input" maxlength="60" placeholder="输入备注名称" value="${escapeHtml(modal.draft)}" />
           <label for="modal-group-input">分组</label>
           <input id="modal-group-input" class="modal-input" maxlength="32" placeholder="留空为未分组" value="${escapeHtml(modal.groupDraft)}" />
-          ${snapshot?.platform === "ios" ? `<label for="modal-timezone-input">账号时区</label>
-            <input id="modal-timezone-input" class="modal-input" maxlength="96" placeholder="留空跟随系统" value="${escapeHtml(modal.timezoneDraft)}" />` : ""}
+          ${snapshot?.platform === "ios" ? `<label for="modal-timezone-choice">账号时区</label>
+            <select id="modal-timezone-choice" class="modal-input">
+              ${accountTimezoneChoices.map(([value, label]) => `<option value="${value}" ${value === timezone ? "selected" : ""}>${label}</option>`).join("")}
+              <option value="custom" ${customTimezone ? "selected" : ""}>自定义</option>
+            </select>
+            <div id="modal-timezone-custom" ${customTimezone ? "" : "hidden"}>
+              <label for="modal-timezone-input">IANA 时区</label>
+              <input id="modal-timezone-input" class="modal-input" maxlength="96" placeholder="例如 Europe/Paris" value="${customTimezone ? escapeHtml(timezone) : ""}" autocomplete="off" spellcheck="false" />
+            </div>` : ""}
           <div class="modal-footer">
             ${snapshot?.platform === "ios" && modal.account.authState === "authenticated" ? '<button id="account-task-btn" class="btn" type="button">任务</button>' : ""}
             ${snapshot?.platform === "ios" ? '<button id="account-proxy-pool" class="btn" type="button">代理池</button>' : ""}
@@ -4273,6 +4296,16 @@ function bindDelegatedEvents(): void {
   );
 
   root.addEventListener("change", async (ev) => {
+    const timezoneChoice = ev.target as HTMLSelectElement;
+    if (timezoneChoice.id === "modal-timezone-choice" && modal.kind === "rename") {
+      const input = document.querySelector<HTMLInputElement>("#modal-timezone-input");
+      const custom = document.querySelector<HTMLElement>("#modal-timezone-custom");
+      const useCustom = timezoneChoice.value === "custom";
+      if (custom) custom.hidden = !useCustom;
+      modal.timezoneDraft = useCustom ? input?.value ?? "" : timezoneChoice.value;
+      if (useCustom) input?.focus();
+      return;
+    }
     const input = ev.target as HTMLInputElement;
     if (input.id === "account-task-notifications" && modal.kind === "tasks") {
       const view = modal;

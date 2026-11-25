@@ -1294,10 +1294,12 @@ impl SessionManager {
   }
 
   #[cfg(target_os = "ios")]
-  async fn catch_up_muse_unread(&self, app: &AppHandle, account_ids: &[String]) {
+  async fn catch_up_muse_unread(&self, app: &AppHandle, targets: &[crate::platform::ios::ForegroundTaskTarget]) {
     let Ok(_batch) = self.unread_catch_up_lock.try_lock() else { return; };
     let cancel = app.state::<Arc<crate::probe_cancel::ProbeCancel>>();
-    for uuid in account_ids.iter().filter_map(|uuid| normalize_uuid(uuid)).take(8) {
+    for target in targets.iter().take(8) {
+      let Some(uuid) = normalize_uuid(&target.uuid) else { continue; };
+      let thread = target.thread_id.as_deref().and_then(|id| Uuid::parse_str(id).ok());
       if !crate::platform::ios::automatic_task_polling_available(app).await.unwrap_or(false) {
         return;
       }
@@ -1319,7 +1321,7 @@ impl SessionManager {
         if header.is_empty() { return Err("缺少可用登录态".to_string()); }
         let cookies = muse_native_client::cookie::SessionCookies::from_header(&header);
         let egress = crate::egress::resolve_for_app(app, account.proxy.as_ref())?;
-        Box::pin(crate::muse_sessions::fetch_unread(&egress, &cookies)).await
+        Box::pin(crate::muse_sessions::fetch_unread(&egress, &cookies, thread, target.primary, target.parked_at_ms)).await
       });
       let result = tokio::select! {
         biased;
@@ -1336,15 +1338,28 @@ impl SessionManager {
       let account = &mut locked.store.accounts[index];
       let previous = account.clone();
       let status = match result {
-        Ok(Ok(Some(counts))) => {
+        Ok(Ok((_, Some(id), status))) => {
+          let digest = ring::digest::digest(&ring::digest::SHA256, format!("{uuid}|complete|{id}").as_bytes());
+          let key: String = digest.as_ref().iter().map(|byte| format!("{byte:02x}")).collect();
+          if !account.task_notice_keys.contains(&key) {
+            if account.task_notice_keys.len() >= 256 {
+              account.task_notice_keys.drain(..account.task_notice_keys.len() - 255);
+            }
+            account.task_notice_keys.push(key);
+            account.has_unread_reply = true;
+            account.last_task_reply_at_ms = Some(now_ms());
+          }
+          status
+        }
+        Ok(Ok((Some(counts), _, status))) => {
           let new_reply = crate::muse_sessions::update_unread_counts(&mut account.muse_unread_counts, &counts);
           if new_reply && !account.has_unread_reply {
             account.has_unread_reply = true;
             account.last_task_reply_at_ms = Some(now_ms());
           }
-          if counts.values().any(|count| *count > 0) { "unread" } else { "zero" }
+          if counts.values().any(|count| *count > 0) { "unread" } else if thread.is_some() || target.primary { status } else { "zero" }
         }
-        Ok(Ok(None)) => "unavailable",
+        Ok(Ok((None, _, status))) => status,
         Ok(Err(_)) => "network_or_protocol",
         Err(_) => "timeout",
       };
@@ -3515,9 +3530,7 @@ impl SessionManager {
       uuid: account.uuid.clone(),
     };
 
-    // 0.1.16: if a flag was cleared, the aggregate dot on the "← 账号"
-    // button may need to go out — the block reports the new aggregate.
-    let badge_sync = {
+    {
       let mut locked = self.inner.lock().await;
       if self.current_seq.load(Ordering::SeqCst) != expected_seq {
         return Ok(Self::snapshot_from_locked(&locked));
@@ -3528,29 +3541,6 @@ impl SessionManager {
         switch_seq: expected_seq,
         committed: false,
       });
-      // 0.1.15: opening the account clears its unread-reply flag — the
-      // user is looking at the reply now.
-      let mut cleared_flag = false;
-      if let Some(acc) = locked
-        .store
-        .accounts
-        .iter_mut()
-        .find(|a| a.provider_id == key.provider_id && a.uuid == key.uuid)
-      {
-        if acc.has_unread_reply {
-          acc.has_unread_reply = false;
-          let _ = save_store_atomic(&locked.store_path, &locked.store);
-          cleared_flag = true;
-        }
-      }
-      if cleared_flag {
-        Some(locked.store.accounts.iter().any(|a| a.has_unread_reply))
-      } else {
-        None
-      }
-    };
-    if let Some(any_unread) = badge_sync {
-      let _ = crate::platform::ios::set_unread_badge(app, any_unread).await;
     }
 
     let spec = get_provider(account.provider_id);
@@ -3994,8 +3984,8 @@ impl SessionManager {
       // (0.1.16: the active account never reaches here — the Swift
       // coordinator skips it). Mark it unread in the manager list;
       // the flag clears when the account is opened (open_ios_session).
-      IosSessionEvent::ForegroundTaskCatchUp { account_ids } => {
-        Box::pin(self.catch_up_muse_unread(app, &account_ids)).await;
+      IosSessionEvent::ForegroundTaskCatchUp { targets } => {
+        Box::pin(self.catch_up_muse_unread(app, &targets)).await;
       }
       IosSessionEvent::TaskReplyDetected {
         provider_id,
@@ -4170,14 +4160,17 @@ impl SessionManager {
         account.provider_id == key.provider_id && account.uuid == key.uuid
       }).expect("account checked with state locked");
       let previous_thread = locked.store.accounts[index].last_muse_thread;
+      let was_unread = locked.store.accounts[index].has_unread_reply;
       if let Some(thread) = thread {
         locked.store.accounts[index].last_muse_thread = Some(thread);
       }
+      locked.store.accounts[index].has_unread_reply = false;
       let prev_last = locked.store.last_committed.clone();
       locked.store.last_committed = Some(key.clone());
       if let Err(err) = save_store_atomic(&locked.store_path, &locked.store) {
         locked.store.last_committed = prev_last;
         locked.store.accounts[index].last_muse_thread = previous_thread;
+        locked.store.accounts[index].has_unread_reply = was_unread;
         self.hide_foreground_slot(app, expected_seq, &mut locked).await;
         locked.notice = Some(format!("提交账号记录写盘失败，已回退管理页: {err}"));
         Some(Self::snapshot_from_locked(&locked))
@@ -4196,6 +4189,7 @@ impl SessionManager {
     };
 
     if let Some(snap) = snap_opt {
+      let _ = crate::platform::ios::set_unread_badge(app, snap.accounts.iter().any(|account| account.has_unread_reply)).await;
       self.emit_snapshot(app, &snap);
     }
   }

@@ -393,8 +393,19 @@ pub enum IosSessionEvent {
   },
   #[serde(rename_all = "camelCase")]
   ForegroundTaskCatchUp {
-    account_ids: Vec<String>,
+    targets: Vec<ForegroundTaskTarget>,
   },
+}
+
+#[cfg(target_os = "ios")]
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ForegroundTaskTarget {
+  pub uuid: String,
+  pub thread_id: Option<String>,
+  #[serde(default)]
+  pub primary: bool,
+  pub parked_at_ms: u64,
 }
 
 #[cfg(target_os = "ios")]
