@@ -230,8 +230,10 @@ async fn observe_account_tasks(
   {
     let provider = providers::ProviderId::parse(&provider_id).ok_or("服务标识无效")?;
     let uuid = storage::normalize_uuid(&uuid).ok_or("账号标识无效")?;
+    let proxy_lock = mgr.proxy_write_lock.lock().await;
     let (mut token, _guard) = cancel.register(&uuid, "product_task_watch");
     let snapshot = mgr.get_snapshot().await;
+    drop(proxy_lock);
     let account = snapshot.accounts.iter().find(|account| account.provider_id == provider && account.uuid == uuid
       && account.auth_state == storage::AuthState::Authenticated).ok_or("请先登录该账号")?;
     if snapshot.conflicts.iter().any(|entry| entry.uuid == uuid)
@@ -394,8 +396,10 @@ async fn decide_muse_approval(
     {
       return Err("审批选择或标识无效".into());
     }
+    let proxy_lock = mgr.proxy_write_lock.lock().await;
     let (mut token, _guard) = cancel.register(&uuid, "approval_decision");
     let snapshot = mgr.get_snapshot().await;
+    drop(proxy_lock);
     let account = snapshot.accounts.iter().find(|account| {
       account.provider_id == providers::ProviderId::Muse && account.uuid == uuid
         && account.auth_state == storage::AuthState::Authenticated
@@ -525,8 +529,10 @@ async fn list_muse_sessions(
   #[cfg(target_os = "ios")]
   {
     let uuid = storage::normalize_uuid(&uuid).ok_or("账号标识无效")?;
+    let proxy_lock = mgr.proxy_write_lock.lock().await;
     let (mut token, _guard) = cancel.register(&uuid, "sessions");
     let snapshot = mgr.get_snapshot().await;
+    drop(proxy_lock);
     let account = snapshot.accounts.iter().find(|account| {
       account.provider_id == providers::ProviderId::Muse && account.uuid == uuid
         && account.auth_state == storage::AuthState::Authenticated
@@ -689,13 +695,17 @@ async fn muse_native_quota_probe(
   uuid: String,
   cache: tauri::State<'_, std::sync::Arc<quota::ActionCache>>,
   mgr: State<'_, Arc<SessionManager>>,
+  cancel: State<'_, Arc<probe_cancel::ProbeCancel>>,
 ) -> Result<QuotaProbe, String> {
   if provider_id != "muse" {
     return Err("额度探针只支持 Muse 账号".to_string());
   }
   // 额度请求也属于账号出站流量：启用代理的账号必须经代理，解析失败即失败。
   let uuid = storage::normalize_uuid(&uuid).ok_or("账号标识无效")?;
+  let proxy_lock = mgr.proxy_write_lock.lock().await;
+  let (mut token, _guard) = cancel.register(&uuid, "quota");
   let snapshot = mgr.get_snapshot().await;
+  drop(proxy_lock);
   let account = snapshot.accounts.iter().find(|account| {
     account.provider_id == providers::ProviderId::Muse && account.uuid == uuid
       && account.auth_state == storage::AuthState::Authenticated
@@ -742,7 +752,11 @@ async fn muse_native_quota_probe(
     }
   };
   let cached = cache.get();
-  let (result, mut diag) = quota::fetch_quota_v2(&client, &cookie, cached.as_deref()).await;
+  let (result, mut diag) = tokio::select! {
+    biased;
+    _ = token.cancelled() => return Err("账号出站配置已变化，已停止额度请求".into()),
+    response = quota::fetch_quota_v2(&client, &cookie, cached.as_deref()) => response,
+  };
   if egress.is_proxy() {
     diag.insert(0, format!("出站：经代理 {}", egress.display));
   }

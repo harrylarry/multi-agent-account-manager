@@ -1075,6 +1075,29 @@ let foregroundTaskIndex = 0;
 let foregroundTaskBusy = false;
 let foregroundTaskTimer: number | null = null;
 const taskRetryAt = new Map<string, number>();
+const pendingTaskActivity = new Map<string, TaskObservation>();
+
+function applyTaskObservation(key: string, result: TaskObservation): void {
+  const previous = latestTaskObservations.get(key);
+  if (!result.observedAtMs) {
+    pendingTaskActivity.delete(key);
+    result.observedAtMs = previous?.observedAtMs ?? null;
+    result.source = previous?.source ?? null;
+  } else if (previous?.activity !== result.activity) {
+    const priorSample = pendingTaskActivity.get(key);
+    if (priorSample?.activity !== result.activity || priorSample.source !== result.source) {
+      pendingTaskActivity.set(key, result);
+      result = { ...result, activity: "unknown" };
+    } else if (result.observedAtMs - (priorSample.observedAtMs ?? 0) < 5_000) {
+      result = { ...result, activity: "unknown" };
+    } else {
+      pendingTaskActivity.delete(key);
+    }
+  } else {
+    pendingTaskActivity.delete(key);
+  }
+  latestTaskObservations.set(key, result);
+}
 
 async function refreshForegroundTask(): Promise<void> {
   if (!snapshot || document.hidden || !navigator.onLine || foregroundTaskBusy || (modal.kind === "tasks" && modal.checking)) return;
@@ -1090,19 +1113,15 @@ async function refreshForegroundTask(): Promise<void> {
     const result = await invoke<TaskObservation>("observe_account_tasks", {
       uuid: account.uuid, providerId: account.providerId, automatic: true, timezone: Intl.DateTimeFormat().resolvedOptions().timeZone || "UTC",
     });
-    const previous = latestTaskObservations.get(key);
-    if (!result.observedAtMs) {
-      result.observedAtMs = previous?.observedAtMs ?? null;
-      result.source = previous?.source ?? null;
-    }
-    latestTaskObservations.set(key, result);
-    taskRetryAt.set(key, Date.now() + (result.activity === "working" ? 15_000 :
+    applyTaskObservation(key, result);
+    taskRetryAt.set(key, Date.now() + (pendingTaskActivity.has(key) || result.activity === "working" ? 15_000 :
       result.activity === "unknown" ? 180_000 : 60_000));
-    if (modal.kind === "tasks" && modal.account.uuid === account.uuid) render();
   } catch {
+    applyTaskObservation(key, { activity: "unknown", observedAtMs: null, source: null });
     taskRetryAt.set(key, Date.now() + 120_000);
   } finally {
     foregroundTaskBusy = false;
+    if (modal.kind === "tasks" && modal.account.uuid === account.uuid) render();
   }
 }
 
@@ -2497,15 +2516,9 @@ async function checkAccountTasks(view: Extract<ModalMode, { kind: "tasks" }>): P
     const result = await invoke<TaskObservation>("observe_account_tasks", {
       uuid, providerId, timezone: Intl.DateTimeFormat().resolvedOptions().timeZone || "UTC",
     });
-    const previous = latestTaskObservations.get(key);
-    if (!result.observedAtMs) {
-      result.observedAtMs = previous?.observedAtMs ?? null;
-      result.source = previous?.source ?? null;
-    }
-    latestTaskObservations.set(key, result);
+    applyTaskObservation(key, result);
   } catch (error) {
-    const previous = latestTaskObservations.get(key);
-    latestTaskObservations.set(key, { activity: "unknown", observedAtMs: previous?.observedAtMs ?? null, source: previous?.source ?? null });
+    applyTaskObservation(key, { activity: "unknown", observedAtMs: null, source: null });
     view.note = String(error);
   } finally {
     view.checking = false;

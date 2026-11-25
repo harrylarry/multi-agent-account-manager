@@ -39,6 +39,8 @@ pub struct Profile {
   pub group: Option<String>,
   #[serde(default)]
   pub timezone: Option<String>,
+  #[serde(default)]
+  pub last_muse_thread: Option<uuid::Uuid>,
   pub created_at_ms: u64,
   pub proxy_endpoint: Option<String>,
   pub proxy_requires_auth: bool,
@@ -67,7 +69,7 @@ pub fn preview(backup: &AccountBackup, current: &[AccountRecord]) -> RestorePrev
     if let Some(account) = old {
       existing += 1;
       let projection = serde_json::json!([
-        account.uuid, account.provider_id, account.alias, account.group, account.timezone,
+        account.uuid, account.provider_id, account.alias, account.group, account.timezone, account.last_muse_thread,
         account.proxy.as_ref().map(ProxySetting::display_safe),
       ]);
       digest.update(projection.to_string().as_bytes());
@@ -105,6 +107,7 @@ pub fn from_accounts(
         alias: account.alias.clone(),
         group: account.group.clone().filter(|_| include_groups),
         timezone: account.timezone.clone(),
+        last_muse_thread: account.last_muse_thread,
         created_at_ms: account.created_at_ms,
         proxy_endpoint: proxy.filter(|setting| setting.validate().is_ok()).map(ProxySetting::display_safe),
         proxy_requires_auth: proxy.is_some_and(|setting| setting.credential_ref.is_some()),
@@ -170,6 +173,7 @@ pub fn decrypt(encoded: &str, password: &str) -> Result<AccountBackup, String> {
       || !seen.insert(&profile.uuid) || profile.alias.trim().is_empty() || profile.alias.chars().count() > 160
       || profile.group.as_deref().is_some_and(|group| normalize_account_group(group).is_err())
       || profile.timezone.as_deref().is_some_and(|timezone| crate::storage::normalize_account_timezone(timezone).is_err())
+      || (profile.provider_id != ProviderId::Muse && profile.last_muse_thread.is_some())
     {
       return Err("备份含无效账号或重复标识".into());
     }

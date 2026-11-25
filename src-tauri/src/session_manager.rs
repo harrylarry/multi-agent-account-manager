@@ -1100,6 +1100,7 @@ impl SessionManager {
           record.alias = saved.alias;
           record.auto_alias = false;
           record.timezone = saved.timezone;
+          if saved.last_muse_thread.is_some() { record.last_muse_thread = saved.last_muse_thread; }
           if backup.includes_groups { record.group = saved.group; }
         }
         continue;
@@ -1113,7 +1114,8 @@ impl SessionManager {
       });
       updated.accounts.push(AccountRecord {
         provider_id: saved.provider_id, uuid: saved.uuid, alias: saved.alias,
-        group: saved.group, timezone: saved.timezone, last_muse_thread: None, created_at_ms: saved.created_at_ms, auto_alias: false,
+        group: saved.group, timezone: saved.timezone, last_muse_thread: saved.last_muse_thread,
+        created_at_ms: saved.created_at_ms, auto_alias: false,
         avatar_url: None, quota_text: None, quota_percent: None, quota_detail: None, quota_observation: None,
         auth_state: AuthState::Unknown, has_unread_reply: false, last_task_reply_at_ms: None,
         task_notifications: false, task_notice_keys: Vec::new(), pending_approval_count: None, proxy,
