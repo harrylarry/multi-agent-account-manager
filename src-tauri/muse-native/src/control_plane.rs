@@ -35,6 +35,10 @@ pub struct ControlPlaneError {
 }
 
 impl ControlPlaneError {
+  fn is_invalid_vm_type(&self) -> bool {
+    self.status == Some(400) && self.message.ends_with(": HTTP 400 Invalid vmType")
+  }
+
   fn new(message: impl Into<String>, status: Option<u16>, code: Option<ControlPlaneCode>) -> Self {
     Self {
       message: message.into(),
@@ -253,7 +257,7 @@ impl<F: ControlPlaneFetch> MuseControlPlane<F> {
       .await;
   }
 
-  async fn existing_vm(&mut self) -> Result<VmLease, ControlPlaneError> {
+  async fn existing_vm(&mut self, wake_if_needed: bool) -> Result<VmLease, ControlPlaneError> {
     const PATH: &str = "/api/session?vm_state=live";
     let cookie = self.cookies.cookie_header();
     let (status, body) = self.fetch.get(&format!("{ORIGIN}{PATH}"), &self.headers(&cookie))
@@ -288,7 +292,7 @@ impl<F: ControlPlaneFetch> MuseControlPlane<F> {
       expires_at_ms: None, ttl_seconds: None,
     };
     self.lease = Some(lease.clone());
-    if !value["vm_state"].as_str().is_some_and(|state| state.eq_ignore_ascii_case("running")) {
+    if wake_if_needed && !value["vm_state"].as_str().is_some_and(|state| state.eq_ignore_ascii_case("running")) {
       self.wake().await;
     }
     Ok(lease)
@@ -394,6 +398,19 @@ impl<F: ControlPlaneFetch> MuseControlPlane<F> {
     }))
   }
 
+  /// Observe the same assignment fallback as the gateway connection,
+  /// without waking the VM or requesting gateway credentials.
+  pub async fn observe_lease(&mut self) -> Result<(VmLease, bool), ControlPlaneError> {
+    match self.lease_vm().await {
+      Err(error) if error.is_invalid_vm_type() => self.existing_vm(false).await
+        .map(|lease| (lease, true))
+        .map_err(|fallback| ControlPlaneError::new(
+          format!("{error} · {fallback}"), fallback.status, fallback.code,
+        )),
+      result => result.map(|lease| (lease, false)),
+    }
+  }
+
   /// 取一次 Noise 连接所需的全部凭证（wake → lease → token → notary）。
   pub async fn credentials(
     &mut self,
@@ -403,8 +420,8 @@ impl<F: ControlPlaneFetch> MuseControlPlane<F> {
     let lease = match (&self.lease, force_refresh) {
       (Some(l), false) => l.clone(),
       _ => match self.lease_vm().await {
-        Err(error) if error.status == Some(400) && error.message.ends_with(": HTTP 400 Invalid vmType") => {
-          self.existing_vm().await.map_err(|fallback| ControlPlaneError::new(
+        Err(error) if error.is_invalid_vm_type() => {
+          self.existing_vm(true).await.map_err(|fallback| ControlPlaneError::new(
             format!("{error} · {fallback}"), fallback.status, fallback.code,
           ))?
         }
@@ -628,6 +645,25 @@ mod tests {
         assert_eq!(cp.fetch.seen_urls.lock().unwrap().len(), 4);
       }
     }
+  }
+
+  #[tokio::test]
+  async fn observing_an_assigned_stopped_vm_does_not_wake_it() {
+    let fetch = MockFetch::new(vec![
+      (400, r#"{"error":"Invalid vmType"}"#),
+      (400, r#"{"error":"Invalid vmType"}"#),
+      (200, r#"{"vm_id":"vm-123","endpoint_url":"https://vm-123.metaaivm.com/","vm_state":"STOPPED"}"#),
+    ]);
+    let mut cp = MuseControlPlane::new(fetch, cookies());
+    let (lease, from_assignment) = cp.observe_lease().await.unwrap();
+    assert!(from_assignment);
+    assert_eq!(lease.vm_id, "vm-123");
+    assert_eq!(lease.expires_at_ms, None);
+    let urls = cp.fetch.seen_urls.lock().unwrap();
+    assert_eq!(urls.len(), 3);
+    assert!(urls[0].ends_with("/api/hatch/lease-vm"));
+    assert!(urls[1].ends_with("/api/hatch/lease-vm"));
+    assert!(urls[2].ends_with("/api/session?vm_state=live"));
   }
 
   #[tokio::test]

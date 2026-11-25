@@ -10,6 +10,7 @@ pub struct Liveness {
   pub phase: String,
   pub started_ms: u64,
   pub connected_ms: Option<u64>,
+  pub subscription_ready_ms: Option<u64>,
   pub deadline_ms: Option<u64>,
   pub observed_at_ms: u64,
   pub max_observation_gap_ms: u64,
@@ -47,6 +48,7 @@ impl Liveness {
 
   pub fn reading(&mut self, now: u64, seconds: u64) {
     self.observe(now);
+    self.subscription_ready_ms = Some(now);
     self.deadline_ms = Some(now.saturating_add(seconds.saturating_mul(1000)));
     self.phase = "reading".into();
   }
@@ -93,6 +95,7 @@ mod tests {
     let mut l = Liveness::started(1000);
     l.connected(3000);
     l.reading(5000, 300);
+    assert_eq!(l.subscription_ready_ms, Some(5000));
     assert!(!l.expired(304999));
     assert!(l.expired(305000));
   }

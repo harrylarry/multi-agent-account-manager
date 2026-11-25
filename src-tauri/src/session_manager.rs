@@ -1523,6 +1523,7 @@ impl SessionManager {
         provider_id,
         uuid: uuid.clone(),
         alias,
+        group: None,
         created_at_ms: now_ms(),
         auto_alias,
         avatar_url: None,
@@ -1547,6 +1548,7 @@ impl SessionManager {
     raw_provider: &str,
     raw_uuid: &str,
     raw_alias: &str,
+    raw_group: Option<&str>,
   ) -> Result<ManagerSnapshot, String> {
     let provider_id = ProviderId::parse(raw_provider).ok_or_else(|| "无效的服务标识".to_string())?;
     let uuid = normalize_uuid(raw_uuid).ok_or_else(|| "无效的账号 UUID".to_string())?;
@@ -1555,16 +1557,27 @@ impl SessionManager {
       return Err("账号别名不能为空".to_string());
     }
 
+    let group = raw_group.map(crate::storage::normalize_account_group).transpose()?;
     let mut locked = self.inner.lock().await;
-    let target = locked
+    let index = locked
       .store
       .accounts
-      .iter_mut()
-      .find(|a| a.provider_id == provider_id && a.uuid == uuid)
+      .iter()
+      .position(|a| a.provider_id == provider_id && a.uuid == uuid)
       .ok_or_else(|| "未找到匹配的账号记录，拒绝跨服务改名".to_string())?;
-    target.alias = alias.to_string();
-    target.auto_alias = false;
-    save_store_atomic(&locked.store_path, &locked.store)?;
+    let target = &mut locked.store.accounts[index];
+    let before = target.clone();
+    if target.alias != alias {
+      target.alias = alias.to_string();
+      target.auto_alias = false;
+    }
+    if let Some(group) = group {
+      target.group = group;
+    }
+    if let Err(error) = save_store_atomic(&locked.store_path, &locked.store) {
+      locked.store.accounts[index] = before;
+      return Err(error);
+    }
 
     if let Some(slot) = &locked.active_slot {
       if slot.committed && slot.account_key.provider_id == provider_id && slot.account_key.uuid == uuid {

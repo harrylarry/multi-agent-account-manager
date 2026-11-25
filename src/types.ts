@@ -33,6 +33,7 @@ export interface AccountRecord {
   providerId: ProviderId;
   uuid: string;
   alias: string;
+  group?: string;
   createdAtMs: number;
   autoAlias: boolean;
   avatarUrl: string | null;

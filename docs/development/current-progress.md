@@ -67,3 +67,5 @@
 `ab6f6fa` 的 [Quick checks](https://github.com/harrylarry/multi-agent-account-manager/actions/runs/45613514999) 和 [Xcode 打包](https://github.com/harrylarry/multi-agent-account-manager/actions/runs/45613523633) 均通过，已下载校验新 IPA。下一次真机先确认清除代理时后台额度路径能到达主文档提交及实际额度，再用正确 SOCKS5 重跑同一入口；若原生查询仍失败，回填新诊断。新构建实际结果 `UNVERIFIED`。[复测包和步骤](../acceptance/iphone-acceptance.md#ios-后台额度同步)
 
 `ab6f6fa` 的 Muse 后台额度同步已完成同一账号的直连、错误 SOCKS5 密码和恢复正确密码对照。错误密码下主文档提交前失败且未取得额度。恢复正确密码后代理已下发，主文档已提交，额度已取得且数据未变。用户补充确认正确 SOCKS5 密码下的原生「查询额度」也成功。独立网络出口、跨账号隔离与数值变化写入继续保留待验收。[真机回执](../acceptance/iphone-acceptance.md#ab6f6fa-真机回执)
+
+本批转入 VM 租约、后台连接与账号组织。租约探针区分已有 VM 分配和明确租约，去掉原始 VM 名称和网关标识，复查不同 VM 时不推断为续期。订阅就绪后才开始计算存活窗口，租约、存活、订阅和单发沿用启动账号与任务 ID 的停止操作，发送仍按实际网络写入保留未知状态。Muse/Hark 账号支持分组与搜索，旧档默认为未分组。Phase 1 的通知和 watcher 产品能力、Phase 2 的审批及代理池、后续备份和协作房间仍按执行计划保留。[集中复测入口](../acceptance/iphone-acceptance.md#vm-租约后台连接与账号组织)

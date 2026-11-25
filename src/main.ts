@@ -16,7 +16,7 @@ import type {
 type ModalMode =
   | { kind: "none" }
   | { kind: "add"; providerId: ProviderId; draft: string }
-  | { kind: "rename"; account: AccountRecord; draft: string }
+  | { kind: "rename"; account: AccountRecord; draft: string; groupDraft: string }
   | { kind: "remove"; account: AccountRecord }
   | { kind: "update" }
   // 应用内确认框（替代 window.confirm）。WKWebView 的 UIDelegate 没有
@@ -122,7 +122,7 @@ let backgroundQuotaError = "";
 let spikeQuotaError: string | null = null;
 interface SpikeLiveness {
   running: boolean; phase: string; startedMs: number; connectedMs: number | null;
-  deadlineMs: number | null; observedAtMs: number; maxObservationGapMs: number;
+  subscriptionReadyMs: number | null; deadlineMs: number | null; observedAtMs: number; maxObservationGapMs: number;
   lastEventMs: number | null; endedMs: number | null; lines: number;
   events: number; endReason: string | null; error: string | null;
 }
@@ -130,7 +130,7 @@ let spikeLive: SpikeLiveness | null = null;
 let spikeLiveError: string | null = null;
 let spikeLiveRefreshing = false;
 interface SpikeLease {
-  ok: boolean; phase: string; gatewayHost: string; vmName: string;
+  ok: boolean; phase: string; assignmentOnly: boolean; sameVmOnRecheck: boolean | null;
   firstExpiresAtMs: number | null; ttlSeconds: number | null;
   expiryFieldPresent: boolean; renewal: string; renewalConfirmed: boolean;
   secondExpiresAtMs: number | null; calls: string[]; sideEffectsNote: string;
@@ -291,6 +291,10 @@ interface SpikeProxyProbe {
 }
 let spikeProxyRunning = false;
 let spikeProxyTask: SpikeFingerprintTask | null = null;
+let spikeLiveTask: SpikeFingerprintTask | null = null;
+let spikeLeaseTask: SpikeFingerprintTask | null = null;
+let spikeSendTask: SpikeFingerprintTask | null = null;
+let spikeWatchTask: SpikeFingerprintTask | null = null;
 // #11/#16 账号级代理配置（脱敏视图；口令只进 Keychain）。
 interface SpikeWebviewProxyView {
   applied: boolean; sessionOpen: boolean; reason: string | null;
@@ -355,6 +359,10 @@ let pendingSwitch: {
   optimisticTarget: AccountKey | null;
 } | null = null;
 // Batch-1 reorder mode: long-press a row to reorder accounts by drag.
+const accountFilters: Record<ProviderId, { query: string; group: string | null }> = {
+  muse: { query: "", group: null },
+  hark: { query: "", group: null },
+};
 let reorderMode = false;
 let reorderProviderId: ProviderId | null = null;
 // True while a reorder drag is in progress. render() skips while set: a
@@ -1081,14 +1089,14 @@ function spikeDiagInnerHtml(accountUuid: string | undefined = pickWatchAccount()
       : 0;
     const gapSeconds = Math.round((l.maxObservationGapMs ?? 0) / 1000);
     const suspendedGap = gapSeconds >= 15;
-    const windowSeconds = l.deadlineMs && l.connectedMs
-      ? Math.max(0, Math.round((l.deadlineMs - l.connectedMs) / 1000))
+    const windowSeconds = l.deadlineMs && l.subscriptionReadyMs
+      ? Math.max(0, Math.round((l.deadlineMs - l.subscriptionReadyMs) / 1000))
       : 0;
     liveHtml = `
       <div class="spike-diag-result ${l.error ? "fail" : "ok"}">
         <div>${l.running ? "● 探针任务运行中" : "■ 探针已结束"}（阶段 ${escapeHtml(l.phase || "—")}）</div>
         <div>订阅窗口 ${windowSeconds}s；墙钟经过 ${observedElapsed}s；事件 ${l.events}（读行 ${l.lines}）</div>
-        <div>建立 ${l.connectedMs ? fmt(l.connectedMs) : "—"}　最后事件 ${l.lastEventMs ? fmt(l.lastEventMs) : "—"}　观测结束 ${l.endedMs ? fmt(l.endedMs) : "—"}</div>
+        <div>建立 ${l.connectedMs ? fmt(l.connectedMs) : "—"}　订阅就绪 ${l.subscriptionReadyMs ? fmt(l.subscriptionReadyMs) : "—"}　最后事件 ${l.lastEventMs ? fmt(l.lastEventMs) : "—"}　观测结束 ${l.endedMs ? fmt(l.endedMs) : "—"}</div>
         <div>最大任务观测间隔 ${gapSeconds}s${suspendedGap ? "（存在未观测区间，不能证明连接持续存活）" : ""}；结束原因 ${escapeHtml(l.endReason || "—")}</div>
         ${l.error ? `<div>错误：${escapeHtml(l.error)}</div>` : ""}
       </div>`;
@@ -1104,13 +1112,15 @@ function spikeDiagInnerHtml(accountUuid: string | undefined = pickWatchAccount()
       not_attempted: "未测（只取一次租约）",
       unobservable: "不可观测（到期字段缺失或前后不一致）",
       unchanged: "到期字段未变化",
-      changed: "到期字段变化（≠ 自动续租）",
+      changed: "同一 VM 的到期字段已变化",
+      vm_changed: "服务端分配了不同 VM，本轮无法比较到期时间",
+      recheck_failed: "第二次观测失败",
     };
     leaseHtml = `
       <div class="spike-diag-result ${l.ok ? "ok" : "fail"}">
-        <div>${l.ok ? "✓ 已取得 VM 租约" : "✗ 租约获取失败"}（阶段 ${escapeHtml(l.phase)}）</div>
-        ${l.ok ? `<div>VM：${escapeHtml(l.vmName || "—")}　网关：${escapeHtml(l.gatewayHost || "—")}</div>` : ""}
+        <div>${l.ok ? (l.assignmentOnly ? "✓ 已确认 VM 分配" : "✓ 已取得 VM 租约") : "✗ 租约观测失败"}（阶段 ${escapeHtml(l.phase)}）</div>
         ${l.ok ? `<div>到期 ${fmt(l.firstExpiresAtMs)}　TTL ${l.ttlSeconds ?? "—"}s　到期字段${l.expiryFieldPresent ? "存在" : "缺失"}</div>` : ""}
+        ${l.secondExpiresAtMs ? `<div>复查到期 ${fmt(l.secondExpiresAtMs)}</div>` : ""}
         ${l.ok ? `<div>续租：${escapeHtml(renewalLabel[l.renewal] ?? l.renewal)}${l.renewalConfirmed ? "" : "　（未确认）"}</div>` : ""}
         ${l.calls.length ? `<div>调用：${escapeHtml(l.calls.join("；"))}</div>` : ""}
         ${l.ok ? `<div class="hint">${escapeHtml(l.sideEffectsNote)}</div>` : ""}
@@ -1502,6 +1512,7 @@ async function refreshSpikeLive(): Promise<void> {
   spikeLiveRefreshing = true;
   try {
     spikeLive = await invoke<SpikeLiveness>("muse_native_liveness_status");
+    if (!spikeLive.running) spikeLiveTask = null;
     spikeLiveError = null;
   } catch (e) {
     spikeLiveError = String(e);
@@ -1532,7 +1543,7 @@ function startLiveTimer(): void {
 }
 
 async function startSpikeLive(): Promise<void> {
-  if (!snapshot) return;
+  if (!snapshot || spikeLiveTask) return;
   const acc = pickWatchAccount();
   if (!acc) {
     spikeLiveError = "没有已登录的 Muse 账号，无法开始存活探针。";
@@ -1541,15 +1552,20 @@ async function startSpikeLive(): Promise<void> {
     return;
   }
   spikeNotice = null;
+  const task = { accountUuid: acc.uuid, taskId: createSpikeTaskId() };
+  spikeLiveTask = task;
   spikeTrace("存活探针", "调用后端", "muse_native_liveness_start");
   try {
     spikeLive = await invoke<SpikeLiveness>("muse_native_liveness_start", {
-      uuid: acc.uuid,
+      uuid: task.accountUuid,
+      taskId: task.taskId,
       seconds: 300,
     });
     spikeLiveError = null;
-    startLiveTimer();
+    if (spikeLive.running) startLiveTimer();
+    else spikeLiveTask = null;
   } catch (e) {
+    spikeLiveTask = null;
     spikeLiveError = String(e);
   }
   syncSpikeDiag();
@@ -1570,26 +1586,26 @@ async function runSpikeLease(): Promise<void> {
     syncSpikeDiag();
     return;
   }
+  const task = { accountUuid: acc.uuid, taskId: createSpikeTaskId() };
+  spikeLeaseTask = task;
   spikeLeaseRunning = true;
+  spikeLease = null;
   spikeLeaseError = null;
   syncSpikeDiag();
   try {
-    spikeLease = await Promise.race([
-      invoke<SpikeLease>("muse_native_lease_probe", {
-        providerId: "muse",
-        uuid: acc.uuid,
-        twice: true,
-      }),
-      new Promise<SpikeLease>((_, reject) =>
-        setTimeout(() => reject(new Error("租约探针超时（60 秒）")), 60_000)
-      ),
-    ]);
+    spikeLease = await invoke<SpikeLease>("muse_native_lease_probe", {
+      providerId: "muse",
+      uuid: task.accountUuid,
+      taskId: task.taskId,
+      twice: true,
+    });
   } catch (e) {
-    spikeLease = null;
     spikeLeaseError = String(e);
+  } finally {
+    spikeLeaseTask = null;
+    spikeLeaseRunning = false;
+    syncSpikeDiag();
   }
-  spikeLeaseRunning = false;
-  syncSpikeDiag();
 }
 
 async function runSpikeSend(): Promise<void> {
@@ -1607,28 +1623,27 @@ async function runSpikeSend(): Promise<void> {
     syncSpikeDiag();
     return;
   }
+  const task = { accountUuid: acc.uuid, taskId: createSpikeTaskId() };
+  spikeSendTask = task;
   spikeSendRunning = true;
   spikeSendError = null;
   syncSpikeDiag();
   try {
     // 隔离测试会话：内容是无语义整数，不含隐私，也不发往用户主聊天。
     const probeText = `[spike b4] ${Math.floor(Math.random() * 1e6)}`;
-    spikeSend = await Promise.race([
-      invoke<SpikeSendResult>("muse_native_send_probe", {
+    spikeSend = await invoke<SpikeSendResult>("muse_native_send_probe", {
         providerId: "muse",
-        uuid: acc.uuid,
+        uuid: task.accountUuid,
+        taskId: task.taskId,
         text: probeText,
         nodeId: "",
         sessionId: null,
-      }),
-      new Promise<SpikeSendResult>((_, reject) =>
-        setTimeout(() => reject(new Error("发送探针超时（60 秒）")), 60_000)
-      ),
-    ]);
+      });
   } catch (e) {
     spikeSend = null;
     spikeSendError = String(e);
   }
+  spikeSendTask = null;
   spikeSendRunning = false;
   syncSpikeDiag();
 }
@@ -1980,19 +1995,22 @@ function createSpikeTaskId(): string {
   return `${hex.slice(0, 8)}-${hex.slice(8, 12)}-${hex.slice(12, 16)}-${hex.slice(16, 20)}-${hex.slice(20)}`;
 }
 
-async function cancelSpikeProbe(task = spikeFingerprintTask ?? spikeProxyTask): Promise<void> {
-  const uuid = task?.accountUuid ?? pickWatchAccount()?.uuid;
-  if (!uuid) {
+async function cancelSpikeProbe(task?: SpikeFingerprintTask): Promise<void> {
+  const tasks = task ? [task] : [spikeFingerprintTask, spikeProxyTask, spikeLeaseTask, spikeLiveTask, spikeSendTask, spikeWatchTask]
+    .filter((entry): entry is SpikeFingerprintTask => entry !== null);
+  const uuid = pickWatchAccount()?.uuid;
+  if (!uuid && !tasks.length) {
     spikeNotice = "停止失败：没有已登录的 Muse 账号。";
     syncSpikeDiag();
     return;
   }
   try {
-    const hit = await invoke<number>("muse_native_cancel_probe", {
-      providerId: "muse",
-      uuid,
-      taskId: task?.taskId ?? null,
-    });
+    const hits = tasks.length
+      ? await Promise.all(tasks.map((entry) => invoke<number>("muse_native_cancel_probe", {
+        providerId: "muse", uuid: entry.accountUuid, taskId: entry.taskId,
+      })))
+      : [await invoke<number>("muse_native_cancel_probe", { providerId: "muse", uuid, taskId: null })];
+    const hit = hits.reduce((total, count) => total + count, 0);
     spikeNotice =
       hit > 0
         ? `已请求停止 ${hit} 个任务：不再发起新的请求/发送`
@@ -2090,24 +2108,23 @@ async function runSpikeWatch(): Promise<void> {
     syncSpikeDiag();
     return;
   }
+  const task = { accountUuid: acc.uuid, taskId: createSpikeTaskId() };
+  spikeWatchTask = task;
   spikeWatchRunning = true;
   spikeWatchError = null;
   syncSpikeDiag();
   try {
-    spikeWatch = await Promise.race([
-      invoke<SpikeWatchResult>("muse_native_watch_probe", {
+    spikeWatch = await invoke<SpikeWatchResult>("muse_native_watch_probe", {
         providerId: "muse",
-        uuid: acc.uuid,
+        uuid: task.accountUuid,
+        taskId: task.taskId,
         seconds: 15,
-      }),
-      new Promise<SpikeWatchResult>((_, reject) =>
-        setTimeout(() => reject(new Error("订阅探针超时（75 秒）")), 75_000)
-      ),
-    ]);
+      });
   } catch (e) {
     spikeWatch = null;
     spikeWatchError = String(e);
   }
+  spikeWatchTask = null;
   spikeWatchRunning = false;
   syncSpikeDiag();
 }
@@ -2308,9 +2325,11 @@ function renderModal(provider: ProviderInfo): string {
     return `
       <div class="inline-modal" role="dialog" aria-modal="true">
         <div class="modal-card">
-          <div class="modal-title">修改备注名称</div>
-          <div class="modal-desc">仅更新本机列表中的显示名称，不影响已登录的官方会话。</div>
-          <input id="modal-alias-input" class="modal-input" maxlength="60" placeholder="输入新的备注名称" value="${escapeHtml(modal.draft)}" />
+          <div class="modal-title">编辑账号</div>
+          <label for="modal-alias-input">备注</label>
+          <input id="modal-alias-input" class="modal-input" maxlength="60" placeholder="输入备注名称" value="${escapeHtml(modal.draft)}" />
+          <label for="modal-group-input">分组</label>
+          <input id="modal-group-input" class="modal-input" maxlength="32" placeholder="留空为未分组" value="${escapeHtml(modal.groupDraft)}" />
           <div class="modal-footer">
             <button id="modal-cancel-btn" class="btn" type="button">取消</button>
             <button id="modal-confirm-btn" class="btn primary" type="button">保存</button>
@@ -2346,6 +2365,26 @@ function renderModal(provider: ProviderInfo): string {
       </div>
     </div>
   `;
+}
+
+function applyAccountFilter(state: ManagerSnapshot, provider: ProviderInfo): void {
+  const { query, group } = accountFilters[provider.id];
+  const needle = query.trim().toLocaleLowerCase();
+  const accounts = new Map(state.accounts.filter((acc) => acc.providerId === provider.id).map((acc) => [acc.uuid, acc]));
+  const rows = document.querySelectorAll<HTMLElement>(".account-list [data-switch-uuid]");
+  let visible = 0;
+  for (const row of rows) {
+    const acc = accounts.get(row.dataset.switchUuid ?? "");
+    if (!acc) continue;
+    const label = acc.group ?? "";
+    row.hidden = !reorderMode && (
+      (group !== null && group !== label) ||
+      (needle.length > 0 && !acc.alias.toLocaleLowerCase().includes(needle) && !label.toLocaleLowerCase().includes(needle))
+    );
+    if (!row.hidden) visible++;
+  }
+  const empty = document.getElementById("account-filter-empty");
+  if (empty) empty.hidden = rows.length === 0 || visible > 0;
 }
 
 function renderMiddleContent(state: ManagerSnapshot, provider: ProviderInfo): string {
@@ -2387,6 +2426,20 @@ function renderMiddleContent(state: ManagerSnapshot, provider: ProviderInfo): st
 
   // Batch-1 reorder mode: the header shows only a Done button.
   const inReorder = reorderMode && reorderProviderId === provider.id;
+  const filter = accountFilters[provider.id];
+  const groups = [...new Set(providerAccounts.map((account) => account.group).filter((group): group is string => Boolean(group)))].sort((a, b) => a.localeCompare(b));
+  if (filter.group && !groups.includes(filter.group)) filter.group = null;
+  const groupOptions = ["", ...groups].map((group) =>
+    `<option value="group:${escapeHtml(group)}" ${filter.group === group ? "selected" : ""}>${escapeHtml(group || "未分组")}</option>`
+  ).join("");
+  const filtersHtml = provider.enabled && providerAccounts.length && !inReorder ? `
+    <div class="account-filters">
+      <input id="account-search" class="modal-input" type="search" aria-label="搜索账号" placeholder="搜索备注或分组" value="${escapeHtml(filter.query)}" />
+      <select id="account-group-select" class="modal-input" aria-label="按分组筛选">
+        <option value="all" ${filter.group === null ? "selected" : ""}>全部分组</option>
+        ${groupOptions}
+      </select>
+    </div>` : "";
   const headerBtnHtml = inReorder
     ? `<button id="reorder-done-btn" class="icon-btn" type="button">完成</button>`
     : provider.enabled
@@ -2434,13 +2487,14 @@ function renderMiddleContent(state: ManagerSnapshot, provider: ProviderInfo): st
               <div class="account-meta">
                 <div class="account-alias-row">
                   <span class="account-alias">${escapeHtml(acc.alias)}</span>
+                  ${acc.group ? `<span class="account-group-label" title="${escapeHtml(acc.group)}">${escapeHtml(acc.group)}</span>` : ""}
                   ${shortcutHint}
                   ${alertBadgeHtml(d)}
                 </div>
                 ${subHtmlFor(acc, d, isMobile)}
               </div>
               <div class="row-ops">
-                <button class="action-icon-btn" data-rename-uuid="${escapeHtml(acc.uuid)}" title="修改备注" type="button">${ICON_EDIT}</button>
+                <button class="action-icon-btn" data-rename-uuid="${escapeHtml(acc.uuid)}" title="编辑账号备注与分组" aria-label="编辑账号备注与分组" type="button">${ICON_EDIT}</button>
                 <button class="action-icon-btn danger" data-remove-uuid="${escapeHtml(acc.uuid)}" title="从本机移除" type="button">${ICON_TRASH}</button>
               </div>
             </div>
@@ -2498,7 +2552,8 @@ function renderMiddleContent(state: ManagerSnapshot, provider: ProviderInfo): st
     </div>
     ${noticeHtml}
     ${conflictsHtml}
-    <div class="account-list${inReorder ? " reorder-mode" : ""}">${listBody}</div>
+    ${filtersHtml}
+    <div class="account-list${inReorder ? " reorder-mode" : ""}">${listBody}<div id="account-filter-empty" class="empty-list" hidden>没有匹配的账号</div></div>
     ${museDiagnostics ? `</div>` : ""}
     ${spikeDiagHtml}
     <!-- 0.1.21: the modal lives in its own overlay container and is
@@ -2595,7 +2650,7 @@ function structuralSignature(state: ManagerSnapshot, provider: ProviderInfo): st
           `${p.id}:${p.enabled ? 1 : 0}:${p.name}:${p.shortName}:${p.statusText}`
       )
       .join(","),
-    providerAccounts.map((a) => a.uuid).join(","),
+    JSON.stringify(providerAccounts.map((a) => [a.uuid, a.group])),
     // 0.1.21: hasUnreadReply is NOT here — it already lives in
     // avatarSigFor, so patchRows updates the unread dot in place
     // instead of rebuilding the whole list when a reply arrives.
@@ -2852,6 +2907,7 @@ function render(): void {
     // modal open/close and update checks take this path, so the list
     // is never rebuilt for them.
     patchRows(snapshot, provider);
+    applyAccountFilter(snapshot, provider);
     const diag = document.querySelector<HTMLElement>("#spike-workspace .spike-diag");
     if (diag) {
       const account = pickWatchAccount();
@@ -2938,6 +2994,7 @@ function render(): void {
   // the new mount and writes the modal HTML into it.
   renderModalRoot(provider);
   seedPatchState(snapshot, provider);
+  applyAccountFilter(snapshot, provider);
   root.querySelectorAll<HTMLDetailsElement>("#spike-workspace details[data-spike-section]").forEach((section) => {
     section.open = spikeSections.includes(section.dataset.spikeSection);
   });
@@ -3087,7 +3144,8 @@ function bindDelegatedEvents(): void {
         await setModal({
           kind: "rename",
           account: acc,
-          draft: acc.autoAlias ? "" : acc.alias,
+          draft: acc.alias,
+          groupDraft: acc.group ?? "",
         });
       }
       return;
@@ -3349,6 +3407,7 @@ function bindDelegatedEvents(): void {
             providerId: currentModal.account.providerId,
             uuid: currentModal.account.uuid,
             alias,
+            group: currentModal.groupDraft.trim(),
           });
         } else if (currentModal.kind === "remove") {
           await setModal({ kind: "none" });
@@ -3425,8 +3484,26 @@ function bindDelegatedEvents(): void {
     { passive: false }
   );
 
+  root.addEventListener("change", (ev) => {
+    const select = ev.target as HTMLSelectElement;
+    if (select.id !== "account-group-select" || !snapshot) return;
+    const provider = currentProvider(snapshot);
+    accountFilters[provider.id].group = select.value === "all" ? null : select.value.slice(6);
+    applyAccountFilter(snapshot, provider);
+  });
+
   root.addEventListener("input", (ev) => {
     const input = ev.target as HTMLInputElement;
+    if (input.id === "account-search" && snapshot) {
+      const provider = currentProvider(snapshot);
+      accountFilters[provider.id].query = input.value;
+      applyAccountFilter(snapshot, provider);
+      return;
+    }
+    if (input.id === "modal-group-input" && modal.kind === "rename") {
+      modal.groupDraft = input.value;
+      return;
+    }
     if (input.id === "spike-proxy-uri" || input.id === "spike-proxy-user") {
       const accountUuid = input.closest<HTMLElement>(".spike-diag")?.dataset.accountUuid;
       if (accountUuid) {
@@ -3443,7 +3520,7 @@ function bindDelegatedEvents(): void {
   });
   root.addEventListener("keydown", async (ev) => {
     const input = ev.target as HTMLElement;
-    if (input.id !== "modal-alias-input") return;
+    if (input.id !== "modal-alias-input" && input.id !== "modal-group-input") return;
     if (ev.key === "Enter") {
       ev.preventDefault();
       document.querySelector<HTMLButtonElement>("#modal-confirm-btn")?.click();

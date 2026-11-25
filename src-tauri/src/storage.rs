@@ -157,6 +157,8 @@ pub struct AccountRecord {
   pub provider_id: ProviderId,
   pub uuid: String,
   pub alias: String,
+  #[serde(default, skip_serializing_if = "Option::is_none")]
+  pub group: Option<String>,
   pub created_at_ms: u64,
   #[serde(default)]
   pub auto_alias: bool,
@@ -245,6 +247,14 @@ pub fn detect_conflicts(accounts: &[AccountRecord]) -> Vec<ConflictItem> {
   conflicts
 }
 
+pub fn normalize_account_group(value: &str) -> Result<Option<String>, String> {
+  let value = value.trim();
+  if value.chars().count() > 32 || value.chars().any(char::is_control) {
+    return Err("分组名称最多 32 个字符，不能包含控制字符".to_string());
+  }
+  Ok((!value.is_empty()).then(|| value.to_string()))
+}
+
 fn parse_key_or_legacy_muse(val: &Value) -> Option<AccountKey> {
   if let Some(raw_uuid) = val.as_str() {
     return normalize_uuid(raw_uuid).map(|uuid| AccountKey {
@@ -306,6 +316,8 @@ fn migrate_from_value(root: Value) -> Result<(AccountsStoreFile, bool), String> 
         .map(|s| s.trim().to_string())
         .filter(|s| !s.is_empty())
         .unwrap_or_else(|| format!("账号 {}", &uuid[..8]));
+      let group = item_obj.get("group").and_then(Value::as_str)
+        .and_then(|value| normalize_account_group(value).ok()).flatten();
       let created_at_ms = item_obj
         .get("createdAtMs")
         .or_else(|| item_obj.get("created_at_ms"))
@@ -374,6 +386,7 @@ fn migrate_from_value(root: Value) -> Result<(AccountsStoreFile, bool), String> 
         provider_id,
         uuid,
         alias,
+        group,
         created_at_ms,
         auto_alias,
         avatar_url,
@@ -652,6 +665,27 @@ mod proxy_tests {
       assert!(crate::egress::AccountEgress::resolve(Some(setting), &secrets).is_err());
     }
     assert!(store.accounts[3..].iter().all(|record| record.proxy.is_none()));
+  }
+
+  #[test]
+  fn account_groups_round_trip_and_legacy_accounts_stay_ungrouped() {
+    let account = |provider, name| serde_json::json!({
+      "providerId": provider, "uuid": Uuid::new_v4().to_string(), "alias": name,
+    });
+    let mut muse = account("muse", "test-muse");
+    muse["group"] = serde_json::json!("  工作  ");
+    let hark = account("hark", "test-hark");
+    let mut malformed = account("hark", "legacy");
+    malformed["group"] = serde_json::json!({"name": "invalid"});
+    let (store, _) = migrate_from_value(serde_json::json!({
+      "version": STORE_VERSION, "accounts": [muse, hark, malformed],
+    })).unwrap();
+    let (reloaded, _) = migrate_from_value(serde_json::to_value(store).unwrap()).unwrap();
+    assert_eq!(reloaded.accounts[0].group.as_deref(), Some("工作"));
+    assert!(reloaded.accounts[1..].iter().all(|account| account.group.is_none()));
+    assert_eq!(normalize_account_group("  ").unwrap(), None);
+    assert!(normalize_account_group("a\nb").is_err());
+    assert!(normalize_account_group(&"长".repeat(33)).is_err());
   }
 
   #[test]

@@ -231,7 +231,7 @@ pub async fn send_probe(
   session_id: Option<&str>,
   setting: Option<&ProxySetting>,
   secrets: &Secrets,
-  cancel: &ProbeCancel,
+  mut cancel_token: crate::probe_cancel::CancelToken,
 ) -> SendOutcome {
   use crate::send_ledger::SendError;
   let conversation = session_id.unwrap_or("new").to_string();
@@ -261,7 +261,7 @@ pub async fn send_probe(
 
   #[cfg(target_os = "android")]
   {
-    let _ = (app, node_id, text, setting, secrets, cancel);
+    let _ = (app, node_id, text, setting, secrets, &mut cancel_token);
     ledger.fail(&send_id, "Android 不可用".to_string());
     return SendOutcome {
       ok: false, status: "DEFINITIVELY_FAILED".to_string(), send_id,
@@ -275,7 +275,19 @@ pub async fn send_probe(
     let app_owned = app.clone();
     let uuid_owned = uuid.to_string();
     let handle = tokio::spawn(async move { fetch_session_cookies(&app_owned, &uuid_owned).await });
-    let mut cookies = match tokio::time::timeout(COOKIE_TIMEOUT, handle).await {
+    let fetched = tokio::select! {
+      biased;
+      _ = cancel_token.cancelled() => {
+        ledger.fail(&send_id, "用户取消".to_string());
+        return SendOutcome {
+          ok: false, status: "DEFINITIVELY_FAILED".to_string(), send_id,
+          ack: None, session_id: session_id.map(str::to_string),
+          error: Some("用户取消（未发送）".to_string()),
+        };
+      }
+      result = tokio::time::timeout(COOKIE_TIMEOUT, handle) => result,
+    };
+    let mut cookies = match fetched {
       Err(_) => {
         ledger.fail(&send_id, "取 cookie 超时".to_string());
         return SendOutcome {
@@ -311,7 +323,6 @@ pub async fn send_probe(
     }
 
     // 后端取消：用户停止后不再发出这条消息。
-    let (mut cancel_token, _cancel_guard) = cancel.register(uuid, "message");
     if cancel_token.check() {
       cookies.zeroize();
       ledger.fail(&send_id, "用户取消".to_string());
@@ -954,14 +965,16 @@ pub fn liveness_start(
   state: &std::sync::Arc<LivenessState>,
   uuid: &str,
   seconds: u64,
-  setting: Option<ProxySetting>,
-) {
+  manager: Arc<SessionManager>,
+  cancel: Arc<ProbeCancel>,
+  task: uuid::Uuid,
+) -> Result<(), String> {
   let seconds = seconds.clamp(30, 3600);
   // Check-and-set under one lock: concurrent starts must not create two probes.
   {
     let mut current = state.inner.lock().unwrap();
     if current.running {
-      return;
+      return Err("已有存活探针在运行".into());
     }
     *current = Liveness::started(observation_now_ms());
   }
@@ -973,7 +986,7 @@ pub fn liveness_start(
   tauri::async_runtime::spawn(async move {
     #[cfg(target_os = "android")]
     {
-      let _ = (app_owned, uuid_owned, seconds, setting);
+      let _ = (app_owned, uuid_owned, seconds, manager, cancel, task);
       state_owned.set(|l| {
         l.running = false;
         l.ended_ms = Some(observation_now_ms());
@@ -983,140 +996,155 @@ pub fn liveness_start(
     }
     #[cfg(not(target_os = "android"))]
     {
-      let cookies = match tokio::time::timeout(
-        COOKIE_TIMEOUT,
-        fetch_session_cookies(&app_owned, &uuid_owned),
-      )
-      .await
-      {
-        Err(_) => {
-          state_owned.set(|l| {
-            l.running = false;
-            l.phase = "cookies-timeout".to_string();
-            l.ended_ms = Some(observation_now_ms());
-            l.error = Some("取 cookie 超时（15 秒）".to_string());
-          });
-          return;
+      let (mut token, _guard) = cancel.register_task(&uuid_owned, "liveness", task);
+      tokio::select! {
+        biased;
+        _ = token.cancelled() => {
+          state_owned.set(|l| l.finish(observation_now_ms(), "cancelled", None));
         }
-        Ok(Ok(c)) => c,
-        Ok(Err(e)) => {
-          state_owned.set(|l| {
-            l.running = false;
-            l.phase = "cookies-error".to_string();
-            l.ended_ms = Some(observation_now_ms());
-            l.error = Some(e);
-          });
-          return;
-        }
-      };
-      state_owned.set(|l| l.phase = "connect".to_string());
-      if cookies.is_empty() {
-        state_owned.set(|l| {
-          l.running = false;
-          l.phase = "no-cookies".to_string();
-          l.ended_ms = Some(observation_now_ms());
-          l.error = Some("无登录态".to_string());
-        });
-        return;
-      }
-      let egress = match crate::egress::resolve_for_app(&app_owned, setting.as_ref()) {
-        Ok(e) => e,
-        Err(e) => {
-          state_owned.set(|l| {
-            l.running = false;
-            l.phase = "egress".to_string();
-            l.ended_ms = Some(observation_now_ms());
-            l.error = Some(e);
-          });
-          return;
-        }
-      };
-      let mut cookies = cookies;
-      let connected = match tokio::time::timeout(Duration::from_secs(60), egress.connect(&cookies)).await {
-        Err(_) => {
+        _ = async {
+          let setting = manager.proxy_setting(ProviderId::Muse, &uuid_owned).await;
+          let cookies = match tokio::time::timeout(
+            COOKIE_TIMEOUT,
+            fetch_session_cookies(&app_owned, &uuid_owned),
+          )
+          .await
+          {
+            Err(_) => {
+              state_owned.set(|l| {
+                l.running = false;
+                l.phase = "cookies-timeout".to_string();
+                l.ended_ms = Some(observation_now_ms());
+                l.error = Some("取 cookie 超时（15 秒）".to_string());
+              });
+              return;
+            }
+            Ok(Ok(c)) => c,
+            Ok(Err(e)) => {
+              state_owned.set(|l| {
+                l.running = false;
+                l.phase = "cookies-error".to_string();
+                l.ended_ms = Some(observation_now_ms());
+                l.error = Some(e);
+              });
+              return;
+            }
+          };
+          state_owned.set(|l| l.phase = "connect".to_string());
+          if cookies.is_empty() {
+            state_owned.set(|l| {
+              l.running = false;
+              l.phase = "no-cookies".to_string();
+              l.ended_ms = Some(observation_now_ms());
+              l.error = Some("无登录态".to_string());
+            });
+            return;
+          }
+          let egress = match crate::egress::resolve_for_app(&app_owned, setting.as_ref()) {
+            Ok(e) => e,
+            Err(e) => {
+              state_owned.set(|l| {
+                l.running = false;
+                l.phase = "egress".to_string();
+                l.ended_ms = Some(observation_now_ms());
+                l.error = Some(e);
+              });
+              return;
+            }
+          };
+          let mut cookies = cookies;
+          let connected = match tokio::time::timeout(Duration::from_secs(60), egress.connect(&cookies)).await {
+            Err(_) => {
+              cookies.zeroize();
+              state_owned.set(|l| {
+                l.running = false;
+                l.phase = "connect-timeout".to_string();
+                l.ended_ms = Some(observation_now_ms());
+                l.error = Some("建连超时（60 秒）".to_string());
+              });
+              return;
+            }
+            Ok(Ok(c)) => c,
+            Ok(Err(e)) => {
+              cookies.zeroize();
+              state_owned.set(|l| {
+                l.running = false;
+                l.phase = "connect-error".to_string();
+                l.ended_ms = Some(observation_now_ms());
+                l.error = Some(e.to_string());
+              });
+              return;
+            }
+          };
           cookies.zeroize();
-          state_owned.set(|l| {
-            l.running = false;
-            l.phase = "connect-timeout".to_string();
-            l.ended_ms = Some(observation_now_ms());
-            l.error = Some("建连超时（60 秒）".to_string());
-          });
-          return;
-        }
-        Ok(Ok(c)) => c,
-        Ok(Err(e)) => {
-          cookies.zeroize();
-          state_owned.set(|l| {
-            l.running = false;
-            l.phase = "connect-error".to_string();
-            l.ended_ms = Some(observation_now_ms());
-            l.error = Some(e.to_string());
-          });
-          return;
-        }
-      };
-      cookies.zeroize();
-      state_owned.set(|l| l.connected(observation_now_ms()));
+          state_owned.set(|l| l.connected(observation_now_ms()));
 
-      let mut sub = match tokio::time::timeout(Duration::from_secs(15), connected.subscribe()).await {
-        Err(_) => {
-          state_owned.set(|l| l.finish(observation_now_ms(), "subscribe_timeout", Some("订阅发送超时（15 秒）".into())));
-          return;
-        }
-        Ok(Ok(s)) => s,
-        Ok(Err(e)) => {
-          state_owned.set(|l| {
-            l.running = false;
-            l.ended_ms = Some(observation_now_ms());
-            l.error = Some(e.to_string());
-          });
-          return;
-        }
-      };
-      state_owned.set(|l| l.reading(observation_now_ms(), seconds));
-      let mut end_reason = "window_elapsed";
-      let mut error = None;
-      loop {
-        let now = observation_now_ms();
-        state_owned.set(|l| l.observe(now));
-        let snapshot = state_owned.snapshot();
-        if snapshot.expired(now) {
-          break;
-        }
-        // Poll in short slices to record observation gaps. These are local task
-        // polls, not network heartbeats and not evidence of a live remote peer.
-        let left_ms = snapshot.deadline_ms.unwrap_or(now).saturating_sub(now);
-        let slice = Duration::from_millis(left_ms.min(5000));
-        let result = sub.next_line(slice).await;
-        let observed = observation_now_ms();
-        state_owned.set(|l| l.observe(observed));
-        match result {
-          Ok(Some(line)) => {
-            // A buffered row read on resume was received at an unknown time.
-            if state_owned.snapshot().expired(observed) {
+          let mut sub = match tokio::time::timeout(Duration::from_secs(15), connected.subscribe()).await {
+            Err(_) => {
+              state_owned.set(|l| l.finish(observation_now_ms(), "subscribe_timeout", Some("订阅发送超时（15 秒）".into())));
+              return;
+            }
+            Ok(Ok(s)) => s,
+            Ok(Err(e)) => {
+              state_owned.set(|l| {
+                l.running = false;
+                l.ended_ms = Some(observation_now_ms());
+                l.error = Some(e.to_string());
+              });
+              return;
+            }
+          };
+          if let Err(error) = sub.wait_ready(Duration::from_secs(15)).await {
+            state_owned.set(|l| l.finish(observation_now_ms(), "subscription_not_ready", Some(error.to_string())));
+            return;
+          }
+          state_owned.set(|l| l.reading(observation_now_ms(), seconds));
+          let mut end_reason = "window_elapsed";
+          let mut error = None;
+          loop {
+            let now = observation_now_ms();
+            state_owned.set(|l| l.observe(now));
+            let snapshot = state_owned.snapshot();
+            if snapshot.expired(now) {
               break;
             }
-            let is_event = serde_json::from_str::<serde_json::Value>(&line)
-              .ok()
-              .and_then(|v| v.get("type").and_then(|t| t.as_str()).map(|t| t == "event"))
-              .unwrap_or(false);
-            state_owned.set(|l| l.record_line(observed, is_event));
+            // Poll in short slices to record observation gaps. These are local task
+            // polls, not network heartbeats and not evidence of a live remote peer.
+            let left_ms = snapshot.deadline_ms.unwrap_or(now).saturating_sub(now);
+            let slice = Duration::from_millis(left_ms.min(5000));
+            let result = sub.next_line(slice).await;
+            let observed = observation_now_ms();
+            state_owned.set(|l| l.observe(observed));
+            match result {
+              Ok(Some(line)) => {
+                // A buffered row read on resume was received at an unknown time.
+                if state_owned.snapshot().expired(observed) {
+                  break;
+                }
+                let is_event = serde_json::from_str::<serde_json::Value>(&line)
+                  .ok()
+                  .and_then(|v| v.get("type").and_then(|t| t.as_str()).map(|t| t == "event"))
+                  .unwrap_or(false);
+                state_owned.set(|l| l.record_line(observed, is_event));
+              }
+              Ok(None) => {
+                end_reason = "stream_ended";
+                break;
+              }
+              Err(GatewayError::Timeout(_)) => continue,
+              Err(e) => {
+                end_reason = "read_error";
+                error = Some(e.to_string());
+                break;
+              }
+            }
           }
-          Ok(None) => {
-            end_reason = "stream_ended";
-            break;
-          }
-          Err(GatewayError::Timeout(_)) => continue,
-          Err(e) => {
-            end_reason = "read_error";
-            error = Some(e.to_string());
-            break;
-          }
-        }
+          state_owned.set(|l| l.finish(observation_now_ms(), end_reason, error));
+        } => {}
       }
-      state_owned.set(|l| l.finish(observation_now_ms(), end_reason, error));
     }
   });
+  Ok(())
 }
 
 /// #8 VM 租约观测结果（不含任何凭据）。
@@ -1125,9 +1153,8 @@ pub fn liveness_start(
 pub struct LeaseProbe {
   pub ok: bool,
   pub phase: String,
-  /// 网关主机（只保留域名，便于对照不同 VM）。
-  pub gateway_host: String,
-  pub vm_name: String,
+  pub assignment_only: bool,
+  pub same_vm_on_recheck: Option<bool>,
   pub first_expires_at_ms: Option<i64>,
   pub ttl_seconds: Option<i64>,
   /// 上游是否真的返回了到期字段；缺失时一切都只能算「不可观测」。
@@ -1181,19 +1208,19 @@ pub async fn lease_probe(
   let mut cp = muse_native_client::control_plane::MuseControlPlane::new(fetch, cookies);
   let note = concat!(
     "探针不调用 wake()；每次 lease_vm 依次尝试 standard 与 hatch_vm",
-    "（最多 2 次 POST /api/hatch/lease-vm）。该接口在服务端是否触发 VM",
+    "（最多 2 次 POST /api/hatch/lease-vm），类型被拒时查询已有分配。租约 POST 是否触发 VM",
     "分配/唤醒未经证实，因此不要把本探针当作「无副作用」。"
   )
   .to_string();
 
-  let lease = match cp.lease_vm().await {
+  let (lease, assignment_only) = match cp.observe_lease().await {
     Ok(l) => l,
     Err(e) => {
       return Ok(LeaseProbe {
         ok: false,
         phase: "lease".to_string(),
-        gateway_host: String::new(),
-        vm_name: String::new(),
+        assignment_only: false,
+        same_vm_on_recheck: None,
         first_expires_at_ms: None,
         ttl_seconds: None,
         expiry_field_present: false,
@@ -1207,49 +1234,42 @@ pub async fn lease_probe(
     }
   };
 
-  let host = lease
-    .gateway_url
-    .split("://")
-    .nth(1)
-    .unwrap_or(&lease.gateway_url)
-    .split('/')
-    .next()
-    .unwrap_or("")
-    .to_string();
-
   let first = lease.expires_at_ms;
   let ttl = lease.ttl_seconds;
-  let vm_name = lease.vm_name.clone();
-
-  let (renewal, second) = if !twice {
-    ("not_attempted".to_string(), None)
+  let mut recheck_error = None;
+  let (renewal, second, same_vm) = if !twice {
+    ("not_attempted", None, None)
+  } else if assignment_only {
+    ("unobservable", None, None)
   } else {
     tokio::time::sleep(Duration::from_secs(2)).await;
-    match cp.lease_vm().await {
-      Ok(l2) => {
-        let second = l2.expires_at_ms;
-        // 关键：两者都缺失 → 不可观测；相等 → 字段未变化；
-        // 不等 → 仅说明字段变了，不能据此断言自动续租。
-        (renewal_verdict(first, second).to_string(), second)
+    match cp.observe_lease().await {
+      Ok((next, _)) => {
+        let same_vm = lease.vm_id == next.vm_id;
+        let result = if same_vm { renewal_verdict(first, next.expires_at_ms) } else { "vm_changed" };
+        (result, next.expires_at_ms, Some(same_vm))
       }
-      Err(_) => ("unobservable".to_string(), None),
+      Err(_) => {
+        recheck_error = Some("第二次观测失败，未确认到期变化".to_string());
+        ("recheck_failed", None, None)
+      }
     }
   };
 
   Ok(LeaseProbe {
     ok: true,
-    phase: "leased".to_string(),
-    gateway_host: host,
-    vm_name,
+    phase: if assignment_only { "assigned_vm" } else { "leased" }.to_string(),
+    assignment_only,
+    same_vm_on_recheck: same_vm,
     first_expires_at_ms: first,
     ttl_seconds: ttl,
     expiry_field_present: first.is_some() || ttl.is_some(),
-    renewal,
+    renewal: renewal.to_string(),
     renewal_confirmed: false,
     second_expires_at_ms: second,
     calls: cp.lease_calls.clone(),
     side_effects_note: note,
-    error: None,
+    error: recheck_error,
   })
 }
 

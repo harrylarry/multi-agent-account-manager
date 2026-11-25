@@ -60,8 +60,9 @@ async fn rename_account(
   provider_id: String,
   uuid: String,
   alias: String,
+  group: Option<String>,
 ) -> Result<ManagerSnapshot, String> {
-  mgr.rename_account(&app, &provider_id, &uuid, &alias).await
+  mgr.rename_account(&app, &provider_id, &uuid, &alias, group.as_deref()).await
 }
 
 #[tauri::command]
@@ -192,11 +193,21 @@ async fn muse_native_watch_probe(
   app: AppHandle,
   provider_id: String,
   uuid: String,
+  task_id: String,
   seconds: u64,
   mgr: State<'_, Arc<SessionManager>>,
+  cancel: State<'_, Arc<probe_cancel::ProbeCancel>>,
 ) -> Result<muse_native::WatchProbe, String> {
-  let setting = account_proxy_setting(&mgr, &provider_id, &uuid).await;
-  muse_native::watch_probe(&app, &provider_id, &uuid, seconds, setting.as_ref()).await
+  let task = uuid::Uuid::parse_str(&task_id).map_err(|_| "订阅任务标识无效".to_string())?;
+  let (mut token, _guard) = cancel.register_task(&uuid, "watch", task);
+  tokio::select! {
+    biased;
+    _ = token.cancelled() => Err("订阅探针已停止".into()),
+    result = tokio::time::timeout(std::time::Duration::from_secs(120), async {
+      let setting = account_proxy_setting(&mgr, &provider_id, &uuid).await;
+      muse_native::watch_probe(&app, &provider_id, &uuid, seconds, setting.as_ref()).await
+    }) => result.map_err(|_| "订阅探针达到总时限".to_string())?,
+  }
 }
 
 /// B2：只读拉取 `egress.approvals`。
@@ -306,14 +317,24 @@ async fn muse_native_lease_probe(
   app: AppHandle,
   provider_id: String,
   uuid: String,
+  task_id: String,
   twice: Option<bool>,
   mgr: State<'_, Arc<SessionManager>>,
+  cancel: State<'_, Arc<probe_cancel::ProbeCancel>>,
 ) -> Result<muse_native::LeaseProbe, String> {
   if provider_id != "muse" {
     return Err("租约探针只支持 Muse 账号".to_string());
   }
-  let setting = account_proxy_setting(&mgr, &provider_id, &uuid).await;
-  muse_native::lease_probe(&app, &uuid, twice.unwrap_or(true), setting.as_ref()).await
+  let task = uuid::Uuid::parse_str(&task_id).map_err(|_| "租约任务标识无效".to_string())?;
+  let (mut token, _guard) = cancel.register_task(&uuid, "lease", task);
+  tokio::select! {
+    biased;
+    _ = token.cancelled() => Err("租约探针已停止".into()),
+    result = tokio::time::timeout(std::time::Duration::from_secs(60), async {
+      let setting = account_proxy_setting(&mgr, &provider_id, &uuid).await;
+      muse_native::lease_probe(&app, &uuid, twice.unwrap_or(true), setting.as_ref()).await
+    }) => result.map_err(|_| "租约探针达到 60 秒总时限".to_string())?,
+  }
 }
 
 /// B4：发送一条消息到隔离测试会话（单发锁 + 台账在 muse_native::send_probe）。
@@ -324,6 +345,7 @@ async fn muse_native_send_probe(
   uuid: String,
   text: String,
   node_id: String,
+  task_id: String,
   session_id: Option<String>,
   ledger: tauri::State<'_, std::sync::Arc<send_ledger::SendLedger>>,
   mgr: State<'_, Arc<SessionManager>>,
@@ -332,6 +354,8 @@ async fn muse_native_send_probe(
   if provider_id != "muse" {
     return Err("发送探针只支持 Muse 账号".to_string());
   }
+  let task = uuid::Uuid::parse_str(&task_id).map_err(|_| "发送任务标识无效".to_string())?;
+  let (token, _guard) = cancel.register_task(&uuid, "message", task);
   let setting = account_proxy_setting(&mgr, &provider_id, &uuid).await;
   let dir = app.path().app_data_dir().map_err(|e| e.to_string())?;
   let secrets = secrets::Secrets::new(&dir);
@@ -344,7 +368,7 @@ async fn muse_native_send_probe(
     session_id.as_deref(),
     setting.as_ref(),
     &secrets,
-    &cancel,
+    token,
   )
   .await)
 }
@@ -738,12 +762,14 @@ fn muse_native_cancel_probe(
 async fn muse_native_liveness_start(
   app: AppHandle,
   uuid: String,
+  task_id: String,
   seconds: u64,
-  state: tauri::State<'_, std::sync::Arc<muse_native::LivenessState>>,
+  state: State<'_, Arc<muse_native::LivenessState>>,
   mgr: State<'_, Arc<SessionManager>>,
+  cancel: State<'_, Arc<probe_cancel::ProbeCancel>>,
 ) -> Result<muse_native::Liveness, String> {
-  let setting = account_proxy_setting(&mgr, "muse", &uuid).await;
-  muse_native::liveness_start(&app, &state, &uuid, seconds, setting);
+  let task = uuid::Uuid::parse_str(&task_id).map_err(|_| "存活任务标识无效".to_string())?;
+  muse_native::liveness_start(&app, &state, &uuid, seconds, mgr.inner().clone(), cancel.inner().clone(), task)?;
   Ok(state.snapshot())
 }
 

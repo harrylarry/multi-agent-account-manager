@@ -1839,3 +1839,33 @@ body,
   font-size: 11px;
   padding: 3px 7px;
 }
+
+.account-filters {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) minmax(110px, 36%);
+  gap: 8px;
+  padding: 0 12px 8px;
+}
+
+.account-filters .modal-input {
+  min-width: 0;
+}
+
+.account-group-label {
+  flex: 0 1 auto;
+  min-width: 0;
+  max-width: 35%;
+  padding: 2px 6px;
+  overflow: hidden;
+  border-radius: 5px;
+  color: var(--text-muted);
+  background: var(--primary-soft);
+  font-size: 11px;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.account-row[hidden],
+#account-filter-empty[hidden] {
+  display: none;
+}
