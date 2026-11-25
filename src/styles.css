@@ -1905,3 +1905,20 @@ body,
 .account-cookie-actions {
   flex-wrap: wrap;
 }
+
+.muse-thread-row {
+  display: grid;
+  gap: 4px;
+  width: 100%;
+  padding: 10px 6px;
+  border: 0;
+  border-bottom: 1px solid var(--border-strong);
+  background: transparent;
+  color: var(--text-main);
+  text-align: start;
+  overflow-wrap: anywhere;
+}
+
+.muse-thread-row small {
+  color: var(--text-muted);
+}

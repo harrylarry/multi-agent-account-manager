@@ -18,6 +18,7 @@ type ModalMode =
   | { kind: "add"; providerId: ProviderId; draft: string }
   | { kind: "rename"; account: AccountRecord; draft: string; groupDraft: string }
   | { kind: "remove"; account: AccountRecord }
+  | { kind: "sessions"; account: AccountRecord; loading: boolean; items: MuseSession[] | null; error: string }
   | { kind: "cookies"; account: AccountRecord; busy: boolean; preview: CookiePreview | null; message: string; imported: boolean }
   | { kind: "approvals"; account: AccountRecord; loading: boolean; result: SpikeApprovalsResult | null; fetchedAt: number | null }
   | { kind: "update" }
@@ -31,6 +32,14 @@ type ModalMode =
       confirmLabel: string;
       danger: boolean;
     };
+
+interface MuseSession {
+  id: string;
+  title: string;
+  updatedAtMs: number | null;
+  pinned: boolean;
+  archived: boolean;
+}
 
 interface CookiePreview {
   count: number;
@@ -991,7 +1000,7 @@ async function callCommand(
     // another command is in flight is queued (only the latest one
     // matters) and runs as soon as the current command finishes;
     // other commands keep the old drop behavior.
-    if (cmd === "switch_account") {
+    if (cmd === "switch_account" || cmd === "open_muse_thread") {
       pendingSwitch = { cmd, args, optimisticTarget };
       if (optimisticTarget) {
         optimisticSwitching = optimisticTarget;
@@ -2358,6 +2367,42 @@ async function loadAccountApprovals(view: Extract<ModalMode, { kind: "approvals"
   }
 }
 
+function renderSessionsModal(view: Extract<ModalMode, { kind: "sessions" }>): string {
+  const { account, loading, items, error } = view;
+  const rows = items?.map((item) => `
+    <button type="button" class="muse-thread-row" data-muse-thread="${escapeHtml(item.id)}">
+      <span>${escapeHtml(item.title)}</span>
+      <small>${item.archived ? "已归档 · " : item.pinned ? "已置顶 · " : ""}${item.updatedAtMs ? new Date(item.updatedAtMs).toLocaleString() : ""}</small>
+    </button>`).join("");
+  return `
+    <div class="inline-modal" role="dialog" aria-modal="true" aria-labelledby="muse-sessions-title">
+      <div class="modal-card">
+        <div class="modal-title" id="muse-sessions-title">会话 · ${escapeHtml(account.alias)}</div>
+        ${rows ? `<div class="approval-items">${rows}</div>` : `<div role="status">${escapeHtml(loading ? "正在读取会话…" : error || "该账号没有会话。")}</div>`}
+        <div class="modal-footer">
+          <button id="modal-cancel-btn" type="button" class="btn">关闭</button>
+          <button id="muse-sessions-refresh" type="button" class="btn" ${loading ? "disabled" : ""}>刷新</button>
+        </div>
+      </div>
+    </div>`;
+}
+
+async function loadMuseSessions(view: Extract<ModalMode, { kind: "sessions" }>): Promise<void> {
+  if (modal !== view) return;
+  view.loading = true;
+  view.items = null;
+  view.error = "";
+  render();
+  try {
+    view.items = await invoke<MuseSession[]>("list_muse_sessions", { uuid: view.account.uuid });
+  } catch (error) {
+    view.error = String(error);
+  } finally {
+    view.loading = false;
+    if (modal === view) render();
+  }
+}
+
 function renderCookieModal(view: Extract<ModalMode, { kind: "cookies" }>): string {
   const { account, busy, preview, message, imported } = view;
   return `
@@ -2434,6 +2479,7 @@ function renderModal(provider: ProviderInfo): string {
   if (modal.kind === "none") return "";
   if (modal.kind === "approvals") return renderApprovalsModal(modal);
   if (modal.kind === "cookies") return renderCookieModal(modal);
+  if (modal.kind === "sessions") return renderSessionsModal(modal);
   if (modal.kind === "update") {
     return renderUpdateModal();
   }
@@ -2625,6 +2671,7 @@ function renderMiddleContent(state: ManagerSnapshot, provider: ProviderInfo): st
                 ${subHtmlFor(acc, d, isMobile)}
               </div>
               <div class="row-ops">
+                ${state.platform === "ios" && provider.id === "muse" && acc.authState === "authenticated" ? `<button class="action-icon-btn account-approval-btn" data-sessions-uuid="${escapeHtml(acc.uuid)}" type="button">会话</button>` : ""}
                 ${state.platform === "ios" ? `<button class="action-icon-btn account-approval-btn" data-cookies-uuid="${escapeHtml(acc.uuid)}" type="button">登录恢复</button>` : ""}
                 ${state.platform === "ios" && provider.id === "muse" && acc.authState === "authenticated" ? `<button class="action-icon-btn account-approval-btn" data-approvals-uuid="${escapeHtml(acc.uuid)}" type="button">审批</button>` : ""}
                 <button class="action-icon-btn" data-rename-uuid="${escapeHtml(acc.uuid)}" title="编辑账号备注与分组" aria-label="编辑账号备注与分组" type="button">${ICON_EDIT}</button>
@@ -2842,6 +2889,7 @@ function modalIdentityKey(provider: ProviderInfo): string | null {
       return `confirm:${modal.title}:${modal.desc.length}:${modal.confirmLabel}`;
     case "approvals":
     case "cookies":
+    case "sessions":
       return null;
     case "update":
       // Dynamic content (update check / install progress): no stable
@@ -3270,6 +3318,26 @@ function bindDelegatedEvents(): void {
 
     // Most specific first; each branch returns after handling (this is
     // what stopPropagation used to do for the row-op buttons).
+    const sessionButton = target.closest<HTMLElement>("[data-sessions-uuid]");
+    if (sessionButton) {
+      if (modal.kind !== "none" || reorderMode) return;
+      const account = snapshot.accounts.find((entry) => entry.providerId === "muse" && entry.uuid === sessionButton.dataset.sessionsUuid);
+      if (account?.authState === "authenticated") {
+        const view: Extract<ModalMode, { kind: "sessions" }> = {
+          kind: "sessions", account, loading: true, items: null, error: "",
+        };
+        await setModal(view);
+        await loadMuseSessions(view);
+      }
+      return;
+    }
+    const thread = target.closest<HTMLElement>("[data-muse-thread]")?.dataset.museThread;
+    if (thread && modal.kind === "sessions" && modal.items?.some((item) => item.id === thread)) {
+      const { providerId, uuid } = modal.account;
+      await setModal({ kind: "none" });
+      await callCommand("open_muse_thread", { uuid, threadId: thread }, { providerId, uuid });
+      return;
+    }
     const cookieButton = target.closest<HTMLElement>("[data-cookies-uuid]");
     if (cookieButton) {
       if (modal.kind !== "none" || reorderMode) return;
@@ -3534,6 +3602,9 @@ function bindDelegatedEvents(): void {
         reorderProviderId = null;
         render();
         restoreScrollPosition();
+        break;
+      case "muse-sessions-refresh":
+        if (modal.kind === "sessions" && !modal.loading) await loadMuseSessions(modal);
         break;
       case "account-cookie-preview-btn":
         await accountCookieAction("preview");

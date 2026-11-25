@@ -132,9 +132,11 @@ enum RecentAccountPages {
 
   private static func isReusable(_ view: WKWebView, spec: IosAccountSessionSpec) -> Bool {
     guard let url = view.url,
-      let entryHost = URL(string: spec.entryUrl)?.host
+      let entryURL = URL(string: spec.entryUrl),
+      let entryHost = entryURL.host
     else { return false }
-    return AccountSessionCoordinator.hostMatchesAllowed(url, allowedHosts: [entryHost])
+    return (entryURL.path.isEmpty || entryURL.path == "/" || entryURL.path == url.path)
+      && AccountSessionCoordinator.hostMatchesAllowed(url, allowedHosts: [entryHost])
       && AccountSessionCoordinator.hostMatchesAllowed(url, allowedHosts: spec.allowedHosts)
   }
 

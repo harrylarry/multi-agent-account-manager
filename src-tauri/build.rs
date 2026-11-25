@@ -17,6 +17,8 @@ const APP_COMMANDS: &[&str] = &[
   "trigger_quota_sync",
   "preview_account_cookies",
   "transfer_account_cookies",
+  "list_muse_sessions",
+  "open_muse_thread",
   "spike_ios_quota_sync_probe",
   "check_for_updates",
   "download_and_install_update",

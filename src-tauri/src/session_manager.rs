@@ -1197,7 +1197,7 @@ impl SessionManager {
     };
 
     if let Some(key) = candidate {
-      let _ = self.switch_account_internal(app, key, true).await;
+      let _ = self.switch_account_internal(app, key, true, None).await;
     } else {
       let snap = self.get_snapshot().await;
       self.emit_snapshot(app, &snap);
@@ -1489,7 +1489,7 @@ impl SessionManager {
 
     #[cfg(desktop)]
     if let Some(restore_key) = warm_restore {
-      return self.switch_account_internal(app, restore_key, false).await;
+      return self.switch_account_internal(app, restore_key, false, None).await;
     }
 
     #[cfg(not(desktop))]
@@ -1559,7 +1559,7 @@ impl SessionManager {
       AccountKey { provider_id, uuid }
     };
 
-    self.switch_account_internal(app, created_key, false).await
+    self.switch_account_internal(app, created_key, false, None).await
   }
 
   pub async fn rename_account(
@@ -1839,7 +1839,18 @@ impl SessionManager {
     let provider_id = ProviderId::parse(raw_provider).ok_or_else(|| "无效的服务标识".to_string())?;
     let uuid = normalize_uuid(raw_uuid).ok_or_else(|| "无效的账号 UUID".to_string())?;
     let key = AccountKey { provider_id, uuid };
-    self.switch_account_internal(app, key, false).await
+    self.switch_account_internal(app, key, false, None).await
+  }
+
+  #[cfg(target_os = "ios")]
+  pub async fn open_muse_thread(
+    self: &Arc<Self>,
+    app: &AppHandle,
+    uuid: String,
+    thread: Uuid,
+  ) -> Result<ManagerSnapshot, String> {
+    let key = AccountKey { provider_id: ProviderId::Muse, uuid };
+    self.switch_account_internal(app, key, false, Some(thread)).await
   }
 
   pub async fn switch_account_by_index(
@@ -2047,6 +2058,7 @@ impl SessionManager {
     app: &AppHandle,
     key: AccountKey,
     is_cold_start: bool,
+    #[cfg_attr(not(target_os = "ios"), allow(unused_variables))] muse_thread: Option<Uuid>,
   ) -> Result<ManagerSnapshot, String> {
     {
       let locked = self.inner.lock().await;
@@ -2291,7 +2303,7 @@ impl SessionManager {
       };
 
       self
-        .open_ios_session(app, account_record, next_seq, view_instance_id, is_cold_start)
+        .open_ios_session(app, account_record, next_seq, view_instance_id, is_cold_start, muse_thread)
         .await
     }
   }
@@ -3159,6 +3171,7 @@ impl SessionManager {
     expected_seq: u64,
     view_instance_id: u64,
     is_cold_start: bool,
+    muse_thread: Option<Uuid>,
   ) -> Result<ManagerSnapshot, String> {
     let caps = match crate::platform::ios::check_capabilities(app).await {
       Ok(c) => c,
@@ -3248,7 +3261,8 @@ impl SessionManager {
       uuid: account.uuid.clone(),
       alias: account.alias.clone(),
       auto_alias: account.auto_alias,
-      entry_url: spec.info.entry_url.to_string(),
+      entry_url: muse_thread.map(|thread| format!("https://muse.ai/thread/{thread}"))
+        .unwrap_or_else(|| spec.info.entry_url.to_string()),
       allowed_hosts: spec.allowed_hosts.iter().map(|s| (*s).to_string()).collect(),
       switch_seq: expected_seq,
       view_instance_id,
@@ -3415,7 +3429,7 @@ impl SessionManager {
           locked.store.last_committed.clone()
         };
         if let Some(committed_key) = fallback {
-          let _ = self.switch_account_internal(app, committed_key, true).await;
+          let _ = self.switch_account_internal(app, committed_key, true, None).await;
         } else {
           let snap = self.get_snapshot().await;
           self.emit_snapshot(app, &snap);
@@ -3614,7 +3628,7 @@ impl SessionManager {
           locked.store.last_committed.clone()
         };
         if let Some(committed_key) = fallback {
-          let _ = self.switch_account_internal(app, committed_key, true).await;
+          let _ = self.switch_account_internal(app, committed_key, true, None).await;
         } else {
           let snap = self.get_snapshot().await;
           self.emit_snapshot(app, &snap);

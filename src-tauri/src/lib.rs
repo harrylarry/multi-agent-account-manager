@@ -1,5 +1,6 @@
 mod account_cookies;
 mod muse_native;
+mod muse_sessions;
 mod platform;
 mod hark_native;
 mod probe_cancel;
@@ -274,6 +275,76 @@ async fn transfer_account_cookies(
       cancel.cancel_account(&uuid);
     }
     mgr.with_cookie_profile(&app, provider, &uuid, cookies.as_deref()).await
+  }
+  #[cfg(not(target_os = "ios"))]
+  {
+    Err("此操作仅支持 iOS".to_string())
+  }
+}
+
+#[tauri::command]
+#[cfg_attr(not(target_os = "ios"), allow(unused_variables))]
+async fn list_muse_sessions(
+  app: AppHandle,
+  mgr: State<'_, Arc<SessionManager>>,
+  cancel: State<'_, Arc<probe_cancel::ProbeCancel>>,
+  uuid: String,
+) -> Result<Vec<muse_sessions::MuseSession>, String> {
+  #[cfg(target_os = "ios")]
+  {
+    let uuid = storage::normalize_uuid(&uuid).ok_or("账号标识无效")?;
+    let (mut token, _guard) = cancel.register(&uuid, "sessions");
+    let snapshot = mgr.get_snapshot().await;
+    let account = snapshot.accounts.iter().find(|account| {
+      account.provider_id == providers::ProviderId::Muse && account.uuid == uuid
+        && account.auth_state == storage::AuthState::Authenticated
+    }).ok_or("请先登录 Muse 账号")?;
+    if snapshot.conflicts.iter().any(|entry| entry.uuid == uuid)
+      || snapshot.pending_cleanup.iter().any(|key| key.uuid == uuid) {
+      return Err("请先解决账号归属或清理状态".to_string());
+    }
+    tokio::select! {
+      biased;
+      _ = token.cancelled() => Err("会话查询已停止".into()),
+      result = tokio::time::timeout(std::time::Duration::from_secs(35), async {
+        let header = zeroize::Zeroizing::new(muse_native::cookie_header_for(&app, &uuid).await?);
+        if header.is_empty() { return Err("没有可用的 Muse 登录态".into()); }
+        let client = egress::resolve_for_app(&app, account.proxy.as_ref())?
+          .http_client(std::time::Duration::from_secs(20), false)
+          .map_err(|_| "无法初始化账号网络")?;
+        let mut response = client.get("https://muse.ai/api/session/list")
+          .header("Accept", "application/json").header("Cookie", header.as_str()).send().await
+          .map_err(|error| egress::safe_http_error("读取会话", &error))?;
+        let status = response.status();
+        if !status.is_success() { return Err(format!("会话列表请求失败（HTTP {}）", status.as_u16())); }
+        let mut body = Vec::new();
+        while let Some(chunk) = response.chunk().await.map_err(|error| egress::safe_http_error("读取会话响应", &error))? {
+          if body.len() + chunk.len() > 2 * 1024 * 1024 { return Err("会话列表响应过大".into()); }
+          body.extend_from_slice(&chunk);
+        }
+        muse_sessions::parse_list(&body)
+      }) => result.map_err(|_| "会话查询超时".to_string())?,
+    }
+  }
+  #[cfg(not(target_os = "ios"))]
+  {
+    Err("此操作仅支持 iOS".to_string())
+  }
+}
+
+#[tauri::command]
+#[cfg_attr(not(target_os = "ios"), allow(unused_variables))]
+async fn open_muse_thread(
+  app: AppHandle,
+  mgr: State<'_, Arc<SessionManager>>,
+  uuid: String,
+  thread_id: String,
+) -> Result<ManagerSnapshot, String> {
+  #[cfg(target_os = "ios")]
+  {
+    let uuid = storage::normalize_uuid(&uuid).ok_or("账号标识无效")?;
+    let thread = uuid::Uuid::parse_str(&thread_id).map_err(|_| "会话标识无效")?;
+    mgr.open_muse_thread(&app, uuid, thread).await
   }
   #[cfg(not(target_os = "ios"))]
   {
@@ -966,6 +1037,8 @@ pub fn run() {
       trigger_quota_sync,
       preview_account_cookies,
       transfer_account_cookies,
+      list_muse_sessions,
+      open_muse_thread,
       spike_ios_quota_sync_probe,
       reorder_accounts,
       check_for_updates,
