@@ -55,6 +55,10 @@
 
 ## 原生代理与重启回归
 
+代理专项复测使用 [叠号 Spike 0.1.26 `7588dca`](https://github.com/harrylarry/multi-agent-account-manager/actions/runs/45600497159/artifacts/15015772654)。解压后未签名 IPA 的 SHA-256 为 `150e955efa70bed2dbab3b0f521867bed3d545f51397b85d87166df365a9829f`。[Quick checks](https://github.com/harrylarry/multi-agent-account-manager/actions/runs/45600495276)
+
+`8b7eb0a` 真机中，三协议的连通性均为 200，原生均在 `/api/hatch/lease-vm` 返回 `Invalid vmType`，未进入 WS 握手。新版先复测 SOCKS5，再复测 HTTP CONNECT 与 HTTPS CONNECT。逐次保存原代理配置后点「验证原生代理」，回传握手、Ping 或新失败阶段。
+
 1. 用同一代理地址及认证参数，依次配置 HTTP CONNECT、HTTPS CONNECT、SOCKS5。每种先运行「检测代理连通性」，再运行完整的「代理探针」。分别记录匿名 HTTPS 响应、握手、Ping 状态及失败阶段。
 2. 启用代理后强退并重开 Spike，核对配置和凭据可用状态仍在，并复跑一次完整探针。条件允许时，用另一个非主力账号验证设置和诊断结果不会串号。
 3. 在代理已启用的情况下，使用错误凭据或断开代理。分别检查原生探针、WebView 及可触发的后台额度同步。预期是请求失败并保持阻断。没有代理侧出口日志或受控网络观测时，记录客户端表现并将「无直连」标为 `UNVERIFIED`。
