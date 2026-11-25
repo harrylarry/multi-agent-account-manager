@@ -77,11 +77,15 @@
 
 ## iOS 后台额度同步
 
-使用 [叠号 Spike 0.1.26 后台额度复测包](https://github.com/harrylarry/multi-agent-account-manager/actions/runs/45608434585/artifacts/15019407801)。构建提交为 `dda5127fbbb38ae71efc98570af04296f051e36f`，解压后未签名 IPA 的 SHA-256 为 `5fb9a4f0bcea507490af8240f12c8e84435986e7c44f004c5146515e7f4c33cc`。[Quick checks](https://github.com/harrylarry/multi-agent-account-manager/actions/runs/45608432316) [Xcode 打包](https://github.com/harrylarry/multi-agent-account-manager/actions/runs/45608434585) 均为 `CI_PASSED`，后台额度真机结果为 `UNVERIFIED`。
+当前使用 [叠号 Spike 0.1.26 `ab6f6fa`](https://github.com/harrylarry/multi-agent-account-manager/actions/runs/45613523633/artifacts/15020828326)。解压后未签名 IPA 的 SHA-256 为 `4f5fbe8aaf3f5e0fd933041e3efbf5a6f6a673cac61b0bec95bcf6e9d82ad9ff`。[Quick checks](https://github.com/harrylarry/multi-agent-account-manager/actions/runs/45613514999) 与 [Xcode 打包](https://github.com/harrylarry/multi-agent-account-manager/actions/runs/45613523633) 均通过。
+
+先明确清除代理，再运行一次「测试后台额度同步」，确认主文档提交及额度读取。然后启用已知正确的 SOCKS5 密码并保存，复测后台同步；若「查询额度」仍失败，附上原生的脱敏错误分类。两条基线定位后，再按下方做错误及恢复正确密码的对照。隐藏 WebView 从主文档提交后开始探测，新包中「主文档已提交」表示导航已到该阶段，额度结果另行核对。
+
+上一轮使用 [叠号 Spike 0.1.26 后台额度复测包](https://github.com/harrylarry/multi-agent-account-manager/actions/runs/45608434585/artifacts/15019407801)。构建提交为 `dda5127fbbb38ae71efc98570af04296f051e36f`，解压后未签名 IPA 的 SHA-256 为 `5fb9a4f0bcea507490af8240f12c8e84435986e7c44f004c5146515e7f4c33cc`。[Quick checks](https://github.com/harrylarry/multi-agent-account-manager/actions/runs/45608432316) [Xcode 打包](https://github.com/harrylarry/multi-agent-account-manager/actions/runs/45608434585) 均为 `CI_PASSED`，真机失败见下方回执。
 
 保持叠号在前台的 Muse 账号管理页。测试按钮会为未打开会话的账号运行后台同步，其中隐藏 WebView 重新导航，并排除旧的本地额度缓存。每一行用平台与账号 UUID 末八位标识，分别显示代理、联网和额度结果。
 
-1. 用已登录的同一个测试账号，保存正确的 SOCKS5 代理密码。打开 Muse 顶栏「诊断」→「额度与审批」→「测试后台额度同步」。该账号应显示「代理 已下发」「页面加载成功」，额度为「已更新并保存」或「已取得，数据未变」。
+1. 用已登录的同一个测试账号，保存正确的 SOCKS5 代理密码。打开 Muse 顶栏「诊断」→「额度与审批」→「测试后台额度同步」。该账号应显示「代理 已下发」「主文档已提交」，额度为「已更新并保存」或「已取得，数据未变」。
 2. 只改该账号的代理密码并保存，保留代理地址、协议和用户名。再次运行同一测试。若代理参数下发成功但认证失败，预期显示「代理 已下发」，随后显示联网失败、超时或 HTTP 失败，额度未更新。若代理本身下发失败或应用失败，预期显示对应代理错误和「联网 未发起」。其他账号不应随这一项变更而失败。
 3. 恢复并保存正确的代理密码，第三次运行，确认该账号恢复。每轮用「复制脱敏同步结果」保存对应行。记录 iOS 版本和三轮结果，保持代理凭据只留在设备上。如果提示已有后台同步在运行，等待一轮后重试。
 

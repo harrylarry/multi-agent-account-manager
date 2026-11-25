@@ -4,7 +4,7 @@
 
 ## Phase 0 技术 Spike
 
-开发分支为 `spike/native-methods`。最新 Spike 候选 0.1.26 构建自 `dda5127fbbb38ae71efc98570af04296f051e36f`，覆盖 iOS 后台额度同步脱敏诊断。安装及校验见 [iPhone 后台额度同步真机复测](../acceptance/iphone-acceptance.md#ios-后台额度同步)。
+开发分支为 `spike/native-methods`。最新 Spike 候选 0.1.26 构建自 `ab6f6fa43b627ce2ceff0123e7675fd6a2554897`，覆盖 iOS 后台额度同步脱敏诊断。安装及校验见 [iPhone 后台额度同步真机复测](../acceptance/iphone-acceptance.md#ios-后台额度同步)。
 
 | 切片 | 已核对证据 | 待验收 |
 | --- | --- | --- |
@@ -63,3 +63,5 @@
 `dda5127` 的后台同步诊断按账号分别报告代理下发、隐藏 WebView 主页面联网和额度应用结果。测试入口重载页面并排除旧额度缓存，代理下发或应用失败时跳过该账号联网。Windows 主 crate 61 项测试、13 项嵌入脚本测试、[Quick checks](https://github.com/harrylarry/multi-agent-account-manager/actions/runs/45608432316) 和 [iOS Xcode 打包](https://github.com/harrylarry/multi-agent-account-manager/actions/runs/45608434585) 均通过，IPA 已下载并校验。下一步用同一 iPhone 测试账号做正确、错误、恢复正确三轮代理密码对照，回填账号尾号及三段状态。[下载与步骤](../acceptance/iphone-acceptance.md#ios-后台额度同步)
 
 `dda5127` iPhone 真机用同一账号测试启用及明确清除 SOCKS5。隐藏 WebView 两轮均超时，后台额度正向验收为 `FAIL`。原生额度经代理冷发现 GET 失败，匿名 HEAD 为 200，清除代理后原生额度成功。已在候选修复中让隐藏 WebView 使用前台窗口中的不可交互渲染视口，从主文档提交开始独立探测额度。原生路径补充脱敏的请求或响应体错误分类。后续需验证主文档是否提交、额度是否更新，再做错误密码及恢复正确密码的对照。[真机回执](../acceptance/iphone-acceptance.md#dda5127-真机回执)
+
+`ab6f6fa` 的 [Quick checks](https://github.com/harrylarry/multi-agent-account-manager/actions/runs/45613514999) 和 [Xcode 打包](https://github.com/harrylarry/multi-agent-account-manager/actions/runs/45613523633) 均通过，已下载校验新 IPA。下一次真机先确认清除代理时后台额度路径能到达主文档提交及实际额度，再用正确 SOCKS5 重跑同一入口；若原生查询仍失败，回填新诊断。新构建实际结果 `UNVERIFIED`。[复测包和步骤](../acceptance/iphone-acceptance.md#ios-后台额度同步)
