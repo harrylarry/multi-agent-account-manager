@@ -1,6 +1,6 @@
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
-import { renderRooms, roomCommand, type RoomBook, type RoomsView } from "./rooms";
+import { markRoomSuggestions, renderRooms, roomCommand, type RoomBook, type RoomsView } from "./rooms";
 import "./styles.css";
 import type {
   AccountKey,
@@ -1792,7 +1792,7 @@ async function runSpikeSend(): Promise<void> {
 
 // #18 模型指纹：只应对已授权的**非主力测试账号**手动触发。探针内容是
 // 无语义整数计数（不含隐私），发往隔离会话；3 条样本不足则显示不可判定。
-async function runSpikeFingerprint(view?: Extract<ModalMode, { kind: "tasks" }>): Promise<void> {
+async function runSpikeFingerprint(view?: Extract<ModalMode, { kind: "tasks" }>, automaticAccount?: AccountRecord): Promise<void> {
   if (!snapshot) return;
   if (spikeFingerprintRunning) {
     spikeNotice = "指纹探针正在运行，请等待结果或点「停止」。";
@@ -1800,7 +1800,7 @@ async function runSpikeFingerprint(view?: Extract<ModalMode, { kind: "tasks" }>)
     return;
   }
   spikeNotice = null;
-  const acc = view?.account ?? pickWatchAccount();
+  const acc = automaticAccount ?? view?.account ?? pickWatchAccount();
   if (!acc) {
     spikeFingerprint = null;
     spikeFingerprintError = "没有已登录的 Muse 账号。";
@@ -1809,7 +1809,7 @@ async function runSpikeFingerprint(view?: Extract<ModalMode, { kind: "tasks" }>)
     return;
   }
   spikeTrace("指纹探针", "已点击", `账号 ${acc.alias}`);
-  const confirmed = await askConfirm({
+  const confirmed = automaticAccount != null || await askConfirm({
     title: "运行指纹探针（3 条）",
     desc:
       `将对测试账号「${acc.alias}」的隔离会话发送 3 条无语义计数探针（不是聊天内容），` +
@@ -1842,6 +1842,7 @@ async function runSpikeFingerprint(view?: Extract<ModalMode, { kind: "tasks" }>)
       providerId: "muse",
       uuid: task.accountUuid,
       taskId: task.taskId,
+      automatic: automaticAccount != null,
     });
     spikeTrace("指纹探针", "后端已返回", `阶段 ${spikeFingerprint.phase}`);
   } catch (e) {
@@ -1855,6 +1856,45 @@ async function runSpikeFingerprint(view?: Extract<ModalMode, { kind: "tasks" }>)
     spikeFingerprintProgress = null;
     syncSpikeDiag();
     if (view && modal === view) render();
+    if (automaticAccount) {
+      try { snapshot = await invoke<ManagerSnapshot>("get_manager_state"); }
+      catch { /* Keep the last observed account state until the next snapshot. */ }
+      render();
+    }
+  }
+}
+
+const automaticFingerprintCheckedAt = new Map<string, number>();
+let automaticFingerprintChecking = false;
+
+async function triggerAutomaticFingerprint(): Promise<void> {
+  if (snapshot?.platform !== "ios" || document.hidden || !navigator.onLine || spikeFingerprintRunning
+    || automaticFingerprintChecking || modal.kind !== "none") return;
+  const now = Date.now();
+  const due = snapshot.accounts.find((account) => {
+    const settings = account.fingerprintSettings;
+    if (account.providerId !== "muse" || account.authState !== "authenticated" || !settings?.intervalDays
+      || now - (automaticFingerprintCheckedAt.get(account.uuid) ?? 0) < 300_000) return false;
+    const last = Math.max(settings.lastAutomaticAttemptMs ?? 0, account.fingerprintHistory?.[0]?.recordedAtMs ?? 0);
+    return now >= last + settings.intervalDays * 86_400_000;
+  });
+  if (!due) return;
+  automaticFingerprintCheckedAt.set(due.uuid, now);
+  automaticFingerprintChecking = true;
+  try {
+    const quota = due.quotaObservation;
+    if (quota?.stale !== false || quota.percentUsed == null || now - quota.checkedAtMs > 600_000
+      || (quota.resetsAtMs != null && quota.resetsAtMs <= now)) {
+      const refreshed = await invoke<{ ok: boolean; quota?: { usageObserved: boolean; percentUsed: number } }>(
+        "muse_native_quota_probe", { providerId:"muse", uuid:due.uuid },
+      );
+      if (!refreshed.ok || refreshed.quota?.usageObserved !== true || refreshed.quota.percentUsed >= 100) return;
+    } else if (quota.percentUsed >= 100) return;
+    if (!document.hidden && modal.kind === "none") await runSpikeFingerprint(undefined, due);
+  } catch {
+    // Quota is read-only. An unavailable quota postpones a due automatic probe.
+  } finally {
+    automaticFingerprintChecking = false;
   }
 }
 
@@ -2522,6 +2562,8 @@ function renderTasks(view: Extract<ModalMode, { kind: "tasks" }>): string {
   const recent = current?.lastTaskReplyAtMs;
   const fingerprintRunning = spikeFingerprintTask?.accountUuid === account.uuid;
   const records = current?.fingerprintHistory ?? [];
+  const fingerprintSettings = current?.fingerprintSettings;
+  const lastFingerprintAt = Math.max(fingerprintSettings?.lastAutomaticAttemptMs ?? 0, records[0]?.recordedAtMs ?? 0);
   const unreadStatus: Record<string, string> = {
     unread: "Muse 返回未读", zero: "服务已返回未读计数，本次为零",
     unavailable: "本次未收到未读计数", network_or_protocol: "未读查询失败", timeout: "未读查询超时",
@@ -2550,6 +2592,19 @@ function renderTasks(view: Extract<ModalMode, { kind: "tasks" }>): string {
               ${record.probabilityPpm != null ? ` · ${(record.probabilityPpm / 10000).toFixed(1)}%` : ""}
               ${record.referenceBuiltAt ? `<div>参考库 ${escapeHtml(record.referenceBuiltAt)}${record.referenceSha256 ? ` · ${escapeHtml(record.referenceSha256.slice(0, 12))}` : ""}</div>` : ""}
             </div>`).join("")}
+          </details>
+          <details id="account-fingerprint-settings" class="hark-reply"><summary>模型设置</summary>
+            <label for="account-fingerprint-model">手动指定模型</label>
+            <input id="account-fingerprint-model" class="modal-input" maxlength="80" value="${escapeHtml(fingerprintSettings?.manualModel ?? "")}" placeholder="留空使用指纹参考">
+            <label for="account-fingerprint-period">自动重测间隔（天）</label>
+            <input id="account-fingerprint-period" class="modal-input" type="number" min="0" max="90"
+              value="${fingerprintSettings?.intervalDays ?? 0}">
+            <div class="modal-desc">0 表示关闭。设为 1–90 天即授权到期时在前台自动发三条隔离探针，会消耗账号额度。</div>
+            ${fingerprintSettings?.intervalDays ? `<div class="modal-desc">${lastFingerprintAt ?
+              "下次到期 " + new Date(lastFingerprintAt + fingerprintSettings.intervalDays * 86_400_000).toLocaleString() :
+              "已到期，等前台且额度可用时开始"}</div>` : ""}
+            <div id="account-fingerprint-settings-result" role="status"></div>
+            <button id="account-fingerprint-save" class="btn" type="button">保存模型设置</button>
           </details>
           ${fingerprintRunning ? '<button id="account-fingerprint-stop" class="btn" type="button">停止检测</button>' :
             `<button id="account-fingerprint-start" class="btn" type="button" ${spikeFingerprintRunning ? "disabled" : ""}>手动检测模型</button>`}
@@ -4258,6 +4313,37 @@ function bindDelegatedEvents(): void {
 
     const roomAction = target.closest<HTMLElement>("[data-room-action]");
     if (roomAction && modal.kind === "rooms") {
+      if (roomAction.dataset.roomAction === "refresh_assignment_quota") {
+        const status = document.getElementById("room-result");
+        if (status) status.textContent = "正在通过各账号原生线路刷新 Muse 额度…";
+        (roomAction as HTMLButtonElement).disabled = true;
+        const ids = (snapshot?.accounts ?? []).filter((account) => account.providerId === "muse" && account.authState === "authenticated");
+        let comparable = 0;
+        for (const account of ids) {
+          if (document.hidden) break;
+          try {
+            const result = await invoke<{ ok: boolean; quota?: { window?: string; usageObserved: boolean } }>(
+              "muse_native_quota_probe", { providerId:"muse", uuid:account.uuid },
+            );
+            if (result.ok && result.quota?.window && result.quota.usageObserved) comparable++;
+          } catch { /* Leave this account without a fresh comparable observation. */ }
+        }
+        (roomAction as HTMLButtonElement).disabled = false;
+        if (status) status.textContent = `取得可比较额度的 Muse 账号 ${comparable}/${ids.length}`;
+        return;
+      }
+      if (roomAction.dataset.roomAction === "show_record") {
+        const source = document.querySelector<HTMLElement>(`[data-room-panel="${CSS.escape(roomAction.dataset.roomId ?? "")}"]`);
+        source?.setAttribute("open", "");
+        source?.scrollIntoView({ block: "nearest" });
+        return;
+      }
+      if (roomAction.dataset.roomAction === "delete_record"
+        && !roomAction.closest("[data-room-delete]")?.querySelector("input:checked")) {
+        const status = document.getElementById("room-result");
+        if (status) status.textContent = "请先勾选确认删除。";
+        return;
+      }
       if (roomAction.dataset.roomAction === "open_source" && roomAction.dataset.roomAccount && roomAction.dataset.roomSession) {
         const uuid = roomAction.dataset.roomAccount;
         const threadId = roomAction.dataset.roomSession;
@@ -4336,6 +4422,34 @@ function bindDelegatedEvents(): void {
       case "account-fingerprint-start":
         if (modal.kind === "tasks" && modal.account.providerId === "muse") await runSpikeFingerprint(modal);
         break;
+      case "account-fingerprint-save": {
+        if (modal.kind !== "tasks" || modal.account.providerId !== "muse") break;
+        const view = modal;
+        const model = document.querySelector<HTMLInputElement>("#account-fingerprint-model");
+        const period = document.querySelector<HTMLInputElement>("#account-fingerprint-period");
+        const status = document.getElementById("account-fingerprint-settings-result");
+        const button = document.querySelector<HTMLButtonElement>("#account-fingerprint-save");
+        const days = period?.valueAsNumber ?? NaN;
+        if (!Number.isInteger(days) || days < 0 || days > 90) {
+          if (status) status.textContent = "请输入 0–90 的整数。";
+          break;
+        }
+        if (button) button.disabled = true;
+        try {
+          snapshot = await invoke<ManagerSnapshot>("set_muse_fingerprint_settings", {
+            uuid: view.account.uuid, manualModel: model?.value.trim() || null, intervalDays: days || null,
+          });
+          if (modal === view) {
+            render();
+            document.getElementById("account-fingerprint-settings")?.setAttribute("open", "");
+            const saved = document.getElementById("account-fingerprint-settings-result");
+            if (saved) saved.textContent = "已保存模型设置。";
+          }
+        } catch (error) {
+          if (status) status.textContent = String(error);
+        } finally { if (button) button.disabled = false; }
+        break;
+      }
       case "account-fingerprint-stop":
         if (modal.kind === "tasks" && spikeFingerprintTask?.accountUuid === modal.account.uuid) {
           await cancelSpikeProbe(spikeFingerprintTask);
@@ -4630,6 +4744,10 @@ function bindDelegatedEvents(): void {
 
   root.addEventListener("input", (ev) => {
     const input = ev.target as HTMLInputElement;
+    if (input.id === "room-goal" && modal.kind === "rooms") {
+      markRoomSuggestions(modal.book, input.value);
+      return;
+    }
     if (input.id === "add-cookie-input" && modal.kind === "add") {
       modal.cookiePreview = false;
       const status = document.getElementById("add-account-result");
@@ -4862,7 +4980,10 @@ async function bootstrap(): Promise<void> {
   // active again (foreground / focus). No periodic background sync.
   triggerAutoSync();
   if (snapshot.platform === "ios") {
-    foregroundTaskTimer = window.setInterval(() => void refreshForegroundTask(), 15_000);
+    foregroundTaskTimer = window.setInterval(() => {
+      void refreshForegroundTask();
+      void triggerAutomaticFingerprint();
+    }, 15_000);
     window.addEventListener("pagehide", () => {
       if (foregroundTaskTimer !== null) window.clearInterval(foregroundTaskTimer);
     }, { once: true });

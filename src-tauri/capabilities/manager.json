@@ -49,6 +49,7 @@
     "allow-spike-ios-quota-sync-probe",
     "allow-muse-native-send-probe",
     "allow-muse-native-fingerprint-probe",
+    "allow-set-muse-fingerprint-settings",
     "allow-muse-native-proxy-probe",
     "allow-muse-native-set-account-proxy",
     "allow-muse-native-get-account-proxy",

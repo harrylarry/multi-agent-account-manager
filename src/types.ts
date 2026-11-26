@@ -30,6 +30,7 @@ export interface QuotaDetail {
 }
 
 export interface AccountRecord {
+  fingerprintSettings?: { manualModel?: string | null; intervalDays?: number | null; lastAutomaticAttemptMs?: number | null };
   fingerprintHistory?: {
     taskId: string; recordedAtMs: number; verdict: string; model: string | null; family: string | null;
     probabilityPpm: number | null; validSamples: number; referenceBuiltAt: string | null;

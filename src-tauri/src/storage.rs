@@ -163,6 +163,49 @@ pub struct QuotaObservation {
   pub stale: bool,
 }
 
+impl QuotaObservation {
+  pub fn remaining(&self, now: u64) -> Option<u8> {
+    if self.stale || self.checked_at_ms > now || now - self.checked_at_ms > 10 * 60_000
+      || self.resets_at_ms.is_some_and(|end| end <= now) { return None; }
+    100u8.checked_sub(self.percent_used?)
+  }
+
+  pub fn comparable_remaining(&self, now: u64) -> Option<(&str, u8)> {
+    let window = self.window.as_deref().map(str::trim).filter(|label| !label.is_empty())?;
+    Some((window, self.remaining(now)?))
+  }
+}
+
+#[derive(Debug, Default, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default, rename_all = "camelCase")]
+pub struct FingerprintSettings {
+  pub manual_model: Option<String>,
+  pub interval_days: Option<u8>,
+  pub last_automatic_attempt_ms: Option<u64>,
+}
+
+impl FingerprintSettings {
+  pub fn automatic_due(&self, history: &[FingerprintRecord], now: u64) -> bool {
+    let Some(days) = self.interval_days.filter(|days| (1..=90).contains(days)) else { return false; };
+    let last = self.last_automatic_attempt_ms.into_iter().chain(history.first().map(|row| row.recorded_at_ms)).max();
+    last.is_none_or(|at| now >= at.saturating_add(u64::from(days) * 86_400_000))
+  }
+}
+
+#[cfg(test)]
+#[test]
+fn automatic_fingerprint_is_opt_in_and_not_due_again_after_restart() {
+  let mut settings = FingerprintSettings::default();
+  let now = 1_800_000_000_000;
+  assert!(!settings.automatic_due(&[], now));
+  settings.interval_days = Some(2);
+  assert!(settings.automatic_due(&[], now));
+  settings.last_automatic_attempt_ms = Some(now);
+  let loaded: FingerprintSettings = serde_json::from_str(&serde_json::to_string(&settings).unwrap()).unwrap();
+  assert!(!loaded.automatic_due(&[], now + 2 * 86_400_000 - 1));
+  assert!(loaded.automatic_due(&[], now + 2 * 86_400_000));
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct AccountRecord {
@@ -178,6 +221,8 @@ pub struct AccountRecord {
   pub created_at_ms: u64,
   #[serde(default, skip_serializing_if = "Vec::is_empty")]
   pub fingerprint_history: Vec<FingerprintRecord>,
+  #[serde(default)]
+  pub fingerprint_settings: FingerprintSettings,
   #[serde(default)]
   pub auto_alias: bool,
   #[serde(default)]
@@ -457,6 +502,8 @@ fn migrate_from_value(root: Value) -> Result<(AccountsStoreFile, bool), String> 
         fingerprint_history: item_obj.get("fingerprintHistory")
           .and_then(|value| serde_json::from_value::<Vec<FingerprintRecord>>(value.clone()).ok())
           .unwrap_or_default().into_iter().take(12).collect(),
+        fingerprint_settings: item_obj.get("fingerprintSettings")
+          .and_then(|value| serde_json::from_value(value.clone()).ok()).unwrap_or_default(),
         auto_alias,
         avatar_url,
         quota_text,

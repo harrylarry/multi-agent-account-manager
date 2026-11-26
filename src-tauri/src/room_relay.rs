@@ -22,6 +22,11 @@ pub(super) struct Verdict {
   reason: String,
 }
 
+impl Verdict {
+  pub(super) fn approved(&self) -> bool { self.decision == Decision::Approve }
+  pub(super) fn reason(&self) -> &str { &self.reason }
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct Proposal {
@@ -32,15 +37,15 @@ struct Proposal {
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 #[serde(default, rename_all = "camelCase")]
 pub(super) struct Relay {
-  next: usize,
+  pub(super) next: usize,
   revision_from: usize,
   cycle_from: usize,
-  pending_note: Option<String>,
+  pub(super) pending_note: Option<String>,
   notes: Vec<String>,
   pub(super) hold: Option<Hold>,
   proposal: Option<Proposal>,
   roster_history: Vec<Vec<Member>>,
-  final_attempt: Option<Uuid>,
+  pub(super) final_attempt: Option<Uuid>,
 }
 
 impl Room {
@@ -73,7 +78,7 @@ impl Room {
   }
 
   #[cfg(any(target_os = "ios", test))]
-  fn stage_members(&self) -> Vec<(Stage, &str)> {
+  pub(super) fn stage_members(&self) -> Vec<(Stage, &str)> {
     let mut steps = Vec::new();
     let mut append = |stage, role| {
       steps.extend(self.draft.members.iter().filter(|member| member.roles.contains(&role))
@@ -128,7 +133,7 @@ impl Room {
     Ok(())
   }
 
-  fn restart(&mut self) {
+  pub(super) fn restart(&mut self) {
     self.goal_revision += 1;
     self.relay.next = 0;
     self.relay.revision_from = self.attempts.len();
@@ -158,6 +163,7 @@ impl Room {
     self.validate_members(accounts, &proposal.members)?;
     let proposal = self.relay.proposal.take().expect("validated roster proposal");
     self.relay.roster_history.push(std::mem::replace(&mut self.draft.members, proposal.members));
+    self.lock_confirmed_roster();
     self.restart();
     Ok(())
   }
@@ -172,6 +178,7 @@ impl Room {
     if self.relay.proposal.is_some() { return Err("请先确认或取消成员变更".into()); }
     if self.phase == Phase::NeedsUser && self.relay.hold == Some(Hold::AccountUnavailable) {
       if self.exhausted().is_some() { return Err("已达到裁决上限".into()); }
+      self.reconsider_accounts();
       self.relay.hold = None;
       self.set_phase(Phase::Planning);
       return Ok(());
@@ -248,6 +255,7 @@ impl Room {
       self.draft.goal
     );
     for note in &self.relay.notes { prompt.push_str(&format!("\n\n用户补充要求：\n{note}")); }
+    self.append_record_context(&mut prompt, !(self.template.flow == Flow::Compare && stage == Stage::Work));
     if stage == Stage::Review {
       prompt.push_str(&format!("\n\n{{\"reviewId\":\"{attempt_id}\",\"decision\":\"approve\",\"reason\":\"填写实际审核理由\"}}"));
     }
@@ -258,7 +266,7 @@ impl Room {
       prompt.push_str(&format!("\n\n固定执行席位：共 {count} 位。"));
       if let Some(index) = execution { prompt.push_str(&format!(" 你是第 {} 位执行者。", index + 1)); }
     }
-    if stage == Stage::Work && self.template.flow == Flow::Compare { return Some(prompt); }
+    if stage == Stage::Work && self.template.flow == Flow::Compare { return (prompt.len() <= 64 * 1024).then_some(prompt); }
     let current = self.attempts.get(self.relay.revision_from..)?;
     let cycle_start = self.relay.cycle_from.checked_sub(self.relay.revision_from)?;
     let previous_cycle = current.get(..cycle_start)?;

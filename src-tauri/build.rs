@@ -41,6 +41,7 @@ const APP_COMMANDS: &[&str] = &[
   "muse_native_quota_probe",
   "muse_native_send_probe",
   "muse_native_fingerprint_probe",
+  "set_muse_fingerprint_settings",
   "muse_native_proxy_probe",
   "muse_native_set_account_proxy",
   "muse_native_get_account_proxy",

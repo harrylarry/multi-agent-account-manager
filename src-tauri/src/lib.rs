@@ -71,7 +71,10 @@ async fn manage_rooms(
   let mut initialized = gate.0.lock().await;
   let dir = app.path().app_data_dir().map_err(|_| "无法读取应用目录")?;
   let snapshot = mgr.get_snapshot().await;
-  let result = rooms::apply(&dir.join("rooms-v1.json"), command, &snapshot.accounts, !*initialized);
+  let accounts: Vec<_> = snapshot.accounts.into_iter().filter(|account|
+    !snapshot.conflicts.iter().any(|conflict| conflict.uuid == account.uuid)
+      && !snapshot.pending_cleanup.iter().any(|key| key.uuid == account.uuid)).collect();
+  let result = rooms::apply(&dir.join("rooms-v1.json"), command, &accounts, !*initialized);
   if let Ok(book) = &result {
     *initialized = true;
     if let Some((account, task)) = interrupt.and_then(|id| book.cancellation_target(id)) {
@@ -86,11 +89,13 @@ async fn manage_rooms(
 async fn run_room(
   app: AppHandle, mgr: State<'_, Arc<SessionManager>>, gate: State<'_, rooms::RoomGate>,
   ledger: State<'_, Arc<send_ledger::SendLedger>>, cancel: State<'_, Arc<probe_cancel::ProbeCancel>>,
+  fingerprints: State<'_, FingerprintGate>,
   id: uuid::Uuid, revision: u64, recover: bool,
 ) -> Result<rooms::RoomBook, String> {
   #[cfg(target_os = "ios")]
   {
     use tauri::Emitter;
+    let _exclusive = fingerprints.0.try_lock().map_err(|_| "Muse 指纹任务正在运行，请结束后再派发房间")?;
     let dir = app.path().app_data_dir().map_err(|_| "无法读取应用目录")?;
     let path = dir.join("rooms-v1.json");
     let mut next_revision = revision;
@@ -929,21 +934,46 @@ async fn muse_native_send_probe(
 
 /// #18：模型指纹探针（隔离会话发 3 条计数探针 + lmfpd 本地评分）。
 /// verdict 只有 scored 才是有效识别；partial 只是候选排名；indeterminate 不可判定。
+#[derive(Default)]
+struct FingerprintGate(tokio::sync::Mutex<()>);
+
+#[tauri::command]
+async fn set_muse_fingerprint_settings(
+  app: AppHandle, uuid: String, manual_model: Option<String>, interval_days: Option<u8>,
+  mgr: State<'_, Arc<SessionManager>>, cancel: State<'_, Arc<probe_cancel::ProbeCancel>>,
+) -> Result<ManagerSnapshot, String> {
+  let uuid = storage::normalize_uuid(&uuid).ok_or("账号标识无效")?;
+  let manual_model = manual_model.map(|name| name.trim().to_owned()).filter(|name| !name.is_empty());
+  if manual_model.as_ref().is_some_and(|name| name.chars().count() > 80 || name.chars().any(char::is_control))
+    || interval_days.is_some_and(|days| !(1..=90).contains(&days)) {
+    return Err("模型名称最长 80 字，自动重测间隔为 1–90 天".into());
+  }
+  let snapshot = mgr.save_muse_fingerprint_settings(&app, &uuid, manual_model, interval_days).await?;
+  if interval_days.is_none() { cancel.cancel_kind(&uuid, "fingerprint_automatic"); }
+  Ok(snapshot)
+}
+
 #[tauri::command]
 async fn muse_native_fingerprint_probe(
   app: AppHandle,
   provider_id: String,
   uuid: String,
   task_id: String,
+  automatic: Option<bool>,
   ledger: tauri::State<'_, std::sync::Arc<send_ledger::SendLedger>>,
   mgr: State<'_, Arc<SessionManager>>,
   cancel: State<'_, Arc<probe_cancel::ProbeCancel>>,
+  fingerprints: State<'_, FingerprintGate>,
+  rooms_gate: State<'_, rooms::RoomGate>,
 ) -> Result<muse_native::FingerprintProbe, String> {
   if provider_id != "muse" {
     return Err("指纹探针只支持 Muse 账号".to_string());
   }
   let uuid = storage::normalize_uuid(&uuid).ok_or("账号标识无效")?;
   let task_id = uuid::Uuid::parse_str(&task_id).map_err(|_| "指纹任务标识无效".to_string())?;
+  let automatic = automatic.unwrap_or(false);
+  let _exclusive = fingerprints.0.try_lock().map_err(|_| "已有房间或指纹任务运行")?;
+  let dir = app.path().app_data_dir().map_err(|e| e.to_string())?;
   let proxy_guard = mgr.proxy_write_lock.lock().await;
   let snapshot = mgr.get_snapshot().await;
   let matching = snapshot.accounts.iter().find(|account| account.uuid == uuid
@@ -953,10 +983,22 @@ async fn muse_native_fingerprint_probe(
     || snapshot.pending_cleanup.iter().any(|key| key.uuid == uuid) {
     return Err("请先处理账号归属或清理状态".into());
   }
-  let (token, _guard) = cancel.register_task(&uuid, "fingerprint", task_id);
+  let (token, _guard) = cancel.register_task(&uuid, if automatic { "fingerprint_automatic" } else { "fingerprint" }, task_id);
+  if automatic {
+    #[cfg(not(target_os = "ios"))]
+    return Err("自动指纹重测需要 iOS".into());
+    #[cfg(target_os = "ios")]
+    {
+      let _rooms = rooms_gate.0.lock().await;
+      if rooms::apply(&dir.join("rooms-v1.json"), rooms::Command::List, &snapshot.accounts, false)?.has_active_room()
+        || matching.quota_observation.as_ref().and_then(|quota| quota.remaining(storage::now_ms())).unwrap_or(0) == 0
+      { return Err("房间活跃或尚未确认 Muse 剩余额度，自动重测暂缓".into()); }
+    }
+  }
+  #[cfg(not(target_os = "ios"))]
+  let _ = rooms_gate;
   let setting = matching.proxy.clone();
   drop(proxy_guard);
-  let dir = app.path().app_data_dir().map_err(|e| e.to_string())?;
   let secrets = secrets::Secrets::new(&dir);
   #[cfg(target_os = "ios")]
   let (foreground, reason) = {
@@ -984,6 +1026,8 @@ async fn muse_native_fingerprint_probe(
       .map_err(|_| "无法保持指纹探针前台运行，请在叠号前台重试".to_string())?;
     (guard, reason)
   };
+  #[cfg(target_os = "ios")]
+  if automatic { mgr.claim_automatic_fingerprint(&uuid).await?; }
 
   let result = Box::pin(muse_native::fingerprint_probe(
     &app,
@@ -1637,6 +1681,7 @@ pub fn run() {
     })
     .manage(std::sync::Arc::new(muse_native::LivenessState::default()))
     .manage(std::sync::Arc::new(probe_cancel::ProbeCancel::new()))
+    .manage(FingerprintGate::default())
     .manage(std::sync::Arc::new(quota::ActionCache::default()))
     .invoke_handler(tauri::generate_handler![
       get_manager_state,
@@ -1676,6 +1721,7 @@ pub fn run() {
       muse_native_quota_probe,
       muse_native_send_probe,
       muse_native_fingerprint_probe,
+      set_muse_fingerprint_settings,
       muse_native_proxy_probe,
       muse_native_set_account_proxy,
       muse_native_get_account_proxy,

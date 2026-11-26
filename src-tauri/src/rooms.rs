@@ -7,6 +7,10 @@ use uuid::Uuid;
 
 #[path = "room_relay.rs"]
 mod relay;
+#[path = "room_assignment.rs"]
+mod assignment;
+#[path = "room_records.rs"]
+mod records;
 use relay::{Hold, Relay, Stage, Verdict};
 
 #[derive(Default)]
@@ -60,6 +64,8 @@ pub struct RoomDraft {
   template_id: String,
   round_limit: u8,
   members: Vec<Member>,
+  #[serde(default)]
+  automatic: bool,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -88,6 +94,10 @@ struct Room {
   approved_at_ms: Option<u64>,
   #[serde(default)]
   relay: Relay,
+  #[serde(default)]
+  assignment: assignment::Assignment,
+  #[serde(default)]
+  records: records::RoomRecords,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -219,6 +229,9 @@ pub struct RoomBook {
 
 impl RoomBook {
   #[cfg(target_os = "ios")]
+  pub fn has_active_room(&self) -> bool { self.rooms.iter().any(Room::in_progress) }
+
+  #[cfg(target_os = "ios")]
   pub fn next_relay_revision(&self, id: Uuid) -> Option<u64> {
     let room = self.rooms.iter().find(|room| room.id == id)?;
     (room.template.flow != Flow::Solo && room.phase == Phase::Planning).then_some(room.revision)
@@ -227,7 +240,8 @@ impl RoomBook {
   #[cfg(target_os = "ios")]
   pub fn after_relay_attempt(&self, id: Uuid, completed: &RoomAttempt) -> Option<u64> {
     self.rooms.iter().find(|room| room.id == id)?.attempts.last()
-      .filter(|step| step.id == completed.id && step.worker_id == completed.worker_id && step.delivery.is_some())?;
+      .filter(|step| step.id == completed.id && step.worker_id == completed.worker_id
+        && (step.delivery.is_some() || step.status == "not_sent"))?;
     self.next_relay_revision(id)
   }
 
@@ -249,7 +263,9 @@ impl RoomBook {
 #[serde(tag = "action", rename_all = "snake_case", rename_all_fields = "camelCase")]
 pub enum Command {
   List,
-  Create { draft: RoomDraft },
+  Create { draft: RoomDraft, #[serde(default)] references: Vec<Uuid> },
+  SetReferences { id: Uuid, revision: u64, source_ids: Vec<Uuid> },
+  DeleteRecord { id: Uuid, revision: u64 },
   Prepare { id: Uuid, revision: u64 },
   Pause { id: Uuid, revision: u64 },
   Resume { id: Uuid, revision: u64 },
@@ -276,6 +292,7 @@ fn read(path: &Path, recover: bool) -> Result<RoomBook, String> {
   if book.version != 1 { return Err("房间文件版本不受支持".into()); }
   book.templates = Template::builtin();
   book.templates.extend(book.custom_templates.clone());
+  for room in &mut book.rooms { room.restore_brief(); }
   let mut recovered = false;
   if recover {
     for room in &mut book.rooms {
@@ -293,7 +310,7 @@ pub fn apply(path: &Path, command: Command, accounts: &[AccountRecord], recover:
   let mut book = read(path, recover)?;
   match command {
     Command::List => return Ok(book),
-    Command::Create { mut draft } => {
+    Command::Create { mut draft, references } => {
       draft.name = draft.name.trim().into();
       draft.goal = draft.goal.trim().into();
       if draft.name.is_empty() || draft.name.chars().count() > 80 || draft.goal.is_empty()
@@ -303,14 +320,28 @@ pub fn apply(path: &Path, command: Command, accounts: &[AccountRecord], recover:
         return Err("请检查房间名称、目标、成员和 1–24 轮上限".into());
       }
       let template = book.templates.iter().find(|item| item.id == draft.template_id).ok_or("模板不存在")?.clone();
-      let room = Room {
+      let mut room = Room {
         id: Uuid::new_v4(), revision: 0, draft, template, phase: Phase::Created,
         rounds: 0, returned: 0, run_id: None, steps: vec![Transition { at_ms: now_ms(), phase: Phase::Created }],
         attempts: Vec::new(), goal_revision: 0, rework_note: String::new(), approved_at_ms: None,
         relay: Relay::default(),
+        assignment: assignment::Assignment::default(), records: records::RoomRecords::default(),
       };
-      room.validate(accounts)?;
+      room.records.references = book.resolve_references(None, &references)?;
+      if room.draft.automatic || room.draft.members.iter().any(|member| member.roles.is_empty()) {
+        room.assign_initial(accounts)?;
+      }
+      else { room.validate(accounts)?; }
       book.rooms.insert(0, room);
+    }
+    Command::SetReferences { id, revision, source_ids } => {
+      let references = book.resolve_references(Some(id), &source_ids)?;
+      room_at_revision(&mut book, id, revision)?.set_references(references)?;
+    }
+    Command::DeleteRecord { id, revision } => {
+      let room = room_at_revision(&mut book, id, revision)?;
+      if room.in_progress() { return Err("请先结束活跃房间".into()); }
+      book.rooms.retain(|room| room.id != id);
     }
     Command::SaveTemplate { title, base_id, min_participants } => {
       let title = title.trim();
@@ -374,10 +405,13 @@ pub fn apply(path: &Path, command: Command, accounts: &[AccountRecord], recover:
         save_json_atomic(path, &book)?;
         return Ok(book);
       }
-      if matches!(signal, Signal::Prepare | Signal::Resume) { room.validate(accounts)?; }
+      if matches!(signal, Signal::Prepare | Signal::Resume) && !room.draft.automatic { room.validate(accounts)?; }
       if room.template.flow != Flow::Solo && matches!(signal, Signal::Resume) { room.resume_relay()?; }
       else { room.transition(signal)?; }
-      if matches!(signal, Signal::Confirm) { room.approved_at_ms = Some(now_ms()); }
+      if matches!(signal, Signal::Confirm) {
+        room.approved_at_ms = Some(now_ms());
+        room.record_final_decision();
+      }
       if let Some(note) = rework {
         room.goal_revision += 1;
         room.rework_note = note;
@@ -424,6 +458,11 @@ pub fn begin_dispatch(
     attempt
   } else {
     if room.phase != Phase::Planning { return Err("当前房间不能开始派发".into()); }
+    if room.draft.automatic && !room.resolve_automatic_step(accounts)? {
+      room.hold(Hold::AccountUnavailable);
+      save_json_atomic(path, &book)?;
+      return Ok(None);
+    }
     let (member_uuid, stage) = if room.template.flow == Flow::Solo {
       (room.draft.members[0].uuid.clone(), None)
     } else {
@@ -446,6 +485,8 @@ pub fn begin_dispatch(
       prompt = text;
     } else {
       prompt = room.solo_prompt();
+      room.append_record_context(&mut prompt, true);
+      if prompt.len() > 64 * 1024 { return Err("引用与任务材料过长，请减少引用".into()); }
     }
     room.transition(Signal::PlanReady)?;
     if room.phase != Phase::Dispatching {
@@ -534,10 +575,14 @@ pub fn record(path: &Path, dispatch: &Dispatch, event: Milestone) -> Result<Room
         room.transition(Signal::Reply)?;
         room.transition(Signal::Assembled)?;
       }
+      room.record_completed_step();
     }
     Milestone::FailedBeforeSending if phase == Phase::Dispatching => {
       attempt.status = "not_sent".into();
-      if attempt.stage.is_some() { room.relay_send_failed(); }
+      if attempt.stage.is_some() {
+        if room.draft.automatic { room.automatic_send_failed(); }
+        else { room.relay_send_failed(); }
+      }
       else { room.transition(Signal::Failed)?; }
     }
     Milestone::Uncertain if matches!(phase, Phase::Dispatching | Phase::WaitingReply) => {
@@ -570,10 +615,11 @@ mod tests {
     Room {
       id: Uuid::new_v4(), revision: 0, draft: RoomDraft {
         name: "Test".into(), goal: "Goal".into(), template_id: template.id.clone(),
-        round_limit: limit, members: Vec::new(),
+        round_limit: limit, members: Vec::new(), automatic: false,
       }, template, phase: Phase::Created, rounds: 0, returned: 0, run_id: None, steps: Vec::new(),
       attempts: Vec::new(), goal_revision: 0, rework_note: String::new(), approved_at_ms: None,
       relay: Relay::default(),
+      assignment: assignment::Assignment::default(), records: records::RoomRecords::default(),
     }
   }
 
@@ -607,11 +653,11 @@ mod tests {
       Member { uuid: "a".into(), roles: vec![Role::Commander, Role::Reviewer] },
       Member { uuid: "b".into(), roles: vec![Role::Executor, Role::Reviewer, Role::Publisher] },
     ];
-    assert!(apply(&path, Command::Create { draft: draft.clone() }, &accounts, false).is_err());
+    assert!(apply(&path, Command::Create { draft: draft.clone(), references: Vec::new() }, &accounts, false).is_err());
     assert!(!path.exists());
     draft.members[1].roles.retain(|role| *role != Role::Reviewer);
-    apply(&path, Command::Create { draft: draft.clone() }, &accounts, false).unwrap();
-    let two = apply(&path, Command::Create { draft }, &accounts, false).unwrap();
+    apply(&path, Command::Create { draft: draft.clone(), references: Vec::new() }, &accounts, false).unwrap();
+    let two = apply(&path, Command::Create { draft, references: Vec::new() }, &accounts, false).unwrap();
     let first = two.rooms[0].id;
     let second = two.rooms[1].id;
     let started = apply(&path, Command::Prepare { id: first, revision: 0 }, &accounts, false).unwrap();
@@ -633,7 +679,7 @@ mod tests {
       "providerId":"muse", "uuid":"a", "alias":"a", "createdAtMs":0, "authState":"authenticated",
     })).unwrap();
     let accounts = [account];
-    let created = apply(&path, Command::Create { draft }, &accounts, false).unwrap();
+    let created = apply(&path, Command::Create { draft, references: Vec::new() }, &accounts, false).unwrap();
     let id = created.rooms[0].id;
     let ready = apply(&path, Command::Prepare { id, revision:0 }, &accounts, false).unwrap();
     let dispatch = begin_dispatch(&path, id, ready.rooms[0].revision, &accounts, false).unwrap().unwrap();
@@ -680,7 +726,7 @@ mod tests {
       })).unwrap()).into();
       let mut draft = room(flow, limit).draft;
       draft.members = roles.iter().map(|(uuid, roles)| Member { uuid:(*uuid).into(), roles:roles.to_vec() }).collect();
-      let created = apply(&path, Command::Create { draft }, &accounts, false).unwrap();
+      let created = apply(&path, Command::Create { draft, references: Vec::new() }, &accounts, false).unwrap();
       let id = created.rooms[0].id;
       apply(&path, Command::Prepare { id, revision:0 }, &accounts, false).unwrap();
       Self { dir, path, accounts, id }
@@ -727,6 +773,71 @@ mod tests {
     ("a", &[Role::Executor]),
     ("b", &[Role::Commander, Role::Reviewer, Role::Publisher]),
   ];
+
+  #[test]
+  fn automatic_assignment_uses_comparable_quota_and_preserves_fixed_roles_on_failure() {
+    let fixture = RelayFixture::new(Flow::Review, 8, REVIEW_ROLES);
+    let now = now_ms();
+    let mut accounts = fixture.accounts.clone();
+    for (account, used) in accounts.iter_mut().zip([10, 65, 10, 5]) {
+      account.quota_observation = Some(crate::storage::QuotaObservation {
+        source:"native".into(), window:Some("daily".into()), percent_used:Some(used), resets_at_ms:None,
+        checked_at_ms:now, stale:false,
+      });
+    }
+    accounts[2].fingerprint_settings.manual_model = Some("model-c".into());
+    accounts[3].quota_observation.as_mut().unwrap().window = Some("weekly".into());
+    let mut room = fixture.get();
+    room.draft.automatic = true;
+    room.draft.members.clear();
+    room.assign_initial(&accounts).unwrap();
+    assert_eq!(room.next_step(), Some((Stage::Work, "c")));
+    assert!(serde_json::to_string(&room).unwrap().contains("model-c"));
+    let mut book = read(&fixture.path, false).unwrap();
+    book.rooms = vec![room];
+    save_json_atomic(&fixture.path, &book).unwrap();
+    let first = begin_dispatch(&fixture.path, fixture.id, fixture.get().revision, &accounts, false).unwrap().unwrap();
+    record(&fixture.path, &first, Milestone::FailedBeforeSending).unwrap();
+    let replacement = begin_dispatch(&fixture.path, fixture.id, fixture.get().revision, &accounts, false).unwrap().unwrap();
+    assert_eq!(replacement.attempt.account_uuid, "a");
+    assert_eq!(fixture.get().rounds, 0);
+    // A potentially written attempt must keep its original identity and stop dispatch.
+    record(&fixture.path, &replacement, Milestone::Uncertain).unwrap();
+    assert_eq!(fixture.get().phase, Phase::NeedsReconciliation);
+    assert!(begin_dispatch(&fixture.path, fixture.id, fixture.get().revision, &accounts, false).is_err());
+
+    let mut fixed = fixture.get();
+    fixed.draft.members = vec![Member { uuid:"c".into(), roles:vec![Role::Executor] }];
+    fixed.assign_initial(&accounts).unwrap();
+    assert_eq!(fixed.draft.members[0].roles, vec![Role::Executor]);
+    accounts[2].quota_observation.as_mut().unwrap().stale = true;
+    assert!(!fixed.resolve_automatic_step(&accounts).unwrap());
+    assert_eq!(fixed.next_step(), Some((Stage::Work, "c")));
+  }
+
+  #[test]
+  fn only_finalized_explicit_references_enter_context_and_can_be_removed() {
+    let fixture = RelayFixture::new(Flow::Review, 8, REVIEW_ROLES);
+    assert!(read(&fixture.path, false).unwrap().resolve_references(None, &[fixture.id]).is_err());
+    let work = fixture.send(Stage::Work, "a");
+    fixture.reply(&work, "Draft");
+    let review = fixture.send(Stage::Review, "b");
+    fixture.audit(&review, "approve");
+    let publish = fixture.send(Stage::Publish, "b");
+    fixture.reply(&publish, "ACCEPTED PROJECT CONCLUSION");
+    fixture.command(Command::Confirm { id:fixture.id, revision:fixture.get().revision }).unwrap();
+    let book = read(&fixture.path, false).unwrap();
+    assert!(serde_json::to_string(&book).unwrap().contains("用户已确认本次交付定稿"));
+    assert!(book.resolve_references(Some(fixture.id), &[fixture.id]).is_err());
+    let draft = fixture.get().draft;
+    let target = fixture.command(Command::Create { draft, references:vec![fixture.id] }).unwrap().rooms[0].id;
+    let state = fixture.command(Command::Prepare { id:target, revision:0 }).unwrap();
+    let step = begin_dispatch(&fixture.path, target, state.rooms[0].revision, &fixture.accounts, false).unwrap().unwrap();
+    assert!(step.prompt.contains("ACCEPTED PROJECT CONCLUSION"));
+    assert!(step.prompt.contains(&sha256("ACCEPTED PROJECT CONCLUSION")));
+    assert!(fixture.command(Command::SetReferences { id:target, revision:read(&fixture.path, false).unwrap().rooms[0].revision,
+      source_ids:Vec::new() }).is_err());
+  }
 
   #[test]
   fn build_routes_two_executors_to_independent_review_then_publisher_with_audit_rework() {

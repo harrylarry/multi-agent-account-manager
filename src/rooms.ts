@@ -30,11 +30,20 @@ interface Attempt { accountUuid: string; status: string; sessionId: string | nul
   delivery: { kind: string; text: string; capturedAtMs: number; source: string; sha256: string } | null }
 interface Room {
   id: string; revision: number; phase: string; rounds: number; returned: number;
-  draft: { name: string; goal: string; roundLimit: number; members: Member[] };
+  draft: { name: string; goal: string; roundLimit: number; members: Member[]; automatic?: boolean };
   template: Template;
   steps: { phase: string; atMs: number }[];
   attempts: Attempt[];
   approvedAtMs: number | null;
+  assignment?: {
+    quotaWindow?: string; fixed?: string[];
+    basis?: (Member & { remaining?: number; model?: string; modelSource?: string; fixed?: boolean })[];
+    changes?: { from: string; to: string; atMs: number }[];
+  };
+  records?: {
+    brief: { kind: string; text: string; accountUuid: string; sha256: string; goalRevision: number }[];
+    references: { roomId: string; title: string; sha256: string; excerpt: string; truncated: boolean }[];
+  };
   relay?: {
     hold?: string; pendingNote?: string; notes?: string[]; finalAttempt?: string;
     proposal?: { id: string; members: Member[] };
@@ -43,13 +52,39 @@ interface Room {
 export interface RoomBook { templates: Template[]; rooms: Room[] }
 export interface RoomsView { kind: "rooms"; book: RoomBook | null; busy: boolean; error: string; runningRoomId?: string }
 
+function relatedTerms(text: string): Set<string> {
+  const terms = new Set<string>();
+  for (const word of text.toLowerCase().match(/[a-z0-9]{3,}|[\p{Script=Han}]{2,}/gu) ?? []) {
+    const letters = Array.from(word);
+    if (/[a-z0-9]/.test(word)) terms.add(word);
+    else for (let index = 1; index < letters.length; index++) terms.add(letters[index - 1] + letters[index]);
+  }
+  return terms;
+}
+
+export function markRoomSuggestions(book: RoomBook | null, goal: string): void {
+  const terms = relatedTerms(goal);
+  const related = (book?.rooms ?? []).filter((room) => room.phase === "finalized")
+    .map((room) => ({ id: room.id, score: [...relatedTerms(room.draft.name + " " + room.draft.goal)].filter((term) => terms.has(term)).length }))
+    .filter((room) => room.score >= 2).sort((a, b) => b.score - a.score).slice(0, 3);
+  for (const label of document.querySelectorAll<HTMLElement>("[data-room-new] [data-related-room]")) {
+    label.hidden = !related.some((room) => room.id === label.dataset.relatedRoom);
+  }
+}
+
 export function renderRooms(view: RoomsView, accounts: AccountRecord[], esc: (text: string) => string): string {
   const muse = accounts.filter((account) => account.providerId === "muse");
   const options = view.book?.templates.map((item) => `<option value="${esc(item.id)}">${esc(item.title)} · 至少 ${item.minParticipants} 人</option>`).join("") ?? "";
   const name = (uuid: string) => esc(muse.find((account) => account.uuid === uuid)?.alias ?? "原成员");
   const memberLine = (member: Member) => `${name(member.uuid)} · ${member.roles.map((role) => roles.find(([id]) => id === role)?.[1] ?? "").join("、")}`;
-  const roster = (selected: Member[]) => muse.map((account) => `<fieldset class="hark-reply" data-room-member="${esc(account.uuid)}"><legend>${esc(account.alias)}</legend>
-    ${roles.map(([id, label]) => `<label><input type="checkbox" value="${id}" ${selected.some((member) => member.uuid === account.uuid && member.roles.includes(id)) ? "checked" : ""}> ${label}</label> `).join("")}
+  const referenceOptions = (target?: Room) => (view.book?.rooms ?? [])
+    .filter((source) => source.phase === "finalized" && source.id !== target?.id)
+    .map((source) => `<label><input data-room-reference type="checkbox" value="${esc(source.id)}"
+      ${target?.records?.references.some((reference) => reference.roomId === source.id) ? "checked" : ""}> ${esc(source.draft.name)}
+      <small data-related-room="${esc(source.id)}" hidden> · 与目标相关</small></label>`).join("<br>");
+  const roster = (selected: Member[], creating = false) => muse.map((account) => `<fieldset class="hark-reply" data-room-member="${esc(account.uuid)}"><legend>${esc(account.alias)}</legend>
+    ${creating ? '<label><input type="checkbox" data-room-include> 纳入手选成员</label> ' : ""}
+    ${roles.map(([id, label]) => `<label><input type="checkbox" data-room-role value="${id}" ${selected.some((member) => member.uuid === account.uuid && member.roles.includes(id)) ? "checked" : ""}> ${label}</label> `).join("")}
     </fieldset>`).join("") || '<div class="modal-desc">先添加 Muse 账号，再选择房间成员。</div>';
   return `
     <div class="inline-modal" role="dialog" aria-modal="true" aria-labelledby="rooms-title">
@@ -84,7 +119,29 @@ export function renderRooms(view: RoomsView, accounts: AccountRecord[], esc: (te
               <summary>${esc(room.draft.name)} · ${phaseNames[room.phase] ?? esc(room.phase)} · ${room.rounds}/${room.draft.roundLimit} 轮</summary>
               <div class="hark-reply-text">${esc(room.draft.goal)}</div>
               <div class="modal-desc">${esc(room.template.title)} · v${room.template.version}</div>
-              ${room.draft.members.map((member) => `<div>${memberLine(member)}</div>`).join("")}
+              ${room.draft.automatic ? `<div class="modal-desc">自动分派${room.assignment?.quotaWindow ? ` · ${esc(room.assignment.quotaWindow)}额度窗口` : ""}</div>` : ""}
+              ${room.draft.members.map((member) => {
+                const basis = room.assignment?.basis?.find((entry) => entry.uuid === member.uuid);
+                return `<div>${memberLine(member)}${room.assignment?.fixed?.includes(member.uuid) ? " · 已固定" : ""}${basis?.remaining != null ? ` · 分派时剩余 ${basis.remaining}%` : ""}
+                  ${basis?.model ? ` · ${basis.modelSource === "manual" ? "手动模型" : "指纹候选"} ${esc(basis.model)}` : ""}</div>`;
+              }).join("")}
+              ${room.assignment?.changes?.length ? `<details><summary>自动换人（${room.assignment.changes.length}）</summary>
+                ${room.assignment.changes.map((change) => `<div>${name(change.from)} → ${name(change.to)} · ${new Date(change.atMs).toLocaleString()}</div>`).join("")}</details>` : ""}
+              <details><summary>运行简报</summary>
+                <div>阶段 · ${phaseNames[room.phase] ?? esc(room.phase)}</div>
+                ${room.records?.brief.length ? room.records.brief.map((entry) => `<div class="hark-reply">
+                  <div>${({decision:"决定", dependency:"依赖与计划", todo:"待办", observation:"会话摘录"} as Record<string,string>)[entry.kind] ?? "记录"} · ${name(entry.accountUuid)} · 目标版本 ${entry.goalRevision + 1}</div>
+                  <div class="hark-reply-text">${esc(entry.text)}</div><div class="modal-desc">来源 SHA-256 ${esc(entry.sha256.slice(0, 12))}</div>
+                  </div>`).join("") : '<div class="modal-desc">等待会话结果入账。</div>'}
+              </details>
+              ${room.records?.references.length ? `<details><summary>已引用定稿（${room.records.references.length}）</summary>
+                ${room.records.references.map((reference) => `<div class="hark-reply"><div>${esc(reference.title)}${reference.truncated ? " · 节选" : ""}</div>
+                  <div class="hark-reply-text">${esc(reference.excerpt)}</div><div class="modal-desc">来源 SHA-256 ${esc(reference.sha256.slice(0, 12))}</div>
+                  ${view.book?.rooms.some((source) => source.id === reference.roomId) ? `<button type="button" class="btn" data-room-action="show_record" data-room-id="${esc(reference.roomId)}">查看源房间</button>` : "原房间已删除"}
+                </div>`).join("")}</details>` : ""}
+              ${["created","paused"].includes(room.phase) && (referenceOptions(room) || room.records?.references.length) ? `<details data-room-references><summary>调整旧房间引用</summary>
+                ${referenceOptions(room)}
+                <button type="button" class="btn" data-room-action="set_references" data-room-id="${room.id}" data-room-revision="${room.revision}">确认选定引用</button></details>` : ""}
               ${multi && ["build", "review"].includes(room.template.flow) ? `<div class="modal-desc">审核打回 ${room.returned}/3</div>` : ""}
               ${hold && room.phase === "needs_user" ? `<div role="status">${esc(holdReasons[hold] ?? "需要用户裁决")}</div>` : ""}
               ${running ? `<div role="status">${attempt?.stage && !attempt.delivery ? `${stageNames[attempt.stage]} · ${name(attempt.accountUuid)} · ` : ""}正在等待发送确认或回复。</div>` : ""}
@@ -117,6 +174,9 @@ export function renderRooms(view: RoomsView, accounts: AccountRecord[], esc: (te
               <div class="proxy-pool-actions">
                 ${actions.map(([action, label]) => `<button type="button" class="btn" data-room-action="${action}" data-room-id="${room.id}" data-room-revision="${room.revision}">${label}</button>`).join("")}
               </div>
+              ${["created","stopped","failed","finalized"].includes(room.phase) ? `<details data-room-delete><summary>删除房间记录</summary>
+                <label><input type="checkbox"> 确认删除本机记录。其他房间已引用的节选会保留。</label>
+                <button type="button" class="btn" data-room-action="delete_record" data-room-id="${room.id}" data-room-revision="${room.revision}">删除本机记录</button></details>` : ""}
             </details>`;
           }).join("") ?? ""}
           ${view.book ? `
@@ -125,7 +185,13 @@ export function renderRooms(view: RoomsView, accounts: AccountRecord[], esc: (te
               <label for="room-goal">任务目标和参考资料</label><textarea id="room-goal" class="modal-input" maxlength="8000"></textarea>
               <label for="room-template">模板</label><select id="room-template" class="modal-input">${options}</select>
               <label for="room-round-limit">轮次上限</label><input id="room-round-limit" class="modal-input" type="number" min="1" max="24" value="8">
-              ${roster([])}
+              <label for="room-assignment">成员分派</label><select id="room-assignment" class="modal-input">
+                <option value="manual">手选成员与角色</option><option value="automatic">自动分派与换人</option>
+              </select>
+              <div class="modal-desc">自动模式可从所有符合条件的 Muse 账号选人和换人。手选模式可勾成员，让房间在这些成员内分派。勾具体角色即固定分工。</div>
+              <button type="button" class="btn" data-room-action="refresh_assignment_quota">刷新 Muse 额度</button>
+              ${roster([], true)}
+              ${referenceOptions() ? `<details><summary>选择要引用的旧房间（最多 5 个）</summary>${referenceOptions()}</details>` : ""}
               <button type="button" class="btn primary" data-room-action="create">保存房间</button>
             </details>
             <details class="hark-reply"><summary>自定义模板</summary>
@@ -144,19 +210,25 @@ export function renderRooms(view: RoomsView, accounts: AccountRecord[], esc: (te
 export function roomCommand(button: HTMLElement): { action?: string; id?: string; revision?: number; [key: string]: unknown } {
   const action = button.dataset.roomAction;
   const value = (id: string) => document.querySelector<HTMLInputElement | HTMLTextAreaElement | HTMLSelectElement>(`#${id}`)?.value ?? "";
+  const sourceIds = (scope: Element | null) =>
+    Array.from(scope?.querySelectorAll<HTMLInputElement>("[data-room-reference]:checked") ?? [], (input) => input.value);
   if (action === "create" || action === "propose_roster") {
     const panel = button.closest("[data-room-new], [data-room-roster]");
+    const automatic = action === "create" && value("room-assignment") === "automatic";
     const members = Array.from(panel?.querySelectorAll<HTMLElement>("[data-room-member]") ?? [], (element) => ({
-      uuid: element.dataset.roomMember,
-      roles: Array.from(element.querySelectorAll<HTMLInputElement>("input:checked"), (input) => input.value),
-    })).filter((item) => item.roles.length > 0);
+      selected: !automatic && !!element.querySelector("[data-room-include]:checked"),
+      member: { uuid: element.dataset.roomMember,
+        roles: Array.from(element.querySelectorAll<HTMLInputElement>("[data-room-role]:checked"), (input) => input.value) },
+    })).filter((item) => item.selected || item.member.roles.length > 0).map((item) => item.member);
     if (action === "propose_roster") return { action, id: button.dataset.roomId, revision: Number(button.dataset.roomRevision), members };
-    return { action, draft: { name: value("room-name"), goal: value("room-goal"),
-      templateId: value("room-template"), roundLimit: Number(value("room-round-limit")), members } };
+    return { action, references: sourceIds(panel), draft: { name: value("room-name"), goal: value("room-goal"),
+      templateId: value("room-template"), roundLimit: Number(value("room-round-limit")), members,
+      automatic } };
   }
   if (action === "save_template") return { action, title: value("room-template-title"),
     baseId: value("room-template-base"), minParticipants: Number(value("room-template-min")) };
   return { action, id: button.dataset.roomId, revision: Number(button.dataset.roomRevision),
     ...(action === "rework" || action === "supplement" ? { note: value(`rework-${button.dataset.roomId}`) } : {}),
-    ...(action === "confirm_roster" ? { proposalId: button.dataset.roomProposal } : {}) };
+    ...(action === "confirm_roster" ? { proposalId: button.dataset.roomProposal } : {}),
+    ...(action === "set_references" ? { sourceIds: sourceIds(button.closest("[data-room-references]")) } : {}) };
 }

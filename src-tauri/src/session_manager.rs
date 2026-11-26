@@ -1128,7 +1128,8 @@ impl SessionManager {
       updated.accounts.push(AccountRecord {
         provider_id: saved.provider_id, uuid: saved.uuid, alias: saved.alias,
         group: saved.group, timezone: saved.timezone, last_muse_thread: saved.last_muse_thread,
-        created_at_ms: saved.created_at_ms, fingerprint_history: Vec::new(), auto_alias: false,
+        created_at_ms: saved.created_at_ms, fingerprint_history: Vec::new(),
+        fingerprint_settings: Default::default(), auto_alias: false,
         avatar_url: None, quota_text: None, quota_percent: None, quota_detail: None, quota_observation: None,
         auth_state: AuthState::Unknown, has_unread_reply: false, last_task_reply_at_ms: None,
         muse_unread_counts: Default::default(), muse_unread_status: None,
@@ -1931,6 +1932,7 @@ impl SessionManager {
         last_muse_thread: None,
         created_at_ms: now_ms(),
         fingerprint_history: Vec::new(),
+        fingerprint_settings: Default::default(),
         auto_alias,
         avatar_url: None,
         quota_text: None,
@@ -2196,6 +2198,48 @@ impl SessionManager {
     let snapshot = Self::snapshot_from_locked(&locked);
     drop(locked);
     self.emit_snapshot(app, &snapshot);
+    Ok(())
+  }
+
+  pub async fn save_muse_fingerprint_settings(
+    &self, app: &AppHandle, uuid: &str, manual_model: Option<String>, interval_days: Option<u8>,
+  ) -> Result<ManagerSnapshot, String> {
+    let mut locked = self.inner.lock().await;
+    if locked.conflicts.iter().any(|item| item.uuid == uuid) { return Err("请先处理账号归属冲突".into()); }
+    let index = locked.store.accounts.iter().position(|account| {
+      account.provider_id == ProviderId::Muse && account.uuid == uuid
+    }).ok_or("Muse 账号不存在")?;
+    let previous = locked.store.accounts[index].fingerprint_settings.clone();
+    let settings = &mut locked.store.accounts[index].fingerprint_settings;
+    settings.manual_model = manual_model;
+    settings.interval_days = interval_days;
+    if let Err(error) = save_store_atomic(&locked.store_path, &locked.store) {
+      locked.store.accounts[index].fingerprint_settings = previous;
+      return Err(error);
+    }
+    let snapshot = Self::snapshot_from_locked(&locked);
+    drop(locked);
+    self.emit_snapshot(app, &snapshot);
+    Ok(snapshot)
+  }
+
+  #[cfg(target_os = "ios")]
+  pub async fn claim_automatic_fingerprint(&self, uuid: &str) -> Result<(), String> {
+    let mut locked = self.inner.lock().await;
+    let now = crate::storage::now_ms();
+    let index = locked.store.accounts.iter().position(|account| {
+      account.provider_id == ProviderId::Muse && account.uuid == uuid
+        && account.auth_state == crate::storage::AuthState::Authenticated
+    }).ok_or("Muse 账号不可用")?;
+    let account = &mut locked.store.accounts[index];
+    if !account.fingerprint_settings.automatic_due(&account.fingerprint_history, now) {
+      return Err("自动重测未启用或未到期".into());
+    }
+    let previous = account.fingerprint_settings.last_automatic_attempt_ms.replace(now);
+    if let Err(error) = save_store_atomic(&locked.store_path, &locked.store) {
+      locked.store.accounts[index].fingerprint_settings.last_automatic_attempt_ms = previous;
+      return Err(error);
+    }
     Ok(())
   }
 

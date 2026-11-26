@@ -151,6 +151,12 @@ impl ProbeCancel {
     }
   }
 
+  pub fn cancel_kind(&self, account: &str, kind: &str) {
+    if let Some(entries) = self.entries.lock().unwrap().get(account) {
+      for entry in entries.iter().filter(|entry| entry.kind == kind) { let _ = entry.tx.send(true); }
+    }
+  }
+
   /// 取消该账号**所有**正在运行的任务，返回命中的任务数。
   pub fn cancel_account(&self, account: &str) -> usize {
     let entries = self.entries.lock().unwrap();
