@@ -3230,11 +3230,19 @@ async function submitNewAccount(view: Extract<ModalMode, { kind: "add" }>, previ
   }
 }
 
+async function requestRoomBook(cmd: "manage_rooms" | "run_room", args: Record<string, unknown>): Promise<RoomBook> {
+  const book = await invoke<RoomBook>(cmd, args);
+  if (!Array.isArray(book?.rooms) || !Array.isArray(book?.templates) || !book.templates.length) {
+    throw new Error("房间数据缺少模板或列表，请重新读取房间。");
+  }
+  return book;
+}
+
 async function updateRooms(view: RoomsView, command: { action?: string; id?: string; revision?: number; [key: string]: unknown }): Promise<void> {
   if (modal !== view) return;
   if (command.action === "interrupt" || (command.action === "supplement" && view.busy)) {
     try {
-      const result = await invoke<RoomBook>("manage_rooms", { command });
+      const result = await requestRoomBook("manage_rooms", { command });
       if (command.action === "interrupt") view.runningRoomId = undefined;
       paintRoomUpdate(view, result, command.id, command.action !== "supplement");
     } catch (error) {
@@ -3255,14 +3263,14 @@ async function updateRooms(view: RoomsView, command: { action?: string; id?: str
   const status = document.getElementById("room-result");
   if (status) status.textContent = "正在保存或读取…";
   try {
-    view.book = run ? await invoke<RoomBook>("run_room", {
+    view.book = run ? await requestRoomBook("run_room", {
       id: command.id, revision: command.revision, recover: command.action === "recover",
-    }) : await invoke<RoomBook>("manage_rooms", { command });
+    }) : await requestRoomBook("manage_rooms", { command });
     if (status) status.textContent = "";
   } catch (error) {
     view.error = String(error);
     if (run) {
-      try { view.book = await invoke<RoomBook>("manage_rooms", { command: { action: "list" } }); }
+      try { view.book = await requestRoomBook("manage_rooms", { command: { action: "list" } }); }
       catch { /* Keep the previous view and the original error. */ }
     }
   } finally {
@@ -5078,7 +5086,7 @@ async function bootstrap(): Promise<void> {
     const view = modal;
     if (view.kind !== "rooms" || !view.book || (view.runningRoomId !== id &&
       !document.querySelector(`[data-room-panel="${CSS.escape(id)}"][open]`))) return;
-    void invoke<RoomBook>("manage_rooms", { command: { action: "list" } })
+    void requestRoomBook("manage_rooms", { command: { action: "list" } })
       .then((book) => paintRoomUpdate(view, book, id))
       .catch(() => { /* The active command also returns the authoritative room state. */ });
   });

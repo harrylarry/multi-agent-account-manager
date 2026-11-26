@@ -310,6 +310,18 @@ pub struct RoomBook {
   templates: Vec<Template>,
 }
 
+#[derive(Serialize)]
+pub struct RoomBookView {
+  rooms: Vec<Room>,
+  templates: Vec<Template>,
+}
+
+impl From<RoomBook> for RoomBookView {
+  fn from(book: RoomBook) -> Self {
+    Self { rooms: book.rooms, templates: book.templates }
+  }
+}
+
 impl RoomBook {
   pub fn archive_checksum(&self) -> Result<String, String> {
     let data = serde_json::to_vec(self).map_err(|_| "房间资料无法核验")?;
@@ -1003,6 +1015,23 @@ mod tests {
     assert!(apply_verified(&fixture.path, make("a"), &fixture.accounts, false, Some("Owned".into())).is_ok());
     let bad_commit = "https://github.com/a/b/commit/123";
     assert!(commit_coordinates(bad_commit).is_err());
+  }
+
+  #[test]
+  fn room_ipc_includes_builtin_and_custom_templates_without_changing_archive_format() {
+    let fixture = RelayFixture::new(Flow::Review, 8, REVIEW_ROLES);
+    let book = fixture.command(Command::SaveTemplate {
+      title: "设备回归模板".into(), base_id: "review".into(), min_participants: 2,
+      edit_id: None, version: None, workflow: Vec::new(), work_seats: None, role_seats: None,
+    }).unwrap();
+    let archive = serde_json::to_value(&book).unwrap();
+    assert!(archive.get("templates").is_none());
+    assert_eq!(archive["customTemplates"][0]["title"], "设备回归模板");
+    let ipc = serde_json::to_value(RoomBookView::from(book)).unwrap();
+    let templates = ipc["templates"].as_array().unwrap();
+    assert!(templates.iter().any(|template| template["id"] == "solo"));
+    assert!(templates.iter().any(|template| template["title"] == "设备回归模板"));
+    assert_eq!(ipc["rooms"][0]["id"], fixture.id.to_string());
   }
 
   #[test]

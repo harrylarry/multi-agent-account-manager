@@ -30,6 +30,8 @@ Windows 主 crate 67 项、muse-native 110 项、嵌入脚本 13 项与构建检
 
 ## 下一步
 
+R1 单账号房间的 iPhone 首轮在打开房间面板时阻断。用户截图只有面板标题、说明和关闭。代码核对发现 IPC 直接返回房间归档结构，派生模板目录被序列化跳过。前端收到数据后访问缺失的模板并在渲染时出错。改为在列表、修改和真实派发的 IPC 返回中提供完整模板目录，保持归档结构；首次读取失败时显示错误及重试。R1 尚未进行派发、回复回收与定稿。[R1 验收](../acceptance/iphone-acceptance.md#muse-单账号房间和指纹档案)
+
 `e598f3c` 补齐全量备份的一次合并或覆盖。先核对账号及房间两份预览，再一并恢复账号、代理元数据、房间、附件和模板。房间写入后以账号持久化标记提交，进程中断后保留已提交结果或回滚房间。另补齐 v2.2 房间新话题入口。新话题使用旧模板版本，保留手选范围及用户指定的固定角色，自动模式重新计算其余分派。用户可主动选入旧定稿，新话题从独立会话和发送台账开始。主 crate 91 项、Muse native 110 项、嵌入脚本 13 项、前端构建和两种移动视口 WebKit 回归通过。真机为 `UNVERIFIED`。[Quick checks](https://github.com/harrylarry/multi-agent-account-manager/actions/runs/45774086898) · [iPhone 复测](../acceptance/iphone-acceptance.md#全量恢复与房间新话题)
 
 同一 SHA 的 iOS 构建成功，本机下载后核验 ZIP 和 IPA 完整性、Spike Bundle ID、iOS 最低版本及 SHA-256。新包仍待真机执行联合验收。[iOS 构建](https://github.com/harrylarry/multi-agent-account-manager/actions/runs/45774090087) · [下载与验收步骤](../acceptance/iphone-acceptance.md#全量恢复与房间新话题)

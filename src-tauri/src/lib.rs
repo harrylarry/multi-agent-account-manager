@@ -70,7 +70,7 @@ async fn add_account(
 async fn manage_rooms(
   app: AppHandle, mgr: State<'_, Arc<SessionManager>>, gate: State<'_, rooms::RoomGate>, command: rooms::Command,
   cancel: State<'_, Arc<probe_cancel::ProbeCancel>>,
-) -> Result<rooms::RoomBook, String> {
+) -> Result<rooms::RoomBookView, String> {
   let evidence = match &command {
     rooms::Command::BindSession { account_uuid, thread_id, .. } => {
       let sessions = list_muse_sessions(app.clone(), mgr.clone(), cancel.clone(), account_uuid.clone()).await?;
@@ -110,7 +110,7 @@ async fn manage_rooms(
       cancel.cancel_task(&account, task);
     }
   }
-  result
+  result.map(Into::into)
 }
 
 #[tauri::command]
@@ -138,7 +138,7 @@ async fn run_room(
   ledger: State<'_, Arc<send_ledger::SendLedger>>, cancel: State<'_, Arc<probe_cancel::ProbeCancel>>,
   fingerprints: State<'_, FingerprintGate>,
   id: uuid::Uuid, revision: u64, recover: bool,
-) -> Result<rooms::RoomBook, String> {
+) -> Result<rooms::RoomBookView, String> {
   #[cfg(target_os = "ios")]
   {
     use tauri::Emitter;
@@ -153,14 +153,14 @@ async fn run_room(
       let current = rooms::apply(&path, rooms::Command::List, &snapshot.accounts, !*initialized)?;
       *initialized = true;
       if next_revision != revision && current.next_relay_revision(id) != Some(next_revision) {
-        return Ok(current);
+        return Ok(current.into());
       }
       let allowed: Vec<_> = snapshot.accounts.into_iter().filter(|account| {
         !snapshot.conflicts.iter().any(|conflict| conflict.uuid == account.uuid)
           && !snapshot.pending_cleanup.iter().any(|key| key.uuid == account.uuid)
       }).collect();
       let Some(dispatch) = rooms::begin_dispatch(&path, id, next_revision, &allowed, recover)? else {
-        return rooms::apply(&path, rooms::Command::List, &allowed, false);
+        return rooms::apply(&path, rooms::Command::List, &allowed, false).map(Into::into);
       };
       let account = allowed.iter().find(|account| account.uuid == dispatch.attempt.account_uuid
         && account.provider_id == providers::ProviderId::Muse).ok_or("账号不存在")?;
@@ -175,7 +175,7 @@ async fn run_room(
       let _ = app.emit("room-progress", id);
       // Explicit recovery reads just this attempt, without authorizing another send.
       let Some(revision) = result.after_relay_attempt(id, &dispatch.attempt).filter(|_| !recover) else {
-        return Ok(result);
+        return Ok(result.into());
       };
       next_revision = revision;
     }

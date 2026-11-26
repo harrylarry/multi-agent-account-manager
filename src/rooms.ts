@@ -311,7 +311,10 @@ export function renderRooms(view: RoomsView, accounts: AccountRecord[], esc: (te
             </details>` : ""}
         </div>
         <div id="room-result" class="modal-desc" role="status">${esc(view.error || (view.busy ? "正在读取房间…" : ""))}</div>
-        <div class="modal-footer"><button id="modal-cancel-btn" class="btn" type="button">关闭</button></div>
+        <div class="modal-footer">
+          ${view.error && !view.book ? '<button class="btn primary" type="button" data-room-action="list">重试读取房间</button>' : ""}
+          <button id="modal-cancel-btn" class="btn" type="button">关闭</button>
+        </div>
       </div>
     </div>`;
 }
