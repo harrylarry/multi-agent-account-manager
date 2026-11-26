@@ -203,6 +203,8 @@ SOCKS5 启用时，后台同步显示「代理 已下发」「联网超时」「
 
 ### Muse 单账号房间和指纹档案
 
+**R1 入口复测使用 `36a172e`。** `bc85566` 真机只显示房间标题与关闭，未进入派发。新版补齐 IPC 模板列表，读取失败时显示错误和重试。下载 ZIP 后校验内部 IPA SHA-256 `7f09f54b7304196ff017340825aef6890c71b210e0eb2cbe21d33a43aeef0ccb`。打开「Muse → 房间」，应看到「新增房间」和「自定义模板」。选择「单账号任务」后继续本节的真实派发与定稿。消息正文直接显示，核对摘要时展开「消息来源」。[新版下载](https://github.com/harrylarry/multi-agent-account-manager/actions/runs/45817334685/artifacts/15117311145) · [CI](https://github.com/harrylarry/multi-agent-account-manager/actions/runs/45817329827) · [Xcode](https://github.com/harrylarry/multi-agent-account-manager/actions/runs/45817334685)
+
 联合候选 Spike 0.1.26（iOS 17.0+），代码提交 `4884cee0adf797cb15cbf2f1df3ee44cb5b87b63`。iOS target、宿主检查及 Xcode 打包均通过，房间真实发收和按账号指纹档案待 iPhone 验收。[Quick checks](https://github.com/harrylarry/multi-agent-account-manager/actions/runs/45711886220) · [iOS 构建](https://github.com/harrylarry/multi-agent-account-manager/actions/runs/45711886482) · [SPIKE IPA 下载](https://github.com/harrylarry/multi-agent-account-manager/actions/runs/45711886482/artifacts/15068048520)
 
 下载 ZIP 后取出 `account-manager-ios-unsigned.ipa`。IPA SHA-256 为 `37956d838372289ebb0bedf6d5c05d5329069b8e6ddcc5f2b620518e592b14a4`。外层 ZIP SHA-256 为 `c3785cf6f374b2a6ec4748b0e817b05aabf5a4b869c8f986a825da9cf82c545f`。
