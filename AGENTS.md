@@ -49,7 +49,7 @@ Rust 的 `cargo check` 需要在 macOS + Xcode 环境；若在 CI 中执行，�
 
 - 认证、发送、审批、代理 fail-closed、备份恢复、房间编排等高风险改动必须遵守开发计划中的失败路径测试、真机验证和回滚门禁。当前 Agent 负责自检，必要时按风险另请复核，**但复核不是某个固定 Agent 的独占职责**。
 - 不得向公开仓库、Issue、PR、Actions 日志或构建产物泄漏 Cookie、token、代理密码及真实账号隐私；不要随意 force-push 已公开提交。
-- 保留既定产品范围：iOS 独立 App、Tauri/Rust/Swift、Muse 与 Hark、WebView 聊天、不依赖自建服务器；不得借开发流程调整删减产品的协作房间角色。
+- 保留既定产品范围：iOS 独立 App、Tauri/Rust/Swift、Muse 与 Hark、WebView 聊天、不依赖自建服务器。按最新用户裁决移除协作房间，优先保障多账号隔离、切换、代理和额度同步。
 - `main` 的版本号、Bundle ID（`com.ldjx.accountmanager`）、签名与发布流程不随开发分支改动；Spike 版独立的 bundle id 只在 Spike 分支使用。
 
 ## 六、每次开始的动作

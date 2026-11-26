@@ -193,16 +193,6 @@ fn final_text(payload: &Value, root: &Value, assistant_id: &str) -> Option<Strin
 /// Recover a persisted, completed reply from a session-scoped history response.
 /// Only the latest user turn is eligible, and its ID must match the send ACK.
 pub fn completed_history_reply(body: &[u8], session_id: &str, user_id: &str) -> Option<String> {
-  history_reply(body, session_id, user_id, false)
-}
-
-/// A room may hand off a long-running turn only after an explicitly linked idle event.
-/// A completed assistant message by itself can be an intermediate progress bubble.
-pub fn completed_room_history_reply(body: &[u8], session_id: &str, user_id: &str) -> Option<String> {
-  history_reply(body, session_id, user_id, true)
-}
-
-fn history_reply(body: &[u8], session_id: &str, user_id: &str, require_turn_end: bool) -> Option<String> {
   let raw: Value = serde_json::from_slice(body).ok()?;
   if raw["ok"] == false || !raw["error"].is_null() || raw["has_more"] == true {
     return None;
@@ -229,9 +219,7 @@ fn history_reply(body: &[u8], session_id: &str, user_id: &str, require_turn_end:
   let mut unlinked = false;
   let mut pending = HashSet::new();
   let mut completed = HashMap::new();
-  let mut turn = None;
-  let mut idle_after_reply = false;
-  for (index, row) in ordered.into_iter().enumerate() {
+  for row in ordered {
     let payload = &row["payload"];
     let fields = [payload, row, &payload["chat_context"]];
     if text_field(&fields, &["session_id", "thread_id"]).is_some_and(|id| id != session_id) {
@@ -245,19 +233,9 @@ fn history_reply(body: &[u8], session_id: &str, user_id: &str, require_turn_end:
         pending.clear();
         completed.clear();
         unlinked = false;
-        idle_after_reply = false;
       }
       current = id == Some(user_id);
-      turn = if current { text_field(&fields, &["turn_id"]) } else { None };
       foreign_user |= !current;
-      continue;
-    }
-    if require_turn_end && current && kind == Some("agent.status") {
-      let linked_turn = text_field(&fields, &["turn_id"]).zip(turn).map(|(actual, expected)| actual == expected);
-      let linked_user = text_field(&fields, &["user_message_id", "reply_to_message_id"]).map(|actual| actual == user_id);
-      if linked_turn != Some(false) && linked_user != Some(false) && (linked_turn == Some(true) || linked_user == Some(true)) {
-        idle_after_reply = text_field(&fields, &["activity_code"]) == Some("idle") && !completed.is_empty() && pending.is_empty();
-      }
       continue;
     }
     if !current
@@ -285,12 +263,8 @@ fn history_reply(body: &[u8], session_id: &str, user_id: &str, require_turn_end:
     if parent.is_some_and(|id| id != user_id) {
       return None;
     }
-    if require_turn_end && text_field(&fields, &["turn_id"]).zip(turn).is_some_and(|(actual, expected)| actual != expected) {
-      return None;
-    }
     unlinked |= parent.is_none();
     let id = id.filter(|id| *id != user_id)?;
-    idle_after_reply = false;
     let terminal = matches!(
       text_field(&fields, &["status"]),
       Some("complete" | "completed" | "done" | "finished")
@@ -300,19 +274,17 @@ fn history_reply(body: &[u8], session_id: &str, user_id: &str, require_turn_end:
         .or_else(|| final_text(row, row, id))
         .filter(|text| !text.trim().is_empty())?;
       pending.remove(id);
-      completed.insert(id, (index, text));
+      completed.insert(id, text);
     } else if !completed.contains_key(id) {
       pending.insert(id);
     }
   }
   if current
     && pending.is_empty()
-    && (if require_turn_end { idle_after_reply } else { completed.len() == 1 })
+    && completed.len() == 1
     && (sequenced || !foreign_user || !unlinked)
   {
-    let mut messages: Vec<_> = completed.into_values().collect();
-    messages.sort_by_key(|(index, _)| *index);
-    Some(messages.into_iter().map(|(_, text)| text).collect::<Vec<_>>().join("\n\n"))
+    completed.into_values().next()
   } else {
     None
   }
@@ -655,22 +627,6 @@ mod tests {
     let mut unrelated = reply;
     unrelated["parent_message_id"] = serde_json::json!("other");
     assert!(read(vec![user, unrelated]).is_none());
-  }
-
-  #[test]
-  fn room_history_rejects_completed_progress_until_the_matching_turn_ends() {
-    let user = serde_json::json!({"role":"user","id":"u","seq":1,"turn_id":"t"});
-    let progress = serde_json::json!({"role":"assistant","id":"p","seq":2,"status":"completed","text":"正在汇总"});
-    let answer = serde_json::json!({"role":"assistant","id":"a","seq":3,"status":"completed","text":"已完成的清单"});
-    let idle = serde_json::json!({"event":"agent.status","seq":4,"payload":{"activity_code":"idle","turn_id":"t"}});
-    let read = |rows: Vec<Value>| completed_room_history_reply(
-      serde_json::json!({"result":{"session_id":"s","events":rows}}).to_string().as_bytes(), "s", "u",
-    );
-    assert!(read(vec![user.clone(), progress.clone()]).is_none());
-    let mut foreign = idle.clone();
-    foreign["payload"]["user_message_id"] = Value::String("other".into());
-    assert!(read(vec![user.clone(), progress.clone(), foreign]).is_none());
-    assert_eq!(read(vec![idle, user, progress, answer]).as_deref(), Some("正在汇总\n\n已完成的清单"));
   }
   use std::collections::VecDeque;
 

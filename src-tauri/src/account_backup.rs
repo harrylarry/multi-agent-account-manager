@@ -21,8 +21,6 @@ pub struct AccountBackup {
   pub proxy_pool: Vec<ProxyPoolProfile>,
   #[serde(default)]
   pub expires_at_ms: Option<u64>,
-  #[serde(default, skip_serializing_if = "Option::is_none")]
-  pub rooms: Option<crate::rooms::RoomBook>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
@@ -92,9 +90,6 @@ pub struct RestorePreview {
   pub existing: usize,
   pub conflicts: Vec<String>,
   pub proxy_pool_count: usize,
-  pub room_count: usize,
-  pub template_count: usize,
-  pub room_checksum: Option<String>,
   pub checksum: String,
 }
 
@@ -127,8 +122,7 @@ pub fn preview(backup: &AccountBackup, current: &[AccountRecord]) -> RestorePrev
       digest.update(profile.uuid.as_bytes());
     }
   }
-  let (room_count, template_count) = backup.rooms.as_ref().map_or((0,0), crate::rooms::RoomBook::archive_counts);
-  RestorePreview { added, existing, conflicts, proxy_pool_count: backup.proxy_pool.len(), room_count, template_count, room_checksum:None,
+  RestorePreview { added, existing, conflicts, proxy_pool_count: backup.proxy_pool.len(),
     checksum: STANDARD.encode(digest.finish().as_ref()) }
 }
 
@@ -159,7 +153,6 @@ pub fn from_accounts(
     includes_proxy_endpoints: include_proxy_endpoints,
     proxy_pool,
     expires_at_ms,
-    rooms: None,
     accounts: profiles,
   }
 }
@@ -205,7 +198,6 @@ pub fn decrypt(encoded: &str, password: &str) -> Result<AccountBackup, String> {
     .open_in_place(nonce, aead::Aad::from(&header), &mut data[HEADER..])
     .map_err(|_| "口令错误或备份已损坏")?;
   let backup: AccountBackup = serde_json::from_slice(body).map_err(|_| "备份数据无效")?;
-  if let Some(rooms) = &backup.rooms { rooms.validate_archive()?; }
   if backup.expires_at_ms.is_some_and(|deadline| deadline <= crate::storage::now_ms()) {
     return Err("这份加密备份已超过设定的恢复期限".into());
   }
@@ -272,8 +264,18 @@ mod tests {
   }
 
   #[test]
+  fn older_backups_import_accounts_and_discard_retired_keys() {
+    let old = serde_json::json!({ "accounts":[{"providerId":"muse","uuid":"00000000-0000-4000-8000-000000000001",
+      "alias":"test","createdAtMs":0,"proxyRequiresAuth":false,"proxyEnabled":false}],
+      "includesGroups":true,"includesProxyEndpoints":false,"rooms":{"rooms":[{"text":"old data"}]} });
+    let backup: AccountBackup = serde_json::from_value(old).unwrap();
+    assert_eq!(backup.accounts.len(), 1);
+    assert!(serde_json::to_value(&backup).unwrap().get("rooms").is_none());
+  }
+
+  #[test]
   fn account_backup_roundtrip_rejects_wrong_password_and_tampering() {
-    let backup = AccountBackup { accounts: Vec::new(), includes_groups: true, includes_proxy_endpoints: false, proxy_pool: Vec::new(), expires_at_ms: None, rooms:None };
+    let backup = AccountBackup { accounts: Vec::new(), includes_groups: true, includes_proxy_endpoints: false, proxy_pool: Vec::new(), expires_at_ms: None };
     let encoded = encrypt(&backup, "test-password").unwrap();
     assert!(decrypt(&encoded, "bad-password").is_err());
     assert!(decrypt(&encoded, "test-password").unwrap().includes_groups);

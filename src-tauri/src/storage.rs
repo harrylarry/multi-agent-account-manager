@@ -165,16 +165,12 @@ pub struct QuotaObservation {
   pub stale: bool,
 }
 
+#[cfg(target_os = "ios")]
 impl QuotaObservation {
   pub fn remaining(&self, now: u64) -> Option<u8> {
     if self.stale || self.checked_at_ms > now || now - self.checked_at_ms > 10 * 60_000
       || self.resets_at_ms.is_some_and(|end| end <= now) { return None; }
     100u8.checked_sub(self.percent_used?)
-  }
-
-  pub fn comparable_remaining(&self, now: u64) -> Option<(&str, u8)> {
-    let window = self.window.as_deref().map(str::trim).filter(|label| !label.is_empty())?;
-    Some((window, self.remaining(now)?))
   }
 }
 
@@ -294,8 +290,6 @@ pub struct AccountsStoreFile {
   pub approval_attempts: BTreeMap<String, bool>,
   #[serde(default, skip_serializing_if = "Vec::is_empty")]
   pub restored_proxy_pool: Vec<crate::account_backup::ProxyPoolProfile>,
-  #[serde(default, skip_serializing_if = "Option::is_none")]
-  pub(crate) backup_restore_id: Option<Uuid>,
 }
 
 impl Default for AccountsStoreFile {
@@ -307,7 +301,6 @@ impl Default for AccountsStoreFile {
       pending_cleanup: Vec::new(),
       approval_attempts: BTreeMap::new(),
       restored_proxy_pool: Vec::new(),
-      backup_restore_id: None,
     }
   }
 }
@@ -568,7 +561,6 @@ fn migrate_from_value(root: Value) -> Result<(AccountsStoreFile, bool), String> 
       pending_cleanup,
       approval_attempts,
       restored_proxy_pool: obj.get("restoredProxyPool").and_then(|value| serde_json::from_value(value.clone()).ok()).unwrap_or_default(),
-      backup_restore_id: obj.get("backupRestoreId").and_then(Value::as_str).and_then(|value| Uuid::parse_str(value).ok()),
     },
     is_legacy,
   ))
@@ -627,7 +619,7 @@ pub fn load_or_migrate_store(path: &Path) -> LoadedAccountsStore {
     }
   };
 
-  let parsed: Value = match serde_json::from_str(&raw) {
+  let mut parsed: Value = match serde_json::from_str(&raw) {
     Ok(v) => v,
     Err(_) => {
       return LoadedAccountsStore {
@@ -638,6 +630,11 @@ pub fn load_or_migrate_store(path: &Path) -> LoadedAccountsStore {
     }
   };
 
+  if parsed.as_object_mut().and_then(|value| value.remove("backupRestoreId")).is_some() {
+    if save_json_atomic(path, &parsed).is_err() {
+      eprintln!("[storage] 旧版备份标记清理失败，下次启动重试");
+    }
+  }
   let (mut store, migrated) = match migrate_from_value(parsed) {
     Ok(res) => res,
     Err(reason) => {

@@ -10,9 +10,7 @@ mod hark_native;
 mod hark_send;
 mod probe_cancel;
 mod proxy_pool;
-mod rooms;
-#[cfg(target_os = "ios")]
-mod room_dispatch;
+mod retired_data;
 mod webview_proxy;
 mod providers;
 mod quota;
@@ -64,135 +62,6 @@ async fn add_account(
 ) -> Result<ManagerSnapshot, String> {
   let cookies = cookie_input.map(|raw| parse_account_cookies(&provider_id, raw)).transpose()?;
   mgr.add_account(&app, &provider_id, &alias, cookies.as_deref()).await
-}
-
-#[tauri::command]
-async fn manage_rooms(
-  app: AppHandle, mgr: State<'_, Arc<SessionManager>>, gate: State<'_, rooms::RoomGate>, command: rooms::Command,
-  cancel: State<'_, Arc<probe_cancel::ProbeCancel>>,
-) -> Result<rooms::RoomBookView, String> {
-  let evidence = match &command {
-    rooms::Command::BindSession { account_uuid, thread_id, .. } => {
-      let sessions = list_muse_sessions(app.clone(), mgr.clone(), cancel.clone(), account_uuid.clone()).await?;
-      Some(sessions.into_iter().find(|session| session.id == *thread_id).ok_or("该会话不在所选账号的原生会话列表中")?.title)
-    }
-    rooms::Command::SaveArtifact { input: rooms::ArtifactInput::CodeChange { url }, .. } => {
-      let (owner, repo, sha) = rooms::commit_coordinates(url.trim())?;
-      let client = reqwest::Client::builder().redirect(reqwest::redirect::Policy::none())
-        .timeout(std::time::Duration::from_secs(12)).build().map_err(|_| "无法初始化提交核验")?;
-      let endpoint = format!("https://api.github.com/repos/{owner}/{repo}/commits/{sha}");
-      let mut response = client.get(endpoint).header("User-Agent", "Diehao-iOS")
-        .header("Accept", "application/vnd.github.sha").send().await.map_err(|_| "无法连接 GitHub 核验提交")?;
-      if !response.status().is_success() || response.content_length().is_some_and(|len| len > 1024) {
-        return Err("GitHub 未提供可核验的公开提交 SHA".into());
-      }
-      let mut body = Vec::new();
-      while let Some(chunk) = response.chunk().await.map_err(|_| "读取提交凭证失败")? {
-        if body.len() + chunk.len() > 1024 { return Err("GitHub 未提供可核验的提交 SHA".into()); }
-        body.extend_from_slice(&chunk);
-      }
-      if std::str::from_utf8(&body).ok().map(str::trim) != Some(sha.as_str()) { return Err("GitHub 返回的提交 SHA 不匹配".into()); }
-      Some(sha)
-    }
-    _ => None,
-  };
-  let interrupt = match &command { rooms::Command::Stop { id, .. } | rooms::Command::Interrupt { id } => Some(*id), _ => None };
-  let mut initialized = gate.0.lock().await;
-  let dir = app.path().app_data_dir().map_err(|_| "无法读取应用目录")?;
-  let snapshot = mgr.get_snapshot().await;
-  let accounts: Vec<_> = snapshot.accounts.into_iter().filter(|account|
-    !snapshot.conflicts.iter().any(|conflict| conflict.uuid == account.uuid)
-      && !snapshot.pending_cleanup.iter().any(|key| key.uuid == account.uuid)).collect();
-  let result = rooms::apply_verified(&dir.join("rooms-v1.json"), command, &accounts, !*initialized, evidence);
-  if let Ok(book) = &result {
-    *initialized = true;
-    if let Some((account, task)) = interrupt.and_then(|id| book.cancellation_target(id)) {
-      cancel.cancel_task(&account, task);
-    }
-  }
-  result.map(Into::into)
-}
-
-#[tauri::command]
-#[cfg_attr(not(target_os = "ios"), allow(unused_variables))]
-async fn share_room_artifact(
-  app: AppHandle, gate: State<'_, rooms::RoomGate>, room: uuid::Uuid, artifact: uuid::Uuid,
-) -> Result<bool, String> {
-  #[cfg(target_os = "ios")]
-  {
-    let (name, contents) = {
-      let _guard = gate.0.lock().await;
-      let path = app.path().app_data_dir().map_err(|_| "无法读取应用目录")?.join("rooms-v1.json");
-      rooms::apply(&path, rooms::Command::List, &[], false)?.artifact_for_export(room, artifact)?
-    };
-    tauri_plugin_account_session::share_room_artifact(&app, &name, &contents).await
-  }
-  #[cfg(not(target_os = "ios"))]
-  Err("附件分享需要 iOS".into())
-}
-
-#[tauri::command]
-#[cfg_attr(not(target_os = "ios"), allow(unused_variables))]
-async fn run_room(
-  app: AppHandle, mgr: State<'_, Arc<SessionManager>>, gate: State<'_, rooms::RoomGate>,
-  ledger: State<'_, Arc<send_ledger::SendLedger>>, cancel: State<'_, Arc<probe_cancel::ProbeCancel>>,
-  fingerprints: State<'_, FingerprintGate>,
-  id: uuid::Uuid, revision: u64, recover: bool, message: Option<String>,
-) -> Result<rooms::RoomBookView, String> {
-  #[cfg(target_os = "ios")]
-  {
-    use tauri::Emitter;
-    let _exclusive = fingerprints.0.try_lock().map_err(|_| "Muse 指纹任务正在运行，请结束后再派发房间")?;
-    let dir = app.path().app_data_dir().map_err(|_| "无法读取应用目录")?;
-    let path = dir.join("rooms-v1.json");
-    let mut next_revision = if let Some(text) = message {
-      if recover { return Err("恢复回复时不能同时发送新消息".into()); }
-      let mut initialized = gate.0.lock().await;
-      let snapshot = mgr.get_snapshot().await;
-      let accounts: Vec<_> = snapshot.accounts.into_iter().filter(|account| {
-        !snapshot.conflicts.iter().any(|conflict| conflict.uuid == account.uuid)
-          && !snapshot.pending_cleanup.iter().any(|key| key.uuid == account.uuid)
-      }).collect();
-      let current = rooms::apply(&path, rooms::Command::PostMessage { id, revision, text }, &accounts, !*initialized)?;
-      *initialized = true;
-      current.next_relay_revision(id).ok_or("房间消息已保存，但尚未进入派发")?
-    } else { revision };
-    loop {
-      let proxy_guard = mgr.proxy_write_lock.lock().await;
-      let mut initialized = gate.0.lock().await;
-      let snapshot = mgr.get_snapshot().await;
-      let current = rooms::apply(&path, rooms::Command::List, &snapshot.accounts, !*initialized)?;
-      *initialized = true;
-      if next_revision != revision && current.next_relay_revision(id) != Some(next_revision) {
-        return Ok(current.into());
-      }
-      let allowed: Vec<_> = snapshot.accounts.into_iter().filter(|account| {
-        !snapshot.conflicts.iter().any(|conflict| conflict.uuid == account.uuid)
-          && !snapshot.pending_cleanup.iter().any(|key| key.uuid == account.uuid)
-      }).collect();
-      let Some(dispatch) = rooms::begin_dispatch(&path, id, next_revision, &allowed, recover)? else {
-        return rooms::apply(&path, rooms::Command::List, &allowed, false).map(Into::into);
-      };
-      let account = allowed.iter().find(|account| account.uuid == dispatch.attempt.account_uuid
-        && account.provider_id == providers::ProviderId::Muse).ok_or("账号不存在")?;
-      let worker_id = dispatch.attempt.worker_id.unwrap_or(dispatch.attempt.id);
-      let (token, _cancel_guard) = cancel.register_task(&account.uuid, "room", worker_id);
-      drop(initialized);
-      drop(proxy_guard);
-      let _ = app.emit("room-progress", id);
-      let result = Box::pin(room_dispatch::run(
-        &app, &gate, &ledger, &path, &dispatch, account.proxy.as_ref(), token, recover,
-      )).await?;
-      let _ = app.emit("room-progress", id);
-      // Explicit recovery reads just this attempt, without authorizing another send.
-      let Some(revision) = result.after_relay_attempt(id, &dispatch.attempt).filter(|_| !recover) else {
-        return Ok(result.into());
-      };
-      next_revision = revision;
-    }
-  }
-  #[cfg(not(target_os = "ios"))]
-  { Err("房间真实派发需要 iOS".into()) }
 }
 
 #[tauri::command]
@@ -789,8 +658,6 @@ async fn export_account_backup(
   include_groups: bool,
   include_proxy_endpoints: bool,
   expiry_days: Option<u8>,
-  include_rooms: Option<bool>,
-  room_gate: State<'_, rooms::RoomGate>,
 ) -> Result<bool, String> {
   #[cfg(target_os = "ios")]
   {
@@ -809,14 +676,7 @@ async fn export_account_backup(
       Some(days @ (1 | 7 | 30)) => Some(storage::now_ms() + u64::from(days) * 86_400_000),
       _ => return Err("备份有效期无效".into()),
     };
-    let mut backup = account_backup::from_accounts(&snapshot.accounts, include_groups, include_proxy_endpoints, pool, expiration);
-    if include_rooms.unwrap_or(false) {
-      let _guard = room_gate.0.lock().await;
-      let path = app.path().app_data_dir().map_err(|_| "无法读取应用目录")?.join("rooms-v1.json");
-      let book = rooms::apply(&path, rooms::Command::List, &[], false)?;
-      book.validate_archive()?;
-      backup.rooms = Some(book);
-    }
+    let backup = account_backup::from_accounts(&snapshot.accounts, include_groups, include_proxy_endpoints, pool, expiration);
     let password = zeroize::Zeroizing::new(password);
     let encrypted = tokio::task::spawn_blocking(move || account_backup::encrypt(&backup, &password))
       .await.map_err(|_| "备份加密操作失败".to_string())??;
@@ -824,29 +684,21 @@ async fn export_account_backup(
   }
   #[cfg(not(target_os = "ios"))]
   {
-    let _ = (app, mgr, gate, password, include_groups, include_proxy_endpoints, expiry_days, include_rooms, room_gate);
+    let _ = (app, mgr, gate, password, include_groups, include_proxy_endpoints, expiry_days);
     Err("此操作仅支持 iOS".into())
   }
 }
 
 #[tauri::command]
 async fn preview_account_backup(
-  app: AppHandle,
   mgr: State<'_, Arc<SessionManager>>,
-  room_gate: State<'_, rooms::RoomGate>,
   encrypted: String,
   password: String,
 ) -> Result<account_backup::RestorePreview, String> {
   let password = zeroize::Zeroizing::new(password);
   let backup = tokio::task::spawn_blocking(move || account_backup::decrypt(&encrypted, &password))
     .await.map_err(|_| "备份解密操作失败".to_string())??;
-  let mut result = account_backup::preview(&backup, &mgr.get_snapshot().await.accounts);
-  if backup.rooms.is_some() {
-    let _guard = room_gate.0.lock().await;
-    let path = app.path().app_data_dir().map_err(|_| "无法读取应用目录")?.join("rooms-v1.json");
-    result.room_checksum = Some(rooms::apply(&path, rooms::Command::List, &[], false)?.archive_checksum()?);
-  }
-  Ok(result)
+  Ok(account_backup::preview(&backup, &mgr.get_snapshot().await.accounts))
 }
 
 #[derive(Default)]
@@ -937,17 +789,15 @@ async fn local_data_protection(app: AppHandle) -> Result<serde_json::Value, Stri
 async fn restore_account_backup(
   app: AppHandle,
   mgr: State<'_, Arc<SessionManager>>,
-  room_gate: State<'_, rooms::RoomGate>,
   encrypted: String,
   password: String,
   overwrite: bool,
   preview_checksum: String,
-  room_checksum: Option<String>,
 ) -> Result<ManagerSnapshot, String> {
   let password = zeroize::Zeroizing::new(password);
   let backup = tokio::task::spawn_blocking(move || account_backup::decrypt(&encrypted, &password))
     .await.map_err(|_| "备份解密操作失败".to_string())??;
-  mgr.restore_account_backup(&app, &room_gate, backup, overwrite, &preview_checksum, room_checksum.as_deref()).await
+  mgr.restore_account_backup(&app, backup, overwrite, &preview_checksum).await
 }
 
 #[tauri::command]
@@ -1181,7 +1031,6 @@ async fn muse_native_fingerprint_probe(
   mgr: State<'_, Arc<SessionManager>>,
   cancel: State<'_, Arc<probe_cancel::ProbeCancel>>,
   fingerprints: State<'_, FingerprintGate>,
-  rooms_gate: State<'_, rooms::RoomGate>,
 ) -> Result<muse_native::FingerprintProbe, String> {
   if provider_id != "muse" {
     return Err("指纹探针只支持 Muse 账号".to_string());
@@ -1189,7 +1038,7 @@ async fn muse_native_fingerprint_probe(
   let uuid = storage::normalize_uuid(&uuid).ok_or("账号标识无效")?;
   let task_id = uuid::Uuid::parse_str(&task_id).map_err(|_| "指纹任务标识无效".to_string())?;
   let automatic = automatic.unwrap_or(false);
-  let _exclusive = fingerprints.0.try_lock().map_err(|_| "已有房间或指纹任务运行")?;
+  let _exclusive = fingerprints.0.try_lock().map_err(|_| "已有指纹任务运行")?;
   let dir = app.path().app_data_dir().map_err(|e| e.to_string())?;
   let proxy_guard = mgr.proxy_write_lock.lock().await;
   let snapshot = mgr.get_snapshot().await;
@@ -1206,14 +1055,11 @@ async fn muse_native_fingerprint_probe(
     return Err("自动指纹重测需要 iOS".into());
     #[cfg(target_os = "ios")]
     {
-      let _rooms = rooms_gate.0.lock().await;
-      if rooms::apply(&dir.join("rooms-v1.json"), rooms::Command::List, &snapshot.accounts, false)?.has_active_room()
-        || matching.quota_observation.as_ref().and_then(|quota| quota.remaining(storage::now_ms())).unwrap_or(0) == 0
-      { return Err("房间活跃或尚未确认 Muse 剩余额度，自动重测暂缓".into()); }
+      if matching.quota_observation.as_ref().and_then(|quota| quota.remaining(storage::now_ms())).unwrap_or(0) == 0 {
+        return Err("尚未确认 Muse 剩余额度，自动重测暂缓".into());
+      }
     }
   }
-  #[cfg(not(target_os = "ios"))]
-  let _ = rooms_gate;
   let setting = matching.proxy.clone();
   drop(proxy_guard);
   let secrets = secrets::Secrets::new(&dir);
@@ -1370,7 +1216,7 @@ fn hark_isolation_proved(ledger: &send_ledger::SendLedger, uuid: &str) -> bool {
 async fn hark_fingerprint_probe(
   app: AppHandle, uuid: String, timezone: String, task_id: uuid::Uuid, automatic: bool,
   mgr: State<'_, Arc<SessionManager>>, ledger: State<'_, Arc<send_ledger::SendLedger>>,
-  cancel: State<'_, Arc<probe_cancel::ProbeCancel>>, gate: State<'_, FingerprintGate>, rooms_gate: State<'_, rooms::RoomGate>,
+  cancel: State<'_, Arc<probe_cancel::ProbeCancel>>, gate: State<'_, FingerprintGate>,
 ) -> Result<serde_json::Value, String> {
   #[cfg(target_os = "ios")]
   {
@@ -1381,7 +1227,7 @@ async fn hark_fingerprint_probe(
     if !hark_isolation_proved(&ledger, &uuid) {
       return Err("该 Hark 账号需要先完成隔离发送验证并收到本轮的完整关联回复".into());
     }
-    let _exclusive = gate.0.try_lock().map_err(|_| "已有房间或指纹任务运行")?;
+    let _exclusive = gate.0.try_lock().map_err(|_| "已有指纹任务运行")?;
     let proxy_guard = mgr.proxy_write_lock.lock().await;
     let snapshot = mgr.get_snapshot().await;
     let provider = providers::ProviderId::Hark;
@@ -1389,13 +1235,6 @@ async fn hark_fingerprint_probe(
       && account.provider_id == provider && account.auth_state == AuthState::Authenticated).ok_or("请先登录该 Hark 账号")?;
     if snapshot.conflicts.iter().any(|item| item.uuid == uuid) || snapshot.pending_cleanup.iter().any(|key| key.uuid == uuid) {
       return Err("请先处理账号归属或清理状态".into());
-    }
-    if automatic {
-      let _rooms = rooms_gate.0.lock().await;
-      let path = app.path().app_data_dir().map_err(|_| "无法读取应用目录")?.join("rooms-v1.json");
-      if rooms::apply(&path, rooms::Command::List, &snapshot.accounts, false)?.has_active_room() {
-        return Err("房间正在运行，自动重测暂缓".into());
-      }
     }
     let timezone = storage::normalize_account_timezone(account.timezone.as_deref().unwrap_or(&timezone))?
       .unwrap_or_else(|| "UTC".into());
@@ -1948,7 +1787,6 @@ pub fn run() {
   let builder = tauri::Builder::default();
   let builder = builder.manage(proxy_pool::ProxyPoolGate::default());
   let builder = builder.manage(LanBackupGate::default());
-  let builder = builder.manage(rooms::RoomGate::default());
   let builder = builder.manage(ApprovalNotificationGate::default());
 
   #[cfg(target_os = "android")]
@@ -1960,6 +1798,13 @@ pub fn run() {
   builder
     .setup(|app| {
       let app_data_dir = app.path().app_data_dir()?;
+      if retired_data::purge(&app_data_dir).is_err() {
+        eprintln!("[storage] 旧版资料清理未完成，下次启动重试");
+      }
+      #[cfg(target_os = "ios")]
+      if retired_data::purge_temporary_shares().is_err() {
+        eprintln!("[storage] 旧版分享临时文件清理未完成，下次启动重试");
+      }
       let session_mgr = Arc::new(SessionManager::new(app_data_dir.clone()));
       app.manage(Arc::clone(&session_mgr));
 
@@ -2064,9 +1909,6 @@ pub fn run() {
       get_manager_state,
       select_provider,
       add_account,
-      manage_rooms,
-      share_room_artifact,
-      run_room,
       rename_account,
       remove_account,
       switch_account,

@@ -288,24 +288,6 @@ pub enum AccountSubscription {
 }
 
 impl AccountSubscription {
-  #[cfg(target_os = "ios")]
-  pub async fn send_room_message(
-    &mut self, text: &str, route: &IsolatedProbeRoute, attachments: &[chat_send::ChatAttachment],
-    timeout: Duration, cancel: &mut tokio::sync::watch::Receiver<bool>,
-  ) -> SendAttemptResult {
-    match self {
-      Self::Direct(s) => chat_send::send_with_attachments_on_subscription(s, text, route, attachments, timeout, cancel).await,
-      Self::Proxied(s) => chat_send::send_with_attachments_on_subscription(s, text, route, attachments, timeout, cancel).await,
-    }
-  }
-  #[cfg(target_os = "ios")]
-  pub async fn cancel_isolated_turn(&mut self, route: &IsolatedProbeRoute) -> bool {
-    match self {
-      Self::Direct(s) => chat_send::cancel_isolated_turn(s, route).await,
-      Self::Proxied(s) => chat_send::cancel_isolated_turn(s, route).await,
-    }
-  }
-
   pub fn enable_chat_wire_trace(&mut self) {
     match self {
       Self::Direct(s) => s.enable_chat_wire_trace(),

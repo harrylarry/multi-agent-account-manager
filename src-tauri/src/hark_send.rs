@@ -96,7 +96,9 @@ pub(crate) async fn send_isolated(
     _ = token.cancelled() => return Err("会话准备取消，尚未发送".into()),
     result = tokio::time::timeout(std::time::Duration::from_secs(35), setup) => result.map_err(|_| "会话准备超时，尚未发送")??,
   };
-  let send_id = mission.begin_hark_send(&conversation, &crate::rooms::digest_bytes(text.as_bytes()), diagnostic)
+  let digest: String = ring::digest::digest(&ring::digest::SHA256, text.as_bytes()).as_ref()
+    .iter().map(|byte| format!("{byte:02x}")).collect();
+  let send_id = mission.begin_hark_send(&conversation, &digest, diagnostic)
     .map_err(|_| "无法写入发送台账")?;
   let reply_id = response_id(&send_id)?;
   if token.is_cancelled() {

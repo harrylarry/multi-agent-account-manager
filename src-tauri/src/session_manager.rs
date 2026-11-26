@@ -1082,14 +1082,11 @@ impl SessionManager {
   pub async fn restore_account_backup(
     &self,
     app: &AppHandle,
-    room_gate: &crate::rooms::RoomGate,
     backup: crate::account_backup::AccountBackup,
     overwrite: bool,
     preview_checksum: &str,
-    room_checksum: Option<&str>,
   ) -> Result<ManagerSnapshot, String> {
     let _proxy_guard = self.proxy_write_lock.lock().await;
-    let _room_guard = room_gate.0.lock().await;
     let mut locked = self.inner.lock().await;
     if locked.active_slot.is_some() || !locked.store.pending_cleanup.is_empty() || !locked.conflicts.is_empty() {
       return Err("请关闭会话并完成账号清理或冲突处理后再恢复".into());
@@ -1098,12 +1095,6 @@ impl SessionManager {
     if preview.checksum != preview_checksum {
       return Err("账号数据已变化，请重新预览".into());
     }
-    let room_path = locked.store_path.with_file_name("rooms-v1.json");
-    let restored_rooms = match (backup.rooms, room_checksum) {
-      (Some(archive), Some(checksum)) => Some(crate::rooms::prepare_restore(&room_path, archive, overwrite, checksum)?),
-      (None, None) => None,
-      _ => return Err("恢复范围已变化，请重新预览".into()),
-    };
     let mut updated = locked.store.clone();
     for entry in backup.proxy_pool {
       if updated.restored_proxy_pool.iter().any(|old| crate::proxy_pool::restored_entry_id(old) == crate::proxy_pool::restored_entry_id(&entry) && old != &entry) {
@@ -1150,11 +1141,7 @@ impl SessionManager {
       .any(|id| !seen_pool.insert(id)) {
       return Err("备份会让两个账号使用同一代理池条目，已保留原资料".into());
     }
-    if let Some(book) = restored_rooms {
-      crate::rooms::backup_restore::commit(&locked.store_path, &mut updated, &room_path, &book)?;
-    } else {
-      save_store_atomic(&locked.store_path, &updated)?;
-    }
+    save_store_atomic(&locked.store_path, &updated)?;
     locked.store = updated;
     let snapshot = Self::snapshot_from_locked(&locked);
     drop(locked);
@@ -2387,11 +2374,12 @@ impl SessionManager {
       #[cfg(not(target_os = "ios"))]
       let interval_ms = 30_000;
       let last = self.last_sync_timestamp.load(Ordering::SeqCst);
-      if now.saturating_sub(last) < interval_ms {
+      if now.saturating_sub(last) < interval_ms || self.last_sync_timestamp.compare_exchange(last, now, Ordering::SeqCst, Ordering::SeqCst).is_err() {
         return;
       }
+    } else {
+      self.last_sync_timestamp.store(now, Ordering::SeqCst);
     }
-    self.last_sync_timestamp.store(now, Ordering::SeqCst);
 
     #[cfg(target_os = "ios")]
     {
@@ -2502,18 +2490,30 @@ impl SessionManager {
         let key = AccountKey { provider_id: account.provider_id, uuid: account.uuid.clone() };
         let provider = get_provider(key.provider_id);
         if !provider.info.enabled || locked.store.pending_cleanup.contains(&key)
+          || locked.conflicts.iter().any(|entry| entry.uuid == key.uuid)
           || locked.active_slot.as_ref().is_some_and(|slot| slot.account_key == key)
         {
           return None;
         }
-        Some((key, provider.info.entry_url.to_string(), account.timezone.clone()))
+        Some((key, provider.info.entry_url.to_string()))
       }).collect::<Vec<_>>()
     };
 
     let mut diagnostics = Vec::with_capacity(targets.len());
     let mut eligible = Vec::with_capacity(targets.len());
-    for (key, entry_url, timezone) in targets {
-      let setting = self.proxy_setting(key.provider_id, &key.uuid).await;
+    let mut issued = HashMap::new();
+    for (key, entry_url) in targets {
+      let _proxy_guard = self.proxy_write_lock.lock().await;
+      let (setting, timezone) = {
+        let locked = self.inner.lock().await;
+        if locked.active_slot.as_ref().is_some_and(|slot| slot.account_key == key)
+          || locked.store.pending_cleanup.contains(&key) || locked.conflicts.iter().any(|entry| entry.uuid == key.uuid) {
+          continue;
+        }
+        let Some(account) = locked.store.accounts.iter().find(|entry| entry.uuid == key.uuid && entry.provider_id == key.provider_id)
+          else { continue; };
+        (account.proxy.clone(), account.timezone.clone())
+      };
       let outcome = crate::webview_proxy::push(app, &key.uuid, setting.as_ref()).await;
       let provider_id = key.provider_id.as_str().to_string();
       let mut suffix = key.uuid.chars().rev().take(8).collect::<Vec<_>>();
@@ -2530,13 +2530,14 @@ impl SessionManager {
         quota: "not_updated",
       }));
       if outcome.applied {
+        issued.insert(key.clone(), (setting, timezone.clone()));
         eligible.push(crate::platform::ios::SyncQuotaTarget { provider_id, uuid: key.uuid, entry_url, timezone });
       }
     }
 
     if !eligible.is_empty() {
       if let Ok(results) = crate::platform::ios::sync_account_quotas(app, eligible, fresh).await {
-        let statuses = self.apply_synced_metadata(app, &results).await;
+        let statuses = self.apply_synced_metadata(app, &results, &issued).await;
         for (result, status) in results.into_iter().zip(statuses) {
           if let Some((_, row)) = diagnostics
             .iter_mut()
@@ -3722,8 +3723,14 @@ impl SessionManager {
     // #11/#16（补 W）：打开会话前把账号代理重新下发一次。
     // Rust 是权威源——App 重启、Swift 本地配置损坏/过期都在这里纠正；
     // 下发失败就拒绝打开，绝不把可能直连的 WebView 放出去。
-    let proxy_setting = self.proxy_setting(account.provider_id, &account.uuid).await;
-    let pushed = crate::webview_proxy::push(app, &account.uuid, proxy_setting.as_ref()).await;
+    let pushed = {
+      let _proxy_guard = self.proxy_write_lock.lock().await;
+      if self.current_seq.load(Ordering::SeqCst) != expected_seq {
+        return Ok(self.get_snapshot().await);
+      }
+      let proxy_setting = self.proxy_setting(account.provider_id, &account.uuid).await;
+      crate::webview_proxy::push(app, &account.uuid, proxy_setting.as_ref()).await
+    };
     if let Some(reason) = pushed.blocked() {
       let mut locked = self.inner.lock().await;
       if self.current_seq.load(Ordering::SeqCst) == expected_seq {
@@ -4844,6 +4851,7 @@ impl SessionManager {
     &self,
     app: &AppHandle,
     results: &[crate::platform::ios::SyncQuotaResult],
+    issued: &HashMap<AccountKey, (Option<ProxySetting>, Option<String>)>,
   ) -> Vec<&'static str> {
     let mut locked = self.inner.lock().await;
     let previous = locked.store.clone();
@@ -4864,6 +4872,11 @@ impl SessionManager {
         continue;
       };
       let before = &previous.accounts[index];
+      if !issued.get(&key).is_some_and(|(proxy, timezone)| before.proxy == *proxy && before.timezone == *timezone)
+        || locked.store.pending_cleanup.contains(&key) || locked.conflicts.iter().any(|entry| entry.uuid == key.uuid) {
+        statuses.push(("account_changed", false));
+        continue;
+      }
       if result.logged_out {
         let target = &mut locked.store.accounts[index];
         let changed = target.auth_state != AuthState::LoggedOut || target.quota_detail.is_some()

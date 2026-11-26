@@ -492,7 +492,7 @@ class AccountSessionPlugin: Plugin {
     var report: [[String: String]] = []
     do {
       try manager.createDirectory(at: directory, withIntermediateDirectories: true)
-      for name in ["目录", "accounts.json", "rooms-v1.json", "send-ledger.json", "backup-restore-v1.json"] {
+      for name in ["目录", "accounts.json", "send-ledger.json"] {
         let target = name == "目录" ? directory : directory.appendingPathComponent(name)
         if name != "目录" && !manager.fileExists(atPath: target.path) {
           report.append(["file":name, "status":"尚未创建"])
@@ -613,44 +613,6 @@ class AccountSessionPlugin: Plugin {
       }
       controller.completionWithItemsHandler = { _, shared, _, _ in
         try? FileManager.default.removeItem(at: file)
-        invoke.resolve(["shared": shared])
-      }
-      presenter.present(controller, animated: true)
-    }
-  }
-
-  @objc public func shareRoomArtifact(_ invoke: Invoke) throws {
-    struct Args: Decodable { let name: String; let contents: String }
-    let args = try invoke.parseArgs(Args.self)
-    DispatchQueue.main.async {
-      guard !args.name.isEmpty, args.name.utf8.count <= 400,
-            !args.name.contains("/"), !args.name.contains("\\"), !args.name.contains(":"),
-            args.name != ".", args.name != "..", args.contents.utf8.count <= 350_000,
-            let decoded = Data(base64Encoded: args.contents), decoded.count <= 262_144, !decoded.isEmpty,
-            let root = UIApplication.shared.connectedScenes.compactMap({ $0 as? UIWindowScene })
-              .first(where: { $0.activationState == .foregroundActive })?.keyWindow?.rootViewController else {
-        invoke.reject("无法打开房间附件分享")
-        return
-      }
-      let folder = FileManager.default.temporaryDirectory.appendingPathComponent("diehao-" + UUID().uuidString, isDirectory: true)
-      let file = folder.appendingPathComponent(args.name, isDirectory: false)
-      do {
-        try FileManager.default.createDirectory(at: folder, withIntermediateDirectories: false)
-        try decoded.write(to: file, options: [.atomic, .completeFileProtection])
-      } catch {
-        try? FileManager.default.removeItem(at: folder)
-        invoke.reject("无法创建分享附件")
-        return
-      }
-      var presenter = root
-      while let next = presenter.presentedViewController { presenter = next }
-      let controller = UIActivityViewController(activityItems: [file], applicationActivities: nil)
-      if let popover = controller.popoverPresentationController {
-        popover.sourceView = presenter.view
-        popover.sourceRect = CGRect(x: presenter.view.bounds.midX, y: presenter.view.bounds.midY, width: 1, height: 1)
-      }
-      controller.completionWithItemsHandler = { _, shared, _, _ in
-        try? FileManager.default.removeItem(at: folder)
         invoke.resolve(["shared": shared])
       }
       presenter.present(controller, animated: true)

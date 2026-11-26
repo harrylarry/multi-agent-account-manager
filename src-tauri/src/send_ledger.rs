@@ -55,7 +55,6 @@ pub enum SendStatus {
 pub enum SendKind {
   Message,
   FingerprintProbe,
-  RoomMessage,
   HarkMessage,
   HarkVerifiedProbe,
   HarkFingerprintProbe,
@@ -412,7 +411,7 @@ impl SendLedger {
       send_id: send_id.clone(),
       account_uuid: account_uuid.to_string(),
       conversation_id: conversation_id.to_string(),
-      digest: if kind == SendKind::RoomMessage { text.to_owned() } else { digest_of(text) },
+      digest: digest_of(text),
       started_at_ms: now_ms(),
       status: SendStatus::Prepared,
       error: None,
@@ -545,7 +544,15 @@ fn load_journal(path: &Path) -> JournalLoad {
       "状态日志为空（可能被截断），无法确认是否存在未定论的发送".to_string(),
     );
   }
-  match serde_json::from_slice::<JournalFile>(&bytes) {
+  let parsed = serde_json::from_slice::<serde_json::Value>(&bytes).and_then(|mut file| {
+    if file["version"].as_u64() == Some(u64::from(JOURNAL_VERSION)) {
+      if let Some(attempts) = file["attempts"].as_array_mut() {
+        attempts.retain(|attempt| attempt.get("kind").and_then(serde_json::Value::as_str) != Some("ROOM_MESSAGE"));
+      }
+    }
+    serde_json::from_value::<JournalFile>(file)
+  });
+  match parsed {
     Ok(f) if f.version == JOURNAL_VERSION => JournalLoad::Loaded(
       f.attempts
         .into_iter()
@@ -627,10 +634,6 @@ pub struct MissionGuard<'a> {
 }
 
 impl<'a> MissionGuard<'a> {
-  #[cfg(target_os = "ios")]
-  pub fn begin_room_send(&self, conversation_id: &str, digest: &str) -> Result<String, SendError> {
-    self.ledger.begin_mission_attempt(&self.mission_id, &self.account_uuid, conversation_id, digest, SendKind::RoomMessage)
-  }
   #[cfg(any(target_os = "ios", test))]
   pub fn begin_hark_send(&self, conversation_id: &str, digest: &str, diagnostic: bool) -> Result<String, SendError> {
     let kind = if diagnostic { SendKind::HarkVerifiedProbe } else { SendKind::HarkFingerprintProbe };
@@ -697,6 +700,27 @@ mod tests {
     assert!(l.busy_account("u1").is_none());
     // 不自动重发：台账里仍然只有一条
     assert_eq!(list.len(), 1);
+  }
+
+  #[test]
+  fn upgrade_purges_retired_entries_without_losing_ordinary_send_recovery() {
+    let path = tmp_journal("retired-entry");
+    let (ledger, _) = SendLedger::open(path.clone());
+    let ordinary = ledger.begin("u1", "c1", "ordinary").unwrap();
+    drop(ledger);
+    let mut saved: serde_json::Value = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+    let mut retired = saved["attempts"][0].clone();
+    retired["kind"] = serde_json::json!("ROOM_MESSAGE");
+    retired["send_id"] = serde_json::json!("purge-on-upgrade");
+    saved["attempts"].as_array_mut().unwrap().push(retired);
+    std::fs::write(&path, serde_json::to_vec(&saved).unwrap()).unwrap();
+    let (restored, report) = SendLedger::open(path.clone());
+    assert!(!report.corrupt);
+    assert_eq!(restored.attempts().len(), 1);
+    assert_eq!(restored.attempts()[0].send_id, ordinary);
+    assert_eq!(restored.attempts()[0].status, SendStatus::Unknown);
+    assert!(!std::fs::read_to_string(&path).unwrap().contains("purge-on-upgrade"));
+    std::fs::remove_dir_all(path.parent().unwrap()).unwrap();
   }
 
   #[test]

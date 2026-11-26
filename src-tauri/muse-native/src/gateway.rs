@@ -1067,10 +1067,6 @@ mod tests {
       server.send(response(
         &mut cipher, 3, b"{\"type\":\"event\",\"event\":\"delta.text_append\"}\n", true,
       )).await.unwrap();
-      let (path, cancel) = decode_test_request(&mut inbound, server.next().await.unwrap().unwrap());
-      assert_eq!(path, "/chat/cancel");
-      assert_eq!(cancel, serde_json::json!({ "session_id": "new" }));
-      server.send(response(&mut cipher, 4, br#"{"ok":true}"#, true)).await.unwrap();
     });
 
     let mut sub = route.subscribe(client, "0.1.26").await.unwrap();
@@ -1089,9 +1085,6 @@ mod tests {
     assert!(sub.next_line(wait).await.unwrap().unwrap().contains("delta.text_append"));
     assert!(sub.last_line_from_send());
     assert!(!sub.stream_ended());
-    let wrong_route = IsolatedProbeRoute::new("other-session".to_string());
-    assert!(!crate::chat_send::cancel_isolated_turn(&mut sub, &wrong_route).await);
-    assert!(crate::chat_send::cancel_isolated_turn(&mut sub, &route).await);
     let trace = sub.take_chat_wire_trace().join("\n");
     assert!(trace.contains("chat.subscribe 2 response subscription"));
     assert!(trace.contains("chat.stream 3 response send"));

@@ -1,5 +1,11 @@
 # 当前开发进度
 
+## 当前优先级 · 多账号稳定性
+
+用户已取消协作房间。先前房间设计与验收记录仅作历史。新版移除入口、派发、模板、附件分享及备份扩展，在升级启动时清理应用内的相关文件和旧台账条目。账号、网页登录态、代理、分组、时区和普通发送台账继续兼容。旧加密备份仍能恢复账号和代理资料。
+
+iOS 打开会话和自动额度同步用同一代理写锁读取并下发最新配置；额度回写会重查账号归属、代理与时区。并发的自动额度触发合并。当前回归优先核对 Muse/Hark 切换、代理故障阻断和重启后的登录隔离。[真机步骤](../acceptance/iphone-acceptance.md#多账号稳定性回归)
+
 2026-11-25 接续快照。任务状态和原始证据以 [PR #16 接续记录](https://github.com/harrylarry/multi-agent-account-manager/pull/16#issuecomment-7130670517)、[Issue #13](https://github.com/harrylarry/multi-agent-account-manager/issues/13) 和 [Issue #14](https://github.com/harrylarry/multi-agent-account-manager/issues/14) 为准。范围与验收门禁见[开发计划 v2.1](../叠号开发计划-严谨执行版-v2.1-2026-11-23.md)与[开发决策记录](../开发决策记录.md)。
 
 ## Phase 0 技术 Spike

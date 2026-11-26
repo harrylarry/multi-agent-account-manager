@@ -344,24 +344,6 @@ fn chat_stream_request(text: &str, node_id: &str, session_id: Option<&str>) -> H
   daemon_post("/chat/stream", build_params(text, node_id, session_id))
 }
 
-/// Best-effort cancel on the verified isolated session that owns this subscription.
-pub async fn cancel_isolated_turn<S: AsyncRead + AsyncWrite + Unpin>(
-  subscription: &mut Subscription<S>, route: &IsolatedProbeRoute,
-) -> bool {
-  if subscription.session_scope.as_deref() != Some(route.session_id()) { return false; }
-  tokio::time::timeout(Duration::from_secs(5), async {
-    let (_, _, response) = subscription.open_parallel(
-      daemon_post("/chat/cancel", json!({ "session_id": route.session_id() })), None,
-    ).await;
-    let Ok(mut response) = response else { return false; };
-    let Ok(body) = response.next_line(Duration::from_secs(5)).await else { return false; };
-    response.status().is_some_and(|status| (200..300).contains(&status))
-      && body.is_none_or(|line| serde_json::from_str::<Value>(&line).is_ok_and(|value| {
-        value.is_object() && value["ok"] != false && value["success"] != false && value["error"].is_null()
-      }))
-  }).await.unwrap_or(false)
-}
-
 /// One temporary identity for an already verified isolated session. It is not persisted.
 pub struct IsolatedProbeRoute {
   node_id: String,
@@ -517,26 +499,7 @@ pub async fn send_on_subscription<S: AsyncRead + AsyncWrite + Unpin>(
   timeout: Duration,
   cancel: &mut watch::Receiver<bool>,
 ) -> SendAttemptResult {
-  send_with_attachments_on_subscription(subscription, text, route, &[], timeout, cancel).await
-}
-
-#[derive(Clone, Debug)]
-pub struct ChatAttachment {
-  pub filename: String,
-  pub mime_type: &'static str,
-  pub data_base64: String,
-}
-
-pub async fn send_with_attachments_on_subscription<S: AsyncRead + AsyncWrite + Unpin>(
-  subscription: &mut Subscription<S>, text: &str, route: &IsolatedProbeRoute,
-  attachments: &[ChatAttachment], timeout: Duration, cancel: &mut watch::Receiver<bool>,
-) -> SendAttemptResult {
-  let mut params = build_params(text, &route.node_id, Some(route.session_id()));
-  if let Some(items) = params["items"].as_array_mut() {
-    items.extend(attachments.iter().map(|attachment| json!({
-      "type":"file", "filename":attachment.filename, "mime_type":attachment.mime_type, "data_base64":attachment.data_base64,
-    })));
-  }
+  let params = build_params(text, &route.node_id, Some(route.session_id()));
   let req = daemon_post("/chat/stream", params);
   let (on_wire, wrote_frames, response) = subscription.open_parallel(req, Some(cancel)).await;
   let outcome = match response {
