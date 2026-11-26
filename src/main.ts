@@ -1025,9 +1025,26 @@ function renderIphonePanel(state: ManagerSnapshot, provider: ProviderInfo, page:
     .sort((a, b) => (b.item.updatedAtMs ?? 0) - (a.item.updatedAtMs ?? 0));
   const rows = sessions.map(({ account, item }) => {
     const title = `<strong>${escapeHtml(item.title)}</strong><small>${page === "search" ? (account.providerId === "muse" ? "Muse · " : "Hark · ") : ""}${escapeHtml(account.alias)}</small>`;
-    return account.providerId === "muse"
-      ? iphoneMenuItem("chat", title, `data-iphone-thread="${escapeHtml(item.id)}" data-owner-uuid="${escapeHtml(account.uuid)}"`)
-      : `<div class="iphone-item">${iphoneIcon("chat")}<span>${title}</span><small>网页定位待验证</small></div>`;
+    if (account.providerId !== "muse") {
+      return `<div class="iphone-item">${iphoneIcon("chat")}<span>${title}</span><small>网页定位待验证</small></div>`;
+    }
+    const attributes = `data-iphone-thread="${escapeHtml(item.id)}" data-owner-uuid="${escapeHtml(account.uuid)}"`;
+    const link = iphoneMenuItem("chat", title, attributes);
+    if (page !== "sessions") return link;
+    const artifacts = iphoneArtifacts?.uuid === account.uuid && iphoneArtifacts.threadId === item.id ? iphoneArtifacts : null;
+    return `<div class="iphone-session-entry">
+      <div class="iphone-session-row">${link}
+        <button type="button" class="iphone-back" aria-expanded="${Boolean(artifacts)}"
+          data-iphone-artifacts="${escapeHtml(item.id)}" data-artifact-owner="${escapeHtml(account.uuid)}">${artifacts?.failed ? "重试产物" : "产物"}</button>
+      </div>
+      ${artifacts ? `<div class="iphone-artifact-list" role="status">
+        ${artifacts.pending ? "正在读取产物…" : artifacts.failed ? "未能读取产物。" : artifacts.names.length
+          ? `<ul>${artifacts.names.map((name) => `<li>${escapeHtml(name)}</li>`).join("")}</ul>`
+          : "暂无已确认归属此会话的产物。"}
+        ${!artifacts.pending && artifacts.unscoped > 0 ? `<p>${artifacts.unscoped} 项缺少可核对的会话归属。</p>` : ""}
+        ${artifacts.names.length ? `<button class="iphone-back" type="button" ${attributes}>打开原会话</button>` : ""}
+      </div>` : ""}
+    </div>`;
   }).join("");
   const matching = page === "search" ? accounts.filter((account) => matches(`${account.alias} ${account.group ?? ""} ${account.providerId}`)) : [];
   return `<h1 class="iphone-sr-only">${page === "search" ? "全局搜索" : "会话"}</h1>
@@ -1052,6 +1069,32 @@ async function refreshIphoneSessionBatch(force = false, failedOnly = false): Pro
     const work = updateIphoneSessions(account, force, refreshView);
     refreshView();
     await work;
+  }
+}
+
+let iphoneArtifacts: { uuid: string; threadId: string; pending: boolean; names: string[]; unscoped: number; failed: boolean } | null = null;
+
+async function readIphoneArtifacts(uuid: string, threadId: string): Promise<void> {
+  const account = snapshot?.accounts.find((item) => item.providerId === "muse" && item.authState === "authenticated" && item.uuid === uuid);
+  if (!snapshot || snapshot.conflicts.length || !account || !iphoneSessionsFor(account).items.some((session) => session.id === threadId)) return;
+  const current = iphoneArtifacts;
+  if (current?.uuid === uuid && current.threadId === threadId && !current.failed) {
+    iphoneArtifacts = null;
+    syncIphoneViews(snapshot, currentProvider(snapshot));
+    return;
+  }
+  const view = { uuid, threadId, pending: true, names: [] as string[], unscoped: 0, failed: false };
+  iphoneArtifacts = view;
+  syncIphoneViews(snapshot, currentProvider(snapshot));
+  try {
+    const rows = await invoke<{ names: string[]; unscoped: number }>("list_muse_thread_artifacts", { uuid, threadId });
+    view.names = rows.names;
+    view.unscoped = rows.unscoped;
+  } catch {
+    view.failed = true;
+  } finally {
+    view.pending = false;
+    if (snapshot && iphoneArtifacts === view) syncIphoneViews(snapshot, currentProvider(snapshot));
   }
 }
 
@@ -1106,6 +1149,8 @@ function syncIphoneViews(state: ManagerSnapshot, provider: ProviderInfo): void {
   const detailAccount = state.accounts.find((account) => isSameKey(iphoneDetail, account) && account.providerId === provider.id);
   const page = detailAccount ? "detail" : iphonePage;
   reconcileIphoneSessions(state.accounts);
+  if (iphoneArtifacts && !state.accounts.some((item) => item.uuid === iphoneArtifacts?.uuid &&
+    item.providerId === "muse" && item.authState === "authenticated")) iphoneArtifacts = null;
   const pageMode = spikeWorkspaceOpen && provider.id === "muse" ? "diagnostics" : page;
   shell.dataset.iphoneView = pageMode;
   scheduleIphoneGlass();
@@ -2996,7 +3041,12 @@ async function checkAccountTasks(view: Extract<ModalMode, { kind: "tasks" }>): P
     const result = await invoke<TaskObservation>("observe_account_tasks", {
       uuid, providerId, timezone: Intl.DateTimeFormat().resolvedOptions().timeZone || "UTC",
     });
-    applyTaskObservation(key, result);
+    if (result.source === "native" && result.observedAtMs) {
+      pendingTaskActivity.delete(key);
+      latestTaskObservations.set(key, result);
+    } else {
+      applyTaskObservation(key, result);
+    }
   } catch (error) {
     applyTaskObservation(key, { activity: "unknown", observedAtMs: null, source: null });
     view.note = String(error);
@@ -4689,6 +4739,11 @@ function bindDelegatedEvents(): void {
       if ((next && overlays.includes(next)) || exiting) animateIphoneEntrance(iphonePage, previous, exiting);
       if (next === "search") document.getElementById("iphone-global-search")?.focus();
       if (next === "sessions" || next === "search") void refreshIphoneSessionBatch();
+      return;
+    }
+    const artifactButton = target.closest<HTMLElement>("[data-iphone-artifacts]");
+    if (artifactButton && modal.kind === "none" && iphonePage === "sessions") {
+      await readIphoneArtifacts(artifactButton.dataset.artifactOwner ?? "", artifactButton.dataset.iphoneArtifacts ?? "");
       return;
     }
     const openResult = target.closest<HTMLElement>("[data-iphone-open-account], [data-iphone-thread]");

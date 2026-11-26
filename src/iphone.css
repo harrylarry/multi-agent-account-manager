@@ -382,3 +382,11 @@
 @media (prefers-contrast: more) {
   .native-iphone-glass .iphone-shell [data-iphone-glass] { background: var(--dh-surface); }
 }
+
+.iphone-session-entry { border-bottom: 1px solid var(--dh-line); }
+.iphone-session-entry:last-child { border-bottom: 0; }
+.iphone-session-row { display: grid; grid-template-columns: minmax(0, 1fr) auto; align-items: center; }
+.iphone-session-row .iphone-item { border-bottom: 0; }
+.iphone-session-row > button:last-child { margin-inline: 4px; white-space: nowrap; }
+.iphone-artifact-list { margin: 0 12px 8px; padding: 6px 8px; overflow-wrap: anywhere; color: var(--dh-secondary); font-size: 13px; }
+.iphone-artifact-list ul { padding-inline-start: 20px; }

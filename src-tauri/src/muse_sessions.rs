@@ -65,6 +65,53 @@ async fn request(gateway: &mut crate::egress::AccountGateway, path: &str) -> Res
   Ok(body)
 }
 
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct MuseThreadArtifacts {
+  names: Vec<String>,
+  unscoped: usize,
+}
+
+#[cfg(target_os = "ios")]
+pub async fn fetch_thread_artifacts(
+  egress: &crate::egress::AccountEgress, cookies: &muse_native_client::cookie::SessionCookies,
+  thread: Uuid,
+) -> Result<MuseThreadArtifacts, String> {
+  let mut gateway = Box::pin(egress.connect(cookies)).await.map_err(|_| "无法连接 Muse 会话网关")?;
+  parse_thread_artifacts(&request(&mut gateway, "/api/artifacts").await?, thread)
+}
+
+#[cfg(any(target_os = "ios", test))]
+fn parse_thread_artifacts(body: &[u8], thread: Uuid) -> Result<MuseThreadArtifacts, String> {
+  let raw: Value = serde_json::from_slice(body).map_err(|_| "产物响应格式无效")?;
+  if raw["ok"] == false || !raw["error"].is_null() { return Err("服务未返回产物列表".into()); }
+  let envelope = raw.get("result").unwrap_or(&raw);
+  let rows = envelope.as_array().or_else(|| ["artifacts", "items", "files", "results"].into_iter()
+    .find_map(|key| envelope[key].as_array())).ok_or("无法核验产物列表结构")?;
+  let mut names = Vec::new();
+  let mut unscoped = 0;
+  let mut ids = std::collections::HashSet::new();
+  for row in rows {
+    let scopes: Vec<_> = ["session_id", "thread_id"].into_iter().filter_map(|key| row[key].as_str())
+      .collect();
+    if scopes.is_empty() || scopes.iter().any(|id| Uuid::parse_str(id).is_err()) {
+      unscoped += 1;
+      continue;
+    }
+    if scopes.iter().any(|id| Uuid::parse_str(id).ok() != Some(thread)) { continue; }
+    let identifier = ["artifact_id", "id", "file_id"].into_iter().find_map(|key| row[key].as_str());
+    let Some(identifier) = identifier.filter(|id| !id.is_empty()) else { unscoped += 1; continue; };
+    if !ids.insert(identifier) { continue; }
+    let display = ["name", "title", "filename", "display_name"].into_iter().find_map(|key| row[key].as_str());
+    let Some(display) = display.filter(|name| !name.trim().is_empty()) else { unscoped += 1; continue; };
+    let name: String = display.split(['?', '#']).next().unwrap_or("").rsplit('/').next().unwrap_or("")
+      .trim().chars().filter(|character| !character.is_control()).take(160).collect();
+    if !name.is_empty() { names.push(name); }
+    if names.len() >= 100 { break; }
+  }
+  Ok(MuseThreadArtifacts { names, unscoped })
+}
+
 #[cfg(target_os = "ios")]
 pub async fn verify_first_message(
   egress: &crate::egress::AccountEgress, cookies: &muse_native_client::cookie::SessionCookies,
@@ -256,6 +303,21 @@ pub fn parse_list(raw: &[u8]) -> Result<Vec<MuseSession>, String> {
 #[cfg(test)]
 mod tests {
   use super::*;
+
+  #[test]
+  fn artifacts_require_explicit_thread_ownership_and_hide_download_urls() {
+    let thread = Uuid::new_v4();
+    let raw = serde_json::json!({"ok":true,"result":{"artifacts":[
+      {"id":"same","session_id":thread,"name":"brief.md", "url":"https://private.example/file?sig=secret"},
+      {"id":"same","thread_id":thread,"name":"brief.md"},
+      {"id":"other","session_id":Uuid::new_v4(),"name":"other.md"},
+      {"id":"unbound","name":"not-attributed.md"}
+    ]}});
+    let items = parse_thread_artifacts(raw.to_string().as_bytes(), thread).unwrap();
+    assert_eq!(items.names, vec!["brief.md"]);
+    assert_eq!(items.unscoped, 1);
+    assert!(!serde_json::to_string(&items).unwrap().contains("secret"));
+  }
 
   #[test]
   fn reconciliation_requires_exact_text_and_the_allocated_session() {

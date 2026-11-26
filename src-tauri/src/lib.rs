@@ -680,6 +680,41 @@ async fn list_muse_sessions(
 
 #[tauri::command]
 #[cfg_attr(not(target_os = "ios"), allow(unused_variables))]
+async fn list_muse_thread_artifacts(
+  app: AppHandle, mgr: State<'_, Arc<SessionManager>>, cancel: State<'_, Arc<probe_cancel::ProbeCancel>>,
+  uuid: String, thread_id: String,
+) -> Result<muse_sessions::MuseThreadArtifacts, String> {
+  #[cfg(target_os = "ios")]
+  {
+    let uuid = storage::normalize_uuid(&uuid).ok_or("账号标识无效")?;
+    let thread = uuid::Uuid::parse_str(&thread_id).map_err(|_| "会话标识无效")?;
+    let proxy_guard = mgr.proxy_write_lock.lock().await;
+    let (mut token, _guard) = cancel.register(&uuid, "muse_artifacts");
+    let snapshot = mgr.get_snapshot().await;
+    drop(proxy_guard);
+    if snapshot.conflicts.iter().any(|entry| entry.uuid == uuid)
+      || snapshot.pending_cleanup.iter().any(|key| key.uuid == uuid) { return Err("账号当前不可用".into()); }
+    let account = snapshot.accounts.iter().find(|account| account.provider_id == providers::ProviderId::Muse
+      && account.uuid == uuid && account.auth_state == storage::AuthState::Authenticated)
+      .ok_or("请先登录此 Muse 账号")?;
+    tokio::select! {
+      biased;
+      _ = token.cancelled() => Err("会话产物查询已停止".into()),
+      response = tokio::time::timeout(std::time::Duration::from_secs(30), async {
+        let header = zeroize::Zeroizing::new(muse_native::cookie_header_for(&app, &uuid).await?);
+        if header.is_empty() { return Err("没有可用的 Muse 登录态".into()); }
+        let cookies = muse_native_client::cookie::SessionCookies::from_header(&header);
+        let egress = egress::resolve_for_app(&app, account.proxy.as_ref())?;
+        muse_sessions::fetch_thread_artifacts(&egress, &cookies, thread).await
+      }) => response.map_err(|_| "读取会话产物超时")?,
+    }
+  }
+  #[cfg(not(target_os = "ios"))]
+  Err("此操作仅支持 iOS".into())
+}
+
+#[tauri::command]
+#[cfg_attr(not(target_os = "ios"), allow(unused_variables))]
 async fn list_hark_sessions(
   app: AppHandle, mgr: State<'_, Arc<SessionManager>>, cancel: State<'_, Arc<probe_cancel::ProbeCancel>>, uuid: String,
 ) -> Result<Vec<hark_native::HarkSessionSummary>, String> {
@@ -2140,6 +2175,7 @@ pub fn run() {
       transfer_account_cookies,
       inspect_account_cookies,
       list_muse_sessions,
+      list_muse_thread_artifacts,
       open_muse_thread,
       list_hark_sessions,
       spike_ios_quota_sync_probe,
