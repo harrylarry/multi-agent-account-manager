@@ -1,6 +1,6 @@
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
-import { markRoomSuggestions, renderRooms, roomCommand, type RoomBook, type RoomsView } from "./rooms";
+import { markRoomSuggestions, renderRooms, roomCommand, updateRoomTemplateForm, type RoomBook, type RoomsView } from "./rooms";
 import "./styles.css";
 import type {
   AccountKey,
@@ -4837,6 +4837,11 @@ function bindDelegatedEvents(): void {
 
   root.addEventListener("change", async (ev) => {
     const timezoneChoice = ev.target as HTMLSelectElement;
+    if (modal.kind === "rooms" && timezoneChoice.closest("[data-template-editor]") &&
+        (timezoneChoice.id === "room-template-base" || timezoneChoice.id === "room-template-edit" || timezoneChoice.matches("[data-template-stage]"))) {
+      updateRoomTemplateForm(modal.book, timezoneChoice.id || "stage");
+      return;
+    }
     if (timezoneChoice.id === "modal-timezone-choice" && modal.kind === "rename") {
       const input = document.querySelector<HTMLInputElement>("#modal-timezone-input");
       const custom = document.querySelector<HTMLElement>("#modal-timezone-custom");

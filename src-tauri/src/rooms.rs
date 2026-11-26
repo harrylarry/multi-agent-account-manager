@@ -35,6 +35,13 @@ enum Role { Commander, Executor, Reviewer, Publisher, Discussant }
 #[serde(rename_all = "snake_case")]
 enum Flow { Build, Brainstorm, Review, Compare, Solo }
 
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+#[serde(default, rename_all = "camelCase", deny_unknown_fields)]
+pub struct RoleSeats {
+  executors: Option<usize>,
+  discussants: Option<usize>,
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct Template {
@@ -47,6 +54,8 @@ struct Template {
   workflow: Vec<Stage>,
   #[serde(default)]
   work_seats: Option<usize>,
+  #[serde(default, skip_serializing_if = "Option::is_none")]
+  role_seats: Option<RoleSeats>,
 }
 
 impl Template {
@@ -55,8 +64,70 @@ impl Template {
       ("review", "评审", Flow::Review, 2), ("compare", "群发对比", Flow::Compare, 2),
       ("solo", "单账号任务", Flow::Solo, 1)]
       .into_iter().map(|(id, title, flow, min_participants)| Self {
-        id: id.into(), title: title.into(), version: 1, flow, min_participants, workflow: Vec::new(), work_seats:None,
+        id: id.into(), title: title.into(), version: 1, flow, min_participants, workflow: Vec::new(), work_seats:None, role_seats:None,
       }).collect()
+  }
+
+  fn stages(&self) -> &[Stage] {
+    if self.workflow.is_empty() { relay::default_workflow(self.flow) } else { &self.workflow }
+  }
+
+  fn seats(&self, role: Role, size: usize) -> std::ops::RangeInclusive<usize> {
+    let configured = self.role_seats.as_ref();
+    match role {
+      Role::Commander | Role::Publisher => 1..=1,
+      Role::Reviewer => { let count = usize::from(self.stages().contains(&Stage::Review)); count..=count }
+      Role::Executor if self.flow == Flow::Solo => 1..=1,
+      Role::Executor if !self.stages().contains(&Stage::Work) => 0..=0,
+      Role::Executor => {
+        if let Some(count) = configured.and_then(|seats| seats.executors)
+          .or(self.work_seats.filter(|_| self.flow == Flow::Build)) { return count..=count; }
+        match self.flow {
+          Flow::Build => 1..=2,
+          Flow::Compare if !self.stages().contains(&Stage::Review) => size..=size,
+          Flow::Compare => { let count = size.saturating_sub(1); count..=count }
+          _ => 1..=1,
+        }
+      }
+      Role::Discussant if !self.stages().contains(&Stage::Discuss) => 0..=0,
+      Role::Discussant => {
+        if let Some(count) = configured.and_then(|seats| seats.discussants)
+          .or(self.work_seats.filter(|_| self.flow == Flow::Brainstorm)) { return count..=count; }
+        if self.flow == Flow::Brainstorm { 3..=5 } else { 2..=2 }
+      }
+    }
+  }
+
+  fn validate_config(&self, check_feasibility: bool) -> Result<(), String> {
+    relay::validate_workflow(self.flow, &self.workflow)?;
+    if self.work_seats.is_some_and(|count| match self.flow {
+      Flow::Build => !(1..=2).contains(&count),
+      Flow::Brainstorm => !(3..=5).contains(&count),
+      _ => true,
+    }) { return Err("旧版模板的执行或讨论席位无效".into()); }
+    if let Some(seats) = &self.role_seats {
+      let min_discussion = if self.flow == Flow::Brainstorm { 3 } else { 2 };
+      if self.work_seats.is_some()
+        || seats.executors.is_some_and(|count| !self.stages().contains(&Stage::Work) || !(1..=12).contains(&count))
+        || seats.discussants.is_some_and(|count| !self.stages().contains(&Stage::Discuss) || !(min_discussion..=12).contains(&count))
+      { return Err("角色席位必须对应流程阶段并符合人数要求".into()); }
+    }
+    let floor = match self.flow { Flow::Solo => 1, Flow::Brainstorm => 3, _ => 2 };
+    let ceiling = if self.flow == Flow::Solo { 1 } else { 12 };
+    if !check_feasibility { return Ok(()); }
+    let possible = (self.min_participants..=ceiling).any(|size| {
+      let counts = [Role::Executor, Role::Reviewer, Role::Discussant, Role::Commander, Role::Publisher]
+        .map(|role| self.seats(role, size));
+      let fixed_steps = self.stages().iter().filter(|stage| matches!(stage, Stage::Plan | Stage::Summarize | Stage::Publish)).count();
+      counts.iter().all(|range| !range.is_empty() && *range.start() <= size)
+        && counts[0].start() + counts[1].start() <= size
+        && counts.iter().map(|range| *range.end()).sum::<usize>() >= size
+        && counts[..3].iter().map(|range| *range.start()).sum::<usize>() + fixed_steps <= 24
+    });
+    if !(floor..=ceiling).contains(&self.min_participants) || !possible {
+      return Err("模板人数与角色席位不相容，执行者和审核者必须相互独立".into());
+    }
+    Ok(())
   }
 }
 
@@ -218,18 +289,12 @@ impl Room {
         return Err("必须分配有效角色，执行者和审核者不能由同一账号担任".into());
       }
     }
-    let count = |role| members.iter().filter(|member| member.roles.contains(&role)).count();
-    let flow_ok = match self.template.flow {
-      Flow::Build => self.template.work_seats.map_or_else(|| (1..=2).contains(&count(Role::Executor)), |seats| count(Role::Executor) == seats)
-        && count(Role::Reviewer) == 1 && count(Role::Discussant) == 0,
-      Flow::Review => count(Role::Executor) == 1 && count(Role::Reviewer) == 1 && count(Role::Discussant) == 0,
-      Flow::Brainstorm => self.template.work_seats.map_or_else(|| (3..=5).contains(&count(Role::Discussant)), |seats| count(Role::Discussant) == seats)
-        && count(Role::Reviewer) == 0 && count(Role::Executor) == 0,
-      Flow::Compare => count(Role::Executor) == members.len() && count(Role::Reviewer) == 0 && count(Role::Discussant) == 0,
-      Flow::Solo => members.len() == 1 && count(Role::Executor) == 1 && count(Role::Reviewer) == 0 && count(Role::Discussant) == 0,
-    };
-    if count(Role::Commander) != 1 || count(Role::Publisher) != 1 || !flow_ok {
-      return Err("请设置一名指挥者和一名上传者，再核对模板所需的执行、审核或讨论角色".into());
+    if self.template.flow == Flow::Solo && members.len() != 1 { return Err("单账号任务只允许一个成员".into()); }
+    for role in [Role::Commander, Role::Executor, Role::Reviewer, Role::Publisher, Role::Discussant] {
+      let count = members.iter().filter(|member| member.roles.contains(&role)).count();
+      if !self.template.seats(role, members.len()).contains(&count) {
+        return Err("成员角色与模板席位不符，请核对指挥、执行、审核、上传和讨论人数".into());
+      }
     }
     Ok(())
   }
@@ -261,7 +326,7 @@ impl RoomBook {
       if room.attempts.len() > 64 || room.draft.members.len() > 12 || !(1..=24).contains(&room.draft.round_limit) {
         return Err("房间归档含无效轮次或成员".into());
       }
-      relay::validate_workflow(room.template.flow, &room.template.workflow)?;
+      room.template.validate_config(room.template.role_seats.is_some())?;
       room.validate_archived_artifacts()?;
     }
     let builtin = Template::builtin();
@@ -272,7 +337,7 @@ impl RoomBook {
         || !(1..=12).contains(&template.min_participants) {
         return Err("备份含无效自定义模板".into());
       }
-      relay::validate_workflow(template.flow, &template.workflow)?;
+      template.validate_config(template.role_seats.is_some())?;
     }
     Ok(())
   }
@@ -350,7 +415,7 @@ pub enum Command {
   Interrupt { id: Uuid },
   SaveTemplate { title: String, base_id: String, min_participants: usize,
     #[serde(default)] edit_id: Option<String>, #[serde(default)] version: Option<u32>,
-    #[serde(default)] workflow: Vec<Stage>, #[serde(default)] work_seats: Option<usize> },
+    #[serde(default)] workflow: Vec<Stage>, #[serde(default)] work_seats: Option<usize>, #[serde(default)] role_seats: Option<RoleSeats> },
   SaveArtifact { id: Uuid, revision: u64, input: artifacts::ArtifactInput },
   BindSession { id: Uuid, revision: u64, account_uuid: String, thread_id: Uuid },
   UnbindSession { id: Uuid, revision: u64, account_uuid: String, thread_id: Uuid },
@@ -445,21 +510,14 @@ pub fn apply_verified(path: &Path, command: Command, accounts: &[AccountRecord],
       if room.in_progress() { return Err("请先结束活跃房间".into()); }
       book.rooms.retain(|room| room.id != id);
     }
-    Command::SaveTemplate { title, base_id, min_participants, edit_id, version, workflow, work_seats } => {
+    Command::SaveTemplate { title, base_id, min_participants, edit_id, version, workflow, work_seats, role_seats } => {
       let title = title.trim();
       let base = book.templates.iter().find(|item| item.id == base_id).ok_or("基础流程不存在")?;
-      let maximum = match base.flow { Flow::Solo => 1, Flow::Brainstorm => 5, _ => 12 };
-      if title.is_empty() || title.chars().count() > 60 || !(base.min_participants..=maximum).contains(&min_participants)
+      if title.is_empty() || title.chars().count() > 60
         || (edit_id.is_none() && book.custom_templates.len() >= 32)
         || book.templates.iter().any(|item| item.title == title && edit_id.as_deref() != Some(&item.id)) {
         return Err("请检查模板名称、人数要求或重名".into());
       }
-      relay::validate_workflow(base.flow, &workflow)?;
-      if work_seats.is_some_and(|seats| match base.flow {
-        Flow::Build => !(1..=2).contains(&seats),
-        Flow::Brainstorm => !(3..=5).contains(&seats),
-        _ => true,
-      }) { return Err("执行人数仅代码开发可设为 1–2 人，讨论人数仅头脑风暴可设为 3–5 人".into()); }
       let (id, next_version) = match &edit_id {
         Some(id) => {
           let existing = book.custom_templates.iter().find(|item| &item.id == id && version == Some(item.version))
@@ -468,7 +526,8 @@ pub fn apply_verified(path: &Path, command: Command, accounts: &[AccountRecord],
         }
         None => (Uuid::new_v4().to_string(), 1),
       };
-      let template = Template { id, version: next_version, title: title.into(), flow: base.flow, min_participants, workflow, work_seats };
+      let template = Template { id, version: next_version, title: title.into(), flow: base.flow, min_participants, workflow, work_seats, role_seats };
+      template.validate_config(true)?;
       book.templates.retain(|item| item.id != template.id);
       book.custom_templates.retain(|item| item.id != template.id);
       book.templates.push(template.clone());
@@ -944,6 +1003,54 @@ mod tests {
     assert!(apply_verified(&fixture.path, make("a"), &fixture.accounts, false, Some("Owned".into())).is_ok());
     let bad_commit = "https://github.com/a/b/commit/123";
     assert!(commit_coordinates(bad_commit).is_err());
+  }
+
+  #[test]
+  fn template_role_config_is_validated_versioned_and_used_by_both_assignment_modes() {
+    let fixture = RelayFixture::new(Flow::Review, 12, REVIEW_ROLES);
+    let workflow = vec![Stage::Plan, Stage::Discuss, Stage::Work, Stage::Review, Stage::Summarize, Stage::Publish];
+    let save = |id: Option<String>, version, executors| Command::SaveTemplate {
+      title:"Design review".into(), base_id:"review".into(), min_participants:3, edit_id:id, version,
+      workflow:workflow.clone(), work_seats:None,
+      role_seats:Some(RoleSeats { executors:Some(executors), discussants:Some(2) }),
+    };
+    assert!(fixture.command(save(None, None, 12)).is_err());
+    let book = fixture.command(save(None, None, 2)).unwrap();
+    let template = book.custom_templates[0].clone();
+    let mut draft = fixture.get().draft;
+    draft.template_id = template.id.clone();
+    assert!(fixture.command(Command::Create { draft:draft.clone(), references:Vec::new() }).is_err());
+    draft.members = vec![
+      Member { uuid:"a".into(), roles:vec![Role::Executor, Role::Commander] },
+      Member { uuid:"b".into(), roles:vec![Role::Executor, Role::Discussant] },
+      Member { uuid:"c".into(), roles:vec![Role::Reviewer, Role::Discussant, Role::Publisher] },
+    ];
+    let created = fixture.command(Command::Create { draft:draft.clone(), references:Vec::new() }).unwrap();
+    let saved_room = created.rooms[0].id;
+    assert_eq!(created.rooms[0].stage_members(), vec![
+      (Stage::Plan,"a"), (Stage::Discuss,"b"), (Stage::Discuss,"c"), (Stage::Work,"a"),
+      (Stage::Work,"b"), (Stage::Review,"c"), (Stage::Summarize,"a"), (Stage::Publish,"c"),
+    ]);
+    let mut accounts = fixture.accounts.clone();
+    for (account, used) in accounts.iter_mut().zip([10, 25, 30, 35]) {
+      account.quota_observation = Some(crate::storage::QuotaObservation {
+        source:"native".into(), window:Some("daily".into()), percent_used:Some(used), resets_at_ms:None,
+        checked_at_ms:now_ms(), stale:false,
+      });
+    }
+    draft.automatic = true;
+    draft.members.retain(|member| member.uuid == "a");
+    let assigned = apply(&fixture.path, Command::Create { draft, references:Vec::new() }, &accounts, false).unwrap();
+    assert_eq!(assigned.rooms[0].assignment.fixed, vec!["a"]);
+    assert_eq!(assigned.rooms[0].stage_members().iter().filter(|(stage, _)| *stage == Stage::Work).count(), 2);
+    assert!(assigned.rooms[0].validate(&accounts).is_ok());
+    assert!(fixture.command(save(Some(template.id.clone()), Some(0), 1)).is_err());
+    let book = fixture.command(save(Some(template.id), Some(1), 1)).unwrap();
+    assert_eq!(book.custom_templates[0].version, 2);
+    assert_eq!(book.rooms.iter().find(|room| room.id == saved_room).unwrap().template.version, 1);
+    let archived: RoomBook = serde_json::from_slice(&serde_json::to_vec(&book).unwrap()).unwrap();
+    archived.validate_archive().unwrap();
+    assert!(relay::validate_workflow(Flow::Brainstorm, &[Stage::Discuss, Stage::Work, Stage::Summarize, Stage::Publish]).is_err());
   }
 
   #[test]

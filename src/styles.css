@@ -1958,3 +1958,35 @@ body,
   overflow-wrap: anywhere;
   padding-block: 0.45rem;
 }
+
+.room-timeline {
+  display: grid;
+  gap: 0.75rem;
+  list-style: none;
+  margin: 0.75rem 0;
+  padding: 0;
+}
+
+.room-message {
+  min-width: 0;
+  padding: 0.65rem 0;
+  border-top: 1px solid var(--border-strong);
+}
+
+.room-message-heading {
+  display: flex;
+  align-items: center;
+  gap: 0.55rem;
+  overflow-wrap: anywhere;
+}
+
+.room-message-avatar {
+  display: grid;
+  place-items: center;
+  flex: 0 0 2rem;
+  height: 2rem;
+  border: 1px solid var(--border-strong);
+  border-radius: 50%;
+  font-size: 0.875rem;
+  font-weight: 600;
+}

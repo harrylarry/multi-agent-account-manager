@@ -6,7 +6,7 @@ const MAX_REVIEW_RETURNS: u8 = 3;
 #[serde(rename_all = "snake_case")]
 pub enum Stage { Plan, Work, Review, Discuss, Summarize, Publish }
 
-fn default_workflow(flow: Flow) -> &'static [Stage] {
+pub(super) fn default_workflow(flow: Flow) -> &'static [Stage] {
   use Stage::*;
   match flow {
     Flow::Build => &[Plan, Work, Review, Publish],
@@ -20,13 +20,18 @@ fn default_workflow(flow: Flow) -> &'static [Stage] {
 pub(super) fn validate_workflow(flow: Flow, workflow: &[Stage]) -> Result<(), String> {
   use Stage::*;
   if workflow.is_empty() { return Ok(()); }
-  let mut expected = default_workflow(flow).to_vec();
-  if expected.is_empty() { return Err("单账号模板只支持一次派发".into()); }
-  if workflow.first() == Some(&Plan) && !expected.contains(&Plan) { expected.insert(0, Plan); }
-  if workflow.contains(&Summarize) && !expected.contains(&Summarize) {
-    expected.insert(expected.len() - 1, Summarize);
+  let required = default_workflow(flow);
+  if required.is_empty() { return Err("单账号模板只支持一次派发".into()); }
+  let canonical = [Plan, Discuss, Work, Review, Summarize, Publish];
+  let expected: Vec<_> = canonical.into_iter().filter(|stage| workflow.contains(stage)).collect();
+  if workflow != expected || required.iter().any(|stage| !workflow.contains(stage)) {
+    return Err("请保留基础流程所需阶段。自定义流程依次为拆解、讨论、执行、审核、汇总、交付，阶段不能重复".into());
   }
-  if workflow != expected { return Err("流程必须保留原模板必需阶段与顺序。可在开头增加指挥拆解，或在交付前增加指挥汇总。".into()); }
+  let review = workflow.contains(&Review);
+  let work = workflow.contains(&Work);
+  if (review && !work) || (flow == Flow::Brainstorm && work && !review) {
+    return Err("审核需要执行产出，讨论模板新增执行时必须启用独立审核".into());
+  }
   Ok(())
 }
 
@@ -104,9 +109,7 @@ impl Room {
   #[cfg(any(target_os = "ios", test))]
   pub(super) fn stage_members(&self) -> Vec<(Stage, &str)> {
     let mut steps = Vec::new();
-    let workflow = if self.template.workflow.is_empty() { default_workflow(self.template.flow) }
-      else { &self.template.workflow };
-    for &stage in workflow {
+    for &stage in self.template.stages() {
       let role = match stage {
         Stage::Plan | Stage::Summarize => Role::Commander,
         Stage::Work => Role::Executor,
@@ -257,7 +260,7 @@ impl Room {
   pub(super) fn relay_prompt(&self, stage: Stage, account: &str, attempt_id: Uuid) -> Option<String> {
     let instruction = match (self.template.flow, stage) {
       (_, Stage::Plan) => "你是指挥者。拆解目标，明确每个已指定执行者的子任务、依赖和验收标准。成员和角色由用户确定，不能改派。输出可供后续执行的简报。",
-      (Flow::Compare, Stage::Work) => "你是执行者。根据用户原题独立给出你的方案，不预设其他成员的结论。",
+      (Flow::Compare, Stage::Work) => "你是执行者。根据用户原题独立给出你的方案，不预设其他成员的结论。有审核打回时，仅依据和你有关的审查理由修改。",
       (_, Stage::Work) => "你是执行者。按目标及已分派子任务提交完整产出。如有审核打回，请逐点修改。用实际可核对的证据说明外部产出；没有外部验证时只交付原文、方案或标明待交付。",
       (_, Stage::Review) => "你是独立审核者。逐项检查本轮提交的所有产出与用户要求，仅返回下面 JSON 对象。通过用 approve，打回用 return，reason 写清依据或具体修改要求。审核不等于用户定稿。",
       (_, Stage::Discuss) => "你是讨论者。给出自己的观点，补充或质疑前面的发言，并明确假设与待解决问题。",
@@ -282,7 +285,7 @@ impl Room {
       prompt.push_str(&format!("\n\n固定执行席位：共 {count} 位。"));
       if let Some(index) = execution { prompt.push_str(&format!(" 你是第 {} 位执行者。", index + 1)); }
     }
-    if stage == Stage::Work && self.template.flow == Flow::Compare { return Some(prompt); }
+    let independent = stage == Stage::Work && self.template.flow == Flow::Compare;
     let current = self.attempts.get(self.relay.revision_from..)?;
     let cycle_start = self.relay.cycle_from.checked_sub(self.relay.revision_from)?;
     let previous_cycle = current.get(..cycle_start)?;
@@ -300,11 +303,13 @@ impl Room {
         Stage::Discuss => step.stage == Some(Stage::Discuss),
         Stage::Summarize => step.stage == Some(Stage::Discuss) || (in_cycle && matches!(step.stage, Some(Stage::Work | Stage::Review))),
         Stage::Publish => in_cycle && matches!(step.stage, Some(Stage::Work | Stage::Review | Stage::Summarize))
-          || (self.template.flow == Flow::Brainstorm && step.stage == Some(Stage::Discuss)),
+          || step.stage == Some(Stage::Discuss),
       };
       let share_new = !matches!(stage, Stage::Review | Stage::Publish)
         && last_seen.is_none_or(|last| index > last) && current.len() - index <= 20;
-      if required || share_new {
+      let include = if independent { last_review == Some(step.id) || last_work == Some(step.id) }
+        else { required || share_new };
+      if include {
         if let Some(delivery) = &step.delivery { evidence.push((step, delivery)); }
       }
     }

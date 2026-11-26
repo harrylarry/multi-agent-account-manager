@@ -23,7 +23,16 @@ const holdReasons: Record<string, string> = {
 };
 
 interface Member { uuid: string; roles: string[] }
-interface Template { id: string; title: string; version: number; minParticipants: number; flow: string; workflow?: string[] }
+interface Template {
+  id: string; title: string; version: number; minParticipants: number; flow: string; workflow?: string[];
+  workSeats?: number; roleSeats?: { executors?: number; discussants?: number };
+}
+const orderedStages = ["plan", "discuss", "work", "review", "summarize", "publish"];
+const baseStages: Record<string, string[]> = {
+  build: ["plan", "work", "review", "publish"], review: ["work", "review", "publish"],
+  brainstorm: ["discuss", "summarize", "publish"], compare: ["work", "publish"], solo: [],
+};
+const builtInTemplates = ["development", "brainstorm", "review", "compare", "solo"];
 interface Attempt { id?: string; accountUuid: string; status: string; sessionId: string | null; userMessageId: string | null;
   remoteCancelAcknowledged?: boolean;
   stage?: string; review?: { decision: "approve" | "return"; reason: string };
@@ -74,11 +83,55 @@ export function markRoomSuggestions(book: RoomBook | null, goal: string): void {
   }
 }
 
+export function updateRoomTemplateForm(book: RoomBook | null, changed: string): void {
+  const field = (id: string) => document.getElementById(id) as HTMLInputElement | HTMLSelectElement | null;
+  const base = field("room-template-base");
+  const edit = field("room-template-edit");
+  if (!base || !edit) return;
+  const editing = book?.templates.find((item) => item.id === edit.value);
+  if (changed === edit.id && editing) {
+    base.value = book?.templates.find((item) => item.flow === editing.flow && builtInTemplates.includes(item.id))?.id ?? base.value;
+  }
+  const template = book?.templates.find((item) => item.id === base.value);
+  if (!template) return;
+  const required = baseStages[template.flow] ?? [];
+  const source = changed === edit.id && editing ? editing : template;
+  const stageFields = Array.from(document.querySelectorAll<HTMLInputElement>("[data-template-stage]"));
+  if (changed === edit.id || changed === base.id || !changed) {
+    const title = field("room-template-title");
+    const minimum = field("room-template-min");
+    if (title && changed === edit.id) title.value = editing?.title ?? "";
+    if (minimum) minimum.value = String(source.minParticipants);
+    const selected = source.workflow?.length ? source.workflow : required;
+    for (const input of stageFields) input.checked = selected.includes(input.value);
+    const executors = field("room-template-executors");
+    const discussants = field("room-template-discussants");
+    if (executors) executors.value = String(source.roleSeats?.executors ?? (source.flow === "build" ? source.workSeats ?? "" : ""));
+    if (discussants) discussants.value = String(source.roleSeats?.discussants ?? (source.flow === "brainstorm" ? source.workSeats ?? "" : ""));
+  }
+  const work = stageFields.some((input) => input.value === "work" && input.checked);
+  for (const input of stageFields) {
+    const mandatory = required.includes(input.value) || (template.flow === "brainstorm" && work && input.value === "review");
+    const unavailable = template.flow === "solo" || (input.value === "review" && !work);
+    input.disabled = unavailable || mandatory;
+    if (mandatory) input.checked = true;
+    if (unavailable) input.checked = false;
+  }
+  for (const [role, stage] of [["executors", "work"], ["discussants", "discuss"]]) {
+    const input = field(`room-template-${role}`);
+    if (!input) continue;
+    input.disabled = !stageFields.some((item) => item.value === stage && item.checked);
+  }
+}
+
 export function renderRooms(view: RoomsView, accounts: AccountRecord[], esc: (text: string) => string): string {
   const muse = accounts.filter((account) => account.providerId === "muse");
   const options = view.book?.templates.map((item) => `<option value="${esc(item.id)}">${esc(item.title)} · 至少 ${item.minParticipants} 人</option>`).join("") ?? "";
-  const customTemplates = view.book?.templates.filter((item) => !["development","brainstorm","review","compare","solo"].includes(item.id)) ?? [];
-  const name = (uuid: string) => esc(muse.find((account) => account.uuid === uuid)?.alias ?? "原成员");
+  const customTemplates = view.book?.templates.filter((item) => !builtInTemplates.includes(item.id)) ?? [];
+  const templateOptions = view.book?.templates.filter((item) => builtInTemplates.includes(item.id))
+    .map((item) => `<option value="${esc(item.id)}">${esc(item.title)}</option>`).join("") ?? "";
+  const alias = (uuid: string) => muse.find((account) => account.uuid === uuid)?.alias ?? "原成员";
+  const name = (uuid: string) => esc(alias(uuid));
   const memberLine = (member: Member) => `${name(member.uuid)} · ${member.roles.map((role) => roles.find(([id]) => id === role)?.[1] ?? "").join("、")}`;
   const referenceOptions = (target?: Room) => (view.book?.rooms ?? [])
     .filter((source) => source.phase === "finalized" && source.id !== target?.id)
@@ -179,15 +232,17 @@ export function renderRooms(view: RoomsView, accounts: AccountRecord[], esc: (te
               ${running ? `<div role="status">${attempt?.stage && !attempt.delivery ? `${stageNames[attempt.stage]} · ${name(attempt.accountUuid)} · ` : ""}正在等待发送确认或回复。</div>` : ""}
               ${room.relay?.pendingNote ? '<div role="status">已记录补充要求。当前回复入账后暂停，等待你继续。</div>' : ""}
               ${room.relay?.notes?.length ? `<details><summary>用户补充（${room.relay.notes.length}）</summary>${room.relay.notes.map((note) => `<div class="hark-reply-text">${esc(note)}</div>`).join("")}</details>` : ""}
-              ${room.attempts?.map((step, index) => step.delivery ? `<details data-room-step="${index}"><summary>第 ${index + 1} 次派发 · ${step.stage ? stageNames[step.stage] : "文字交付"}${step.review ? step.review.decision === "approve" ? "通过" : "打回" : ""}</summary>
+              ${room.attempts?.some((step) => step.delivery) ? `<ol class="room-timeline" aria-label="房间消息">${room.attempts.map((step, index) => step.delivery ? `<li class="room-message">
+                <div class="room-message-heading"><span class="room-message-avatar" aria-hidden="true">${esc(Array.from(alias(step.accountUuid).trim())[0] ?? "●")}</span>
+                  <div><strong>${name(step.accountUuid)}</strong><div class="modal-desc">${step.stage ? esc(stageNames[step.stage] ?? step.stage) : "文字交付"}${step.review ? step.review.decision === "approve" ? " · 通过" : " · 打回" : ""}
+                  · ${new Date(step.delivery.capturedAtMs).toLocaleTimeString()}</div></div></div>
                 <div class="hark-reply-text">${esc(step.review?.reason ?? (step.id && room.artifacts?.some((item) => item.attemptId === step.id)
                   ? step.delivery.text.slice(0, 1200) + "…\n完整正文见交付凭证中的 Markdown 附件。"
                   : step.delivery.text))}</div>
-                <div class="modal-desc">${name(step.accountUuid)}
-                  · ${step.delivery.source === "history" ? "会话历史" : "实时订阅"} · ${new Date(step.delivery.capturedAtMs).toLocaleString()}</div>
+                <details data-room-step="${index}"><summary>消息来源</summary><div class="modal-desc">${step.delivery.source === "history" ? "会话历史" : "实时订阅"} · ${new Date(step.delivery.capturedAtMs).toLocaleString()}</div>
                 <div class="modal-desc" style="overflow-wrap:anywhere">SHA-256 ${esc(step.delivery.sha256)}</div>
                 ${multi ? sourceButton(step) : ""}
-              </details>` : "").join("") ?? ""}
+                </details></li>` : "").join("")}</ol>` : ""}
               ${attempt && (!multi || !attempt.delivery) ? sourceButton(attempt) : ""}
               ${room.phase === "needs_reconciliation" ? '<div class="modal-desc">本轮结果需要核对。可以查看原会话或结束房间。</div>' : ""}
               ${room.phase === "needs_reconciliation" && attempt?.remoteCancelAcknowledged != null ? `<div class="modal-desc">${attempt.remoteCancelAcknowledged ? "远端已应答停止请求，生成是否停止仍需在原会话核对。" : "未收到远端停止应答，请在原会话核对。"}</div>` : ""}
@@ -237,18 +292,21 @@ export function renderRooms(view: RoomsView, accounts: AccountRecord[], esc: (te
               ${referenceOptions() ? `<details><summary>选择要引用的旧房间（最多 5 个）</summary>${referenceOptions()}</details>` : ""}
               <button type="button" class="btn primary" data-room-action="create">保存房间</button>
             </details>
-            <details class="hark-reply"><summary>自定义模板</summary>
-              <label for="room-template-title">模板名称</label><input id="room-template-title" class="modal-input" maxlength="60">
-              <label for="room-template-base">基础流程</label><select id="room-template-base" class="modal-input">${options}</select>
-              <label for="room-template-min">至少几人</label><input id="room-template-min" class="modal-input" type="number" min="1" max="12" value="2">
-              <label for="room-template-workflow">自定义阶段顺序</label>
-              <input id="room-template-workflow" class="modal-input" placeholder="执行,审核,交付">
-              <div class="modal-desc">阶段对应各自角色。留空沿用基础模板。可用阶段为拆解、执行、审核、讨论、汇总、交付。</div>
-              <label for="room-template-seats">执行或讨论人数（可选）</label>
-              <input id="room-template-seats" class="modal-input" type="number" min="1" max="5" placeholder="默认模板人数">
-              <label for="room-template-edit">编辑版本</label><select id="room-template-edit" class="modal-input">
+            <details class="hark-reply" data-template-editor><summary>自定义模板</summary>
+              <label for="room-template-edit">模板版本</label><select id="room-template-edit" class="modal-input">
                 <option value="">新建</option>${customTemplates.map((item) => `<option value="${esc(item.id)}" data-version="${item.version}">${esc(item.title)} · v${item.version}</option>`).join("")}
               </select>
+              <label for="room-template-title">模板名称</label><input id="room-template-title" class="modal-input" maxlength="60">
+              <label for="room-template-base">基础流程</label><select id="room-template-base" class="modal-input">${templateOptions}</select>
+              <label for="room-template-min">至少几人</label><input id="room-template-min" class="modal-input" type="number" min="1" max="12" value="2">
+              <fieldset class="hark-reply"><legend>流程阶段（按顺序执行）</legend>
+                ${orderedStages.map((stage) => `<label><input type="checkbox" data-template-stage value="${stage}" ${baseStages.build.includes(stage) ? "checked disabled" : ""}> ${stageNames[stage]}</label>`).join(" ")}
+              </fieldset>
+              <div class="modal-desc">指挥与上传各一席，可兼任。启用审核时需一名独立审核者，执行者不能兼审核。</div>
+              <label for="room-template-executors">执行者人数（可选）</label>
+              <input id="room-template-executors" class="modal-input" type="number" min="1" max="12" placeholder="按流程分派">
+              <label for="room-template-discussants">讨论者人数（可选）</label>
+              <input id="room-template-discussants" class="modal-input" type="number" min="2" max="12" placeholder="按流程分派" disabled>
               <button type="button" class="btn" data-room-action="save_template">保存模板</button>
             </details>` : ""}
         </div>
@@ -284,11 +342,15 @@ export function roomCommand(button: HTMLElement): { action?: string; id?: string
       automatic, requiredArtifact: value("room-required-artifact") || null } };
   }
   if (action === "save_template") {
-    const names: Record<string,string> = { 拆解:"plan", 执行:"work", 审核:"review", 讨论:"discuss", 汇总:"summarize", 交付:"publish" };
-    const workflow = value("room-template-workflow").split(/[,，、]/).map((part) => part.trim()).filter(Boolean).map((part) => names[part] ?? part);
+    const workflow = Array.from(document.querySelectorAll<HTMLInputElement>("[data-template-stage]:checked"), (input) => input.value);
+    const seatCount = (id: string) => {
+      const input = document.querySelector<HTMLInputElement>(`#room-template-${id}`);
+      return input && !input.disabled && input.value ? input.valueAsNumber : null;
+    };
     const edit = document.querySelector<HTMLSelectElement>("#room-template-edit")?.selectedOptions[0];
     return { action, title:value("room-template-title"), baseId:value("room-template-base"),
-      minParticipants:Number(value("room-template-min")), workflow, workSeats:Number(value("room-template-seats")) || null, editId:edit?.value || null,
+      minParticipants:Number(value("room-template-min")), workflow,
+      roleSeats:{ executors:seatCount("executors"), discussants:seatCount("discussants") }, editId:edit?.value || null,
       version: edit?.value ? Number(edit.dataset.version) : null };
   }
   return { action, id: button.dataset.roomId, revision: Number(button.dataset.roomRevision),

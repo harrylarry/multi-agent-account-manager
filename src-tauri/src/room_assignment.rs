@@ -93,7 +93,8 @@ impl Room {
       && fixed.iter().all(|member| group.iter().any(|candidate| candidate.account.uuid == member.uuid))).collect();
     groups.sort_by(|a, b| b.1.len().cmp(&a.1.len()).then(a.0.cmp(b.0)));
     for (window, group) in groups {
-      let max = match self.template.flow { Flow::Build | Flow::Brainstorm => 5, Flow::Review => 4, _ => 12 };
+      let max = if self.template.role_seats.is_some() || !self.template.workflow.is_empty() { 12 }
+        else { match self.template.flow { Flow::Build | Flow::Brainstorm => 5, Flow::Review => 4, _ => 12 } };
       let minimum = if restricted { required.max(pool.len()) } else { required.max(fixed.len()) };
       for target in minimum..=max.min(group.len()) {
         let Some(members) = self.pick_members(accounts, &group, &fixed, target) else { continue; };
@@ -112,15 +113,14 @@ impl Room {
 
   fn pick_members(&self, accounts: &[AccountRecord], group: &[Candidate<'_>], fixed: &[Member], target: usize) -> Option<Vec<Member>> {
       let mut members = fixed.to_vec();
-      let mut seats = match self.template.flow {
-        Flow::Build => vec![(Role::Executor, self.template.work_seats.unwrap_or(if target >= 4 { 2 } else { 1 })), (Role::Reviewer, 1)],
-        Flow::Review => vec![(Role::Executor, 1), (Role::Reviewer, 1)],
-        Flow::Brainstorm => vec![(Role::Discussant, self.template.work_seats.unwrap_or(target))],
-        Flow::Compare => vec![(Role::Executor, target)],
-        Flow::Solo => unreachable!(),
-      };
-      seats.extend([(Role::Commander, 1), (Role::Publisher, 1)]);
-      for (role, seats) in seats {
+      for role in [Role::Executor, Role::Reviewer, Role::Discussant, Role::Commander, Role::Publisher] {
+        let range = self.template.seats(role, target);
+        let preferred = match (role, self.template.flow) {
+          (Role::Executor, Flow::Build) if target >= 4 => 2,
+          (Role::Discussant, Flow::Brainstorm) => target,
+          _ => *range.start(),
+        };
+        let seats = preferred.clamp(*range.start(), *range.end());
         let assigned = members.iter().filter(|member| member.roles.contains(&role)).count();
         for _ in assigned..seats {
           let eligible = group.iter().filter(|candidate| {
@@ -131,7 +131,7 @@ impl Room {
           let candidate = eligible.min_by_key(|candidate| {
             let present = members.iter().any(|member| member.uuid == candidate.account.uuid);
             let high = matches!(role, Role::Executor | Role::Discussant | Role::Commander);
-            let spread = members.len() < target && !matches!(role, Role::Commander);
+            let spread = members.len() < target;
             (spread && present, if high { 100 - candidate.remaining } else { candidate.remaining },
               candidate.model.is_none(), candidate.account.uuid.as_str())
           });
