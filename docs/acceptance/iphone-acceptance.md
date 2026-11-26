@@ -8,6 +8,8 @@
 
 ### iPhone 界面与切号
 
+导航优化后的入口为「账号详情 → 账号代理」。在这里可从代理池选择，也可展开「手动配置代理」录入测试代理。全局代理条目从「管理 → 代理池」维护。分别打开「任务与通知」「账号额度」和「模型指纹」，检查页面标题、按钮和返回位置。Hark「回复补同步」从账号详情直接打开。Muse 的高级网络测试在「管理 → Muse 连接诊断」。
+
 Spike 0.1.26 的构建提交为 `1e8445fcb72b8b26e6eecf638c225058b8a26290`。解压后的未签名 IPA SHA-256 为 `36251d89721f3ef7ae6e61aef37537b26f958d053bdd57cfaa6599fa10656726`。[下载](https://github.com/harrylarry/multi-agent-account-manager/actions/runs/45864748192/artifacts/15141185752) · [CI](https://github.com/harrylarry/multi-agent-account-manager/actions/runs/45864744624) · [iOS 构建](https://github.com/harrylarry/multi-agent-account-manager/actions/runs/45864748192)
 
 1. 覆盖安装新版 Spike，打开「账号」。检查已有账号、备注、分组、登录态和代理配置。分别切换 iOS 浅色与深色外观，查看首页、账号详情、添加账号、管理页及诊断的可读性和滚动。
