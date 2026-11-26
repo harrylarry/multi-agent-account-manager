@@ -253,6 +253,8 @@ SOCKS5 启用时，后台同步显示「代理 已下发」「联网超时」「
 
 ## 全量恢复与房间新话题
 
+Spike `0.1.26`，构建提交 `e598f3ca9171038794ae898edb051d3b591ca165`。IPA SHA-256 为 `2ac052b8cdd082c945888d7a9d32110e1bcc349ac100496234e301d55e1dff92`。下载 ZIP 后解压，再校验内部的 `account-manager-ios-unsigned.ipa`。构建为独立 Spike Bundle，最低 iOS 17.0。`CI_PASSED`，真机 `UNVERIFIED`。[下载](https://github.com/harrylarry/multi-agent-account-manager/actions/runs/45774090087/artifacts/15096230504) · [Xcode](https://github.com/harrylarry/multi-agent-account-manager/actions/runs/45774090087) · [Quick checks](https://github.com/harrylarry/multi-agent-account-manager/actions/runs/45774086898)
+
 1. **备份**。在全量或自定义中勾选代理与房间，导出，再预览核对代理、房间和模板数量。含房间的备份使用一次「合并」或「覆盖冲突资料」恢复全部所选数据。用测试备份验证预览后资料变动会要求重新预览。覆盖带认证的新代理端点，恢复后补录凭据前应阻断。重新打开房间验证附件摘要，历史房间不会自动续跑。
 2. **新话题**。在已定稿房间里点「开新话题」，填写新名称和目标。先取消「引用这次定稿」保存一次，再勾选保存第二次。两次均应独立出现在房间列表，沿用原模板和手选范围，未绑定会话且没有发出请求。自动模式保留你指定的固定角色，并按当前额度重新分派其余席位。只有勾选引用的房间应有原定稿节选和摘要。点「校验并准备」后检查仍遵守单活跃房间限制。
 
