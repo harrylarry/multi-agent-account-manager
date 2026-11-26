@@ -544,7 +544,8 @@ fn load_journal(path: &Path) -> JournalLoad {
       "状态日志为空（可能被截断），无法确认是否存在未定论的发送".to_string(),
     );
   }
-  let parsed = serde_json::from_slice::<serde_json::Value>(&bytes).and_then(|mut file| {
+  let parsed = serde_json::from_slice::<JournalFile>(&bytes).or_else(|_| {
+    let mut file: serde_json::Value = serde_json::from_slice(&bytes)?;
     if file["version"].as_u64() == Some(u64::from(JOURNAL_VERSION)) {
       if let Some(attempts) = file["attempts"].as_array_mut() {
         attempts.retain(|attempt| attempt.get("kind").and_then(serde_json::Value::as_str) != Some("ROOM_MESSAGE"));
