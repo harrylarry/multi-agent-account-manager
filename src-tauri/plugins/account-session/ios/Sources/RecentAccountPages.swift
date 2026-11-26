@@ -107,6 +107,7 @@ enum RecentAccountPages {
     /// whenever the account is re-parked.
     let alias: String
     let timezone: String?
+    let language: String?
     let parkedAtMs: Int64
   }
 
@@ -193,7 +194,7 @@ enum RecentAccountPages {
     else { return nil }
     let entry = pages.remove(at: idx).entry
     trim(maxAccountPages - 1)
-    if spec.isColdStart || entry.timezone != spec.timezone || !isReusable(entry.view, spec: spec) {
+    if spec.isColdStart || entry.timezone != spec.timezone || entry.language != spec.language || !isReusable(entry.view, spec: spec) {
       destroy(entry.view)
       return nil
     }
@@ -216,7 +217,7 @@ enum RecentAccountPages {
       destroy(pages.remove(at: idx).entry.view)
     }
     pages.append((key: key, entry: Entry(view: view, delegate: delegate, alias: spec.alias,
-      timezone: spec.timezone, parkedAtMs: Int64(Date().timeIntervalSince1970 * 1000))))
+      timezone: spec.timezone, language: spec.language, parkedAtMs: Int64(Date().timeIntervalSince1970 * 1000))))
     trim(maxAccountPages)
     if spec.providerId == "muse" {
       view.evaluateJavaScript(TaskWatcher.taskStateScript) { [weak view] result, _ in

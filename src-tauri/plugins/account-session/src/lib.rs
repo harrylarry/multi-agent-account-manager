@@ -301,6 +301,7 @@ pub struct OpenIosAccountPayload {
   pub uuid: String,
   pub alias: String,
   pub timezone: Option<String>,
+  pub language: Option<String>,
   pub auto_alias: bool,
   pub entry_url: String,
   pub allowed_hosts: Vec<String>,
@@ -820,12 +821,12 @@ pub struct ProfileCookieSummary {
 
 #[cfg(target_os = "ios")]
 pub async fn copy_profile_cookies(
-  app: &AppHandle, provider: &str, uuid: &str, text: &str, count: usize,
+  app: &AppHandle, provider: &str, uuid: &str, text: &str, count: usize, seconds: u16,
 ) -> Result<(), String> {
   let bridge = app.state::<IosSessionBridge<tauri::Wry>>();
   bridge.0.run_mobile_plugin_async::<ProfileCookieSummary>(
     "transferProfileCookies",
-    serde_json::json!({ "provider": provider, "uuid": uuid, "clipboardText": text, "clipboardCount": count }),
+    serde_json::json!({ "provider": provider, "uuid": uuid, "clipboardText": text, "clipboardCount": count, "clipboardSeconds": seconds }),
   ).await.map(|_| ()).map_err(|error| error.to_string())
 }
 
@@ -918,4 +919,10 @@ pub async fn automatic_task_polling_available(app: &AppHandle) -> Result<bool, S
     "isAutomaticTaskPollingAvailable", serde_json::json!({}),
   ).await.map_err(|e| e.to_string())?;
   Ok(result.available)
+}
+
+#[cfg(target_os = "ios")]
+pub async fn update_manager_glass(app: &AppHandle, layout: serde_json::Value) -> Result<serde_json::Value, String> {
+  let bridge = app.state::<IosSessionBridge<tauri::Wry>>();
+  bridge.0.run_mobile_plugin_async("updateManagerGlass", layout).await.map_err(|error| error.to_string())
 }

@@ -74,14 +74,14 @@ fn parse_lines(raw: &str) -> Result<Vec<String>, String> {
   if raw.len() > MAX_INPUT { return Err("代理列表过大".into()); }
   let mut unique = HashSet::new();
   let mut proxies = Vec::new();
-  for (index, line) in raw.lines().enumerate() {
+  for (index, line) in raw.split(['\n', ';', '；']).enumerate() {
     let line = line.trim();
     if line.is_empty() || line.starts_with('#') { continue; }
     let proxy = ProxyConfig::parse(line)
-      .map_err(|_| format!("第 {} 行代理格式无效", index + 1))?;
+      .map_err(|_| format!("第 {} 条代理格式无效", index + 1))?;
     let rest = line.split_once("://").map(|(_, rest)| rest).unwrap_or_default();
     if rest.contains(['/', '?', '#']) {
-      return Err(format!("第 {} 行应只有代理地址和认证信息", index + 1));
+      return Err(format!("第 {} 条应只有代理地址和认证信息", index + 1));
     }
     let uri = proxy.to_reqwest_proxy_uri().replacen("socks5h://", "socks5://", 1);
     if unique.insert(uri.clone()) { proxies.push(uri); }

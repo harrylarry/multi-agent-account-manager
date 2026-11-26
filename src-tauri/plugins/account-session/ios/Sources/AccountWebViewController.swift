@@ -510,6 +510,22 @@ final class AccountWebViewController: UIViewController, WKNavigationDelegate, WK
       // no working close control. Inline playback keeps video in-page.
       config.allowsInlineMediaPlayback = true
       AccountTimeZone.install(spec.timezone, into: config)
+      if let language = spec.language,
+         let data = try? JSONEncoder().encode(language),
+         let locale = String(data: data, encoding: .utf8) {
+        let script = """
+        (() => {
+          const language = \(locale);
+          const languages = Object.freeze([language, language.split("-")[0]]);
+          Object.defineProperties(Navigator.prototype, {
+            language: { configurable: true, get: () => language },
+            languages: { configurable: true, get: () => languages }
+          });
+        })();
+        """
+        config.userContentController.addUserScript(WKUserScript(
+          source: script, injectionTime: .atDocumentStart, forMainFrameOnly: true))
+      }
       config.userContentController.addUserScript(
         WKUserScript(
           source: Scripts.quotaHookInitScript,
@@ -568,7 +584,9 @@ final class AccountWebViewController: UIViewController, WKNavigationDelegate, WK
         closeAndFinishFromManager()
         return
       }
-      webView.load(URLRequest(url: entryURL))
+      var request = URLRequest(url: entryURL)
+      if let language = spec.language { request.setValue(language, forHTTPHeaderField: "Accept-Language") }
+      webView.load(request)
     }
   }
 

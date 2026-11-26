@@ -136,10 +136,7 @@ jobs:
     runs-on: macos-15-intel
     timeout-minutes: 30
     env:
-      # tauri-utils 用 swift-rs 编译插件里的 Swift 时读这个变量（缺省回落 13.0），
-      # 而本 App 最低 iOS 是 17.0（tauri.ios.conf.json）。不设会让 cargo check
-      # 在插件 Swift 的 iOS 15+ API 上报可用性错误——那是构建上下文问题，不是源码错误。
-      IPHONEOS_DEPLOYMENT_TARGET: "17.0"
+      IPHONEOS_DEPLOYMENT_TARGET: "26.0"
     steps:
       - uses: actions/checkout@v7
         with:
@@ -151,6 +148,8 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
         with:
           targets: aarch64-apple-ios
+      - name: Select Xcode 26
+        run: sudo xcode-select --switch /Applications/Xcode_26.3.app/Contents/Developer
       - uses: Swatinem/rust-cache@v2
         with:
           workspaces: ./src-tauri -> target

@@ -35,7 +35,7 @@
   --list-bg: var(--dh-surface);
   --stage-bg: var(--dh-page);
   color: var(--dh-ink);
-  font: 15px/1.42 -apple-system, BlinkMacSystemFont, "PingFang SC", sans-serif;
+  font: 16px/1.42 -apple-system, BlinkMacSystemFont, "PingFang SC", sans-serif;
   background: linear-gradient(165deg, var(--dh-wash), var(--dh-page) 48%);
 }
 
@@ -65,21 +65,42 @@
 .iphone-shell [hidden] { display: none !important; }
 .iphone-shell :focus-visible { outline: 2px solid var(--dh-blue); outline-offset: -2px; }
 .iphone-shell .iphone-column { width: 100%; min-width: 0; flex: 1; border: 0; background: transparent; }
-.iphone-shell h1 { font-size: 34px; font-weight: 720; line-height: 1.18; letter-spacing: -.035em; overflow-wrap: anywhere; }
-.iphone-shell h2 { font-size: 14px; font-weight: 680; }
-.iphone-shell small { color: var(--dh-secondary); font-size: 12px; font-weight: 450; }
+.iphone-shell h1 { font-size: 28px; font-weight: 700; line-height: 1.18; letter-spacing: -.035em; overflow-wrap: anywhere; }
+.iphone-shell h2 { font-size: 17px; font-weight: 600; }
+.iphone-shell small { color: var(--dh-secondary); font-size: 13px; font-weight: 400; }
 .iphone-shell button { font-family: inherit; }
 .iphone-shell svg { flex: none; vertical-align: middle; }
 .iphone-shell #spike-account-view,
 .iphone-shell .iphone-account-detail,
 .iphone-shell .iphone-management,
+.iphone-shell .iphone-account-panel,
 .iphone-shell .spike-workspace { display: none; }
 .iphone-shell[data-iphone-view="accounts"] #spike-account-view,
 .iphone-shell[data-iphone-view="detail"] .iphone-account-detail,
 .iphone-shell[data-iphone-view="manage"] .iphone-management,
+.iphone-shell[data-iphone-view="sessions"] .iphone-account-panel,
+.iphone-shell[data-iphone-view="overview"] .iphone-account-panel,
+.iphone-shell[data-iphone-view="search"] .iphone-account-panel,
 .iphone-shell[data-iphone-view="diagnostics"] .spike-workspace { display: flex; }
-.iphone-shell[data-iphone-view="diagnostics"] .iphone-nav { display: none; }
+.iphone-shell:not([data-iphone-view="accounts"]):not([data-iphone-view="sessions"]) .iphone-nav { display: none; }
 .iphone-shell #spike-account-view { padding: 0 18px; }
+.iphone-sr-only { position: absolute; width: 1px; height: 1px; overflow: hidden; clip-path: inset(50%); white-space: nowrap; }
+.iphone-shell .iphone-toolbar { display: block; flex: none; min-height: 57px; padding: 4px 16px 8px; position: relative; z-index: 10; }
+.iphone-global-tools, .iphone-search-tools, .iphone-list-actions { display: flex; align-items: center; gap: 8px; }
+.iphone-service-picker { position: relative; flex: 1; min-width: 0; }
+.iphone-service-button, .iphone-search-tools button {
+  min-height: 44px; padding: 0 12px; border: 1px solid var(--dh-line); border-radius: 14px;
+  color: var(--dh-blue); background: var(--dh-surface); font-weight: 650;
+}
+.iphone-service-menu { position: absolute; top: 50px; left: 0; min-width: 138px; padding: 6px; background: var(--dh-surface); border: 1px solid var(--dh-line); border-radius: 14px; }
+.iphone-service-menu button { display: block; width: 100%; text-align: left; min-height: 44px; padding: 0 9px; border: 0; border-radius: 9px; background: transparent; color: var(--dh-ink); }
+.iphone-service-menu button[aria-current="true"] { background: var(--dh-mist); color: var(--dh-blue); }
+.iphone-toolbar .iphone-icon-button { border-radius: 50%; }
+.iphone-back-button { font-size: 28px; line-height: 1; }
+.iphone-search-tools input { flex: 1; min-width: 0; min-height: 44px; padding: 0 12px; border-radius: 14px; border: 1px solid var(--dh-line); color: var(--dh-ink); background: var(--dh-surface); font: inherit; }
+.iphone-account-panel h2 { font-size: 17px; }
+.iphone-account-panel p { margin: 8px 0; }
+.iphone-account-panel .iphone-item strong, .iphone-account-panel .iphone-item small { display: block; overflow-wrap: anywhere; }
 .iphone-top, .iphone-heading, .iphone-list-title {
   display: flex;
   align-items: center;
@@ -202,11 +223,9 @@
 .iphone-nav {
   display: grid;
   flex: none;
-  grid-template-columns: repeat(3, minmax(0, 1fr));
-  gap: 8px;
+  grid-template-columns: minmax(0, 1fr) 48px;
+  gap: 10px;
   padding: 7px 15px 9px;
-  background: var(--dh-surface);
-  border-top: 1px solid var(--dh-line);
 }
 .iphone-nav button {
   display: grid;
@@ -220,6 +239,7 @@
   color: var(--dh-secondary);
   background: transparent;
 }
+.iphone-nav > .iphone-add { border-radius: 50%; width: 48px; justify-self: end; background: var(--dh-mist); }
 .iphone-nav [aria-current="page"] { color: var(--dh-blue); background: var(--dh-mist); font-weight: 650; }
 .iphone-nav .iphone-add { color: var(--dh-blue); font-weight: 650; }
 .iphone-nav button:disabled { opacity: .5; }
@@ -343,3 +363,15 @@
 .iphone-add-methods button[aria-pressed="true"] { color: var(--dh-blue); border-color: var(--dh-blue); background: var(--dh-mist); }
 .iphone-screen-modal #iphone-add-cookie-fields { display: grid; gap: 8px; }
 .iphone-screen-modal #add-cookie-input { min-height: 96px; padding: 10px 12px; }
+
+.iphone-nav-tabs { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); border-radius: 24px; background: var(--dh-surface); }
+.iphone-page-exit { position: fixed; z-index: 8; background: var(--dh-page); pointer-events: none; }
+.iphone-compose-account { display: flex; align-items: center; gap: 9px; min-height: 44px; }
+.native-iphone-glass,
+.native-iphone-glass body,
+.native-iphone-glass #app,
+.native-iphone-glass .iphone-shell,
+.native-iphone-glass .iphone-shell [data-iphone-glass] { background: transparent; }
+@media (prefers-contrast: more) {
+  .native-iphone-glass .iphone-shell [data-iphone-glass] { background: var(--dh-surface); }
+}

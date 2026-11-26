@@ -41,6 +41,7 @@ export interface AccountRecord {
   alias: string;
   group?: string;
   timezone?: string;
+  language?: string;
   lastMuseThread?: string;
   createdAtMs: number;
   autoAlias: boolean;
@@ -70,6 +71,7 @@ export interface ManagerSnapshot {
   platform: string;
   providers: ProviderInfo[];
   accounts: AccountRecord[];
+  accountGroups?: Partial<Record<ProviderId, string[]>>;
   selectedProviderId: ProviderId;
   activeAccount: AccountKey | null;
   switchingAccount: AccountKey | null;

@@ -44,6 +44,7 @@ private struct OpenSessionArgs: Decodable {
   let autoAlias: Bool
   let entryUrl: String
   let timezone: String?
+  let language: String?
   let allowedHosts: [String]
   let switchSeq: Int64
   let viewInstanceId: Int64
@@ -81,6 +82,7 @@ private struct TransferProfileCookiesArgs: Decodable {
   let inspect: Bool?
   let clipboardText: String?
   let clipboardCount: Int?
+  let clipboardSeconds: Int?
 }
 
 private struct TaskNotificationArgs: Decodable {
@@ -196,7 +198,67 @@ private struct QuarantineProxyArgs: Decodable {
   let reason: String?
 }
 
+private struct ManagerGlassArgs: Decodable {
+  struct Rect: Decodable {
+    let x: Double
+    let y: Double
+    let width: Double
+    let height: Double
+  }
+  let generation: Int
+  let viewportWidth: Double
+  let surfaces: [Rect]
+}
+
 class AccountSessionPlugin: Plugin {
+  private weak var managerWebView: WKWebView?
+  private var managerGlass: [UIVisualEffectView] = []
+  private var managerGlassGeneration = -1
+
+  override func load(webview: WKWebView) {
+    managerWebView = webview
+  }
+
+  @objc public func updateManagerGlass(_ invoke: Invoke) throws {
+    let args = try invoke.parseArgs(ManagerGlassArgs.self)
+    DispatchQueue.main.async {
+      guard #available(iOS 26.0, *), let web = self.managerWebView,
+            let parent = web.superview, args.viewportWidth.isFinite, args.viewportWidth > 0 else {
+        invoke.resolve(["ready": false])
+        return
+      }
+      guard args.generation >= self.managerGlassGeneration else {
+        invoke.resolve(["ready": true])
+        return
+      }
+      self.managerGlassGeneration = args.generation
+      self.managerGlass.forEach { $0.removeFromSuperview() }
+      self.managerGlass.removeAll(keepingCapacity: true)
+      web.isOpaque = false
+      web.backgroundColor = .clear
+      web.scrollView.backgroundColor = .clear
+      parent.backgroundColor = .systemGroupedBackground
+      let scale = web.bounds.width / CGFloat(args.viewportWidth)
+      for bounds in args.surfaces.prefix(8) {
+        guard [bounds.x, bounds.y, bounds.width, bounds.height].allSatisfy({ $0.isFinite }),
+              bounds.width > 0, bounds.height > 0 else { continue }
+        let local = CGRect(x: CGFloat(bounds.x) * scale, y: CGFloat(bounds.y) * scale,
+                           width: CGFloat(bounds.width) * scale, height: CGFloat(bounds.height) * scale)
+        guard web.bounds.insetBy(dx: -1, dy: -1).contains(local) else { continue }
+        let glass = UIGlassEffect(style: .regular)
+        let view = UIVisualEffectView(effect: glass)
+        view.isUserInteractionEnabled = false
+        view.accessibilityElementsHidden = true
+        view.frame = web.convert(local, to: parent)
+        view.layer.cornerRadius = min(24, view.bounds.height / 2)
+        view.layer.cornerCurve = .continuous
+        parent.insertSubview(view, belowSubview: web)
+        self.managerGlass.append(view)
+      }
+      invoke.resolve(["ready": true])
+    }
+  }
+
   private var fingerprintTasks: [String: (Channel, DispatchWorkItem)] = [:]
   private var fingerprintPreviousIdleTimer: Bool?
   private var fingerprintBackgroundObserver: NSObjectProtocol?
@@ -300,6 +362,7 @@ class AccountSessionPlugin: Plugin {
         autoAlias: args.autoAlias,
         entryUrl: args.entryUrl,
         timezone: args.timezone,
+        language: args.language,
         allowedHosts: args.allowedHosts,
         switchSeq: args.switchSeq,
         viewInstanceId: args.viewInstanceId,
@@ -636,9 +699,14 @@ class AccountSessionPlugin: Plugin {
         return
       }
       if let text = args.clipboardText, let count = args.clipboardCount {
+        let seconds = args.clipboardSeconds ?? 60
+        guard [30, 60, 300].contains(seconds) else {
+          invoke.reject("不支持的剪贴板保留时间")
+          return
+        }
         UIPasteboard.general.setItems(
           [["public.utf8-plain-text": text]],
-          options: [.localOnly: true, .expirationDate: Date().addingTimeInterval(60)]
+          options: [.localOnly: true, .expirationDate: Date().addingTimeInterval(TimeInterval(seconds))]
         )
         invoke.resolve(["count": count])
         return

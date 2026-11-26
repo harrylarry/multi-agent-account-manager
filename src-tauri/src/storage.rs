@@ -215,6 +215,8 @@ pub struct AccountRecord {
   #[serde(default, skip_serializing_if = "Option::is_none")]
   pub timezone: Option<String>,
   #[serde(default, skip_serializing_if = "Option::is_none")]
+  pub language: Option<String>,
+  #[serde(default, skip_serializing_if = "Option::is_none")]
   pub last_muse_thread: Option<Uuid>,
   pub created_at_ms: u64,
   #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -287,6 +289,8 @@ pub struct AccountsStoreFile {
   pub last_committed: Option<AccountKey>,
   pub pending_cleanup: Vec<AccountKey>,
   #[serde(default)]
+  pub account_groups: BTreeMap<String, Vec<String>>,
+  #[serde(default)]
   pub approval_attempts: BTreeMap<String, bool>,
   #[serde(default, skip_serializing_if = "Vec::is_empty")]
   pub restored_proxy_pool: Vec<crate::account_backup::ProxyPoolProfile>,
@@ -299,6 +303,7 @@ impl Default for AccountsStoreFile {
       accounts: Vec::new(),
       last_committed: None,
       pending_cleanup: Vec::new(),
+      account_groups: BTreeMap::new(),
       approval_attempts: BTreeMap::new(),
       restored_proxy_pool: Vec::new(),
     }
@@ -342,6 +347,14 @@ pub fn detect_conflicts(accounts: &[AccountRecord]) -> Vec<ConflictItem> {
     }
   }
   conflicts
+}
+
+pub fn normalize_account_language(value: &str) -> Result<Option<String>, String> {
+  match value {
+    "" => Ok(None),
+    "zh-CN" | "zh-TW" | "en-US" | "ja-JP" | "ko-KR" => Ok(Some(value.to_owned())),
+    _ => Err("不支持此账号语言".into()),
+  }
 }
 
 pub fn normalize_account_timezone(value: &str) -> Result<Option<String>, String> {
@@ -496,6 +509,7 @@ fn migrate_from_value(root: Value) -> Result<(AccountsStoreFile, bool), String> 
         alias,
         group,
         last_muse_thread: item_obj.get("lastMuseThread").and_then(Value::as_str).and_then(|value| Uuid::parse_str(value).ok()),
+        language: item_obj.get("language").and_then(Value::as_str).and_then(|value| normalize_account_language(value).ok()).flatten(),
         timezone: item_obj.get("timezone").and_then(Value::as_str).and_then(|value| normalize_account_timezone(value).ok()).flatten(),
         created_at_ms,
         fingerprint_history: item_obj.get("fingerprintHistory")
@@ -559,6 +573,7 @@ fn migrate_from_value(root: Value) -> Result<(AccountsStoreFile, bool), String> 
       accounts,
       last_committed,
       pending_cleanup,
+      account_groups: obj.get("accountGroups").map(|value| serde_json::from_value(value.clone()).map_err(|_| "账号分组目录损坏".to_string())).transpose()?.unwrap_or_default(),
       approval_attempts,
       restored_proxy_pool: obj.get("restoredProxyPool").and_then(|value| serde_json::from_value(value.clone()).ok()).unwrap_or_default(),
     },

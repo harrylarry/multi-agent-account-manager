@@ -44,6 +44,15 @@ async fn get_manager_state(mgr: State<'_, Arc<SessionManager>>) -> Result<Manage
 }
 
 #[tauri::command]
+#[cfg_attr(not(target_os = "ios"), allow(unused_variables))]
+async fn update_iphone_glass(app: AppHandle, layout: serde_json::Value) -> Result<serde_json::Value, String> {
+  #[cfg(target_os = "ios")]
+  return crate::platform::ios::update_manager_glass(&app, layout).await;
+  #[cfg(not(target_os = "ios"))]
+  Ok(serde_json::json!({ "ready": false }))
+}
+
+#[tauri::command]
 async fn select_provider(
   app: AppHandle,
   mgr: State<'_, Arc<SessionManager>>,
@@ -59,9 +68,21 @@ async fn add_account(
   provider_id: String,
   alias: String,
   cookie_input: Option<String>,
+  timezone: Option<String>,
+  language: Option<String>,
+  proxy_entry_id: Option<uuid::Uuid>,
+  gate: State<'_, proxy_pool::ProxyPoolGate>,
 ) -> Result<ManagerSnapshot, String> {
   let cookies = cookie_input.map(|raw| parse_account_cookies(&provider_id, raw)).transpose()?;
-  mgr.add_account(&app, &provider_id, &alias, cookies.as_deref()).await
+  let pool = if let Some(id) = proxy_entry_id {
+    let _guard = gate.0.lock().await;
+    let dir = app.path().app_data_dir().map_err(|_| "无法读取应用存储")?;
+    let secrets = secrets::Secrets::new(&dir);
+    Some((id, proxy_pool::ProxyPool::read(&secrets)?.selected(id)?))
+  } else {
+    None
+  };
+  mgr.add_account(&app, &provider_id, &alias, cookies.as_deref(), timezone.as_deref(), language.as_deref(), pool).await
 }
 
 #[tauri::command]
@@ -73,8 +94,14 @@ async fn rename_account(
   alias: String,
   group: Option<String>,
   timezone: Option<String>,
+  language: Option<String>,
 ) -> Result<ManagerSnapshot, String> {
-  mgr.rename_account(&app, &provider_id, &uuid, &alias, group.as_deref(), timezone.as_deref()).await
+  mgr.rename_account(&app, &provider_id, &uuid, &alias, group.as_deref(), timezone.as_deref(), language.as_deref()).await
+}
+
+#[tauri::command]
+async fn delete_account_group(app: AppHandle, mgr: State<'_, Arc<SessionManager>>, provider_id: String, group: String) -> Result<ManagerSnapshot, String> {
+  mgr.delete_account_group(&app, &provider_id, &group).await
 }
 
 #[tauri::command]
@@ -570,6 +597,7 @@ async fn transfer_account_cookies(
   provider_id: String,
   uuid: String,
   raw: Option<String>,
+  clipboard_seconds: Option<u16>,
 ) -> Result<serde_json::Value, String> {
   #[cfg(target_os = "ios")]
   {
@@ -579,7 +607,7 @@ async fn transfer_account_cookies(
     if cookies.is_some() {
       cancel.cancel_account(&uuid);
     }
-    let (result, skipped) = mgr.with_cookie_profile(&app, provider, &uuid, cookies.as_deref(), false).await?;
+    let (result, skipped) = mgr.with_cookie_profile(&app, provider, &uuid, cookies.as_deref(), false, clipboard_seconds.unwrap_or(60)).await?;
     Ok(serde_json::json!({ "count": result.count, "skipped": skipped }))
   }
   #[cfg(not(target_os = "ios"))]
@@ -812,7 +840,7 @@ async fn inspect_account_cookies(
   {
     let provider = providers::ProviderId::parse(&provider_id).ok_or("服务标识无效")?;
     let uuid = storage::normalize_uuid(&uuid).ok_or("账号标识无效")?;
-    let (info, _) = mgr.with_cookie_profile(&app, provider, &uuid, None, true).await?;
+    let (info, _) = mgr.with_cookie_profile(&app, provider, &uuid, None, true, 60).await?;
     Ok(serde_json::json!({ "count": info.count, "nextExpiry": info.next_expiry }))
   }
   #[cfg(not(target_os = "ios"))]
@@ -957,6 +985,51 @@ async fn muse_native_lease_probe(
       muse_native::lease_probe(&app, &uuid, twice.unwrap_or(true), setting.as_ref()).await
     }) => result.map_err(|_| "租约探针达到 60 秒总时限".to_string())?,
   }
+}
+
+#[derive(serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+struct NewConversationResult {
+  status: String,
+  session_id: Option<String>,
+}
+
+#[tauri::command]
+#[cfg_attr(not(target_os = "ios"), allow(unused_variables))]
+async fn send_new_muse_conversation(
+  app: AppHandle, uuid: String, text: String,
+  ledger: State<'_, Arc<send_ledger::SendLedger>>,
+  mgr: State<'_, Arc<SessionManager>>,
+  cancel: State<'_, Arc<probe_cancel::ProbeCancel>>,
+) -> Result<NewConversationResult, String> {
+  #[cfg(target_os = "ios")]
+  {
+    let uuid = storage::normalize_uuid(&uuid).ok_or("账号标识无效")?;
+    let text = text.trim();
+    if text.is_empty() || text.chars().count() > 16000 {
+      return Err("请输入 1–16000 字的消息".into());
+    }
+    let _proxy_guard = mgr.proxy_write_lock.lock().await;
+    let snapshot = mgr.get_snapshot().await;
+    if snapshot.conflicts.iter().any(|account| account.uuid == uuid)
+      || snapshot.pending_cleanup.iter().any(|account| account.uuid == uuid) {
+      return Err("账号当前不可用".into());
+    }
+    let account = snapshot.accounts.iter().find(|account|
+      account.provider_id == providers::ProviderId::Muse && account.uuid == uuid
+        && account.auth_state == storage::AuthState::Authenticated
+    ).ok_or("账号未登录或已移除")?;
+    let root = app.path().app_data_dir().map_err(|_| "无法读取应用存储")?;
+    let secrets = secrets::Secrets::new(&root);
+    let (token, _guard) = cancel.register_task(&uuid, "new_muse_conversation", uuid::Uuid::new_v4());
+    let outcome = muse_native::send_muse_message(
+      &app, &ledger, &uuid, text, "", None, account.proxy.as_ref(), &secrets, token, true,
+    ).await;
+    let session_id = outcome.session_id.filter(|id| outcome.ok && uuid::Uuid::parse_str(id).is_ok());
+    Ok(NewConversationResult { status: outcome.status, session_id })
+  }
+  #[cfg(not(target_os = "ios"))]
+  Err("此操作仅支持 iOS".into())
 }
 
 /// B4：发送一条消息到隔离测试会话（单发锁 + 台账在 muse_native::send_probe）。
@@ -1908,8 +1981,10 @@ pub fn run() {
     .invoke_handler(tauri::generate_handler![
       get_manager_state,
       select_provider,
+      update_iphone_glass,
       add_account,
       rename_account,
+      delete_account_group,
       remove_account,
       switch_account,
       set_modal_active,
@@ -1948,6 +2023,7 @@ pub fn run() {
       process_approval_notification_actions,
       muse_native_quota_probe,
       muse_native_send_probe,
+      send_new_muse_conversation,
       muse_native_fingerprint_probe,
       set_muse_fingerprint_settings,
       muse_native_proxy_probe,

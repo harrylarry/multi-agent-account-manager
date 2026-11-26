@@ -22,6 +22,7 @@ struct IosAccountSessionSpec {
   let autoAlias: Bool
   let entryUrl: String
   let timezone: String?
+  let language: String?
   let allowedHosts: [String]
   let switchSeq: Int64
   let viewInstanceId: Int64
@@ -37,6 +38,7 @@ struct IosAccountSessionSpec {
       autoAlias: false,
       entryUrl: entryUrl,
       timezone: timezone,
+      language: language,
       allowedHosts: allowedHosts,
       switchSeq: switchSeq,
       viewInstanceId: viewInstanceId,

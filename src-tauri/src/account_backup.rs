@@ -41,6 +41,8 @@ pub struct Profile {
   pub group: Option<String>,
   #[serde(default)]
   pub timezone: Option<String>,
+  #[serde(default, skip_serializing_if = "Option::is_none")]
+  pub language: Option<String>,
   #[serde(default)]
   pub last_muse_thread: Option<uuid::Uuid>,
   pub created_at_ms: u64,
@@ -104,13 +106,13 @@ pub fn preview(backup: &AccountBackup, current: &[AccountRecord]) -> RestorePrev
     if let Some(account) = old {
       existing += 1;
       let projection = serde_json::json!([
-        account.uuid, account.provider_id, account.alias, account.group, account.timezone, account.last_muse_thread,
+        account.uuid, account.provider_id, account.alias, account.group, account.timezone, account.language, account.last_muse_thread,
         account.proxy.as_ref().and_then(safe_proxy_endpoint), account.proxy.as_ref().and_then(|proxy| proxy.pool_entry_id),
       ]);
       digest.update(projection.to_string().as_bytes());
       if account.provider_id != profile.provider_id {
         conflicts.push(format!("{}（标识归属另一个服务）", profile.alias));
-      } else if account.alias != profile.alias || account.timezone != profile.timezone || (backup.includes_groups && account.group != profile.group) {
+      } else if account.alias != profile.alias || account.timezone != profile.timezone || account.language != profile.language || (backup.includes_groups && account.group != profile.group) {
         conflicts.push(profile.alias.clone());
       }
       if backup.includes_proxy_endpoints && (profile.proxy_enabled || profile.proxy_endpoint.is_some())
@@ -142,7 +144,7 @@ pub fn from_accounts(
     });
     Profile {
       provider_id: account.provider_id, uuid: account.uuid.clone(), alias: account.alias.clone(),
-      group: account.group.clone().filter(|_| include_groups), timezone: account.timezone.clone(),
+      group: account.group.clone().filter(|_| include_groups), timezone: account.timezone.clone(), language: account.language.clone(),
       last_muse_thread: account.last_muse_thread, created_at_ms: account.created_at_ms,
       proxy_endpoint: endpoint, proxy_requires_auth: proxy.is_some_and(|setting| setting.credential_ref.is_some()),
       proxy_enabled: proxy.is_some_and(|setting| setting.enabled), proxy_pool_entry_id: pool_entry_id,
@@ -213,6 +215,7 @@ pub fn decrypt(encoded: &str, password: &str) -> Result<AccountBackup, String> {
     if normalize_uuid(&profile.uuid).as_deref() != Some(&profile.uuid)
       || !seen.insert(&profile.uuid) || profile.alias.trim().is_empty() || profile.alias.chars().count() > 160
       || profile.group.as_deref().is_some_and(|group| normalize_account_group(group).is_err())
+      || profile.language.as_deref().is_some_and(|value| crate::storage::normalize_account_language(value).is_err())
       || profile.timezone.as_deref().is_some_and(|timezone| crate::storage::normalize_account_timezone(timezone).is_err())
       || (profile.provider_id != ProviderId::Muse && profile.last_muse_thread.is_some())
     {

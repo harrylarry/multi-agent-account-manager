@@ -894,6 +894,7 @@ pub struct ManagerSnapshot {
   pub platform: &'static str,
   pub providers: Vec<ProviderInfo>,
   pub accounts: Vec<AccountRecord>,
+  pub account_groups: std::collections::BTreeMap<String, Vec<String>>,
   pub selected_provider_id: ProviderId,
   pub active_account: Option<AccountKey>,
   pub switching_account: Option<AccountKey>,
@@ -1059,7 +1060,9 @@ impl SessionManager {
     uuid: &str,
     cookies: Option<&[crate::account_cookies::AccountCookie]>,
     inspect: bool,
+    clipboard_seconds: u16,
   ) -> Result<(crate::platform::ios::ProfileCookieSummary, usize), String> {
+    if !matches!(clipboard_seconds, 30 | 60 | 300) { return Err("不支持的剪贴板保留时间".into()); }
     let _sync = self.quota_sync_lock.lock().await;
     let locked = self.inner.lock().await;
     let key = AccountKey { provider_id: provider, uuid: uuid.to_string() };
@@ -1074,7 +1077,7 @@ impl SessionManager {
     let raw = zeroize::Zeroizing::new(response.cookie_export_json.take().ok_or("无法读取 Cookie 导出数据")?);
     let entries = serde_json::from_str(&raw).map_err(|_| "无法读取 Cookie 导出格式")?;
     let (text, count, skipped) = crate::account_cookies::prepare_export(entries, provider.as_str(), now_ms() as f64 / 1000.0)?;
-    crate::platform::ios::copy_profile_cookies(app, provider.as_str(), uuid, &text, count).await?;
+    crate::platform::ios::copy_profile_cookies(app, provider.as_str(), uuid, &text, count, clipboard_seconds).await?;
     response.count = count;
     Ok((response, skipped))
   }
@@ -1127,7 +1130,7 @@ impl SessionManager {
       let proxy = saved.restored_proxy(None);
       updated.accounts.push(AccountRecord {
         provider_id: saved.provider_id, uuid: saved.uuid, alias: saved.alias,
-        group: saved.group, timezone: saved.timezone, last_muse_thread: saved.last_muse_thread,
+        group: saved.group, timezone: saved.timezone, language: saved.language, last_muse_thread: saved.last_muse_thread,
         created_at_ms: saved.created_at_ms, fingerprint_history: Vec::new(),
         fingerprint_settings: Default::default(), auto_alias: false,
         avatar_url: None, quota_text: None, quota_percent: None, quota_detail: None, quota_observation: None,
@@ -1450,7 +1453,16 @@ impl SessionManager {
     #[cfg(not(desktop))]
     let warm_accounts = Vec::new();
 
+    let mut groups = locked.store.account_groups.clone();
+    for account in &locked.store.accounts {
+      if let Some(group) = &account.group {
+        let entries = groups.entry(account.provider_id.as_str().to_owned()).or_default();
+        if !entries.contains(group) { entries.push(group.clone()); }
+      }
+    }
+    for entries in groups.values_mut() { entries.sort(); }
     ManagerSnapshot {
+      account_groups: groups,
       badge_sample_at_ms: None,
       platform: current_platform_name(),
       providers: all_provider_infos(),
@@ -1880,7 +1892,12 @@ impl SessionManager {
     raw_provider: &str,
     raw_alias: &str,
     cookies: Option<&[crate::account_cookies::AccountCookie]>,
+    timezone: Option<&str>,
+    language: Option<&str>,
+    pool: Option<(Uuid, crate::proxy_pool::ApplyEntry)>,
   ) -> Result<ManagerSnapshot, String> {
+    let timezone = crate::storage::normalize_account_timezone(timezone.unwrap_or_default())?;
+    let language = crate::storage::normalize_account_language(language.unwrap_or_default())?;
     #[cfg(not(target_os = "ios"))]
     if cookies.is_some() { return Err("新增时导入 Cookie 需要 iOS".into()); }
     let provider_id = ProviderId::parse(raw_provider).ok_or_else(|| "无效的服务标识".to_string())?;
@@ -1900,6 +1917,7 @@ impl SessionManager {
     #[cfg(target_os = "ios")]
     let _cookie_guard = if cookies.is_some() { Some(self.quota_sync_lock.lock().await) } else { None };
     let created_key = {
+      let _proxy_guard = self.proxy_write_lock.lock().await;
       let mut locked = self.inner.lock().await;
       if !locked.conflicts.is_empty() {
         return Err("请先处理 UUID 归属冲突后再新增账号".to_string());
@@ -1914,6 +1932,18 @@ impl SessionManager {
         }
       };
 
+      let proxy = pool.map(|(entry_id, entry)| {
+        if locked.store.accounts.iter().any(|account| account.proxy.as_ref().is_some_and(|proxy| proxy.pool_entry_id == Some(entry_id))) {
+          return Err("该代理已分配给其他账号".to_string());
+        }
+        let password = entry.password.map(zeroize::Zeroizing::new);
+        let setting = crate::storage::ProxySetting {
+          pool_entry_id: Some(entry_id), uri: entry.endpoint, username: entry.username,
+          credential_ref: password.as_ref().map(|_| format!("proxy-{uuid}")), enabled: true,
+        };
+        setting.validate()?;
+        Ok((setting, password))
+      }).transpose()?;
       let key = AccountKey { provider_id, uuid: uuid.clone() };
       #[cfg(target_os = "ios")]
       if let Some(cookies) = cookies {
@@ -1936,12 +1966,21 @@ impl SessionManager {
         }
         locked.store.pending_cleanup.retain(|entry| entry != &key);
       }
+      let proxy_secrets = crate::secrets::Secrets::new(locked.store_path.parent().ok_or("无法定位凭据目录")?);
+      if let Some((setting, Some(password))) = &proxy {
+        let reference = setting.credential_ref.as_deref().ok_or("缺少代理凭据标识")?;
+        if let Err(error) = proxy_secrets.set(reference, password) {
+          if cookies.is_some() { locked.store.pending_cleanup.push(key); }
+          return Err(error);
+        }
+      }
       locked.store.accounts.push(AccountRecord {
         provider_id,
         uuid: uuid.clone(),
         alias,
         group: None,
-        timezone: None,
+        timezone,
+        language,
         last_muse_thread: None,
         created_at_ms: now_ms(),
         fingerprint_history: Vec::new(),
@@ -1960,10 +1999,13 @@ impl SessionManager {
         task_notifications: false,
         task_notice_keys: Vec::new(),
         pending_approval_count: None,
-        proxy: None,
+        proxy: proxy.as_ref().map(|(setting, _)| setting.clone()),
       });
       if let Err(error) = save_store_atomic(&locked.store_path, &locked.store) {
         locked.store.accounts.pop();
+        if let Some(reference) = proxy.as_ref().and_then(|(setting, _)| setting.credential_ref.as_deref()) {
+          let _ = proxy_secrets.delete(reference);
+        }
         if cookies.is_some() { locked.store.pending_cleanup.push(key); }
         return Err(error);
       }
@@ -1974,6 +2016,25 @@ impl SessionManager {
     self.switch_account_internal(app, created_key, false, None).await
   }
 
+
+  pub async fn delete_account_group(&self, app: &AppHandle, raw_provider: &str, raw_group: &str) -> Result<ManagerSnapshot, String> {
+    let provider = ProviderId::parse(raw_provider).ok_or("无效的服务标识")?;
+    let name = crate::storage::normalize_account_group(raw_group)?.ok_or("无分组不可删除")?;
+    let mut locked = self.inner.lock().await;
+    let count = locked.store.accounts.iter().filter(|account| account.provider_id == provider && account.group.as_deref() == Some(name.as_str())).count();
+    if count != 0 { return Err(format!("分组还有 {count} 个账号，请先移出后再删除。")); }
+    let before = locked.store.account_groups.clone();
+    if let Some(groups) = locked.store.account_groups.get_mut(provider.as_str()) { groups.retain(|group| group != &name); }
+    if let Err(error) = save_store_atomic(&locked.store_path, &locked.store) {
+      locked.store.account_groups = before;
+      return Err(error);
+    }
+    let state = Self::snapshot_from_locked(&locked);
+    drop(locked);
+    self.emit_snapshot(app, &state);
+    Ok(state)
+  }
+
   pub async fn rename_account(
     &self,
     app: &AppHandle,
@@ -1982,6 +2043,7 @@ impl SessionManager {
     raw_alias: &str,
     raw_group: Option<&str>,
     raw_timezone: Option<&str>,
+    raw_language: Option<&str>,
   ) -> Result<ManagerSnapshot, String> {
     let provider_id = ProviderId::parse(raw_provider).ok_or_else(|| "无效的服务标识".to_string())?;
     let uuid = normalize_uuid(raw_uuid).ok_or_else(|| "无效的账号 UUID".to_string())?;
@@ -1992,6 +2054,7 @@ impl SessionManager {
 
     let group = raw_group.map(crate::storage::normalize_account_group).transpose()?;
     let timezone = raw_timezone.map(crate::storage::normalize_account_timezone).transpose()?;
+    let language = raw_language.map(crate::storage::normalize_account_language).transpose()?;
     let mut locked = self.inner.lock().await;
     let index = locked
       .store
@@ -2011,8 +2074,16 @@ impl SessionManager {
     if let Some(timezone) = timezone {
       target.timezone = timezone;
     }
+    if let Some(language) = language { target.language = language; }
+    let new_group = target.group.clone();
+    let before_groups = locked.store.account_groups.clone();
+    let names = locked.store.account_groups.entry(provider_id.as_str().to_owned()).or_default();
+    for group in [before.group.as_ref(), new_group.as_ref()].into_iter().flatten() {
+      if !names.contains(group) { names.push(group.clone()); }
+    }
     if let Err(error) = save_store_atomic(&locked.store_path, &locked.store) {
       locked.store.accounts[index] = before;
+      locked.store.account_groups = before_groups;
       return Err(error);
     }
 
@@ -3746,6 +3817,7 @@ impl SessionManager {
       uuid: account.uuid.clone(),
       alias: account.alias.clone(),
       timezone: account.timezone.clone(),
+      language: account.language.clone(),
       auto_alias: account.auto_alias,
       entry_url: muse_thread.map(|thread| format!("https://muse.ai/thread/{thread}"))
         .unwrap_or_else(|| spec.info.entry_url.to_string()),

@@ -3,6 +3,7 @@ import { listen } from "@tauri-apps/api/event";
 import "./styles.css";
 import "./iphone.css";
 import { iphoneIcon } from "./iphone-icons";
+import { iphoneSessionsFor, reconcileIphoneSessions, updateIphoneSessions } from "./iphone-sessions";
 import type {
   AccountKey,
   AccountRecord,
@@ -17,10 +18,12 @@ import type {
 
 type ModalMode =
   | { kind: "none" }
-  | { kind: "add"; providerId: ProviderId; draft: string; cookiePreview: boolean; pending: boolean; cookieMethod?: boolean }
+  | { kind: "compose"; providerId: ProviderId; uuid: string; pending: boolean }
+  | { kind: "add"; providerId: ProviderId; draft: string; cookiePreview: boolean; pending: boolean }
   | { kind: "rename"; account: AccountRecord; draft: string; groupDraft: string; timezoneDraft: string }
   | { kind: "remove"; account: AccountRecord }
   | { kind: "tasks"; account: AccountRecord; section?: "tasks" | "quota" | "models"; checking: boolean; note: string; quotaChecking: boolean }
+  | { kind: "harkDiagnostic"; account: AccountRecord }
   | { kind: "harkReplies"; account: AccountRecord; reading: boolean; result: HarkRecovery | null; error: string }
   | { kind: "backup"; busy: boolean; encrypted: string; fileName: string; preview: BackupPreview | null; message: string; mode: BackupMode; includeGroups: boolean; includeProxy: boolean; expiryDays: number; lanCode?: string; lanShare?: {code:string;png:string;seconds:number} }
   | { kind: "proxyPool"; account: AccountRecord | null; data: ProxyPoolView | null; setting: SpikeProxySettingView | null; busy: boolean; message: string }
@@ -75,6 +78,11 @@ function badgeTimingLine(uuid: string): string {
   const dot = (value: boolean | null) => value == null ? "—" : value ? "有" : "无";
   return `红点计时 · ${new Date(timing.resumedAtMs).toLocaleTimeString()} · ${timing.state} · 前台→启动 ${gap(timing.resumedAtMs, timing.queryAtMs)}（桥接 ${gap(timing.resumedAtMs, timing.handlerAtMs)}） · 启动→网关 ${gap(timing.queryAtMs, timing.gatewayAtMs)} · 历史请求→回包 ${gap(timing.historyRequestAtMs, timing.historyResponseAtMs)} · 服务回复相对前台 ${service} · 启动→判定 ${gap(timing.queryAtMs,timing.resultAtMs)} · 判定→快照 ${gap(timing.resultAtMs,timing.snapshotAtMs)} · 快照→界面 ${gap(timing.snapshotAtMs,correlated?.received ?? null)} · 界面→头像 ${gap(correlated?.received ?? null,correlated?.painted ?? null)} · 应有/实有 ${dot(timing.expectedDot)}/${dot(correlated?.actual ?? null)}`;
 }
+const iphoneLanguages = [
+  ["", "跟随设备"], ["zh-CN", "简体中文"], ["zh-TW", "繁體中文"], ["en-US", "English"],
+  ["ja-JP", "日本語"], ["ko-KR", "한국어"],
+] as const;
+
 const accountTimezoneChoices = [
   ["", "跟随系统"],
   ["Asia/Shanghai", "上海"],
@@ -128,10 +136,18 @@ const ICON_UPDATE = `<svg width="15" height="15" viewBox="0 0 24 24" fill="none"
 const ICON_DRAG = `<svg width="16" height="16" viewBox="0 0 24 24" fill="currentColor"><circle cx="9" cy="6" r="1.6"/><circle cx="15" cy="6" r="1.6"/><circle cx="9" cy="12" r="1.6"/><circle cx="15" cy="12" r="1.6"/><circle cx="9" cy="18" r="1.6"/><circle cx="15" cy="18" r="1.6"/></svg>`;
 
 let snapshot: ManagerSnapshot | null = null;
-let iphonePage: "accounts" | "manage" = "accounts";
+type IphonePage = "accounts" | "sessions" | "manage" | "overview" | "search";
+let iphonePage: IphonePage = "accounts";
+let iphoneReturn: IphonePage = "accounts";
+let iphoneQuery = "";
+let iphoneMenuOpen = false;
+let iphonePanelRequest = 0;
+let iphoneSearchOrigin: ProviderId | null = null;
 let iphoneDetail: AccountKey | null = null;
+let iphoneDiagnosticAccount: AccountKey | null = null;
 let iphoneSearchOpen = false;
 let renderedModal: ModalMode | null = null;
+const iphoneConversationDraft = new Map<string, { text: string; status: string; threadId?: string }>();
 let iphoneQuotaRefresh = { running: false, message: "" };
 const iphoneProxyFaults = new Map<string, "blocked" | "unreachable">();
 let modal: ModalMode = { kind: "none" };
@@ -312,6 +328,10 @@ interface SpikeHarkProbe {
 const harkProbeByAccount = new Map<string, { running: boolean; result: SpikeHarkProbe | null; error: string | null }>();
 
 function harkTestAccount(): AccountRecord | undefined {
+  if (modal.kind === "harkDiagnostic") {
+    const key = modal.account;
+    return snapshot?.accounts.find((account) => isSameKey(key, account) && account.authState === "authenticated");
+  }
   const accounts = snapshot?.accounts.filter((account) =>
     account.providerId === "hark" && account.authState === "authenticated") ?? [];
   const active = snapshot?.activeAccount;
@@ -942,22 +962,18 @@ function iphoneMenuItem(icon: Parameters<typeof iphoneIcon>[0], label: string, t
   return `<button type="button" class="iphone-item" ${target}>${iphoneIcon(icon)}<span>${label}</span>${extra}<span class="iphone-chevron" aria-hidden="true">›</span></button>`;
 }
 
-function iphoneAccountDetail(account: AccountRecord, provider: ProviderInfo, state: ManagerSnapshot): string {
+function iphoneAccountDetail(account: AccountRecord, provider: ProviderInfo): string {
   const uuid = escapeHtml(account.uuid);
   const authenticated = account.authState === "authenticated";
   const target = (action: string) => `data-iphone-account="${uuid}" data-account-action="${action}"`;
-  const row = deriveRowState(account, state, effectiveSwitchingKey(state));
   return `
-    <button type="button" class="iphone-back" data-iphone-page="accounts">‹ 账号</button>
     <h1 tabindex="-1">${escapeHtml(account.alias)}</h1>
-    <p class="iphone-caption">${escapeHtml(provider.shortName)}${account.group ? ` · ${escapeHtml(account.group)}` : ""}</p>
-    <div class="iphone-detail-summary"><div><strong>${iphoneAccountStatus(account, row)}</strong><small>${account.quotaObservation?.checkedAtMs ? `额度更新于 ${escapeHtml(new Date(account.quotaObservation.checkedAtMs).toLocaleString())}` : "额度尚未同步"}</small></div><div class="iphone-quota">${iphoneQuota(account)}</div></div>
-    ${authenticated ? `<section class="iphone-section"><h2>会话与任务</h2><div class="iphone-group">
-      ${provider.id === "muse" ? iphoneMenuItem("chat", "会话", `data-sessions-uuid="${uuid}"`) : ""}
+    ${authenticated ? `<section class="iphone-section"><h2>账号操作</h2><div class="iphone-group">
       ${iphoneMenuItem("task", "任务与通知", target("tasks"))}
       ${provider.id === "muse" ? iphoneMenuItem("approval", "审批", `data-approvals-uuid="${uuid}"`) : iphoneMenuItem("chat", "回复补同步", target("replies"))}
       ${iphoneMenuItem("quota", "账号额度", target("quota"))}
       ${iphoneMenuItem("pulse", "模型指纹", target("models"))}
+      ${iphoneMenuItem("pulse", "账号诊断", target("diagnostics"))}
     </div></section>` : ""}
     <section class="iphone-section"><h2>连接与账号</h2><div class="iphone-group">
       ${iphoneMenuItem("login", "登录恢复", `data-cookies-uuid="${uuid}"`)}
@@ -984,30 +1000,135 @@ function iphoneAttention(accounts: AccountRecord[]): string {
   return items.length ? `<h2>需要处理 <small>${items.length}</small></h2><div class="iphone-group">${items.join("")}</div>` : "";
 }
 
+function renderIphonePanel(state: ManagerSnapshot, provider: ProviderInfo, page: "sessions" | "overview" | "search"): string {
+  const accounts = state.accounts.filter((account) => page === "search" || account.providerId === provider.id);
+  const accountLink = (account: AccountRecord, icon: Parameters<typeof iphoneIcon>[0]) =>
+    iphoneMenuItem(icon, escapeHtml(account.alias), `data-iphone-open-account="${escapeHtml(account.uuid)}" data-owner="${account.providerId}"`,
+      page === "search" ? `<small>${account.providerId === "muse" ? "Muse" : "Hark"}</small>` : "");
+  if (page === "overview") {
+    const unread = accounts.filter((account) => account.hasUnreadReply);
+    const working = accounts.filter((account) => latestTaskObservations.get(iphoneAccountKey(account))?.activity === "working");
+    return `<h1>总览</h1>${iphoneAttention(accounts) || '<section class="iphone-section"><h2>需要处理</h2><p>暂无待处理事项。</p></section>'}
+      <section class="iphone-section"><h2>未读回复</h2>${unread.length ? `<div class="iphone-group">${unread.map((account) => accountLink(account, "chat")).join("")}</div>` : "<p>暂无未读回复。</p>"}</section>
+      <section class="iphone-section"><h2>进行中的任务</h2>${working.length ? `<div class="iphone-group">${working.map((account) => accountLink(account, "task")).join("")}</div>` : "<p>暂无已确认的进行中任务。</p>"}</section>`;
+  }
+  const query = page === "search" ? iphoneQuery.trim().toLocaleLowerCase() : "";
+  const matches = (value: string) => value.toLocaleLowerCase().includes(query);
+  const synced = accounts.filter((account) => account.providerId === "muse" && account.authState === "authenticated")
+    .map((account) => ({ account, ...iphoneSessionsFor(account.uuid) }));
+  const pending = synced.some((entry) => entry.pending);
+  const failures = synced.filter((entry) => entry.failed).map(({ account }) => escapeHtml(account.alias));
+  const sessions = synced.flatMap(({ account, items }) => items.filter((item) => matches(`${item.title} ${account.alias} Muse`)).map((item) => ({ account, item })))
+    .sort((a, b) => (b.item.updatedAtMs ?? 0) - (a.item.updatedAtMs ?? 0));
+  const rows = sessions.map(({ account, item }) => iphoneMenuItem("chat",
+    `<strong>${escapeHtml(item.title)}</strong><small>${page === "search" ? "Muse · " : ""}${escapeHtml(account.alias)}</small>`,
+    `data-iphone-thread="${escapeHtml(item.id)}" data-owner-uuid="${escapeHtml(account.uuid)}"`)).join("");
+  const matching = page === "search" ? accounts.filter((account) => matches(`${account.alias} ${account.group ?? ""} ${account.providerId}`)) : [];
+  return `<h1 class="iphone-sr-only">${page === "search" ? "全局搜索" : "会话"}</h1>
+    ${pending ? '<p class="iphone-caption" role="status">正在同步会话，已有结果仍可打开。</p>' : ""}
+    ${failures.length ? `<p class="iphone-caption" role="status">未能读取 ${failures.join("、")} 的会话。</p><button type="button" class="iphone-back" id="iphone-refresh-sessions">重试失败账号</button>` : ""}
+    ${matching.length ? `<section class="iphone-section"><h2>账号</h2><div class="iphone-group">${matching.map((account) => accountLink(account,"account")).join("")}</div></section>` : ""}
+    <section class="iphone-section"><div class="iphone-list-title"><h2>${page === "search" ? "会话" : "最近会话"}</h2>
+      ${page === "sessions" && !pending && !failures.length && synced.length ? '<button type="button" id="iphone-refresh-sessions">刷新</button>' : ""}</div>
+      ${rows ? `<div class="iphone-group">${rows}</div>` : `<p class="iphone-caption">${pending || failures.length ? "可用数据中暂无会话。" : page === "search" ? "没有匹配的会话。" : "暂无可显示的会话。"}</p>`}</section>
+    ${accounts.some((account) => account.providerId === "hark") ? '<p class="iphone-caption">Hark 全量会话读取与网页定位尚未验证。</p>' : ""}`;
+}
+
+async function refreshIphoneSessionBatch(force = false, failedOnly = false): Promise<void> {
+  if (!snapshot || (iphonePage !== "sessions" && iphonePage !== "search")) return;
+  const request = ++iphonePanelRequest;
+  const refreshView = () => { if (snapshot) syncIphoneViews(snapshot, currentProvider(snapshot)); };
+  const targets = snapshot.accounts.filter((account) => account.providerId === "muse" && account.authState === "authenticated"
+    && (iphonePage === "search" || account.providerId === snapshot?.selectedProviderId)
+    && (!failedOnly || iphoneSessionsFor(account.uuid).failed));
+  for (const account of targets) {
+    if (request !== iphonePanelRequest) break;
+    const work = updateIphoneSessions(account, force, refreshView);
+    refreshView();
+    await work;
+  }
+}
+
+let iphoneGlassFrame = 0;
+let iphoneGlassGeneration = 0;
+let iphoneGlassLayout = "";
+
+function scheduleIphoneGlass(): void {
+  if (iphoneGlassFrame || snapshot?.platform !== "ios") return;
+  iphoneGlassFrame = requestAnimationFrame(() => {
+    iphoneGlassFrame = 0;
+    const shell = document.querySelector<HTMLElement>(".iphone-shell");
+    if (!shell) return;
+    const surfaces = modal.kind === "none" ? [...shell.querySelectorAll<HTMLElement>("[data-iphone-glass]")]
+      .filter((node) => node.getClientRects().length)
+      .map((node) => {
+        const rect = node.getBoundingClientRect();
+        return { x: rect.x, y: rect.y, width: rect.width, height: rect.height };
+      }) : [];
+    const layout = { surfaces, viewportWidth: document.documentElement.clientWidth };
+    const key = JSON.stringify(layout);
+    if (key === iphoneGlassLayout) return;
+    iphoneGlassLayout = key;
+    const generation = ++iphoneGlassGeneration;
+    void invoke<{ ready: boolean }>("update_iphone_glass", { layout: { ...layout, generation } }).then(({ ready }) => {
+      if (generation === iphoneGlassGeneration) document.documentElement.classList.toggle("native-iphone-glass", ready);
+    }).catch(() => {
+      if (generation === iphoneGlassGeneration) iphoneGlassLayout = "";
+    });
+  });
+}
+window.addEventListener("resize", scheduleIphoneGlass);
+
+function animateIphoneEntrance(page: IphonePage, previous: IphonePage, exiting?: HTMLElement): void {
+  if (matchMedia("(prefers-reduced-motion: reduce)").matches) return;
+  const direction = (page === "manage" || previous === "manage") ? -1 : 1;
+  if (exiting) {
+    exiting.animate([{ transform: "translateX(0)" }, { transform: `translateX(${direction * 100}%)` }], {
+      duration: 220, easing: "ease-in",
+    }).finished.finally(() => exiting.remove()).catch(() => {});
+  } else {
+    const panel = document.querySelector<HTMLElement>(page === "manage" ? ".iphone-management" : ".iphone-account-panel");
+    panel?.animate([{ transform: `translateX(${direction * 100}%)` }, { transform: "translateX(0)" }], {
+      duration: 240, easing: "cubic-bezier(.2,.8,.2,1)",
+    });
+  }
+}
+
 function syncIphoneViews(state: ManagerSnapshot, provider: ProviderInfo): void {
   const shell = document.querySelector<HTMLElement>(".iphone-shell");
   if (!shell) return;
   const detailAccount = state.accounts.find((account) => isSameKey(iphoneDetail, account) && account.providerId === provider.id);
   const page = detailAccount ? "detail" : iphonePage;
-  const hark = shell.querySelector<HTMLElement>("#iphone-hark-diagnostic");
-  if (hark && page === "manage") {
-    const html = harkProbeHtml();
-    if (hark.dataset.content !== html) {
-      hark.dataset.content = html;
-      hark.innerHTML = html;
+  reconcileIphoneSessions(state.accounts);
+  const pageMode = spikeWorkspaceOpen && provider.id === "muse" ? "diagnostics" : page;
+  shell.dataset.iphoneView = pageMode;
+  scheduleIphoneGlass();
+  const header = shell.querySelector(".iphone-global-tools");
+  const menu = shell.querySelector(".iphone-service-menu");
+  const search = shell.querySelector(".iphone-search-tools");
+  const back = shell.querySelector("#iphone-back");
+  header?.toggleAttribute("hidden", pageMode !== "accounts" && pageMode !== "sessions");
+  search?.toggleAttribute("hidden", pageMode !== "search");
+  back?.toggleAttribute("hidden", pageMode === "accounts" || pageMode === "sessions" || pageMode === "search");
+  menu?.toggleAttribute("hidden", !iphoneMenuOpen);
+  shell.querySelector("#iphone-service-menu")?.setAttribute("aria-expanded", String(iphoneMenuOpen));
+  shell.querySelector("#iphone-overview")?.toggleAttribute("hidden", pageMode !== "accounts");
+  const searchInput = shell.querySelector<HTMLInputElement>("#iphone-global-search");
+  if (searchInput && searchInput.value !== iphoneQuery) searchInput.value = iphoneQuery;
+  const panel = shell.querySelector<HTMLElement>(".iphone-account-panel");
+  if (panel && (pageMode === "sessions" || pageMode === "overview" || pageMode === "search")) {
+    const html = renderIphonePanel(state, provider, pageMode);
+    if (panel.dataset.content !== html) {
+      panel.dataset.content = html;
+      panel.innerHTML = html;
     }
   }
-  const quotaRefresh = shell.querySelector<HTMLButtonElement>("#sync-all-btn");
-  if (quotaRefresh) quotaRefresh.disabled = iphoneQuotaRefresh.running;
-  const quotaMessage = shell.querySelector("#iphone-quota-message");
-  if (quotaMessage) quotaMessage.textContent = iphoneQuotaRefresh.message;
-  shell.dataset.iphoneView = spikeWorkspaceOpen && provider.id === "muse" ? "diagnostics" : page;
   for (const button of shell.querySelectorAll<HTMLButtonElement>(".iphone-nav [data-iphone-page]")) {
     if (button.dataset.iphonePage === (page === "detail" ? "accounts" : page)) button.setAttribute("aria-current", "page");
     else button.removeAttribute("aria-current");
   }
   const detail = shell.querySelector<HTMLElement>(".iphone-account-detail");
-  const detailHtml = detailAccount ? iphoneAccountDetail(detailAccount, provider, state) : "";
+  const detailHtml = detailAccount ? iphoneAccountDetail(detailAccount, provider) : "";
   if (detail && detail.dataset.content !== detailHtml) {
     detail.dataset.content = detailHtml;
     detail.innerHTML = detailHtml;
@@ -1144,6 +1265,7 @@ async function setModal(next: ModalMode): Promise<void> {
   const wasActive = modal.kind !== "none";
   const isActive = next.kind !== "none";
   modal = next;
+  scheduleIphoneGlass();
   if (wasActive !== isActive) {
     try {
       snapshot = await invoke<ManagerSnapshot>("set_modal_active", {
@@ -1807,6 +1929,9 @@ function syncDiagProxyView(): void {
 
 function pickWatchAccount(): AccountRecord | undefined {
   if (!snapshot) return undefined;
+  if (iphoneDiagnosticAccount && spikeWorkspaceOpen) {
+    return snapshot.accounts.find((account) => isSameKey(iphoneDiagnosticAccount, account) && account.authState === "authenticated");
+  }
   const active = snapshot.activeAccount;
   if (active) {
     const a = snapshot.accounts.find((x) => isSameKey(active, x));
@@ -2033,8 +2158,6 @@ async function runSpikeFingerprint(view?: Extract<ModalMode, { kind: "tasks" }>,
   }
 }
 
-const automaticFingerprintCheckedAt = new Map<string, number>();
-let automaticFingerprintChecking = false;
 
 async function runHarkFingerprint(account: AccountRecord, automatic: boolean, view?: Extract<ModalMode, { kind: "tasks" }>): Promise<void> {
   if (spikeFingerprintRunning) return;
@@ -2076,37 +2199,7 @@ async function runHarkFingerprint(account: AccountRecord, automatic: boolean, vi
   }
 }
 
-async function triggerAutomaticFingerprint(): Promise<void> {
-  if (snapshot?.platform !== "ios" || document.hidden || !navigator.onLine || spikeFingerprintRunning
-    || automaticFingerprintChecking || modal.kind !== "none") return;
-  const now = Date.now();
-  const due = snapshot.accounts.find((account) => {
-    const settings = account.fingerprintSettings;
-    if (account.authState !== "authenticated" || !settings?.intervalDays
-      || now - (automaticFingerprintCheckedAt.get(account.uuid) ?? 0) < 300_000) return false;
-    const last = Math.max(settings.lastAutomaticAttemptMs ?? 0, account.fingerprintHistory?.[0]?.recordedAtMs ?? 0);
-    return now >= last + settings.intervalDays * 86_400_000;
-  });
-  if (!due) return;
-  automaticFingerprintCheckedAt.set(due.uuid, now);
-  automaticFingerprintChecking = true;
-  try {
-    if (due.providerId === "hark") { await runHarkFingerprint(due, true); return; }
-    const quota = due.quotaObservation;
-    if (quota?.stale !== false || quota.percentUsed == null || now - quota.checkedAtMs > 600_000
-      || (quota.resetsAtMs != null && quota.resetsAtMs <= now)) {
-      const refreshed = await invoke<{ ok: boolean; quota?: { usageObserved: boolean; percentUsed: number } }>(
-        "muse_native_quota_probe", { providerId:"muse", uuid:due.uuid },
-      );
-      if (!refreshed.ok || refreshed.quota?.usageObserved !== true || refreshed.quota.percentUsed >= 100) return;
-    } else if (quota.percentUsed >= 100) return;
-    if (!document.hidden && modal.kind === "none") await runSpikeFingerprint(undefined, due);
-  } catch {
-    // Quota is read-only. An unavailable quota postpones a due automatic probe.
-  } finally {
-    automaticFingerprintChecking = false;
-  }
-}
+
 
 // 保存代理后的结果摘要：把三层状态分开写，不让“Rust 侧已保存”被误读成
 // “整个账号已生效”。三行分别是 Rust 配置 / Keychain 凭据 / WebView 下发。
@@ -2772,8 +2865,6 @@ function renderTasks(view: Extract<ModalMode, { kind: "tasks" }>): string {
   const recent = current?.lastTaskReplyAtMs;
   const fingerprintRunning = spikeFingerprintTask?.accountUuid === account.uuid;
   const records = current?.fingerprintHistory ?? [];
-  const fingerprintSettings = current?.fingerprintSettings;
-  const lastFingerprintAt = Math.max(fingerprintSettings?.lastAutomaticAttemptMs ?? 0, records[0]?.recordedAtMs ?? 0);
   const unreadStatus: Record<string, string> = {
     unread: "Muse 返回未读", zero: "服务已返回未读计数，本次为零",
     unavailable: "本次未收到未读计数", network_or_protocol: "未读查询失败", timeout: "未读查询超时",
@@ -2807,21 +2898,8 @@ function renderTasks(view: Extract<ModalMode, { kind: "tasks" }>): string {
               ${record.referenceBuiltAt ? `<div>参考库 ${escapeHtml(record.referenceBuiltAt)}${record.referenceSha256 ? ` · ${escapeHtml(record.referenceSha256.slice(0, 12))}` : ""}</div>` : ""}
             </div>`).join("")}
           </details>
-          <details id="account-fingerprint-settings" class="hark-reply"><summary>模型设置</summary>
-            <label for="account-fingerprint-model">手动标注模型</label>
-            <input id="account-fingerprint-model" class="modal-input" maxlength="80" value="${escapeHtml(fingerprintSettings?.manualModel ?? "")}" placeholder="留空时显示检测结果">
-            <label for="account-fingerprint-period">自动重测间隔（天）</label>
-            <input id="account-fingerprint-period" class="modal-input" type="number" min="0" max="90"
-              value="${fingerprintSettings?.intervalDays ?? 0}">
-            <div class="modal-desc">填 0 关闭自动重测。填 1–90 天后，到期且应用在前台时会自动检测并消耗额度。</div>
-            ${fingerprintSettings?.intervalDays ? `<div class="modal-desc">${lastFingerprintAt ?
-              "下次到期 " + new Date(lastFingerprintAt + fingerprintSettings.intervalDays * 86_400_000).toLocaleString() :
-              "已到期，等前台且额度可用时开始"}</div>` : ""}
-            <div id="account-fingerprint-settings-result" role="status"></div>
-            <button id="account-fingerprint-save" class="btn" type="button">保存模型设置</button>
-          </details>
           ${fingerprintRunning ? '<button id="account-fingerprint-stop" class="btn" type="button">停止检测</button>' :
-            `<button id="account-fingerprint-start" class="btn" type="button" ${spikeFingerprintRunning ? "disabled" : ""}>开始检测</button>`}
+            `<button id="account-fingerprint-start" class="btn" type="button" ${spikeFingerprintRunning ? "disabled" : ""}>检测模型</button>`}
         ` : ""}
         ${section === "quota" && current?.quotaDetail ? (() => {
           const quota = resolveQuotaState(current);
@@ -3265,7 +3343,7 @@ async function loadMuseSessions(view: Extract<ModalMode, { kind: "sessions" }>):
 }
 
 function renderCookieModal(view: Extract<ModalMode, { kind: "cookies" }>): string {
-  const { account, busy, preview, message, imported, stored } = view;
+  const { account, busy, preview, message, stored } = view;
   return `
     <div class="inline-modal" role="dialog" aria-modal="true" aria-labelledby="cookie-title">
       <div class="modal-card">
@@ -3283,10 +3361,10 @@ function renderCookieModal(view: Extract<ModalMode, { kind: "cookies" }>): strin
         <div id="account-cookie-message" role="status">${escapeHtml(message)}</div>
         <div class="modal-footer account-cookie-actions">
           <button id="modal-cancel-btn" class="btn" type="button" ${busy ? "disabled" : ""}>关闭</button>
-          <button id="account-cookie-export" class="btn" type="button" ${busy ? "disabled" : ""}>导出到剪贴板</button>
-          <button id="account-cookie-preview-btn" class="btn" type="button" ${busy ? "disabled" : ""}>预览 Cookie</button>
-          <button id="account-cookie-import" class="btn primary" type="button" ${preview && !busy ? "" : "disabled"}>导入 Cookie</button>
-          <button id="account-cookie-open" class="btn" type="button" ${busy ? "disabled" : ""}>${imported ? "打开并验证" : "打开会话"}</button>
+          <label for="account-cookie-expiry">剪贴板保留时间</label>
+          <select id="account-cookie-expiry" class="modal-input"><option value="30">30 秒</option><option value="60" selected>60 秒</option><option value="300">5 分钟</option></select>
+          <button id="account-cookie-export" class="btn" type="button" ${busy ? "disabled" : ""}>复制本机 Cookie</button>
+          <button id="account-cookie-preview-btn" class="btn primary" type="button" ${busy ? "disabled" : ""}>${preview ? "确认导入" : "预览 Cookie"}</button>
         </div>
       </div>
     </div>`;
@@ -3303,9 +3381,11 @@ async function accountCookieAction(action: "preview" | "import" | "export"): Pro
     render();
     return;
   }
+  const clipboardSeconds = Number(document.querySelector<HTMLSelectElement>("#account-cookie-expiry")?.value ?? 60);
+  const clipboardLabel = clipboardSeconds === 300 ? "5 分钟" : `${clipboardSeconds} 秒`;
   if (action === "export" && !await askConfirm({
     title: "导出登录 Cookie",
-    desc: "剪贴板内容可用于登录。导出只保留在本机剪贴板，60 秒后到期。",
+    desc: `剪贴板内容可用于登录，仅保留在本机剪贴板，${clipboardLabel}后到期。`,
     confirmLabel: "复制",
   })) {
     if ((modal as ModalMode).kind === "none") await setModal(view);
@@ -3321,13 +3401,13 @@ async function accountCookieAction(action: "preview" | "import" | "export"): Pro
       view.preview = await invoke<CookiePreview>("preview_account_cookies", { providerId, raw });
     } else {
       const { count, skipped } = await invoke<{ count: number; skipped: number }>("transfer_account_cookies", {
-        uuid, providerId, raw: action === "import" ? raw : null,
+        uuid, providerId, raw: action === "import" ? raw : null, clipboardSeconds,
       });
       view.preview = null;
       view.imported = action === "import" || view.imported;
       view.message = action === "import"
         ? `已写入 ${count} 条 Cookie，请打开账号验证登录。`
-        : `已复制 ${count} 条 Cookie，60 秒后到期。${skipped ? `其中有 ${skipped} 条本机记录未导出，可能需要重新登录。` : ""}`;
+        : `已复制 ${count} 条 Cookie，${clipboardLabel}后到期。${skipped ? `其中有 ${skipped} 条本机记录未导出，可能需要重新登录。` : ""}`;
     }
   } catch (error) {
     view.preview = null;
@@ -3343,6 +3423,8 @@ async function accountCookieAction(action: "preview" | "import" | "export"): Pro
       if (action === "import" && view.imported && view.message.startsWith("已写入")) {
         const input = document.querySelector<HTMLTextAreaElement>("#account-cookie-input");
         if (input) input.value = "";
+        await setModal({ kind: "none" });
+        await callCommand("switch_account", { providerId, uuid }, { providerId, uuid });
       }
     }
   }
@@ -3392,12 +3474,21 @@ async function submitNewAccount(view: Extract<ModalMode, { kind: "add" }>, previ
   if (view.pending || modal !== view) return;
   const input = document.querySelector<HTMLTextAreaElement>("#add-cookie-input");
   const status = document.getElementById("add-account-result");
-  const cookieInput = view.cookieMethod ? input?.value.trim() || null : null;
-  if ((view.cookieMethod && !cookieInput) || (!previewOnly && cookieInput && !view.cookiePreview)) {
-    if (status) status.textContent = cookieInput ? "请先预览这份 Cookie。" : "请先粘贴 Cookie。";
+  const cookieInput = input?.value.trim() || null;
+  const timeSelect = document.querySelector<HTMLSelectElement>("#add-timezone");
+  const timezone = timeSelect?.value === "custom"
+    ? document.querySelector<HTMLInputElement>("#add-custom-timezone")?.value.trim() : timeSelect?.value;
+  const language = document.querySelector<HTMLSelectElement>("#add-language")?.value;
+  const proxyEntryId = document.querySelector<HTMLSelectElement>("#add-proxy")?.value || null;
+  if (previewOnly && !cookieInput) {
+    if (status) status.textContent = "请先粘贴 Cookie。";
     return;
   }
-  const controls = document.querySelectorAll<HTMLButtonElement>("#modal-root .modal-card button");
+  if (timeSelect?.value === "custom" && !timezone) {
+    if (status) status.textContent = "请输入 IANA 时区。";
+    return;
+  }
+  const controls = document.querySelectorAll<HTMLButtonElement | HTMLSelectElement>("#modal-root .modal-card :is(button, select):not(:disabled)");
   view.pending = true;
   if (input) input.readOnly = true;
   for (const button of controls) button.disabled = true;
@@ -3411,7 +3502,7 @@ async function submitNewAccount(view: Extract<ModalMode, { kind: "add" }>, previ
       }
     } else {
       snapshot = await invoke<ManagerSnapshot>("add_account", {
-        providerId: view.providerId, alias: view.draft.trim(), cookieInput,
+        providerId: view.providerId, alias: view.draft.trim(), cookieInput, timezone, language, proxyEntryId,
       });
       if (input) input.value = "";
       if (modal === view) await setModal({ kind: "none" });
@@ -3425,8 +3516,70 @@ async function submitNewAccount(view: Extract<ModalMode, { kind: "add" }>, previ
   }
 }
 
+async function submitIphoneConversation(view: Extract<ModalMode, { kind: "compose" }>): Promise<void> {
+  if (modal !== view || view.pending || view.providerId !== "muse" || !snapshot) return;
+  const { uuid, providerId } = view;
+  const draft = iphoneConversationDraft.get(uuid);
+  if (!draft?.text.trim() || draft.status === "UNKNOWN" || !snapshot.accounts.some((item) =>
+    item.uuid === uuid && item.providerId === providerId && item.authState === "authenticated")) return;
+  view.pending = true;
+  await setModal(view);
+  try {
+    if (!draft.threadId) {
+      const result = await invoke<{ status: string; sessionId: string | null }>("send_new_muse_conversation", { uuid, text: draft.text });
+      draft.status = result.status;
+      if (result.status === "CONFIRMED" && result.sessionId) draft.threadId = result.sessionId;
+      else if (!["DEFINITIVELY_FAILED", "BUSY"].includes(result.status)) draft.status = "UNKNOWN";
+    }
+    if (draft.threadId) {
+      snapshot = await invoke<ManagerSnapshot>("open_muse_thread", { uuid, threadId: draft.threadId });
+      iphoneConversationDraft.delete(uuid);
+      await setModal({ kind: "none" });
+    }
+  } catch {
+    if (!draft.threadId) draft.status = "UNKNOWN";
+  } finally {
+    view.pending = false;
+    if (modal === view) await setModal(view);
+  }
+}
+
+function renderIphoneConversation(view: Extract<ModalMode, { kind: "compose" }>): string {
+  const accounts = snapshot?.accounts.filter((account) => account.providerId === view.providerId) ?? [];
+  const draft = iphoneConversationDraft.get(view.uuid);
+  const unknown = draft?.status === "UNKNOWN";
+  const confirmed = Boolean(draft?.threadId);
+  const waiting = view.pending;
+  const supported = view.providerId === "muse";
+  const status = waiting ? "正在发送…" : !supported ? "Hark 的新会话网页定位仍待验证。" : unknown
+    ? "发送结果待核对。请在该账号的网页查看会话。"
+    : confirmed ? "消息已确认，重新打开会话。" : draft?.status === "DEFINITIVELY_FAILED"
+      ? "消息未发出。检查该账号的登录与代理后可重试。"
+      : draft?.status === "BUSY" ? "账号已有操作正在发送。等该操作结束后重试。" : "";
+  return `<div class="inline-modal iphone-screen-modal" role="dialog" aria-modal="true" aria-labelledby="iphone-compose-title">
+    <div class="modal-card">
+      <button id="modal-cancel-btn" class="iphone-back" type="button" ${waiting ? "disabled" : ""}>‹ 返回</button>
+      <h1 id="iphone-compose-title">新建对话</h1>
+      <fieldset ${waiting || !supported ? "disabled" : ""}><legend>选择发送账号</legend>
+        ${accounts.map((account) => `<label class="iphone-compose-account">
+          <input type="radio" name="iphone-compose-account" value="${escapeHtml(account.uuid)}" ${account.uuid === view.uuid ? "checked" : ""} ${account.authState !== "authenticated" ? "disabled" : ""}>
+          <span>${escapeHtml(account.alias)}${account.authState === "authenticated" ? "" : " · 需要登录"}</span>
+        </label>`).join("") || "<p>还没有账号。请先新增并登录。</p>"}
+      </fieldset>
+      <label for="iphone-first-message">首条消息</label>
+      <textarea class="modal-input" id="iphone-first-message" maxlength="16000" rows="5" ${waiting || unknown || confirmed || !view.uuid ? "readonly" : ""}>${escapeHtml(draft?.text ?? "")}</textarea>
+      <p role="status" class="iphone-caption">${escapeHtml(status)}</p>
+      <div class="modal-footer">
+        ${unknown ? '<button type="button" class="btn" id="iphone-compose-check">打开账号核对</button>' : ""}
+        <button type="button" class="btn primary" id="iphone-compose-send" ${!supported || waiting || unknown || !draft?.text.trim() ? "disabled" : ""}>${confirmed ? "打开会话" : "发送并打开"}</button>
+      </div>
+    </div>
+  </div>`;
+}
+
 function renderModal(provider: ProviderInfo): string {
   if (modal.kind === "none") return "";
+  if (modal.kind === "compose") return renderIphoneConversation(modal);
   if (modal.kind === "approvals") return renderApprovalsModal(modal);
   if (modal.kind === "cookies") return renderCookieModal(modal);
   if (modal.kind === "sessions") return renderSessionsModal(modal);
@@ -3434,31 +3587,41 @@ function renderModal(provider: ProviderInfo): string {
   if (modal.kind === "backup") return renderAccountBackup(modal);
   if (modal.kind === "tasks") return renderTasks(modal);
   if (modal.kind === "harkReplies") return renderHarkReplies(modal);
+  if (modal.kind === "harkDiagnostic") return `<div class="inline-modal" role="dialog" aria-modal="true"><div class="modal-card"><h1>账号诊断</h1>${harkProbeHtml()}<button type="button" id="modal-cancel-btn" class="btn">关闭</button></div></div>`;
   if (modal.kind === "update") {
     return renderUpdateModal();
   }
   if (modal.kind === "add") {
     if (snapshot?.platform === "ios") {
-      const providerId = modal.providerId;
-      const service = snapshot.providers.find((item) => item.id === providerId) ?? provider;
+      const view = modal;
       return `<div class="inline-modal iphone-screen-modal" role="dialog" aria-modal="true" aria-labelledby="iphone-add-title">
         <div class="modal-card">
-          <button id="modal-cancel-btn" type="button" class="iphone-back">‹ 返回</button>
-          <h1 id="iphone-add-title" tabindex="-1">添加账号</h1>
-          <p class="iphone-caption">${escapeHtml(service.shortName)}</p>
-          <label for="modal-alias-input">账号备注 <small>可选</small></label>
-          <input id="modal-alias-input" class="modal-input" maxlength="60" placeholder="登录后可自动填写" value="${escapeHtml(modal.draft)}" />
-          <div class="iphone-add-methods" role="group" aria-label="登录方式">
-            <button type="button" data-add-method="web" aria-pressed="${!modal.cookieMethod}">${iphoneIcon("globe")}<span>网页登录</span></button>
-            <button type="button" data-add-method="cookie" aria-pressed="${Boolean(modal.cookieMethod)}">${iphoneIcon("cookie")}<span>导入 Cookie</span></button>
-          </div>
-          <div id="iphone-add-cookie-fields" ${modal.cookieMethod ? "" : "hidden"}>
-            <label for="add-cookie-input">Cookie 或带来源的会话 Token JSON</label>
-            <textarea id="add-cookie-input" class="modal-input account-cookie-input" placeholder="粘贴登录数据" autocomplete="off" autocapitalize="off" spellcheck="false"></textarea>
-            <button id="add-cookie-preview" class="btn" type="button">预览 Cookie</button>
-          </div>
+          <h1 id="iphone-add-title" tabindex="-1">新增账号</h1>
+          <label for="add-provider">服务</label>
+          <select id="add-provider" class="modal-input">
+            ${snapshot.providers.filter((item) => item.enabled).map((item) => `<option value="${escapeHtml(item.id)}" ${item.id === view.providerId ? "selected" : ""}>${escapeHtml(item.shortName)}</option>`).join("")}
+          </select>
+          <label for="modal-alias-input">备注名称 <small>可选</small></label>
+          <input id="modal-alias-input" class="modal-input" maxlength="60" placeholder="登录后自动获取邮箱" value="${escapeHtml(view.draft)}" />
+          <label for="add-timezone">时区</label>
+          <select id="add-timezone" class="modal-input">
+            ${accountTimezoneChoices.map(([value, label]) => `<option value="${value}">${label}</option>`).join("")}
+            <option value="custom">自定义</option>
+          </select>
+          <input id="add-custom-timezone" class="modal-input" placeholder="例如 Asia/Shanghai" aria-label="自定义时区" hidden>
+          <label for="add-language">语言</label>
+          <select id="add-language" class="modal-input">
+            ${iphoneLanguages.map(([value, label]) => `<option value="${value}">${label}</option>`).join("")}
+          </select>
+          <label for="add-proxy">代理</label>
+          <select id="add-proxy" class="modal-input">
+            <option value="">不启用代理</option>
+
+          </select>
+          <label for="add-cookie-input">Cookie <small>可选</small></label>
+          <textarea id="add-cookie-input" class="modal-input account-cookie-input" placeholder="留空时使用网页登录" autocomplete="off" autocapitalize="off" spellcheck="false"></textarea>
           <div id="add-account-result" role="status"></div>
-          <div class="modal-footer"><button id="modal-confirm-btn" class="btn primary" type="button">${modal.cookieMethod ? "导入并打开" : "创建并打开"}</button></div>
+          <div class="modal-footer"><button id="modal-cancel-btn" class="btn" type="button">取消</button><button id="modal-confirm-btn" class="btn primary" type="button">创建并打开</button></div>
         </div>
       </div>`;
     }
@@ -3486,8 +3649,18 @@ function renderModal(provider: ProviderInfo): string {
           <div class="modal-title">编辑账号</div>
           <label for="modal-alias-input">备注</label>
           <input id="modal-alias-input" class="modal-input" maxlength="60" placeholder="输入备注名称" value="${escapeHtml(modal.draft)}" />
-          <label for="modal-group-input">分组</label>
-          <input id="modal-group-input" class="modal-input" maxlength="32" placeholder="留空为未分组" value="${escapeHtml(modal.groupDraft)}" />
+          ${snapshot?.platform === "ios" ? (() => {
+            const groupDraft = modal.groupDraft;
+            const providerId = modal.account.providerId;
+            const names = snapshot.accountGroups?.[providerId] ?? [...new Set(snapshot.accounts.filter((account) => account.providerId === providerId).flatMap((account) => account.group ? [account.group] : []))];
+            const custom = groupDraft !== "" && !names.includes(groupDraft);
+            return `<label for="modal-group-choice">分组</label><select id="modal-group-choice" class="modal-input">
+              <option value="">无分组</option>
+              ${names.map((name, index) => `<option value="${index}" ${name === groupDraft ? "selected" : ""}>${escapeHtml(name)}</option>`).join("")}
+              <option value="new" ${custom ? "selected" : ""}>新建分组</option>
+            </select><input id="modal-group-input" class="modal-input" maxlength="32" placeholder="输入分组名称" aria-label="新分组名称" value="${custom ? escapeHtml(groupDraft) : ""}" ${custom ? "" : "hidden"} />
+            <button id="iphone-delete-group" type="button" class="btn danger" ${!groupDraft || custom ? "hidden" : ""}>删除所选分组</button><p id="iphone-group-message" role="status"></p>`;
+          })() : `<label for="modal-group-input">分组</label><input id="modal-group-input" class="modal-input" maxlength="32" value="${escapeHtml(modal.groupDraft)}" />`}
           ${snapshot?.platform === "ios" ? `<label for="modal-timezone-choice">账号时区</label>
             <select id="modal-timezone-choice" class="modal-input">
               ${accountTimezoneChoices.map(([value, label]) => `<option value="${value}" ${value === timezone ? "selected" : ""}>${label}</option>`).join("")}
@@ -3496,7 +3669,11 @@ function renderModal(provider: ProviderInfo): string {
             <div id="modal-timezone-custom" ${customTimezone ? "" : "hidden"}>
               <label for="modal-timezone-input">IANA 时区</label>
               <input id="modal-timezone-input" class="modal-input" maxlength="96" placeholder="例如 Europe/Paris" value="${customTimezone ? escapeHtml(timezone) : ""}" autocomplete="off" spellcheck="false" />
-            </div>` : ""}
+            </div>
+            <label for="modal-language">语言</label>
+            <select id="modal-language" class="modal-input">
+              ${iphoneLanguages.map(([value, label]) => `<option value="${value}" ${value === (modal.kind === "rename" ? modal.account.language ?? "" : "") ? "selected" : ""}>${label}</option>`).join("")}
+            </select>` : ""}
           <div class="modal-footer">
             <button id="modal-cancel-btn" class="btn" type="button">取消</button>
             <button id="modal-confirm-btn" class="btn primary" type="button">保存</button>
@@ -3718,48 +3895,56 @@ function renderMiddleContent(state: ManagerSnapshot, provider: ProviderInfo): st
 
   if (iphone) {
     return `
-      <div id="spike-account-view" class="spike-account-view">
-        <header class="iphone-top">
-          <span class="iphone-brand"><img src="/logos/app-logo.svg" alt="">叠号</span>
-          ${providerAccounts.length && !inReorder ? `<button type="button" id="iphone-search-btn" class="iphone-icon-button" aria-label="搜索与分组" aria-expanded="false">${iphoneIcon("search")}</button>` : ""}
-        </header>
-        <div class="iphone-heading">
-          <h1>账号</h1>
-          <div class="iphone-services" role="group" aria-label="选择服务">
-            ${state.providers.map((item) => `<button type="button" data-provider="${escapeHtml(item.id)}" aria-pressed="${item.id === provider.id}">${escapeHtml(item.shortName)}</button>`).join("")}
+      <header class="iphone-top iphone-toolbar">
+        <div class="iphone-global-tools">
+          <button type="button" data-iphone-page="manage" class="iphone-icon-button" data-iphone-glass aria-label="管理">${iphoneIcon("manage")}</button>
+          <div class="iphone-service-picker">
+            <button type="button" id="iphone-service-menu" class="iphone-service-button" data-iphone-glass aria-expanded="false">${escapeHtml(provider.shortName)} <span aria-hidden="true">⌄</span></button>
+            <div class="iphone-service-menu" hidden>
+              ${state.providers.map((item) => `<button type="button" data-provider="${escapeHtml(item.id)}" aria-current="${item.id === provider.id}">${escapeHtml(item.shortName)}</button>`).join("")}
+              <button type="button" id="add-account-btn">新增账号</button>
+            </div>
           </div>
+          <button type="button" id="iphone-overview" data-iphone-page="overview" class="iphone-icon-button" data-iphone-glass aria-label="总览">${iphoneIcon("pulse")}</button>
+          <button type="button" data-iphone-page="search" class="iphone-icon-button" data-iphone-glass aria-label="全局搜索">${iphoneIcon("search")}</button>
         </div>
+        <button type="button" id="iphone-back" class="iphone-icon-button iphone-back-button" data-iphone-glass aria-label="返回" hidden>‹</button>
+        <div class="iphone-search-tools" hidden>
+          <input type="search" id="iphone-global-search" data-iphone-glass aria-label="全局搜索" placeholder="搜索账号或会话">
+          <button type="button" data-iphone-cancel-search data-iphone-glass>取消</button>
+        </div>
+      </header>
+      <div id="spike-account-view" class="spike-account-view">
+        <h1 class="iphone-sr-only">账号</h1>
         ${noticeHtml}${conflictsHtml}${filtersHtml}
         <div class="account-list${inReorder ? " reorder-mode" : ""}">
           <section class="iphone-attention" aria-label="需要处理" hidden></section>
           <div class="iphone-list-title"><h2>全部账号 <small>${providerAccounts.length}</small></h2>
-            ${inReorder ? '<button type="button" id="reorder-done-btn">完成</button>' : providerAccounts.length > 1 ? '<button type="button" id="iphone-reorder-btn">排序</button>' : ""}
+            <div class="iphone-list-actions">
+              ${inReorder ? '<button type="button" id="reorder-done-btn">完成</button>' : providerAccounts.length ? '<button type="button" id="iphone-search-btn" aria-expanded="false">筛选</button>' : ""}
+              ${!inReorder && providerAccounts.length > 1 ? '<button type="button" id="iphone-reorder-btn">排序</button>' : ""}
+            </div>
           </div>
           ${listBody}<div id="account-filter-empty" class="empty-list" hidden>没有匹配的账号</div>
         </div>
       </div>
       <div class="iphone-account-detail iphone-scroll"></div>
       <section class="iphone-management iphone-scroll" aria-labelledby="iphone-management-title">
-        <div class="iphone-top"><span class="iphone-brand">叠号</span>${spikeBadgeHtml}</div>
         <h1 id="iphone-management-title" tabindex="-1">管理</h1>
         <section class="iphone-section"><h2>连接与数据</h2><div class="iphone-group">
           ${iphoneMenuItem("proxy", "代理池", 'id="iphone-proxy-pool-btn"')}
           ${iphoneMenuItem("backup", "备份与迁移", 'id="account-backup-btn"')}
-          ${iphoneMenuItem("quota", "刷新所有账号额度", 'id="sync-all-btn"')}
-          <p id="iphone-quota-message" class="iphone-caption" role="status"></p>
         </div></section>
         <section class="iphone-section"><h2>应用</h2><div class="iphone-group">
-          ${museDiagnostics ? iphoneMenuItem("pulse", "Muse 连接诊断", 'id="spike-open-btn"') : ""}
           ${iphoneMenuItem("update", "检查更新", 'id="check-update-btn"', hasUpdate ? '<span class="update-dot"></span>' : "")}
-          ${iphoneMenuItem("globe", `打开 ${escapeHtml(provider.shortName)} 官网`, 'id="open-site-btn"')}
         </div></section>
-        ${provider.id === "hark" && spikeDiagHtml ? `<details class="iphone-disclosure"><summary>Hark 连接诊断</summary><div id="iphone-hark-diagnostic">${spikeDiagHtml}</div></details>` : ""}
       </section>
+      <section class="iphone-account-panel iphone-scroll"></section>
       ${museDiagnostics ? spikeDiagHtml : ""}
       <nav class="iphone-nav" aria-label="叠号导航">
-        <button type="button" data-iphone-page="accounts">${iphoneIcon("account")}<span>账号</span></button>
-        <button type="button" data-iphone-page="manage">${iphoneIcon("manage")}<span>管理</span></button>
-        <button type="button" id="add-account-btn" class="iphone-add" ${provider.enabled ? "" : "disabled"}>${iphoneIcon("add")}<span>添加</span></button>
+        <div class="iphone-nav-tabs" data-iphone-glass><button type="button" data-iphone-page="accounts">${iphoneIcon("account")}<span>账号</span></button>
+        <button type="button" data-iphone-page="sessions">${iphoneIcon("chat")}<span>会话</span></button></div>
+        <button type="button" id="iphone-compose" class="iphone-add" data-iphone-glass aria-label="新建对话" ${provider.enabled ? "" : "disabled"}>${iphoneIcon("add")}</button>
       </nav>
       <div id="modal-root"></div>`;
   }
@@ -3917,7 +4102,7 @@ function structuralSignature(state: ManagerSnapshot, provider: ProviderInfo): st
 // live input node already shows it) and the update-progress in-place
 // patching are never disturbed by a rewrite. Called from render() on
 // both the patch and the full paths.
-function modalIdentityKey(provider: ProviderInfo): string | null {
+function modalIdentityKey(_provider: ProviderInfo): string | null {
   // Deliberately excludes modal.draft: a draft change is a keystroke,
   // not a new modal — the input's value is already up to date in the
   // DOM, and rewriting #modal-root here would replace the focused
@@ -3929,7 +4114,7 @@ function modalIdentityKey(provider: ProviderInfo): string | null {
     case "none":
       return "none";
     case "add":
-      return `add:${modal.providerId}:${provider.shortName}`;
+      return "add";
     case "rename":
       return `rename:${modal.account.uuid}`;
     case "remove":
@@ -3937,8 +4122,10 @@ function modalIdentityKey(provider: ProviderInfo): string | null {
     case "confirm":
       // 内容在打开时确定，不会在显示期间变化；标题 + 长度足以区分。
       return `confirm:${modal.title}:${modal.desc.length}:${modal.confirmLabel}`;
+    case "compose":
     case "approvals":
     case "harkReplies":
+    case "harkDiagnostic":
     case "cookies":
     case "sessions":
     case "proxyPool":
@@ -4435,20 +4622,68 @@ function bindDelegatedEvents(): void {
     if (!(ev.target instanceof Element)) return;
     const target = ev.target;
     const provider = currentProvider(snapshot);
-    const iphoneNav = target.closest<HTMLElement>("[data-iphone-page]");
-    if (iphoneNav && modal.kind === "none") {
-      const page = iphoneNav.dataset.iphonePage;
-      if (page === "accounts" || page === "manage") {
-        if (iphonePage === "accounts" && !iphoneDetail) saveScrollPosition();
-        iphonePage = page;
-        iphoneDetail = null;
-        if (reorderMode) {
-          reorderMode = false;
-          reorderProviderId = null;
-          render();
-        } else syncIphoneViews(snapshot, provider);
-        if (page === "accounts") restoreScrollPosition();
+    const iphoneNav = target.closest<HTMLElement>("[data-iphone-page], #iphone-back, [data-iphone-cancel-search], #iphone-service-menu, #iphone-refresh-sessions");
+    if (iphoneNav && modal.kind === "none" && snapshot.platform === "ios") {
+      const next = iphoneNav.dataset.iphonePage as IphonePage | undefined;
+      if (iphoneNav.id === "iphone-refresh-sessions") {
+        await refreshIphoneSessionBatch(true, iphoneNav.textContent === "重试失败账号");
+        return;
       }
+      if (iphoneNav.id === "iphone-service-menu") {
+        iphoneMenuOpen = !iphoneMenuOpen;
+        syncIphoneViews(snapshot, provider);
+        return;
+      }
+      const previous = iphonePage;
+      const overlays = ["manage", "overview", "search"];
+      let exiting: HTMLElement | undefined;
+      if (!next && overlays.includes(previous) && !matchMedia("(prefers-reduced-motion: reduce)").matches) {
+        const panel = document.querySelector<HTMLElement>(previous === "manage" ? ".iphone-management" : ".iphone-account-panel");
+        if (panel) {
+          const bounds = panel.getBoundingClientRect();
+          exiting = panel.cloneNode(true) as HTMLElement;
+          exiting.className = "iphone-scroll iphone-page-exit";
+          exiting.removeAttribute("aria-labelledby");
+          exiting.setAttribute("aria-hidden", "true");
+          exiting.inert = true;
+          for (const element of exiting.querySelectorAll("[id]")) element.removeAttribute("id");
+          Object.assign(exiting.style, { top: `${bounds.top}px`, left: `${bounds.left}px`, width: `${bounds.width}px`, height: `${bounds.height}px` });
+          document.querySelector(".iphone-shell")?.append(exiting);
+          exiting.scrollTop = panel.scrollTop;
+        }
+      }
+      const origin = iphoneSearchOrigin;
+      if (next && previous === "accounts" && !iphoneDetail) saveScrollPosition();
+      iphoneMenuOpen = false;
+      iphonePanelRequest++;
+      if (!next && spikeWorkspaceOpen) { setSpikeWorkspaceOpen(false); return; }
+      if (!next && iphoneDetail) iphoneDetail = null;
+      else {
+        if (next === "search" || next === "overview" || next === "manage") iphoneReturn = previous;
+        iphonePage = next ?? iphoneReturn;
+      }
+      if (next === "search") { iphoneSearchOrigin = provider.id; iphoneQuery = ""; }
+      if (!next && previous === "search") {
+        iphoneSearchOrigin = null;
+        if (origin && origin !== snapshot.selectedProviderId) await callCommand("select_provider", { providerId: origin });
+      }
+      if (reorderMode) { reorderMode = false; reorderProviderId = null; render(); }
+      syncIphoneViews(snapshot, currentProvider(snapshot));
+      if (iphonePage === "accounts" && !iphoneDetail) restoreScrollPosition();
+      if ((next && overlays.includes(next)) || exiting) animateIphoneEntrance(iphonePage, previous, exiting);
+      if (next === "search") document.getElementById("iphone-global-search")?.focus();
+      if (next === "sessions" || next === "search") void refreshIphoneSessionBatch();
+      return;
+    }
+    const openResult = target.closest<HTMLElement>("[data-iphone-open-account], [data-iphone-thread]");
+    if (openResult && modal.kind === "none" && snapshot.conflicts.length === 0) {
+      const threadId = openResult.dataset.iphoneThread;
+      const uuid = threadId ? openResult.dataset.ownerUuid : openResult.dataset.iphoneOpenAccount;
+      const owner = threadId ? "muse" : openResult.dataset.owner;
+      const account = snapshot.accounts.find((item) => item.uuid === uuid && item.providerId === owner);
+      if (!account || (threadId && !iphoneSessionsFor(account.uuid).items.some((item) => item.id === threadId))) return;
+      const key = { uuid: account.uuid, providerId: account.providerId };
+      await callCommand(threadId ? "open_muse_thread" : "switch_account", threadId ? { uuid: key.uuid, threadId } : key, key);
       return;
     }
     const iphoneAction = target.closest<HTMLElement>("[data-iphone-account]");
@@ -4466,6 +4701,10 @@ function bindDelegatedEvents(): void {
         detail?.querySelector("h1")?.focus({ preventScroll: true });
       } else if (action === "proxy") {
         await openProxyPool(account);
+      } else if (account.authState === "authenticated" && action === "diagnostics") {
+        iphoneDiagnosticAccount = { providerId: account.providerId, uuid: account.uuid };
+        if (account.providerId === "muse") setSpikeWorkspaceOpen(true);
+        else await setModal({ kind: "harkDiagnostic", account });
       } else if (account.authState === "authenticated" && action === "replies" && account.providerId === "hark") {
         const view: Extract<ModalMode, { kind: "harkReplies" }> = { kind: "harkReplies", account, reading: false, result: null, error: "" };
         await setModal(view);
@@ -4479,18 +4718,7 @@ function bindDelegatedEvents(): void {
       }
       return;
     }
-    const method = target.closest<HTMLElement>("[data-add-method]");
-    if (method && modal.kind === "add" && !modal.pending) {
-      modal.cookieMethod = method.dataset.addMethod === "cookie";
-      root.querySelectorAll<HTMLElement>("[data-add-method]").forEach((button) => button.setAttribute("aria-pressed", String(button === method)));
-      const fields = root.querySelector<HTMLElement>("#iphone-add-cookie-fields");
-      if (fields) fields.hidden = !modal.cookieMethod;
-      const confirm = root.querySelector("#modal-confirm-btn");
-      if (confirm) confirm.textContent = modal.cookieMethod ? "导入并打开" : "创建并打开";
-      const result = root.querySelector("#add-account-result");
-      if (result) result.textContent = modal.cookiePreview && modal.cookieMethod ? "已预览 Cookie。" : "";
-      return;
-    }
+
 
     // Most specific first; each branch returns after handling (this is
     // what stopPropagation used to do for the row-op buttons).
@@ -4722,13 +4950,15 @@ function bindDelegatedEvents(): void {
     const providerBtn = target.closest<HTMLElement>("[data-provider]");
     if (providerBtn) {
       const nextId = providerBtn.dataset.provider as ProviderId;
-      if (!nextId || nextId === snapshot.selectedProviderId) return;
+      iphoneMenuOpen = false;
+      if (!nextId || nextId === snapshot.selectedProviderId) { syncIphoneViews(snapshot, provider); return; }
       if (modal.kind !== "none") {
         await setModal({ kind: "none" });
       }
       reorderMode = false;
       reorderProviderId = null;
       await callCommand("select_provider", { providerId: nextId });
+      if (iphonePage === "sessions") void refreshIphoneSessionBatch();
       // Batch-1: provider switch counts as activity — refresh quotas.
       triggerAutoSync();
       return;
@@ -4790,11 +5020,43 @@ function bindDelegatedEvents(): void {
         }
         break;
       }
-      case "add-account-btn":
-      case "stage-add-btn":
-        if (modal.kind !== "none" || reorderMode || !provider.enabled) break;
-        await setModal({ kind: "add", providerId: provider.id, draft: "", cookiePreview: false, pending: false });
+      case "iphone-compose":
+        if (modal.kind === "none" && !busy && !snapshot.conflicts.length) {
+          await setModal({ kind: "compose", providerId: provider.id, uuid: "", pending: false });
+        }
         break;
+      case "iphone-compose-send":
+        if (modal.kind === "compose") await submitIphoneConversation(modal);
+        break;
+      case "iphone-compose-check":
+        if (modal.kind === "compose" && !modal.pending && modal.uuid) {
+          const key = { uuid: modal.uuid, providerId: modal.providerId };
+          await setModal({ kind: "none" });
+          await callCommand("switch_account", key, key);
+        }
+        break;
+      case "add-account-btn":
+      case "stage-add-btn": {
+        iphoneMenuOpen = false;
+        if (modal.kind !== "none" || reorderMode || !provider.enabled) break;
+        const view: Extract<ModalMode, { kind: "add" }> = { kind: "add", providerId: provider.id, draft: "", cookiePreview: false, pending: false };
+        await setModal(view);
+        if (snapshot.platform === "ios") {
+          try {
+            const pool = await invoke<ProxyPoolView>("manage_proxy_pool", { action: "list", entryId: null, input: null });
+            const select = document.querySelector<HTMLSelectElement>("#add-proxy");
+            if ((modal as ModalMode) === view && select) for (const entry of pool.entries) {
+              if (!entry.missingCredentials) {
+                select.add(new Option(entry.endpoint, entry.id));
+              }
+            }
+          } catch {
+            const result = document.getElementById("add-account-result");
+            if ((modal as ModalMode) === view && result) result.textContent = "代理池读取失败。若需要代理，请返回后重试。";
+          }
+        }
+        break;
+      }
       case "iphone-search-btn": {
         const filters = root.querySelector<HTMLElement>(".account-filters");
         iphoneSearchOpen = Boolean(filters?.hidden);
@@ -4852,34 +5114,6 @@ function bindDelegatedEvents(): void {
           else await runHarkFingerprint(modal.account, false, modal);
         }
         break;
-      case "account-fingerprint-save": {
-        if (modal.kind !== "tasks") break;
-        const view = modal;
-        const model = document.querySelector<HTMLInputElement>("#account-fingerprint-model");
-        const period = document.querySelector<HTMLInputElement>("#account-fingerprint-period");
-        const status = document.getElementById("account-fingerprint-settings-result");
-        const button = document.querySelector<HTMLButtonElement>("#account-fingerprint-save");
-        const days = period?.valueAsNumber ?? NaN;
-        if (!Number.isInteger(days) || days < 0 || days > 90) {
-          if (status) status.textContent = "请输入 0–90 的整数。";
-          break;
-        }
-        if (button) button.disabled = true;
-        try {
-          snapshot = await invoke<ManagerSnapshot>("set_muse_fingerprint_settings", {
-            uuid: view.account.uuid, providerId:view.account.providerId, manualModel: model?.value.trim() || null, intervalDays: days || null,
-          });
-          if (modal === view) {
-            render();
-            document.getElementById("account-fingerprint-settings")?.setAttribute("open", "");
-            const saved = document.getElementById("account-fingerprint-settings-result");
-            if (saved) saved.textContent = "已保存模型设置。";
-          }
-        } catch (error) {
-          if (status) status.textContent = String(error);
-        } finally { if (button) button.disabled = false; }
-        break;
-      }
       case "account-fingerprint-stop":
         if (modal.kind === "tasks" && spikeFingerprintTask?.accountUuid === modal.account.uuid) {
           await cancelSpikeProbe(spikeFingerprintTask);
@@ -4972,8 +5206,33 @@ function bindDelegatedEvents(): void {
       case "muse-sessions-refresh":
         if (modal.kind === "sessions" && !modal.loading) await loadMuseSessions(modal);
         break;
+      case "iphone-delete-group": {
+        if (modal.kind !== "rename" || !modal.groupDraft) break;
+        const view = modal;
+        const group = view.groupDraft;
+        const providerId = view.account.providerId;
+        const count = snapshot.accounts.filter((item) => item.providerId === providerId && item.group === group).length;
+        if (count) {
+          const message = root.querySelector("#iphone-group-message");
+          if (message) message.textContent = `此分组还有 ${count} 个账号。请先移出组内账号，再删除。`;
+          break;
+        }
+        const confirmed = await askConfirm({ title: "删除空分组", desc: `删除「${group}」？`, confirmLabel: "删除", danger: true });
+        if ((modal as ModalMode).kind !== "none") break;
+        let error = "";
+        if (confirmed) {
+          try {
+            snapshot = await invoke<ManagerSnapshot>("delete_account_group", { providerId, group });
+            view.groupDraft = view.account.group ?? "";
+          } catch (reason) { error = String(reason); }
+        }
+        await setModal(view);
+        const result = root.querySelector("#iphone-group-message");
+        if (result && confirmed) result.textContent = error || "已删除空分组。";
+        break;
+      }
       case "account-cookie-preview-btn":
-        await accountCookieAction("preview");
+        await accountCookieAction(modal.kind === "cookies" && modal.preview ? "import" : "preview");
         break;
       case "account-cookie-import":
         await accountCookieAction("import");
@@ -5000,7 +5259,7 @@ function bindDelegatedEvents(): void {
         break;
       case "modal-cancel-btn":
         if (modal.kind === "update" && updateState.installing) break;
-        if (modal.kind === "add" && modal.pending) break;
+        if ((modal.kind === "add" || modal.kind === "compose") && modal.pending) break;
         await setModal({ kind: "none" });
         break;
       case "add-cookie-preview":
@@ -5031,6 +5290,7 @@ function bindDelegatedEvents(): void {
               break;
             }
           }
+          const language = document.querySelector<HTMLSelectElement>("#modal-language")?.value;
           await setModal({ kind: "none" });
           await callCommand("rename_account", {
             providerId: currentModal.account.providerId,
@@ -5038,6 +5298,7 @@ function bindDelegatedEvents(): void {
             alias,
             group: currentModal.groupDraft.trim(),
             timezone: snapshot?.platform === "ios" ? timezone : null,
+            language,
           });
         } else if (currentModal.kind === "remove") {
           await setModal({ kind: "none" });
@@ -5114,7 +5375,31 @@ function bindDelegatedEvents(): void {
     { passive: false }
   );
 
-  root.addEventListener("change", async (ev) => {
+  root.addEventListener("change", (event) => {
+  const input = event.target;
+  const view = modal;
+  if (!(input instanceof HTMLInputElement) || input.name !== "iphone-compose-account" || !input.checked ||
+    view.kind !== "compose" || view.pending || !snapshot?.accounts.some((account) =>
+      account.providerId === view.providerId && account.uuid === input.value && account.authState === "authenticated")) return;
+  view.uuid = input.value;
+  void setModal(view);
+});
+
+root.addEventListener("change", async (ev) => {
+    const field = ev.target;
+    if (modal.kind === "add" && field instanceof HTMLSelectElement && !modal.pending) {
+      if (field.id === "add-provider" && (field.value === "muse" || field.value === "hark")) {
+        modal.providerId = field.value;
+        modal.cookiePreview = false;
+        const cookie = document.querySelector<HTMLTextAreaElement>("#add-cookie-input");
+        if (cookie) cookie.value = "";
+        const result = document.getElementById("add-account-result");
+        if (result) result.textContent = "";
+      } else if (field.id === "add-timezone") {
+        const custom = document.getElementById("add-custom-timezone");
+        if (custom) custom.hidden = field.value !== "custom";
+      }
+    }
     const timezoneChoice = ev.target as HTMLSelectElement;
     if (modal.kind === "proxyPool" && ["ios-proxy-retention", "ios-quota-interval"].includes(timezoneChoice.id)) {
       const view = modal;
@@ -5130,6 +5415,17 @@ function bindDelegatedEvents(): void {
         view.message = "本机设置已保存。";
       } catch (error) { view.message = String(error); }
       finally { view.busy = false; if (modal === view) render(); }
+      return;
+    }
+    if (timezoneChoice.id === "modal-group-choice" && modal.kind === "rename") {
+      const input = root.querySelector<HTMLInputElement>("#modal-group-input");
+      const isNew = timezoneChoice.value === "new";
+      modal.groupDraft = isNew ? input?.value ?? "" : timezoneChoice.value ? timezoneChoice.selectedOptions[0].text : "";
+      if (input) input.hidden = !isNew;
+      root.querySelector("#iphone-delete-group")?.toggleAttribute("hidden", isNew || !modal.groupDraft);
+      const message = root.querySelector("#iphone-group-message");
+      if (message) message.textContent = "";
+      if (isNew) input?.focus();
       return;
     }
     if (timezoneChoice.id === "modal-timezone-choice" && modal.kind === "rename") {
@@ -5203,6 +5499,20 @@ function bindDelegatedEvents(): void {
 
   root.addEventListener("input", (ev) => {
     const input = ev.target as HTMLInputElement;
+    if (input.id === "iphone-global-search" && snapshot) {
+      iphoneQuery = input.value;
+      syncIphoneViews(snapshot, currentProvider(snapshot));
+      return;
+    }
+    if (input.id === "iphone-first-message" && modal.kind === "compose" && modal.uuid && !modal.pending) {
+      const draft = iphoneConversationDraft.get(modal.uuid) ?? { text: "", status: "" };
+      if (draft.status === "UNKNOWN" || draft.threadId) return;
+      draft.text = input.value;
+      iphoneConversationDraft.set(modal.uuid, draft);
+      const send = document.querySelector<HTMLButtonElement>("#iphone-compose-send");
+      if (send) send.disabled = !draft.text.trim();
+      return;
+    }
     if (input.id === "add-cookie-input" && modal.kind === "add") {
       modal.cookiePreview = false;
       const status = document.getElementById("add-account-result");
@@ -5211,7 +5521,8 @@ function bindDelegatedEvents(): void {
     }
     if (input.id === "account-cookie-input" && modal.kind === "cookies") {
       modal.preview = null;
-      document.querySelector<HTMLButtonElement>("#account-cookie-import")?.setAttribute("disabled", "");
+      const button = document.querySelector<HTMLButtonElement>("#account-cookie-preview-btn");
+      if (button) button.textContent = "预览 Cookie";
       const preview = document.getElementById("account-cookie-preview");
       if (preview) preview.textContent = "";
       return;
@@ -5253,7 +5564,7 @@ function bindDelegatedEvents(): void {
       document.querySelector<HTMLButtonElement>("#modal-confirm-btn")?.click();
     } else if (ev.key === "Escape") {
       ev.preventDefault();
-      if (modal.kind !== "add" || !modal.pending) await setModal({ kind: "none" });
+      if ((modal.kind !== "add" && modal.kind !== "compose") || !modal.pending) await setModal({ kind: "none" });
     }
   });
 }
@@ -5437,7 +5748,6 @@ async function bootstrap(): Promise<void> {
     let lastQuotaTimerTick = 0;
     foregroundTaskTimer = window.setInterval(() => {
       void refreshForegroundTask();
-      void triggerAutomaticFingerprint();
       void processApprovalNotifications();
       if (!document.hidden && navigator.onLine && iosNetworkPrefs?.quotaMinutes && Date.now() - lastQuotaTimerTick >= 60_000) {
         lastQuotaTimerTick = Date.now();

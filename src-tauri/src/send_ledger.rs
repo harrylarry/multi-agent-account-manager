@@ -54,6 +54,7 @@ pub enum SendStatus {
 #[serde(rename_all = "SCREAMING_SNAKE_CASE")]
 pub enum SendKind {
   Message,
+  NewMuseConversation,
   FingerprintProbe,
   HarkMessage,
   HarkVerifiedProbe,
@@ -336,6 +337,26 @@ impl SendLedger {
     })
   }
 
+  pub fn begin_new_muse_conversation(&self, account_uuid: &str, text: &str) -> Result<String, SendError> {
+    use sha2::{Digest, Sha256};
+
+    self.commit(|state| {
+      if let Some(mission) = state.missions.get(account_uuid) {
+        return Err(SendError::Busy(mission.clone()));
+      }
+      let digest = format!("{:x}", Sha256::digest(text.as_bytes()));
+      if state.attempts.iter().any(|attempt| {
+        attempt.kind == SendKind::NewMuseConversation
+          && attempt.account_uuid == account_uuid
+          && attempt.digest == digest
+          && attempt.status == SendStatus::Unknown
+      }) {
+        return Err(SendError::Unknown("相同消息仍待核对，请查看该账号的网页会话".into()));
+      }
+      Self::start_attempt_locked(state, account_uuid, "new", &digest, SendKind::NewMuseConversation, None)
+    })
+  }
+
   /// 开启一次检测任务（mission）。mission 期间该账号拒绝所有手动发送；
   /// 返回的 guard 在 drop 时自动释放 mission，保证异常路径不锁死账号。
   pub fn mission(&self, account_uuid: &str) -> Result<MissionGuard<'_>, SendError> {
@@ -411,7 +432,7 @@ impl SendLedger {
       send_id: send_id.clone(),
       account_uuid: account_uuid.to_string(),
       conversation_id: conversation_id.to_string(),
-      digest: digest_of(text),
+      digest: if kind == SendKind::NewMuseConversation { text.to_owned() } else { digest_of(text) },
       started_at_ms: now_ms(),
       status: SendStatus::Prepared,
       error: None,

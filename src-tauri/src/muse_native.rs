@@ -231,11 +231,33 @@ pub async fn send_probe(
   session_id: Option<&str>,
   setting: Option<&ProxySetting>,
   secrets: &Secrets,
+  cancel_token: crate::probe_cancel::CancelToken,
+) -> SendOutcome {
+  send_muse_message(
+    app, ledger, uuid, text, node_id, session_id, setting, secrets, cancel_token, false,
+  ).await
+}
+
+pub async fn send_muse_message(
+  app: &AppHandle,
+  ledger: &crate::send_ledger::SendLedger,
+  uuid: &str,
+  text: &str,
+  node_id: &str,
+  session_id: Option<&str>,
+  setting: Option<&ProxySetting>,
+  secrets: &Secrets,
   mut cancel_token: crate::probe_cancel::CancelToken,
+  new_conversation: bool,
 ) -> SendOutcome {
   use crate::send_ledger::SendError;
-  let conversation = session_id.unwrap_or("new").to_string();
-  let send_id = match ledger.begin(uuid, &conversation, text) {
+  let conversation = session_id.unwrap_or("new");
+  let prepared = if new_conversation {
+    ledger.begin_new_muse_conversation(uuid, text)
+  } else {
+    ledger.begin(uuid, conversation, text)
+  };
+  let send_id = match prepared {
     Ok(id) => id,
     Err(SendError::Busy(existing)) => {
       return SendOutcome {
@@ -432,11 +454,15 @@ pub async fn send_probe(
     }
     match tracked.outcome {
       Ok(ack) => {
-        ledger.confirm(&send_id);
         let session_verified = ack.session_id.as_deref() == Some(target_session.as_str());
+        if new_conversation && !session_verified {
+          ledger.mark_unknown(&send_id, "ACK 未确认目标会话".into());
+        } else {
+          ledger.confirm(&send_id);
+        }
         SendOutcome {
           ok: session_verified,
-          status: "CONFIRMED".to_string(),
+          status: if new_conversation && !session_verified { "UNKNOWN" } else { "CONFIRMED" }.to_string(),
           send_id,
           ack: Some(ack.raw),
           session_id: ack.session_id,
