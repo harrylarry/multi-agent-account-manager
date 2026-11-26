@@ -127,7 +127,7 @@ private final class ApprovalNotificationDelegate: NSObject, UNUserNotificationCe
       let store = UserDefaults.standard
       var queue = store.array(forKey: Self.queueKey) as? [[String: Any]] ?? []
       if !queue.contains(where: { $0["uuid"] as? String == uuid && $0["approvalId"] as? String == approvalId }) {
-        queue.append(["uuid":uuid, "approvalId":approvalId, "sessionScopeId":sessionScopeId,
+        queue.append(["actionId":UUID().uuidString, "uuid":uuid, "approvalId":approvalId, "sessionScopeId":sessionScopeId,
                       "expiresAtMs":expiry, "decision":decision])
         store.set(Array(queue.suffix(16)), forKey: Self.queueKey)
       }
@@ -449,16 +449,29 @@ class AccountSessionPlugin: Plugin {
     }
   }
 
-  @objc public func takeApprovalNotificationActions(_ invoke: Invoke) {
+  @objc public func readApprovalNotificationActions(_ invoke: Invoke) {
     DispatchQueue.main.async {
       guard UIApplication.shared.applicationState == .active else {
         invoke.resolve(["actions": []])
         return
       }
       let store = UserDefaults.standard
-      let actions = store.array(forKey: ApprovalNotificationDelegate.queueKey) ?? []
-      store.removeObject(forKey: ApprovalNotificationDelegate.queueKey)
+      var actions = store.array(forKey: ApprovalNotificationDelegate.queueKey) as? [[String: Any]] ?? []
+      let legacy = actions.indices.filter { actions[$0]["actionId"] == nil }
+      for index in legacy { actions[index]["actionId"] = UUID().uuidString }
+      if !legacy.isEmpty { store.set(actions, forKey: ApprovalNotificationDelegate.queueKey) }
       invoke.resolve(["actions": actions])
+    }
+  }
+
+  @objc public func finishApprovalNotificationAction(_ invoke: Invoke) throws {
+    struct Args: Decodable { let actionId: String }
+    let args = try invoke.parseArgs(Args.self)
+    DispatchQueue.main.async {
+      let store = UserDefaults.standard
+      let queue = store.array(forKey: ApprovalNotificationDelegate.queueKey) as? [[String: Any]] ?? []
+      store.set(queue.filter { $0["actionId"] as? String != args.actionId }, forKey: ApprovalNotificationDelegate.queueKey)
+      invoke.resolve()
     }
   }
 

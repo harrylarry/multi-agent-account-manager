@@ -631,21 +631,29 @@ async fn decide_muse_approval(
 #[cfg_attr(not(target_os = "ios"), allow(unused_variables))]
 async fn process_approval_notification_actions(
   app: AppHandle, mgr: State<'_, Arc<SessionManager>>, cancel: State<'_, Arc<probe_cancel::ProbeCancel>>,
+  gate: State<'_, ApprovalNotificationGate>,
 ) -> Result<Vec<String>, String> {
   #[cfg(target_os = "ios")]
   {
+    let Ok(_guard) = gate.0.try_lock() else { return Ok(Vec::new()); };
     let mut notes = Vec::new();
-    for item in tauri_plugin_account_session::take_approval_notification_actions(&app).await? {
-      let (Some(uuid), Some(approval_id), Some(session_scope_id), Some(expires_at_ms), Some(decision)) = (
+    for item in tauri_plugin_account_session::read_approval_notification_actions(&app).await? {
+      let Some(action_id) = item["actionId"].as_str() else { continue; };
+      let fields = (
         item["uuid"].as_str(), item["approvalId"].as_str(), item["sessionScopeId"].as_str(),
         item["expiresAtMs"].as_i64(), item["decision"].as_str(),
-      ) else { continue; };
-      if !matches!(decision, "allow_once" | "deny") { continue; }
-      let request = ApprovalDecisionRequest { approval_id:approval_id.into(), session_scope_id:session_scope_id.into(),
-        expires_at_ms, decision:decision.into(), scope:None, permanent_confirmed:false };
-      match Box::pin(decide_muse_approval(app.clone(), mgr.clone(), cancel.clone(), uuid.to_string(), request)).await {
-        Ok(()) => notes.push(if decision == "allow_once" { "通知审批已允许一次" } else { "通知审批已拒绝" }.into()),
-        Err(error) => notes.push(error),
+      );
+      if let (Some(uuid), Some(approval_id), Some(session_scope_id), Some(expires_at_ms), Some(decision @ ("allow_once" | "deny"))) = fields {
+        let request = ApprovalDecisionRequest { approval_id:approval_id.into(), session_scope_id:session_scope_id.into(),
+          expires_at_ms, decision:decision.into(), scope:None, permanent_confirmed:false };
+        match Box::pin(decide_muse_approval(app.clone(), mgr.clone(), cancel.clone(), uuid.to_string(), request)).await {
+          Ok(()) => notes.push(if decision == "allow_once" { "通知审批已允许一次" } else { "通知审批已拒绝" }.into()),
+          Err(error) => notes.push(error),
+        }
+      }
+      if let Err(error) = tauri_plugin_account_session::finish_approval_notification_action(&app, action_id).await {
+        notes.push(error);
+        break;
       }
     }
     Ok(notes)
@@ -1056,6 +1064,9 @@ async fn muse_native_send_probe(
 /// verdict 只有 scored 才是有效识别；partial 只是候选排名；indeterminate 不可判定。
 #[derive(Default)]
 struct FingerprintGate(tokio::sync::Mutex<()>);
+
+#[derive(Default)]
+struct ApprovalNotificationGate(#[cfg_attr(not(target_os = "ios"), allow(dead_code))] tokio::sync::Mutex<()>);
 
 #[tauri::command]
 async fn set_muse_fingerprint_settings(
@@ -1852,6 +1863,7 @@ pub fn run() {
   let builder = tauri::Builder::default();
   let builder = builder.manage(proxy_pool::ProxyPoolGate::default());
   let builder = builder.manage(rooms::RoomGate::default());
+  let builder = builder.manage(ApprovalNotificationGate::default());
 
   #[cfg(target_os = "android")]
   let builder = builder.plugin(platform::android::init());

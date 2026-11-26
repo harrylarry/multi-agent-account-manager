@@ -882,13 +882,21 @@ pub async fn post_task_notification(app: &AppHandle, identifier: &str, kind: &st
 }
 
 #[cfg(target_os = "ios")]
-pub async fn take_approval_notification_actions(app: &AppHandle) -> Result<Vec<serde_json::Value>, String> {
+pub async fn read_approval_notification_actions(app: &AppHandle) -> Result<Vec<serde_json::Value>, String> {
   #[derive(Deserialize)]
   struct Pending { actions: Vec<serde_json::Value> }
   let bridge = app.state::<IosSessionBridge<tauri::Wry>>();
-  let result: Pending = bridge.0.run_mobile_plugin_async("takeApprovalNotificationActions", serde_json::json!({}))
+  let result: Pending = bridge.0.run_mobile_plugin_async("readApprovalNotificationActions", serde_json::json!({}))
     .await.map_err(|e| e.to_string())?;
   Ok(result.actions)
+}
+
+#[cfg(target_os = "ios")]
+pub async fn finish_approval_notification_action(app: &AppHandle, action_id: &str) -> Result<(), String> {
+  let bridge = app.state::<IosSessionBridge<tauri::Wry>>();
+  bridge.0.run_mobile_plugin_async::<serde_json::Value>("finishApprovalNotificationAction", serde_json::json!({ "actionId": action_id }))
+    .await.map_err(|_| "通知审批结果已处理，本机通知队列尚未更新".to_string())?;
+  Ok(())
 }
 
 #[cfg(target_os = "ios")]
