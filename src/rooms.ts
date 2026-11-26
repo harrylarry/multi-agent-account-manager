@@ -18,6 +18,7 @@ const holdReasons: Record<string, string> = {
   round_limit: "已到轮次上限。接力已停止，请裁决。",
   review_limit: "审核已打回 3 次。接力已停止，请裁决。",
   invalid_review: "没有收到可核验的审核决定。已停止接力，审核者的原回复保存在记录中。",
+  invalid_plan: "指挥回复的分工无法校验，已停止派发。",
   account_unavailable: "本轮没有发出。请检查该成员的登录、代理或发送占用，也可提议换人。",
   context_too_large: "必须交接的材料超过范围，已停止。本轮没有发送，前序材料仍保留。",
 };
@@ -44,6 +45,7 @@ interface Room {
   steps: { phase: string; atMs: number }[];
   attempts: Attempt[];
   approvedAtMs: number | null;
+  conversation?: { commander: string; messages: { id:string; text:string; atMs:number; approvedAtMs?:number }[]; replies: Record<string,string> };
   artifacts?: { id:string; kind:string; name:string; sha256:string; byteCount:number; url?:string; verifiedCommit?:string; attemptId?:string }[];
   bindings?: { accountUuid:string; threadId:string; title:string }[];
   assignment?: {
@@ -63,6 +65,10 @@ interface Room {
 export interface RoomBook { templates: Template[]; rooms: Room[] }
 export interface RoomsView { kind: "rooms"; book: RoomBook | null; busy: boolean; error: string; runningRoomId?: string }
 
+function hasRoomFinal(room: Room): boolean {
+  return room.phase === "finalized" || Boolean(room.conversation?.messages.some((row) => row.approvedAtMs));
+}
+
 function relatedTerms(text: string): Set<string> {
   const terms = new Set<string>();
   for (const word of text.toLowerCase().match(/[a-z0-9]{3,}|[\p{Script=Han}]{2,}/gu) ?? []) {
@@ -75,7 +81,7 @@ function relatedTerms(text: string): Set<string> {
 
 export function markRoomSuggestions(book: RoomBook | null, goal: string): void {
   const terms = relatedTerms(goal);
-  const related = (book?.rooms ?? []).filter((room) => room.phase === "finalized")
+  const related = (book?.rooms ?? []).filter(hasRoomFinal)
     .map((room) => ({ id: room.id, score: [...relatedTerms(room.draft.name + " " + room.draft.goal)].filter((term) => terms.has(term)).length }))
     .filter((room) => room.score >= 2).sort((a, b) => b.score - a.score).slice(0, 3);
   for (const label of document.querySelectorAll<HTMLElement>("[data-room-new] [data-related-room]")) {
@@ -132,9 +138,9 @@ export function renderRooms(view: RoomsView, accounts: AccountRecord[], esc: (te
     .map((item) => `<option value="${esc(item.id)}">${esc(item.title)}</option>`).join("") ?? "";
   const alias = (uuid: string) => muse.find((account) => account.uuid === uuid)?.alias ?? "原成员";
   const name = (uuid: string) => esc(alias(uuid));
-  const memberLine = (member: Member) => `${name(member.uuid)} · ${member.roles.map((role) => roles.find(([id]) => id === role)?.[1] ?? "").join("、")}`;
+  const memberLine = (member: Member) => [name(member.uuid), member.roles.map((role) => roles.find(([id]) => id === role)?.[1] ?? "").join("、")].filter(Boolean).join(" · ");
   const referenceOptions = (target?: Room) => (view.book?.rooms ?? [])
-    .filter((source) => source.phase === "finalized" && source.id !== target?.id)
+    .filter((source) => hasRoomFinal(source) && source.id !== target?.id)
     .map((source) => `<label><input data-room-reference type="checkbox" value="${esc(source.id)}"
       ${target?.records?.references.some((reference) => reference.roomId === source.id) ? "checked" : ""}> ${esc(source.draft.name)}
       <small data-related-room="${esc(source.id)}" hidden> · 与目标相关</small></label>`).join("<br>");
@@ -146,12 +152,13 @@ export function renderRooms(view: RoomsView, accounts: AccountRecord[], esc: (te
     <div class="inline-modal" role="dialog" aria-modal="true" aria-labelledby="rooms-title">
       <div class="modal-card proxy-pool-modal">
         <div class="modal-title" id="rooms-title">协作房间</div>
-        <div class="modal-desc">开始接力后，房间按模板依次派发。每轮使用对应账号的隔离 Muse 会话和额度，定稿由你确认。</div>
+        <div class="modal-desc">你的消息先交给指挥，指挥可直接回答或分派给房间成员。各成员使用独立的 Muse 会话，任务定稿由你确认。</div>
         <div class="proxy-pool-body">
           ${view.book?.rooms.map((room) => {
             const attempt = room.attempts?.at(-1);
             const running = view.runningRoomId === room.id || ["dispatching","waiting_reply"].includes(room.phase);
-            const multi = room.template.flow !== "solo";
+            const chat = room.conversation;
+            const multi = Boolean(chat) || room.template.flow !== "solo";
             const hold = room.relay?.hold ?? "";
             const atLimit = room.rounds >= room.draft.roundLimit || room.returned >= 3;
             const proposal = room.relay?.proposal;
@@ -160,21 +167,20 @@ export function renderRooms(view: RoomsView, accounts: AccountRecord[], esc: (te
             const sourceButton = (step: Attempt) => step.sessionId ? `<button type="button" class="btn" data-room-action="open_source"
                 data-room-account="${esc(step.accountUuid)}" data-room-session="${esc(step.sessionId)}">打开原隔离会话</button>` : "";
             const actions = running ? [["interrupt", "停止本轮"]] :
-              room.phase === "created" ? [["prepare", "校验并准备"]] :
+              room.phase === "created" ? (chat ? [] : [["prepare", "校验并准备"]]) :
               room.phase === "planning" ? [["dispatch", multi ? "开始接力" : "真实派发一轮"], ["pause", "暂停"], ["stop", "停止"]] :
               room.phase === "paused" ? [...(proposal ? [] : [["resume", "继续准备"]]), ["stop", "停止"]] :
               room.phase === "needs_reconciliation" ? [...(attempt?.userMessageId ? [["recover","只读回收回复"]] : []), ["abandon","结束房间"]] :
               room.phase === "needs_user" ? [
                 ...(hold === "account_unavailable" && !atLimit && !proposal ? [["resume", "重新检查原分工"]] : []),
                 ...(room.relay?.finalAttempt && !room.relay.pendingNote ? [["confirm", "确认文字定稿"]] : []),
-                ["stop", "结束房间"],
-              ] : room.phase === "pending_confirmation" ? [["confirm","确认文字定稿"], ["rework","要求返工"]] : [];
+                ["stop", chat ? "结束本次任务" : "结束房间"],
+              ] : room.phase === "pending_confirmation" ? [["confirm","确认文字定稿"], ["rework","要求返工"], ...(chat ? [["stop", "结束本次任务"]] : [])] : [];
             if (canSupplement) actions.push(["supplement", running ? "本轮结束后暂停并补充" : "保存要求并暂停"]);
             return `
             <details class="hark-reply" data-room-panel="${room.id}">
-              <summary>${esc(room.draft.name)} · ${phaseNames[room.phase] ?? esc(room.phase)} · ${room.rounds}/${room.draft.roundLimit} 轮</summary>
-              <div class="hark-reply-text">${esc(room.draft.goal)}</div>
-              <div class="modal-desc">${esc(room.template.title)} · v${room.template.version}</div>
+              <summary>${esc(room.draft.name)} · ${chat && room.phase === "created" ? "可发消息" : phaseNames[room.phase] ?? esc(room.phase)}${chat && room.phase === "created" ? "" : ` · ${room.rounds}/${room.draft.roundLimit} 轮`}</summary>
+              ${chat ? "" : `<div class="hark-reply-text">${esc(room.draft.goal)}</div><div class="modal-desc">${esc(room.template.title)} · v${room.template.version}</div>`}
               ${room.draft.automatic ? `<div class="modal-desc">自动分派${room.assignment?.quotaWindow ? ` · ${esc(room.assignment.quotaWindow)}额度窗口` : ""}</div>` : ""}
               ${room.draft.members.map((member) => {
                 const basis = room.assignment?.basis?.find((entry) => entry.uuid === member.uuid);
@@ -232,17 +238,20 @@ export function renderRooms(view: RoomsView, accounts: AccountRecord[], esc: (te
               ${running ? `<div role="status">${attempt?.stage && !attempt.delivery ? `${stageNames[attempt.stage]} · ${name(attempt.accountUuid)} · ` : ""}正在等待发送确认或回复。</div>` : ""}
               ${room.relay?.pendingNote ? '<div role="status">已记录补充要求。当前回复入账后暂停，等待你继续。</div>' : ""}
               ${room.relay?.notes?.length ? `<details><summary>用户补充（${room.relay.notes.length}）</summary>${room.relay.notes.map((note) => `<div class="hark-reply-text">${esc(note)}</div>`).join("")}</details>` : ""}
-              ${room.attempts?.some((step) => step.delivery) ? `<ol class="room-timeline" aria-label="房间消息">${room.attempts.map((step, index) => step.delivery ? `<li class="room-message">
+              ${chat?.messages.length || room.attempts?.some((step) => step.delivery) ? `<ol class="room-timeline" aria-label="房间消息">${[
+                ...(chat?.messages ?? []).map((row) => ({ at:row.atMs, html:`<li class="room-message"><div class="room-message-heading"><strong>你</strong><span class="modal-desc">${new Date(row.atMs).toLocaleTimeString()}${row.approvedAtMs ? " · 已确认定稿" : ""}</span></div><div class="hark-reply-text">${esc(row.text)}</div></li>` })),
+                ...(room.attempts ?? []).flatMap((step, index) => step.delivery ? [{at:step.delivery.capturedAtMs, html:`<li class="room-message">
                 <div class="room-message-heading"><span class="room-message-avatar" aria-hidden="true">${esc(Array.from(alias(step.accountUuid).trim())[0] ?? "●")}</span>
                   <div><strong>${name(step.accountUuid)}</strong><div class="modal-desc">${step.stage ? esc(stageNames[step.stage] ?? step.stage) : "文字交付"}${step.review ? step.review.decision === "approve" ? " · 通过" : " · 打回" : ""}
                   · ${new Date(step.delivery.capturedAtMs).toLocaleTimeString()}</div></div></div>
-                <div class="hark-reply-text">${esc(step.review?.reason ?? (step.id && room.artifacts?.some((item) => item.attemptId === step.id)
+                <div class="hark-reply-text">${esc((step.id ? chat?.replies?.[step.id] : undefined) ?? step.review?.reason ?? (step.id && room.artifacts?.some((item) => item.attemptId === step.id)
                   ? step.delivery.text.slice(0, 1200) + "…\n完整正文见交付凭证中的 Markdown 附件。"
                   : step.delivery.text))}</div>
                 <details data-room-step="${index}"><summary>消息来源</summary><div class="modal-desc">${step.delivery.source === "history" ? "会话历史" : "实时订阅"} · ${new Date(step.delivery.capturedAtMs).toLocaleString()}</div>
                 <div class="modal-desc" style="overflow-wrap:anywhere">SHA-256 ${esc(step.delivery.sha256)}</div>
                 ${multi ? sourceButton(step) : ""}
-                </details></li>` : "").join("")}</ol>` : ""}
+                </details></li>`}] : []),
+              ].sort((a,b) => a.at - b.at).map((row) => row.html).join("")}</ol>` : ""}
               ${attempt && (!multi || !attempt.delivery) ? sourceButton(attempt) : ""}
               ${room.phase === "needs_reconciliation" ? '<div class="modal-desc">本轮结果需要核对。可以查看原会话或结束房间。</div>' : ""}
               ${room.phase === "needs_reconciliation" && attempt?.remoteCancelAcknowledged != null ? `<div class="modal-desc">${attempt.remoteCancelAcknowledged ? "远端已应答停止请求，生成是否停止仍需在原会话核对。" : "未收到远端停止应答，请在原会话核对。"}</div>` : ""}
@@ -254,7 +263,7 @@ export function renderRooms(view: RoomsView, accounts: AccountRecord[], esc: (te
                 ${proposal.members.map((member) => `<div>${memberLine(member)}</div>`).join("")}
                 <button type="button" class="btn" data-room-action="confirm_roster" data-room-id="${room.id}" data-room-revision="${room.revision}" data-room-proposal="${esc(proposal.id)}">确认变更成员与角色</button>
                 <button type="button" class="btn" data-room-action="discard_roster" data-room-id="${room.id}" data-room-revision="${room.revision}">取消变更</button>
-              </div>` : multi && !atLimit && !room.relay?.pendingNote && ["paused", "needs_user"].includes(room.phase) ? `<details data-room-roster>
+              </div>` : !chat && multi && !atLimit && !room.relay?.pendingNote && ["paused", "needs_user"].includes(room.phase) ? `<details data-room-roster>
                 <summary>提议调整成员或固定角色</summary>
                 ${roster(room.draft.members)}
                 <button type="button" class="btn" data-room-action="propose_roster" data-room-id="${room.id}" data-room-revision="${room.revision}">预览变更</button>
@@ -263,7 +272,10 @@ export function renderRooms(view: RoomsView, accounts: AccountRecord[], esc: (te
               <div class="proxy-pool-actions">
                 ${actions.map(([action, label]) => `<button type="button" class="btn" data-room-action="${action}" data-room-id="${room.id}" data-room-revision="${room.revision}">${label}</button>`).join("")}
               </div>
-              ${["finalized","stopped","failed"].includes(room.phase) ? `<details data-room-topic><summary>开新话题</summary>
+              ${chat && ["created","finalized","stopped","failed"].includes(room.phase) ? `<label for="message-${room.id}">发给房间</label>
+                <textarea id="message-${room.id}" class="modal-input" maxlength="8000" placeholder="提问，或告诉指挥要完成什么"></textarea>
+                <button type="button" class="btn primary" data-room-action="post_message" data-room-id="${room.id}" data-room-revision="${room.revision}">发送</button>` : ""}
+              ${!chat && ["finalized","stopped","failed"].includes(room.phase) ? `<details data-room-topic><summary>开新话题</summary>
                 <p class="modal-desc">沿用模板和分派方式。自动模式只保留你确认的固定角色，其余成员重新分派。</p>
                 <label>话题名称<input class="modal-input" data-topic-name maxlength="80"></label>
                 <label>任务目标<textarea class="modal-input" data-topic-goal maxlength="8000"></textarea></label>
@@ -275,7 +287,15 @@ export function renderRooms(view: RoomsView, accounts: AccountRecord[], esc: (te
             </details>`;
           }).join("") ?? ""}
           ${view.book ? `
-            <details class="hark-reply" data-room-new><summary>新增房间</summary>
+            <details class="hark-reply" data-conversation-new><summary>新增房间</summary>
+              <label for="conversation-name">房间名称（可选）</label><input id="conversation-name" class="modal-input" maxlength="80">
+              <fieldset class="hark-reply"><legend>选择成员和一名指挥</legend>${muse.map((account) => `<div class="proxy-pool-actions">
+                <label><input type="checkbox" data-conversation-member value="${esc(account.uuid)}"> ${esc(account.alias)}</label>
+                <label><input type="radio" name="conversation-commander" value="${esc(account.uuid)}" aria-label="指定 ${esc(account.alias)} 为指挥"> 指挥</label>
+              </div>`).join("")}</fieldset>
+              <button type="button" class="btn primary" data-room-action="create_conversation">创建房间</button>
+            </details>
+            <details class="hark-reply" data-room-new><summary>按模板创建任务房间</summary>
               <label for="room-name">房间名称</label><input id="room-name" class="modal-input" maxlength="80">
               <label for="room-goal">任务目标和参考资料</label><textarea id="room-goal" class="modal-input" maxlength="8000"></textarea>
               <label for="room-template">模板</label><select id="room-template" class="modal-input">${options}</select>
@@ -324,6 +344,13 @@ export function roomCommand(button: HTMLElement): { action?: string; id?: string
   const value = (id: string) => document.querySelector<HTMLInputElement | HTMLTextAreaElement | HTMLSelectElement>(`#${id}`)?.value ?? "";
   const sourceIds = (scope: Element | null) =>
     Array.from(scope?.querySelectorAll<HTMLInputElement>("[data-room-reference]:checked") ?? [], (input) => input.value);
+  if (action === "create_conversation") {
+    const panel = button.closest("[data-conversation-new]");
+    const commander = panel?.querySelector<HTMLInputElement>('input[name="conversation-commander"]:checked')?.value ?? "";
+    const members = Array.from(panel?.querySelectorAll<HTMLInputElement>("[data-conversation-member]:checked") ?? [], (input) => input.value);
+    if (commander && !members.includes(commander)) members.push(commander);
+    return { action, name:value("conversation-name"), members, commander };
+  }
   if (action === "new_topic") {
     const panel = button.closest("[data-room-topic]");
     return { action, id: button.dataset.roomId, revision: Number(button.dataset.roomRevision),
@@ -357,6 +384,7 @@ export function roomCommand(button: HTMLElement): { action?: string; id?: string
       version: edit?.value ? Number(edit.dataset.version) : null };
   }
   return { action, id: button.dataset.roomId, revision: Number(button.dataset.roomRevision),
+    ...(action === "post_message" ? { text:value(`message-${button.dataset.roomId}`) } : {}),
     ...(action === "rework" || action === "supplement" ? { note: value(`rework-${button.dataset.roomId}`) } : {}),
     ...(action === "confirm_roster" ? { proposalId: button.dataset.roomProposal } : {}),
     ...(action === "unbind_session" ? { accountUuid:button.dataset.roomAccount, threadId:button.dataset.roomSession } : {}),

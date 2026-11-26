@@ -42,9 +42,13 @@ impl RoomBook {
       return Err("每个房间最多引用 5 条不同的已定稿记录".into());
     }
     sources.iter().map(|source| {
-      let room = self.rooms.iter().find(|room| Some(room.id) != target && room.id == *source && room.phase == Phase::Finalized)
+      let room = self.rooms.iter().find(|room| Some(room.id) != target && room.id == *source)
         .ok_or("只能引用其他已定稿房间")?;
-      let step = room.attempts.last().filter(|step| room.template.flow == Flow::Solo || room.relay.final_attempt == Some(step.id))
+      let step = if let Some(chat) = &room.conversation {
+        chat.last_approved().and_then(|id| room.attempts.iter().find(|step| step.id == id && step.stage == Some(Stage::Publish)))
+      } else {
+        room.attempts.last().filter(|step| room.phase == Phase::Finalized && (!room.is_relay() || room.relay.final_attempt == Some(step.id)))
+      }
         .ok_or("源房间没有可验证的定稿")?;
       let final_text = step.delivery.as_ref().ok_or("源房间缺少交付记录")?;
       Ok(RoomReference { room_id:*source, title:room.draft.name.clone(), attempt_id:step.id,

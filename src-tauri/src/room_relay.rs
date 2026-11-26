@@ -37,7 +37,7 @@ pub(super) fn validate_workflow(flow: Flow, workflow: &[Stage]) -> Result<(), St
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
-pub(super) enum Hold { RoundLimit, ReviewLimit, InvalidReview, AccountUnavailable, ContextTooLarge }
+pub(super) enum Hold { RoundLimit, ReviewLimit, InvalidReview, InvalidPlan, AccountUnavailable, ContextTooLarge }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -68,9 +68,9 @@ struct Proposal {
 pub(super) struct Relay {
   pub(super) next: usize,
   revision_from: usize,
-  cycle_from: usize,
+  pub(super) cycle_from: usize,
   pub(super) pending_note: Option<String>,
-  notes: Vec<String>,
+  pub(super) notes: Vec<String>,
   pub(super) hold: Option<Hold>,
   proposal: Option<Proposal>,
   roster_history: Vec<Vec<Member>>,
@@ -83,7 +83,7 @@ impl Room {
     self.relay.proposal.as_ref().map(|proposal| proposal.id)
   }
 
-  fn exhausted(&self) -> Option<Hold> {
+  pub(super) fn exhausted(&self) -> Option<Hold> {
     if self.returned >= MAX_REVIEW_RETURNS { Some(Hold::ReviewLimit) }
     else if self.rounds >= self.draft.round_limit { Some(Hold::RoundLimit) }
     else { None }
@@ -95,7 +95,7 @@ impl Room {
   }
 
   pub(super) fn can_finalize(&self) -> bool {
-    if self.template.flow == Flow::Solo {
+    if !self.is_relay() {
       return self.phase == Phase::PendingConfirmation
         && self.attempts.last().is_some_and(|attempt| attempt.delivery.is_some());
     }
@@ -108,6 +108,7 @@ impl Room {
 
   #[cfg(any(target_os = "ios", test))]
   pub(super) fn stage_members(&self) -> Vec<(Stage, &str)> {
+    if let Some(steps) = self.conversation_steps() { return steps; }
     let mut steps = Vec::new();
     for &stage in self.template.stages() {
       let role = match stage {
@@ -129,7 +130,7 @@ impl Room {
   }
 
   pub(super) fn supplement(&mut self, note: String) -> Result<(), String> {
-    if self.template.flow == Flow::Solo || !matches!(self.phase,
+    if !self.is_relay() || !matches!(self.phase,
       Phase::Planning | Phase::Paused | Phase::Dispatching | Phase::WaitingReply | Phase::PendingConfirmation | Phase::NeedsUser)
       || self.relay.proposal.is_some() || self.exhausted().is_some()
     {
@@ -159,6 +160,11 @@ impl Room {
     self.relay.final_attempt = None;
     self.relay.hold = None;
     self.set_phase(Phase::Paused);
+  }
+
+  pub(super) fn reset_chat_relay(&mut self) {
+    self.goal_revision += 1;
+    self.relay = Relay { revision_from: self.attempts.len(), cycle_from: self.attempts.len(), ..Relay::default() };
   }
 
   pub(super) fn propose_roster(&mut self, members: Vec<Member>, accounts: &[AccountRecord]) -> Result<(), String> {
@@ -243,7 +249,9 @@ impl Room {
     } else if invalid_review {
       self.hold(Hold::InvalidReview);
     } else if returned {
-      self.relay.next = self.stage_members().iter().position(|(stage, _)| *stage == Stage::Work)
+      self.relay.next = self.stage_members().iter().position(|(stage, _)| {
+        *stage == Stage::Work || (self.conversation.is_some() && *stage == Stage::Discuss)
+      })
         .ok_or("返工缺少执行者")?;
       self.relay.cycle_from = self.attempts.len();
       self.set_phase(Phase::Planning);
@@ -258,6 +266,12 @@ impl Room {
 
   #[cfg(any(target_os = "ios", test))]
   pub(super) fn relay_prompt(&self, stage: Stage, account: &str, attempt_id: Uuid) -> Option<String> {
+    if self.conversation.is_some() {
+      let mut prompt = self.conversation_prompt(stage, attempt_id)?;
+      for note in &self.relay.notes { prompt.push_str(&format!("\n\n用户补充要求：\n{note}")); }
+      self.append_artifact_context(&mut prompt);
+      return Some(prompt);
+    }
     let instruction = match (self.template.flow, stage) {
       (_, Stage::Plan) => "你是指挥者。拆解目标，明确每个已指定执行者的子任务、依赖和验收标准。成员和角色由用户确定，不能改派。输出可供后续执行的简报。",
       (Flow::Compare, Stage::Work) => "你是执行者。根据用户原题独立给出你的方案，不预设其他成员的结论。有审核打回时，仅依据和你有关的审查理由修改。",

@@ -137,7 +137,7 @@ async fn run_room(
   app: AppHandle, mgr: State<'_, Arc<SessionManager>>, gate: State<'_, rooms::RoomGate>,
   ledger: State<'_, Arc<send_ledger::SendLedger>>, cancel: State<'_, Arc<probe_cancel::ProbeCancel>>,
   fingerprints: State<'_, FingerprintGate>,
-  id: uuid::Uuid, revision: u64, recover: bool,
+  id: uuid::Uuid, revision: u64, recover: bool, message: Option<String>,
 ) -> Result<rooms::RoomBookView, String> {
   #[cfg(target_os = "ios")]
   {
@@ -145,7 +145,18 @@ async fn run_room(
     let _exclusive = fingerprints.0.try_lock().map_err(|_| "Muse 指纹任务正在运行，请结束后再派发房间")?;
     let dir = app.path().app_data_dir().map_err(|_| "无法读取应用目录")?;
     let path = dir.join("rooms-v1.json");
-    let mut next_revision = revision;
+    let mut next_revision = if let Some(text) = message {
+      if recover { return Err("恢复回复时不能同时发送新消息".into()); }
+      let mut initialized = gate.0.lock().await;
+      let snapshot = mgr.get_snapshot().await;
+      let accounts: Vec<_> = snapshot.accounts.into_iter().filter(|account| {
+        !snapshot.conflicts.iter().any(|conflict| conflict.uuid == account.uuid)
+          && !snapshot.pending_cleanup.iter().any(|key| key.uuid == account.uuid)
+      }).collect();
+      let current = rooms::apply(&path, rooms::Command::PostMessage { id, revision, text }, &accounts, !*initialized)?;
+      *initialized = true;
+      current.next_relay_revision(id).ok_or("房间消息已保存，但尚未进入派发")?
+    } else { revision };
     loop {
       let proxy_guard = mgr.proxy_write_lock.lock().await;
       let mut initialized = gate.0.lock().await;

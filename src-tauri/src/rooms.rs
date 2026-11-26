@@ -11,6 +11,8 @@ mod relay;
 mod assignment;
 #[path = "room_records.rs"]
 mod records;
+#[path = "room_conversation.rs"]
+mod conversation;
 #[path = "room_artifacts.rs"]
 mod artifacts;
 #[path = "backup_restore.rs"]
@@ -183,6 +185,8 @@ struct Room {
   artifacts: Vec<artifacts::Artifact>,
   #[serde(default)]
   bindings: Vec<artifacts::Binding>,
+  #[serde(default, skip_serializing_if = "Option::is_none")]
+  conversation: Option<conversation::Conversation>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -272,6 +276,7 @@ impl Room {
   }
 
   fn validate(&self, accounts: &[AccountRecord]) -> Result<(), String> {
+    if let Some(chat) = &self.conversation { return chat.validate_members(&self.draft.members, accounts); }
     self.validate_members(accounts, &self.draft.members)
   }
 
@@ -335,7 +340,8 @@ impl RoomBook {
       return Err("房间归档版本、容量或标识无效".into());
     }
     for room in &self.rooms {
-      if room.attempts.len() > 64 || room.draft.members.len() > 12 || !(1..=24).contains(&room.draft.round_limit) {
+      let max_attempts = if room.conversation.is_some() { conversation::MAX_ATTEMPTS } else { 64 };
+      if room.attempts.len() > max_attempts || room.draft.members.len() > 12 || !(1..=24).contains(&room.draft.round_limit) {
         return Err("房间归档含无效轮次或成员".into());
       }
       room.template.validate_config(room.template.role_seats.is_some())?;
@@ -360,7 +366,7 @@ impl RoomBook {
   #[cfg(target_os = "ios")]
   pub fn next_relay_revision(&self, id: Uuid) -> Option<u64> {
     let room = self.rooms.iter().find(|room| room.id == id)?;
-    (room.template.flow != Flow::Solo && room.phase == Phase::Planning).then_some(room.revision)
+    (room.is_relay() && room.phase == Phase::Planning).then_some(room.revision)
   }
 
   #[cfg(target_os = "ios")]
@@ -410,6 +416,8 @@ pub(crate) fn prepare_restore(path: &Path, mut archive: RoomBook, overwrite: boo
 pub enum Command {
   List,
   Create { draft: RoomDraft, #[serde(default)] references: Vec<Uuid> },
+  CreateConversation { name: String, members: Vec<String>, commander: String },
+  PostMessage { id: Uuid, revision: u64, text: String },
   NewTopic { id: Uuid, revision: u64, name: String, goal: String, include_final: bool },
   SetReferences { id: Uuid, revision: u64, source_ids: Vec<Uuid> },
   DeleteRecord { id: Uuid, revision: u64 },
@@ -464,10 +472,10 @@ pub fn apply(path: &Path, command: Command, accounts: &[AccountRecord], recover:
 }
 
 impl RoomBook {
-  fn add_draft(&mut self, mut draft: RoomDraft, template: Template, references: &[Uuid], accounts: &[AccountRecord]) -> Result<(), String> {
+  fn add_draft(&mut self, mut draft: RoomDraft, template: Template, references: &[Uuid], accounts: &[AccountRecord], conversation: Option<conversation::Conversation>) -> Result<(), String> {
       draft.name = draft.name.trim().into();
       draft.goal = draft.goal.trim().into();
-      if draft.name.is_empty() || draft.name.chars().count() > 80 || draft.goal.is_empty()
+      if draft.name.is_empty() || draft.name.chars().count() > 80 || (draft.goal.is_empty() && conversation.is_none())
         || draft.goal.chars().count() > 8000 || !(1..=24).contains(&draft.round_limit)
         || draft.members.len() > 12 || draft.members.iter().any(|member| member.roles.len() > 5)
         || self.rooms.len() >= 100 {
@@ -479,10 +487,10 @@ impl RoomBook {
         attempts: Vec::new(), goal_revision: 0, rework_note: String::new(), approved_at_ms: None,
         relay: Relay::default(),
         assignment: assignment::Assignment::default(), records: records::RoomRecords::default(),
-        artifacts: Vec::new(), bindings: Vec::new(),
+        artifacts: Vec::new(), bindings: Vec::new(), conversation,
       };
       room.records.references = self.resolve_references(None, references)?;
-      if room.draft.automatic || room.draft.members.iter().any(|member| member.roles.is_empty()) {
+      if room.conversation.is_none() && (room.draft.automatic || room.draft.members.iter().any(|member| member.roles.is_empty())) {
         room.assign_initial(accounts)?;
       }
       else { room.validate(accounts)?; }
@@ -497,10 +505,16 @@ pub fn apply_verified(path: &Path, command: Command, accounts: &[AccountRecord],
     Command::List => return Ok(book),
     Command::Create { draft, references } => {
       let template = book.templates.iter().find(|item| item.id == draft.template_id).ok_or("模板不存在")?.clone();
-      book.add_draft(draft, template, &references, accounts)?;
+      book.add_draft(draft, template, &references, accounts, None)?;
+    }
+    Command::CreateConversation { name, members, commander } => book.add_conversation(name, members, commander, accounts)?,
+    Command::PostMessage { id, revision, text } => {
+      if book.rooms.iter().any(|room| room.id != id && room.in_progress()) { return Err("已有其他房间正在运行".into()); }
+      room_at_revision(&mut book, id, revision)?.post_message(text, accounts)?;
     }
     Command::NewTopic { id, revision, name, goal, include_final } => {
       let source = room_at_revision(&mut book, id, revision)?;
+      if source.conversation.is_some() { return Err("可以直接在该房间发送下一条消息".into()); }
       if !matches!(source.phase, Phase::Finalized | Phase::Stopped | Phase::Failed) {
         return Err("请先结束当前房间再开新话题".into());
       }
@@ -511,7 +525,7 @@ pub fn apply_verified(path: &Path, command: Command, accounts: &[AccountRecord],
       draft.name = name;
       draft.goal = goal;
       let reference = [id];
-      book.add_draft(draft, template, if include_final { &reference } else { &[] }, accounts)?;
+      book.add_draft(draft, template, if include_final { &reference } else { &[] }, accounts, None)?;
     }
     Command::SetReferences { id, revision, source_ids } => {
       let references = book.resolve_references(Some(id), &source_ids)?;
@@ -595,19 +609,22 @@ pub fn apply_verified(path: &Path, command: Command, accounts: &[AccountRecord],
         return Err("已有一个活跃房间，请先停止该房间".into());
       }
       let room = room_at_revision(&mut book, id, revision)?;
+      if room.conversation.is_some() && matches!(signal, Signal::Prepare) { return Err("在房间发送一条消息即可开始".into()); }
       if matches!(signal, Signal::Confirm) && (!room.can_finalize() || !room.has_required_artifact()) {
         return Err("没有已回收并核验来源的交付物".into());
       }
-      if room.template.flow != Flow::Solo && matches!(signal, Signal::Rework) {
+      if room.is_relay() && matches!(signal, Signal::Rework) {
         room.supplement(rework.expect("validated rework note"))?;
         save_json_atomic(path, &book)?;
         return Ok(book);
       }
       if matches!(signal, Signal::Prepare | Signal::Resume) && !room.draft.automatic { room.validate(accounts)?; }
-      if room.template.flow != Flow::Solo && matches!(signal, Signal::Resume) { room.resume_relay()?; }
+      if room.is_relay() && matches!(signal, Signal::Resume) { room.resume_relay()?; }
       else { room.transition(signal)?; }
       if matches!(signal, Signal::Confirm) {
-        room.approved_at_ms = Some(now_ms());
+        let approved_at = now_ms();
+        room.approved_at_ms = Some(approved_at);
+        if let Some(chat) = &mut room.conversation { chat.confirm_current(approved_at, room.relay.final_attempt); }
         room.record_final_decision();
       }
       if let Some(note) = rework {
@@ -658,12 +675,17 @@ pub fn begin_dispatch(
     attempt
   } else {
     if room.phase != Phase::Planning { return Err("当前房间不能开始派发".into()); }
+    if room.conversation.is_some() && room.attempts.len() >= conversation::MAX_ATTEMPTS {
+      room.hold(Hold::ContextTooLarge);
+      save_json_atomic(path, &book)?;
+      return Ok(None);
+    }
     if room.draft.automatic && !room.resolve_automatic_step(accounts)? {
       room.hold(Hold::AccountUnavailable);
       save_json_atomic(path, &book)?;
       return Ok(None);
     }
-    let (member_uuid, stage) = if room.template.flow == Flow::Solo {
+    let (member_uuid, stage) = if !room.is_relay() {
       (room.draft.members[0].uuid.clone(), None)
     } else {
       let Some((stage, uuid)) = room.next_step() else { return Err("房间接力步骤不存在".into()); };
@@ -770,7 +792,9 @@ pub fn record(path: &Path, dispatch: &Dispatch, event: Milestone) -> Result<Room
         kind: ArtifactKind::Text, sha256: sha256(&text),
         text, source: source.to_owned(), captured_at_ms: now_ms(),
       });
-      if attempt.stage.is_some() {
+      if attempt.stage == Some(Stage::Plan) && room.conversation.is_some() {
+        room.complete_commander_reply()?;
+      } else if attempt.stage.is_some() {
         room.complete_relay()?;
       } else {
         room.transition(Signal::Reply)?;
@@ -824,7 +848,7 @@ mod tests {
       attempts: Vec::new(), goal_revision: 0, rework_note: String::new(), approved_at_ms: None,
       relay: Relay::default(),
       assignment: assignment::Assignment::default(), records: records::RoomRecords::default(),
-      artifacts: Vec::new(), bindings: Vec::new(),
+      artifacts: Vec::new(), bindings: Vec::new(), conversation: None,
     }
   }
 
@@ -1015,6 +1039,50 @@ mod tests {
     assert!(apply_verified(&fixture.path, make("a"), &fixture.accounts, false, Some("Owned".into())).is_ok());
     let bad_commit = "https://github.com/a/b/commit/123";
     assert!(commit_coordinates(bad_commit).is_err());
+  }
+
+  #[test]
+  fn conversation_routes_messages_automatically_and_keeps_earlier_confirmed_tasks() {
+    let mut fixture = RelayFixture::new(Flow::Review, 8, REVIEW_ROLES);
+    fixture.command(Command::Stop { id:fixture.id, revision:fixture.get().revision }).unwrap();
+    let created = fixture.command(Command::CreateConversation {
+      name:"Persistent room".into(), members:vec!["a".into(), "b".into(), "c".into()], commander:"a".into(),
+    }).unwrap();
+    fixture.id = created.rooms[0].id;
+    assert!(created.rooms[0].draft.goal.is_empty() && created.rooms[0].attempts.is_empty());
+    let post = |fixture: &RelayFixture, text: &str| fixture.command(Command::PostMessage {
+      id:fixture.id, revision:fixture.get().revision, text:text.into(),
+    }).unwrap();
+    post(&fixture, "ordinary question");
+    let first = fixture.send(Stage::Plan, "a");
+    fixture.reply(&first, &serde_json::json!({"turnId":first.attempt.id,"reply":"a direct answer","steps":[]}).to_string());
+    assert_eq!(fixture.get().phase, Phase::Created);
+    post(&fixture, "worked task");
+    let plan = fixture.send(Stage::Plan, "a");
+    assert!(plan.prompt.contains("a direct answer"));
+    fixture.reply(&plan, &serde_json::json!({"turnId":plan.attempt.id,"reply":"route the work","steps":[
+      {"member":2,"stage":"work","instruction":"Draft it"},{"member":3,"stage":"review","instruction":"Check it"},
+    ]}).to_string());
+    let work = fixture.send(Stage::Work, "b");
+    assert!(work.prompt.contains("Draft it") && work.prompt.contains("route the work"));
+    fixture.reply(&work,"specific work output");
+    let audit = fixture.send(Stage::Review, "c");
+    assert!(audit.prompt.contains("specific work output"));
+    fixture.audit(&audit, "approve");
+    let final_step = fixture.send(Stage::Publish, "a");
+    fixture.reply(&final_step, "verified summary");
+    fixture.command(Command::Confirm { id:fixture.id, revision:fixture.get().revision }).unwrap();
+    let postponed = post(&fixture, "next question");
+    assert_eq!(postponed.rooms[0].rounds, 0);
+    assert_eq!(postponed.resolve_references(None, &[fixture.id]).unwrap().len(), 1);
+    let step = fixture.send(Stage::Plan, "a");
+    fixture.reply(&step, &serde_json::json!({"turnId":step.attempt.id,"reply":"bad plan","steps":[
+      {"member":2,"stage":"work","instruction":"Draft it"}, {"member":2,"stage":"review","instruction":"Review yourself"}
+    ]}).to_string());
+    let stopped = fixture.get();
+    assert_eq!(stopped.phase, Phase::NeedsUser);
+    assert_eq!(stopped.relay.hold, Some(Hold::InvalidPlan));
+    assert!(begin_dispatch(&fixture.path, fixture.id, stopped.revision, &fixture.accounts, false).is_err());
   }
 
   #[test]

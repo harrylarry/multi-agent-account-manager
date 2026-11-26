@@ -3252,7 +3252,7 @@ async function updateRooms(view: RoomsView, command: { action?: string; id?: str
     return;
   }
   if (view.busy) return;
-  const run = command.action === "dispatch" || command.action === "recover";
+  const run = command.action === "dispatch" || command.action === "recover" || command.action === "post_message";
   view.busy = true;
   view.error = "";
   if (run) {
@@ -3265,6 +3265,7 @@ async function updateRooms(view: RoomsView, command: { action?: string; id?: str
   try {
     view.book = run ? await requestRoomBook("run_room", {
       id: command.id, revision: command.revision, recover: command.action === "recover",
+      message: command.action === "post_message" ? command.text : null,
     }) : await requestRoomBook("manage_rooms", { command });
     if (status) status.textContent = "";
   } catch (error) {
@@ -3280,7 +3281,12 @@ async function updateRooms(view: RoomsView, command: { action?: string; id?: str
       if (view.error && status && view.book && !run) status.textContent = view.error;
       else {
         render();
-        if (command.id) document.querySelector<HTMLElement>(`[data-room-panel="${CSS.escape(command.id)}"]`)?.setAttribute("open", "");
+        const roomId = command.id ?? (command.action === "create_conversation" && !view.error ? view.book?.rooms[0]?.id : undefined);
+        if (roomId) document.querySelector<HTMLElement>(`[data-room-panel="${CSS.escape(roomId)}"]`)?.setAttribute("open", "");
+        if (view.error && command.action === "post_message" && view.book?.rooms.find((room) => room.id === roomId)?.revision === command.revision) {
+          const input = document.getElementById(`message-${roomId}`) as HTMLTextAreaElement | null;
+          if (input && typeof command.text === "string") input.value = command.text;
+        }
       }
     }
   }
