@@ -126,7 +126,7 @@
 
 ## 应用内更新与发版
 
-- **客户端检查更新**：桌面端点击左侧栏底部「更新」按钮，移动端（Android / iOS）点击右上角下载图标，可检查最新版本并一键下载校验安装；启动后也会静默检查一次并展示红点提醒（iOS 检查到新版后提示手动重新侧载）。
+- **客户端检查更新**：iPhone 在「管理 → 检查更新」查看新版并按提示侧载。Android 使用右上角下载图标，桌面使用左侧栏底部「更新」。启动后会静默检查，发现新版时显示更新标记。
 - **维护者发布新版本**：本 fork 只做 `ios-v*` 发版，不做 `v*` 三端发版（`v*` 标签会触发三端发版流程，不要用）。
   1. 同步更新 [package.json](package.json)、[src-tauri/Cargo.toml](src-tauri/Cargo.toml) 与 [src-tauri/tauri.conf.json](src-tauri/tauri.conf.json) 中的版本号。
   2. 合入 `main` 后由 GitHub Actions（`.github/workflows/ios.yml`）构建未签名 IPA。
