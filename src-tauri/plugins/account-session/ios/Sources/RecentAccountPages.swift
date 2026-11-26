@@ -118,6 +118,49 @@ enum RecentAccountPages {
   /// and dropping the token would unregister the observation immediately.
   private static var memoryObserver: NSObjectProtocol?
 
+  private static let isolateEgressKey = "diehao.isolate-same-egress"
+  private static let quotaMinutesKey = "diehao.quota-sync-minutes"
+
+  static func networkPreferences(isolate: Bool?, quotaMinutes: Int?) -> [String: Any] {
+    let preferences = UserDefaults.standard
+    if let quotaMinutes, [0, 5, 15, 30].contains(quotaMinutes) { preferences.set(quotaMinutes, forKey: quotaMinutesKey) }
+    if let isolate {
+      preferences.set(isolate, forKey: isolateEgressKey)
+      if isolate {
+        // Retain the most recently used page of each known outbound group.
+        var retained = Set<EgressGroup>()
+        for candidate in pages.reversed() {
+          if let group = egress(candidate.key.providerId, candidate.key.uuid), retained.insert(group).inserted { continue }
+          release(candidate.key.providerId, candidate.key.uuid)
+        }
+      }
+    }
+    return ["isolate":preferences.bool(forKey: isolateEgressKey), "quotaMinutes":preferences.integer(forKey: quotaMinutesKey)]
+  }
+
+  private struct EgressGroup: Hashable { let provider: String; let host: String?; let port: UInt16? }
+
+  private static func egress(_ provider: String, _ uuid: String) -> EgressGroup? {
+    switch AccountProxyResolver.resolve(uuid: uuid) {
+    case .direct: return EgressGroup(provider: provider, host: nil, port: nil)
+    case .use(let config): return EgressGroup(provider: provider, host: config.host.lowercased(), port: config.port)
+    case .blocked: return nil
+    }
+  }
+
+  private static func release(_ provider: String, _ uuid: String) {
+    guard let index = pages.firstIndex(where: { $0.key.providerId == provider && $0.key.uuid == uuid }) else { return }
+    let view = pages.remove(at: index).entry.view
+    _ = AccountProxyQuarantine.engage(uuid: uuid)
+    destroy(view)
+  }
+
+  private static func releasePeers(of spec: IosAccountSessionSpec) {
+    guard UserDefaults.standard.bool(forKey: isolateEgressKey), let group = egress(spec.providerId, spec.uuid) else { return }
+    let peers = pages.filter { $0.key.uuid != spec.uuid && egress($0.key.providerId, $0.key.uuid) == group }
+    for peer in peers { release(peer.key.providerId, peer.key.uuid) }
+  }
+
   private static func ensureMemoryObserver() {
     guard !memoryObserverInstalled else { return }
     memoryObserverInstalled = true
@@ -144,6 +187,7 @@ enum RecentAccountPages {
 
   static func take(spec: IosAccountSessionSpec) -> WKWebView? {
     ensureMemoryObserver()
+    releasePeers(of: spec)
     trim(maxAccountPages)
     guard let idx = pages.firstIndex(where: { $0.key.providerId == spec.providerId && $0.key.uuid == spec.uuid })
     else { return nil }
@@ -162,6 +206,7 @@ enum RecentAccountPages {
       destroy(view)
       return
     }
+    releasePeers(of: spec)
     let delegate = ParkedDelegate()
     view.navigationDelegate = delegate
     view.uiDelegate = nil

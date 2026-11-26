@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-manage-lan-backup"
+description = "Enables the manage_lan_backup command without any pre-configured scope."
+commands.allow = ["manage_lan_backup"]
+
+[[permission]]
+identifier = "deny-manage-lan-backup"
+description = "Denies the manage_lan_backup command without any pre-configured scope."
+commands.deny = ["manage_lan_backup"]

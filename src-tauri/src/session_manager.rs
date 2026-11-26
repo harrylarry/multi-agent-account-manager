@@ -2377,8 +2377,17 @@ impl SessionManager {
   pub async fn trigger_silent_sync(self: &Arc<Self>, app: &AppHandle, force: bool) {
     let now = now_ms();
     if !force {
+      #[cfg(target_os = "ios")]
+      let interval_ms = {
+        if !crate::platform::ios::automatic_task_polling_available(app).await.unwrap_or(false) { return; }
+        tauri_plugin_account_session::ios_network_preferences(app, None, None).await.ok()
+          .and_then(|settings| settings["quotaMinutes"].as_u64())
+          .filter(|minutes| matches!(*minutes, 5 | 15 | 30)).map_or(30_000, |minutes| minutes * 60_000)
+      };
+      #[cfg(not(target_os = "ios"))]
+      let interval_ms = 30_000;
       let last = self.last_sync_timestamp.load(Ordering::SeqCst);
-      if now > last && now - last < 30_000 {
+      if now.saturating_sub(last) < interval_ms {
         return;
       }
     }

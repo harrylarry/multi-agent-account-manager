@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-ios-network-preferences"
+description = "Enables the ios_network_preferences command without any pre-configured scope."
+commands.allow = ["ios_network_preferences"]
+
+[[permission]]
+identifier = "deny-ios-network-preferences"
+description = "Denies the ios_network_preferences command without any pre-configured scope."
+commands.deny = ["ios_network_preferences"]

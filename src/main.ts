@@ -22,7 +22,7 @@ type ModalMode =
   | { kind: "remove"; account: AccountRecord }
   | { kind: "tasks"; account: AccountRecord; checking: boolean; note: string; quotaChecking: boolean }
   | { kind: "harkReplies"; account: AccountRecord; reading: boolean; result: HarkRecovery | null; error: string }
-  | { kind: "backup"; busy: boolean; encrypted: string; fileName: string; preview: BackupPreview | null; message: string; mode: BackupMode; includeGroups: boolean; includeProxy: boolean; includeRooms: boolean; expiryDays: number }
+  | { kind: "backup"; busy: boolean; encrypted: string; fileName: string; preview: BackupPreview | null; message: string; mode: BackupMode; includeGroups: boolean; includeProxy: boolean; includeRooms: boolean; expiryDays: number; lanCode?: string; lanShare?: {code:string;png:string;seconds:number} }
   | { kind: "proxyPool"; account: AccountRecord; data: ProxyPoolView | null; setting: SpikeProxySettingView | null; busy: boolean; message: string }
   | { kind: "sessions"; account: AccountRecord; loading: boolean; items: MuseSession[] | null; error: string }
   | { kind: "cookies"; account: AccountRecord; busy: boolean; preview: CookiePreview | null; message: string; imported: boolean; stored: Pick<CookiePreview, "count" | "nextExpiry"> | null }
@@ -1003,6 +1003,7 @@ async function runDownloadAndInstall(): Promise<void> {
 }
 
 async function setModal(next: ModalMode): Promise<void> {
+  if (modal.kind === "backup" && modal !== next && modal.lanShare) stopLanBackup(modal);
   // 离开确认框的所有路径（取消按钮、Esc、切换账号等）都按「取消」结算，
   // 调用方的 await 永远不会悬挂。
   if (modal.kind === "confirm" && next.kind !== "confirm") {
@@ -1194,6 +1195,11 @@ async function refreshForegroundTask(): Promise<void> {
 }
 
 let lastProxyPoolRefresh = 0;
+let iosNetworkPrefs: { isolate: boolean; quotaMinutes: number } | null = null;
+
+async function updateIosNetworkPreferences(isolate: boolean | null, quotaMinutes: number | null): Promise<void> {
+  iosNetworkPrefs = await invoke("ios_network_preferences", { isolate, quotaMinutes });
+}
 
 function triggerAutoSync(): void {
   if (snapshot?.platform === "ios" && Date.now() - lastProxyPoolRefresh >= 30 * 60 * 1000) {
@@ -2776,6 +2782,19 @@ function renderAccountBackup(view: Extract<ModalMode, { kind: "backup" }>): stri
         <div class="modal-title" id="account-backup-title">本机加密备份</div>
         <div class="modal-desc">备份包含账号资料。网页登录、Cookie 和代理口令需在恢复后重新配置。</div>
         <div class="proxy-pool-body">
+          ${snapshot?.platform === "ios" ? `<details ${view.lanShare || view.lanCode ? "open" : ""}>
+            <summary>同一 Wi-Fi 传账号备份</summary>
+            <p class="modal-desc">传输账号资料、分组、时区和代理端点。接收方用口令预览后再恢复。登录态和代理口令留在原设备。</p>
+            ${view.lanShare ? `<div><img class="lan-backup-qr" alt="局域网备份配对二维码" src="data:image/png;base64,${escapeHtml(view.lanShare.png)}"></div>
+              <label for="lan-pair-code">配对码（可手动填写）</label><input id="lan-pair-code" class="modal-input" readonly value="${escapeHtml(view.lanShare.code)}">
+              <p class="modal-desc">两分钟内可接收一次。口令请另行告知接收方。</p>
+              <button id="backup-lan-stop" type="button" class="btn">关闭分享</button>` : `
+              <button id="backup-lan-start" type="button" class="btn" ${disabled}>用下方口令生成配对码</button>
+              <label for="lan-pair-code">接收方配对码</label>
+              <input id="lan-pair-code" class="modal-input" maxlength="100" autocapitalize="off" autocomplete="off" value="${escapeHtml(view.lanCode ?? "")}" ${disabled}>
+              <button id="backup-lan-scan" type="button" class="btn" ${disabled}>扫描配对码</button>
+              <button id="backup-lan-receive" type="button" class="btn" ${disabled}>接收加密备份</button>`}
+          </details>` : ""}
           <label for="backup-mode">备份范围</label>
           <select id="backup-mode" class="modal-input" ${disabled}>
             <option value="light" ${mode === "light" ? "selected" : ""}>轻量（账号、备注及分组）</option>
@@ -2814,6 +2833,49 @@ function renderAccountBackup(view: Extract<ModalMode, { kind: "backup" }>): stri
         </div>
       </div>
     </div>`;
+}
+
+function stopLanBackup(view: Extract<ModalMode, { kind: "backup" }>): void {
+  view.lanShare = undefined;
+  void invoke("manage_lan_backup", { action:"stop" }).catch(() => {});
+}
+
+async function lanBackupAction(view: Extract<ModalMode, { kind: "backup" }>, action: "start" | "scan" | "receive" | "stop"): Promise<void> {
+  if (action === "stop") { stopLanBackup(view); render(); return; }
+  if (view.busy) return;
+  const password = document.querySelector<HTMLInputElement>("#backup-password");
+  view.lanCode = document.querySelector<HTMLInputElement>("#lan-pair-code")?.value.trim() || undefined;
+  const input = action === "start" ? password?.value : action === "receive" ? view.lanCode : undefined;
+  if (action === "start" && password) password.value = "";
+  view.message = "处理中…";
+  view.busy = true;
+  render();
+  try {
+    if (action === "start") {
+      const share = await invoke<NonNullable<typeof view.lanShare>>("manage_lan_backup", { action, input });
+      if (modal !== view || document.hidden) { stopLanBackup(view); return; }
+      view.lanShare = share;
+      view.lanCode = undefined;
+      window.setTimeout(() => {
+        if (view.lanShare !== share) return;
+        stopLanBackup(view);
+        if (modal === view) { view.message = "配对码已到期。"; render(); }
+      }, share.seconds * 1000);
+      view.message = "请用另一台设备扫描或填写配对码。";
+    } else if (action === "scan") {
+      const response = await invoke<{code:string}>("manage_lan_backup", { action });
+      if (response.code) view.lanCode = response.code;
+      view.message = response.code ? "已扫码，请确认接收。" : "已取消扫描。";
+    } else {
+      const response = await invoke<{encrypted:string}>("manage_lan_backup", { action, input });
+      view.lanCode = undefined;
+      view.encrypted = response.encrypted;
+      view.fileName = "Wi-Fi 加密备份";
+      view.preview = null;
+      view.message = "已接收，请输入发送方口令并点「预览恢复」。";
+    }
+  } catch (error) { view.message = String(error); }
+  finally { view.busy = false; if (modal === view) render(); }
 }
 
 async function accountBackupAction(view: Extract<ModalMode, { kind: "backup" }>, action: "export" | "preview" | "merge" | "overwrite"): Promise<void> {
@@ -2877,6 +2939,12 @@ function renderProxyPool(view: Extract<ModalMode, { kind: "proxyPool" }>): strin
       <div class="modal-card proxy-pool-modal">
         <div class="modal-title" id="proxy-pool-title">代理池 · ${escapeHtml(account.alias)}</div>
         <div class="modal-desc">${setting?.enabled ? `当前 ${escapeHtml(setting.display)}` : "当前账号未启用代理"}</div>
+        ${snapshot?.platform === "ios" && iosNetworkPrefs ? `<div class="proxy-pool-actions">
+          <label><input id="ios-proxy-retention" type="checkbox" ${iosNetworkPrefs.isolate ? "checked" : ""} ${disabled}> 同平台同出口只保留最近使用的页面</label>
+          <label for="ios-quota-interval">前台自动额度同步</label>
+          <select id="ios-quota-interval" class="modal-input" ${disabled}>${[[0,"随前台事件"],[5,"每 5 分钟"],[15,"每 15 分钟"],[30,"每 30 分钟"]].map(([minutes,label]) =>
+            `<option value="${minutes}" ${iosNetworkPrefs?.quotaMinutes === minutes ? "selected" : ""}>${label}</option>`).join("")}</select>
+        </div>` : ""}
         ${setting?.poolEntryId && data ? `<div role="status">${data.entries.some((entry) => entry.id === setting.poolEntryId)
           ? "当前设置绑定代理池条目。"
           : "原池条目已删除或订阅内容已变化。当前保留此前账号配置，可手动选择新条目。"}</div>` : ""}
@@ -2952,6 +3020,7 @@ async function proxyPoolAction(view: Extract<ModalMode, { kind: "proxyPool" }>, 
       });
       if (action === "list") {
         view.setting = await invoke<SpikeProxySettingView | null>("muse_native_get_account_proxy", { providerId, uuid });
+        if (snapshot?.platform === "ios") await updateIosNetworkPreferences(null, null);
       }
       view.message = "";
     }
@@ -4662,6 +4731,12 @@ function bindDelegatedEvents(): void {
       case "backup-export":
         if (modal.kind === "backup") await accountBackupAction(modal, "export");
         break;
+      case "backup-lan-start":
+      case "backup-lan-scan":
+      case "backup-lan-receive":
+      case "backup-lan-stop":
+        if (modal.kind === "backup") await lanBackupAction(modal, id.slice(11) as "start" | "scan" | "receive" | "stop");
+        break;
       case "backup-preview":
         if (modal.kind === "backup") await accountBackupAction(modal, "preview");
         break;
@@ -4837,6 +4912,20 @@ function bindDelegatedEvents(): void {
 
   root.addEventListener("change", async (ev) => {
     const timezoneChoice = ev.target as HTMLSelectElement;
+    if (modal.kind === "proxyPool" && ["ios-proxy-retention", "ios-quota-interval"].includes(timezoneChoice.id)) {
+      const view = modal;
+      view.busy = true;
+      try {
+        if (timezoneChoice.id === "ios-proxy-retention") {
+          await updateIosNetworkPreferences((ev.target as HTMLInputElement).checked, null);
+        } else {
+          await updateIosNetworkPreferences(null, Number(timezoneChoice.value));
+        }
+        view.message = "本机设置已保存。";
+      } catch (error) { view.message = String(error); }
+      finally { view.busy = false; if (modal === view) render(); }
+      return;
+    }
     if (modal.kind === "rooms" && timezoneChoice.closest("[data-template-editor]") &&
         (timezoneChoice.id === "room-template-base" || timezoneChoice.id === "room-template-edit" || timezoneChoice.matches("[data-template-stage]"))) {
       updateRoomTemplateForm(modal.book, timezoneChoice.id || "stage");
@@ -5158,10 +5247,16 @@ async function bootstrap(): Promise<void> {
   triggerAutoSync();
   if (snapshot.platform === "ios") {
     void invoke("local_data_protection").catch(() => {});
+    void updateIosNetworkPreferences(null, null).catch(() => {});
+    let lastQuotaTimerTick = 0;
     foregroundTaskTimer = window.setInterval(() => {
       void refreshForegroundTask();
       void triggerAutomaticFingerprint();
       void processApprovalNotifications();
+      if (!document.hidden && navigator.onLine && iosNetworkPrefs?.quotaMinutes && Date.now() - lastQuotaTimerTick >= 60_000) {
+        lastQuotaTimerTick = Date.now();
+        void invoke("trigger_quota_sync", { force:false }).catch(() => {});
+      }
     }, 15_000);
     window.addEventListener("pagehide", () => {
       if (foregroundTaskTimer !== null) window.clearInterval(foregroundTaskTimer);
@@ -5178,7 +5273,10 @@ async function bootstrap(): Promise<void> {
       if (spikeLive?.running) void refreshSpikeLive();
       if (modal.kind === "tasks") void checkAccountTasks(modal);
       else void refreshForegroundTask();
-    } else if (snapshot?.platform === "ios") void invoke("stop_foreground_task_watch").catch(() => {});
+    } else if (snapshot?.platform === "ios") {
+      if (modal.kind === "backup" && modal.lanShare) { stopLanBackup(modal); render(); }
+      void invoke("stop_foreground_task_watch").catch(() => {});
+    }
   });
   window.addEventListener("offline", () => { if (snapshot?.platform === "ios") void invoke("stop_foreground_task_watch").catch(() => {}); });
   window.addEventListener("online", () => {

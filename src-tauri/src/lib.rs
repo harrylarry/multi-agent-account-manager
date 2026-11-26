@@ -1,5 +1,7 @@
 mod account_cookies;
 mod account_backup;
+#[cfg(any(target_os = "ios", test))]
+mod lan_backup;
 mod muse_native;
 mod muse_sessions;
 mod platform;
@@ -834,6 +836,78 @@ async fn preview_account_backup(
     result.room_checksum = Some(rooms::apply(&path, rooms::Command::List, &[], false)?.archive_checksum()?);
   }
   Ok(result)
+}
+
+#[derive(Default)]
+struct LanBackupGate(tokio::sync::Mutex<Option<tokio::task::JoinHandle<()>>>);
+
+#[tauri::command]
+#[cfg_attr(not(target_os = "ios"), allow(unused_variables))]
+async fn ios_network_preferences(app: AppHandle, isolate: Option<bool>, quota_minutes: Option<u16>) -> Result<serde_json::Value, String> {
+  #[cfg(target_os = "ios")]
+  return tauri_plugin_account_session::ios_network_preferences(&app, isolate, quota_minutes).await;
+  #[cfg(not(target_os = "ios"))]
+  Err("此操作仅支持 iOS".into())
+}
+
+#[cfg(target_os = "ios")]
+async fn backup_wifi(app: &AppHandle) -> Result<lan_backup::Wifi, String> {
+  let row = tauri_plugin_account_session::lan_backup_ui(app, "wifi", None).await?;
+  let invalid = || "请打开叠号并连接支持局域网传输的 Wi-Fi".to_string();
+  Ok(lan_backup::Wifi {
+    address: row["address"].as_str().ok_or_else(invalid)?.parse().map_err(|_| invalid())?,
+    mask: row["mask"].as_str().ok_or_else(invalid)?.parse().map_err(|_| invalid())?,
+  })
+}
+
+#[tauri::command]
+#[cfg_attr(not(target_os = "ios"), allow(unused_variables))]
+async fn manage_lan_backup(
+  app: AppHandle, mgr: State<'_, Arc<SessionManager>>, gate: State<'_, LanBackupGate>,
+  action: String, input: Option<String>,
+) -> Result<serde_json::Value, String> {
+  if action == "stop" {
+    if let Some(task) = gate.0.lock().await.take() { task.abort(); }
+    return Ok(serde_json::Value::Null);
+  }
+  #[cfg(target_os = "ios")]
+  match action.as_str() {
+    "start" => {
+      let mut sharing = gate.0.lock().await;
+      if let Some(task) = sharing.take() { task.abort(); }
+      let password = zeroize::Zeroizing::new(input.ok_or("请输入备份口令")?);
+      let snapshot = mgr.get_snapshot().await;
+      if !snapshot.conflicts.is_empty() || !snapshot.pending_cleanup.is_empty() {
+        return Err("请先处理账号归属冲突或清理中的账号".into());
+      }
+      let backup = account_backup::from_accounts(&snapshot.accounts, true, true, Vec::new(), None);
+      let encrypted = tokio::task::spawn_blocking(move || account_backup::encrypt(&backup, &password))
+        .await.map_err(|_| "局域网备份加密失败")??;
+      let wifi = backup_wifi(&app).await?;
+      let network_app = app.clone();
+      let (code, task) = lan_backup::prepare(wifi, encrypted, move || {
+        let app = network_app.clone();
+        async move { backup_wifi(&app).await }
+      }).await?;
+      match tauri_plugin_account_session::lan_backup_ui(&app, "render", Some(&code)).await {
+        Ok(qr) => {
+          *sharing = Some(task);
+          Ok(serde_json::json!({"code":code, "png":qr["png"], "seconds":lan_backup::SHARE_SECONDS}))
+        }
+        Err(error) => { task.abort(); Err(error) }
+      }
+    }
+    "scan" => tauri_plugin_account_session::lan_backup_ui(&app, "scan", None).await,
+    "receive" => {
+      let code = zeroize::Zeroizing::new(input.ok_or("请扫描或填写配对码")?);
+      let pairing = lan_backup::Pairing::parse(&code)?;
+      let encrypted = lan_backup::receive(backup_wifi(&app).await?, pairing).await?;
+      Ok(serde_json::json!({"encrypted":encrypted}))
+    }
+    _ => Err("局域网备份操作无效".into()),
+  }
+  #[cfg(not(target_os = "ios"))]
+  Err("此操作仅支持 iOS".into())
 }
 
 #[tauri::command]
@@ -1862,6 +1936,7 @@ fn muse_native_liveness_status(
 pub fn run() {
   let builder = tauri::Builder::default();
   let builder = builder.manage(proxy_pool::ProxyPoolGate::default());
+  let builder = builder.manage(LanBackupGate::default());
   let builder = builder.manage(rooms::RoomGate::default());
   let builder = builder.manage(ApprovalNotificationGate::default());
 
@@ -1991,6 +2066,8 @@ pub fn run() {
       trigger_quota_sync,
       preview_account_cookies,
       export_account_backup,
+      manage_lan_backup,
+      ios_network_preferences,
       preview_account_backup,
       local_data_protection,
       restore_account_backup,

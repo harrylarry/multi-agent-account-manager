@@ -18,6 +18,7 @@
 // into the decoder's userInfo).
 
 import Foundation
+import AVFoundation
 import Network
 import Tauri
 import UIKit
@@ -536,6 +537,49 @@ class AccountSessionPlugin: Plugin {
         }
         invoke.resolve(["activity": working ? "working" : "idle"])
       }
+    }
+  }
+
+  @objc public func lanBackupUi(_ invoke: Invoke) throws {
+    struct Args: Decodable { let action: String; let code: String? }
+    let args = try invoke.parseArgs(Args.self)
+    DispatchQueue.main.async {
+      switch args.action {
+      case "wifi":
+        if let network = LanBackupUI.wifi() { invoke.resolve(network) }
+        else { invoke.reject("请打开叠号并连接支持局域网传输的 Wi-Fi") }
+      case "render":
+        if let code = args.code, code.utf8.count <= 100, let png = LanBackupUI.png(code: code) { invoke.resolve(["png":png]) }
+        else { invoke.reject("无法生成配对二维码") }
+      case "scan":
+        AVCaptureDevice.requestAccess(for: .video) { allowed in
+          DispatchQueue.main.async {
+            guard allowed else { invoke.reject("相机权限不可用，可以手动填写配对码"); return }
+            guard let root = UIApplication.shared.connectedScenes.compactMap({ $0 as? UIWindowScene })
+              .first(where: { $0.activationState == .foregroundActive })?.keyWindow?.rootViewController else {
+              invoke.reject("无法打开扫码页面"); return
+            }
+            var presenter = root
+            while let next = presenter.presentedViewController { presenter = next }
+            let scanner = LanBackupScanner()
+            scanner.modalPresentationStyle = .fullScreen
+            scanner.result = { code in invoke.resolve(["code":code ?? ""]) }
+            presenter.present(scanner, animated: true)
+          }
+        }
+      default: invoke.reject("局域网备份操作无效")
+      }
+    }
+  }
+
+  @objc public func iosNetworkPreferences(_ invoke: Invoke) throws {
+    struct Args: Decodable { let isolate: Bool?; let quotaMinutes: Int? }
+    let args = try invoke.parseArgs(Args.self)
+    if let minutes = args.quotaMinutes, ![0, 5, 15, 30].contains(minutes) {
+      invoke.reject("额度同步间隔无效"); return
+    }
+    DispatchQueue.main.async {
+      invoke.resolve(RecentAccountPages.networkPreferences(isolate: args.isolate, quotaMinutes: args.quotaMinutes))
     }
   }
 

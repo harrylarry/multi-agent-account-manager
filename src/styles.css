@@ -1990,3 +1990,12 @@ body,
   font-size: 0.875rem;
   font-weight: 600;
 }
+
+.lan-backup-qr {
+  width: min(13rem, 100%);
+  height: auto;
+  box-sizing: border-box;
+  margin-block: 0.5rem;
+  border: 0.75rem solid white;
+  image-rendering: pixelated;
+}

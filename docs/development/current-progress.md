@@ -42,6 +42,17 @@ Muse 红点的设备回执有延迟或不亮症状，暂无可定位的完整分
 
 上游 `v0.2.0` 对比 `v0.1.10` 新增跨设备加密同步、二维码、局域网与 Cloudflare 中转，以及可配置代理保活。同步载荷新增账号 Cookie，涉及既有备份范围、登录隔离与中转信任边界，列入 v2.2 的独立评估。上游保活参数不提供本分支在 iOS 挂起期间运行的验证证据。[上游差异](https://github.com/ldjx7/multi-agent-account-manager/compare/v0.1.10...v0.2.0)
 
+### 上游 v0.2.0 的适配范围
+
+| 切片 | 处理与边界 |
+| --- | --- |
+| 同一 Wi-Fi 与二维码 | 独立配对协议绑定两台 iPhone 当前的私有 IPv4 Wi-Fi 子网。两分钟内一次接收，支持相机扫码与手动填写。配对码包含临时地址和独立随机密钥，备份口令另行传达。挑战应答认证接收方，传输层密文经认证加密后再走原加密备份的口令、预览和显式恢复。传送账号资料、分组、时区及去凭据代理端点。需要代理凭据的新增账号先保持阻断。 |
+| 同出口与额度同步 | 本机可选同平台同出口仅保留最近页面，按明确直连或代理主机和端口分组，配置未知仍按 fail-closed 处理。仅释放旧页面，重开按原 UUID 和凭据配置加载。前台自动额度间隔可选 5、15、30 分钟或沿用前台事件，进入后台后依赖系统生命周期，手动同步仍可用。 |
+| 云中转 | 上游以 Cloudflare Worker 和 Durable Object 暂存密文，通过领取、删除凭证和到期任务释放。纳入产品前需确定中转归属、服务可观测的元数据、到期和删除核验、二维码转发风险及离线替代路径。保留独立议题。 |
+| Cookie 跨设备 | 上游同步载荷带账号 Cookie。纳入产品前需分别验证用户授权、域与账号归属、导入失败回滚、过期/会话撤销及目标设备代理的绑定和阻断。当前局域网使用现有账号资料备份 schema，Keychain 凭据和 WebKit 登录态留在原设备。 |
+
+局域网、摄像头权限、实际两机接收与出口释放为真机 `UNVERIFIED`。[iPhone 复测](../acceptance/iphone-acceptance.md#局域网加密备份和同出口保留策略) · [Apple 局域网权限](https://developer.apple.com/documentation/technotes/tn3179-understanding-local-network-privacy)
+
 本轮收尾范围包括代理池账号持久引用与一对一占用、订阅变更提醒和元数据恢复；账号资料的 iOS 目录及文件保护检查；Muse 的前台 Live/Watch/Idle 监听窗口、掉线退避和系统暂停；以及 Hark 手动和按账号启用的自动指纹检测。Hark 只有在同账号的隔离发送探针取得完整、同会话和同回执的回复并持久落账后才解锁指纹发送。探针严格串行，结果不明、取消、未完成或无效样本均停止后续发送。新增带服务、真实 Cookie 名称和来源域名的会话 Token 导入，走同一预览和写入验证链。
 
 `c285088` 为联合验收候选，`CI_PASSED`。主 crate 89 项、嵌入脚本 13 项、前端和移动 WebKit 回归通过。Hark HTTP 回环核对一发、主会话不发、串会话回执不确认为成功，以及完整关联回复解锁。订阅认证参数变化保留原账号配置，备份保存非敏感绑定元数据。iOS 构建通过，已核验 IPA、ZIP 与最低版本。设备能力和服务端实际行为仍为 `UNVERIFIED`。[CI](https://github.com/harrylarry/multi-agent-account-manager/actions/runs/45770836204) · [iOS 构建](https://github.com/harrylarry/multi-agent-account-manager/actions/runs/45770837066)

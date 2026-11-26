@@ -830,6 +830,20 @@ pub async fn copy_profile_cookies(
 }
 
 #[cfg(target_os = "ios")]
+pub async fn ios_network_preferences(app: &AppHandle, isolate: Option<bool>, quota_minutes: Option<u16>) -> Result<serde_json::Value, String> {
+  let bridge = app.state::<IosSessionBridge<tauri::Wry>>();
+  bridge.0.run_mobile_plugin_async("iosNetworkPreferences", serde_json::json!({ "isolate":isolate, "quotaMinutes":quota_minutes }))
+    .await.map_err(|error| error.to_string())
+}
+
+#[cfg(target_os = "ios")]
+pub async fn lan_backup_ui(app: &AppHandle, action: &str, code: Option<&str>) -> Result<serde_json::Value, String> {
+  let bridge = app.state::<IosSessionBridge<tauri::Wry>>();
+  bridge.0.run_mobile_plugin_async("lanBackupUi", serde_json::json!({ "action":action, "code":code }))
+    .await.map_err(|error| error.to_string())
+}
+
+#[cfg(target_os = "ios")]
 pub async fn share_account_backup(app: &AppHandle, contents: &str) -> Result<bool, String> {
   #[derive(Deserialize)]
   struct ShareResult { shared: bool }

@@ -29,6 +29,8 @@
     "allow-trigger-quota-sync",
     "allow-preview-account-cookies",
     "allow-export-account-backup",
+    "allow-manage-lan-backup",
+    "allow-ios-network-preferences",
     "allow-preview-account-backup",
     "allow-local-data-protection",
     "allow-restore-account-backup",

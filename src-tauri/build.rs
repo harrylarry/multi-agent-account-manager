@@ -20,6 +20,8 @@ const APP_COMMANDS: &[&str] = &[
   "trigger_quota_sync",
   "preview_account_cookies",
   "export_account_backup",
+  "manage_lan_backup",
+  "ios_network_preferences",
   "preview_account_backup",
   "local_data_protection",
   "restore_account_backup",
