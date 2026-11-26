@@ -241,6 +241,10 @@ SOCKS5 启用时，后台同步显示「代理 已下发」「联网超时」「
 
 ### 交付凭证、Hark 隔离发送与备份
 
+联合候选 Spike 0.1.26（iOS 17.0+），代码提交 `38b8286f589858b368e02995bc1adb3e041bfd47`。CI 与 Xcode 构建通过，真机待验。[Quick checks](https://github.com/harrylarry/multi-agent-account-manager/actions/runs/45763568829) · [iOS 构建](https://github.com/harrylarry/multi-agent-account-manager/actions/runs/45763569820) · [Spike IPA 下载](https://github.com/harrylarry/multi-agent-account-manager/actions/runs/45763569820/artifacts/15091606309)
+
+解压后取出 `account-manager-ios-unsigned.ipa`。IPA SHA-256 为 `44ba4442baea1c4cc2200b28e7277d7fe90e993830e0378d4ad6134fe7bb6808`。外层 ZIP SHA-256 为 `eb266de9ff0094840d85946c0ef60c69cd8cc6d8d23cd883b560de0aa6138b63`。
+
 1. **交付凭证与附件**。建一间 Muse 房间，选择「校验文件」为定稿要求。在「添加交付凭证」选择小型 .txt，点「保存并校验文件」，核对字节数和 SHA-256。点「核验并分享文件」存入文件 App，对照原始内容。派发后从原隔离会话确认附件同一条请求送达。让任务输出长文，核对房间能保存完整 Markdown 附件，下一轮长上下文在原隔离会话显示为 `room-turn.md`。另用自己的公开 GitHub 仓库的完整提交链接测试在线核验，错误 SHA 应被拒。通用 HTTPS 链接可以打开，其摘要证明保存的是哪条网址。
 2. **自定义模板与会话绑定**。选择「评审」为基础，填写「拆解,执行,审核,汇总,交付」，保存后建房，测试实际顺序。尝试「执行,交付」，应拒绝省略审核。修改模板后核对旧房间仍显示原版本。在新房间草稿中点「绑定已有 Muse 会话 → 读取该账号会话 → 确认绑定」，重启后从房间打开并检查账号归属。接力继续在独立会话派发，确认绑定会话中没有房间测试消息。
 3. **Hark 隔离发送**。用非主力的已登录 Hark 测试账号，点「编辑 → 任务 → 验证隔离发送」并确认。核对 Hark 网页中的新项目和仅一条测试消息，主会话无新增。回传阶段或 HTTP 状态、`CONFIRMED` / `UNKNOWN` 和是否观察到关联回复，省略完整标识。遇 `UNKNOWN` 时先打开新项目核对。
