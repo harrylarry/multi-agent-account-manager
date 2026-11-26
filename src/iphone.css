@@ -14,6 +14,8 @@
   --dh-amber-bg: #fff0d9;
   --dh-rose: #9d2941;
   --dh-rose-bg: #fce7ed;
+  --dh-rose-ink: #fff;
+  --dh-success: #08765b;
   --dh-hark: #565096;
   --dh-hark-bg: #eeeafb;
   --text-main: var(--dh-ink);
@@ -53,6 +55,8 @@
     --dh-amber-bg: #483522;
     --dh-rose: #ffa5b4;
     --dh-rose-bg: #482b38;
+    --dh-rose-ink: #45222f;
+    --dh-success: #72d3b0;
     --dh-hark: #c1b9ff;
     --dh-hark-bg: #333050;
   }
@@ -248,15 +252,30 @@
 .iphone-remove { align-self: flex-start; min-height: 44px; margin-top: 12px; border: 0; background: transparent; color: var(--dh-rose); font-size: 14px; }
 .iphone-shell .modal-card { color: var(--dh-ink); background: var(--dh-surface); }
 .iphone-shell .inline-modal { inset: 0; background: var(--dh-overlay); }
-.iphone-shell .btn.primary { color: var(--dh-blue-ink); background: var(--dh-blue); }
+.iphone-shell .btn,
+.iphone-shell .mini-btn { background: var(--dh-surface); color: var(--dh-ink); }
+.iphone-shell .btn:hover { background: var(--dh-mist); }
+.iphone-shell .btn.primary,
+.iphone-shell .btn.primary:hover,
+.iphone-shell .spike-workspace .spike-primary,
+.iphone-shell .spike-workspace .spike-primary:not(:disabled):hover { color: var(--dh-blue-ink); background: var(--dh-blue); }
+.iphone-shell .btn.danger,
+.iphone-shell .btn.danger:hover { background: var(--dh-rose); color: var(--dh-rose-ink); }
 .iphone-shell .btn, .iphone-shell .mini-btn, .iphone-shell .modal-input { min-height: 44px; }
-.iphone-shell .modal-input, .iphone-shell select { background: var(--dh-surface); color: var(--dh-ink); }
+.iphone-shell .modal-input,
+.iphone-shell .modal-input:focus,
+.iphone-shell select,
+.iphone-shell .update-notes { background: var(--dh-surface); color: var(--dh-ink); }
+.iphone-shell .conflict-box,
+.iphone-shell .spike-workspace .spike-diag-result.fail { color: var(--dh-rose); border-color: var(--dh-line); }
+.iphone-shell .spike-workspace .spike-diag-result.ok > div:first-child { color: var(--dh-success); }
 .iphone-shell .iphone-screen-modal { padding: 0; align-items: stretch; background: var(--dh-page); }
 .iphone-shell .iphone-screen-modal .modal-card {
   width: 100%;
   max-width: none;
   max-height: none;
   padding: 8px 18px 20px;
+  gap: 10px;
   border: 0;
   border-radius: 0;
   box-shadow: none;
@@ -283,4 +302,4 @@
 }
 .iphone-add-methods button[aria-pressed="true"] { color: var(--dh-blue); border-color: var(--dh-blue); background: var(--dh-mist); }
 .iphone-screen-modal #iphone-add-cookie-fields { display: grid; gap: 8px; }
-.iphone-screen-modal #add-cookie-input { min-height: 112px; padding: 10px 12px; }
+.iphone-screen-modal #add-cookie-input { min-height: 96px; padding: 10px 12px; }
