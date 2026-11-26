@@ -253,6 +253,10 @@ SOCKS5 启用时，后台同步显示「代理 已下发」「联网超时」「
 
 ### 收尾验证：代理引用、文件保护与 Hark 指纹
 
+Spike 0.1.26（iOS 17.0+），代码提交 `c2850880d04a73ff76cd366b786ddad2f2b0a1b6`。CI 和 iOS 构建均通过，真机待验。[CI](https://github.com/harrylarry/multi-agent-account-manager/actions/runs/45770836204) · [构建](https://github.com/harrylarry/multi-agent-account-manager/actions/runs/45770837066) · [下载 IPA](https://github.com/harrylarry/multi-agent-account-manager/actions/runs/45770837066/artifacts/15094411800)
+
+解压后的 `account-manager-ios-unsigned.ipa` SHA-256 为 `d0dbd6004a4b0373a6e7ceb25c734ef443d8951ffe55be757adeb6a77792f9a1`。外层 ZIP SHA-256 为 `481157655c4497d1ba129a456e701a394cf1b23476b8853434bdeac92c6545c1`。
+
 1. **代理池联动**。将池中的一个条目给 A，尝试让 B 使用同一条目，应拒绝。重启确认 A 的账户仍显示绑定。使用自己的测试订阅修改或删除该条目，刷新后核对提示，A 的已配置线路保留。手动选择另一个条目，再以全量备份核对恢复预览和绑定关系。缺凭据时账号保持阻断。
 2. **资料保护**。在「备份 → 检查本机文件保护」核对目录、账号、房间和发送台账属性。尚未产生的数据文件可显示「尚未创建」。创建房间或完成一次发送后重启复测。
 3. **Hark 指纹**。在 Hark 非主力账号先做「验证隔离发送」，等待同一会话的完整关联回复。确认后才可点「手动检测模型」。前台运行时应逐条发送，直到采到三条有效样本或停在具体原因。核对账号档案的候选、样本数和参考库。设置间隔为 1 天启用到期重测，设为 0 关闭。无隔离证据的另一账号应拒绝启动。在任何 `UNKNOWN` 状态先核对原项目。
