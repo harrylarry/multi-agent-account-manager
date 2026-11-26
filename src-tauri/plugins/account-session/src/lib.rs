@@ -892,6 +892,13 @@ pub async fn take_approval_notification_actions(app: &AppHandle) -> Result<Vec<s
 }
 
 #[cfg(target_os = "ios")]
+pub async fn enforce_local_data_protection(app: &AppHandle, directory: &str) -> Result<serde_json::Value, String> {
+  let bridge = app.state::<IosSessionBridge<tauri::Wry>>();
+  bridge.0.run_mobile_plugin_async("enforceLocalDataProtection", serde_json::json!({ "directory":directory }))
+    .await.map_err(|_| "本机资料保护尚未核验".into())
+}
+
+#[cfg(target_os = "ios")]
 pub async fn automatic_task_polling_available(app: &AppHandle) -> Result<bool, String> {
   #[derive(Deserialize)]
   struct Availability { available: bool }

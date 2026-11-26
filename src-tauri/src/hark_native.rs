@@ -529,12 +529,14 @@ pub(crate) async fn checked_json(mut response: reqwest::Response) -> Result<serd
 }
 
 #[cfg(any(target_os = "ios", test))]
-pub(crate) fn bound_reply_seen(payload: &serde_json::Value, conversation: &str, reply: &str) -> bool {
+pub(crate) fn bound_reply(payload: &serde_json::Value, conversation: &str, reply: &str) -> (bool, Option<String>) {
   let mut tracker = SyncTracker { conversation:conversation.to_owned(), collect_replies:true, polling:true, ..Default::default() };
   for frame in payload["frames"].as_array().into_iter().flatten().filter_map(serde_json::Value::as_str) {
     tracker.apply_frame(frame);
   }
-  tracker.states.contains_key(reply)
+  let seen = tracker.states.contains_key(reply);
+  let text = tracker.replies.remove(reply).filter(|entry| entry.completed && !entry.text.trim().is_empty()).map(|entry| entry.text);
+  (seen, text)
 }
 
 #[cfg(any(target_os = "ios", test))]

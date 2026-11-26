@@ -27,6 +27,8 @@ pub struct AccountKey {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ProxySetting {
+  #[serde(default, skip_serializing_if = "Option::is_none")]
+  pub pool_entry_id: Option<Uuid>,
   /// scheme://host[:port]，可含 user@，但**不得含 :password**。
   pub uri: String,
   /// 代理认证用户名。与 `uri` 里的 user@ 二选一（都以 `uri` 为准）。
@@ -484,6 +486,7 @@ fn migrate_from_value(root: Value) -> Result<(AccountsStoreFile, bool), String> 
           }
         }
         ProxySetting {
+          pool_entry_id: None,
           uri: String::new(),
           username: None,
           credential_ref: None,
@@ -689,6 +692,7 @@ mod proxy_tests {
   #[test]
   fn proxy_display_safe_hides_userinfo() {
     let p = ProxySetting {
+      pool_entry_id: None,
       uri: "http://alice:p%40ss@p.example:8080".to_string(),
       username: None,
       credential_ref: Some("kc-proxy-p.example".to_string()),
@@ -703,6 +707,7 @@ mod proxy_tests {
   #[test]
   fn proxy_is_always_fail_closed() {
     let p = ProxySetting {
+      pool_entry_id: None,
       uri: "socks5://p.example".to_string(),
       username: None,
       credential_ref: None,
@@ -714,6 +719,7 @@ mod proxy_tests {
   #[test]
   fn validate_rejects_inline_password() {
     let p = ProxySetting {
+      pool_entry_id: None,
       uri: "http://alice:secret@p.example:8080".to_string(),
       username: None,
       credential_ref: None,
@@ -726,6 +732,7 @@ mod proxy_tests {
   #[test]
   fn validate_requires_username_and_credential_pair() {
     let orphan_user = ProxySetting {
+      pool_entry_id: None,
       uri: "http://alice@p.example:8080".to_string(),
       username: None,
       credential_ref: None,
@@ -734,6 +741,7 @@ mod proxy_tests {
     assert!(orphan_user.validate().is_err(), "有用户名却无 Keychain 引用应被拒");
 
     let paired = ProxySetting {
+      pool_entry_id: None,
       uri: "http://alice@p.example:8080".to_string(),
       username: None,
       credential_ref: Some("proxy-account-1".to_string()),
@@ -742,6 +750,7 @@ mod proxy_tests {
     assert!(paired.validate().is_ok(), "{:?}", paired.validate());
 
     let no_auth = ProxySetting {
+      pool_entry_id: None,
       uri: "socks5://p.example:1080".to_string(),
       username: None,
       credential_ref: None,
@@ -754,6 +763,7 @@ mod proxy_tests {
   fn validate_rejects_bad_host_and_port() {
     for uri in ["p.example", "ftp://p.example", "http://:8080", "http://p.example:0"] {
       let p = ProxySetting {
+        pool_entry_id: None,
         uri: uri.to_string(),
         username: None,
         credential_ref: None,
@@ -766,6 +776,7 @@ mod proxy_tests {
   #[test]
   fn disabled_setting_skips_validation() {
     let p = ProxySetting {
+      pool_entry_id: None,
       uri: "not-a-uri".to_string(),
       username: None,
       credential_ref: None,
@@ -777,6 +788,7 @@ mod proxy_tests {
   #[test]
   fn effective_username_prefers_uri_user() {
     let p = ProxySetting {
+      pool_entry_id: None,
       uri: "http://alice%40corp@p.example:8080".to_string(),
       username: Some("bob".to_string()),
       credential_ref: Some("ref".to_string()),

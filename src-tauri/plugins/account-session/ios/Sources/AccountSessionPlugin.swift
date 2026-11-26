@@ -462,6 +462,48 @@ class AccountSessionPlugin: Plugin {
     }
   }
 
+  @objc public func enforceLocalDataProtection(_ invoke: Invoke) throws {
+    struct Args: Decodable { let directory: String }
+    let args = try invoke.parseArgs(Args.self)
+    let manager = FileManager.default
+    let base = URL(fileURLWithPath: NSHomeDirectory()).appendingPathComponent("Library/Application Support", isDirectory: true)
+      .resolvingSymlinksInPath().path
+    let directory = URL(fileURLWithPath: args.directory, isDirectory: true).resolvingSymlinksInPath()
+    guard directory.deletingLastPathComponent().path == base,
+          directory.lastPathComponent == Bundle.main.bundleIdentifier else {
+      invoke.reject("本机资料目录归属无法核验")
+      return
+    }
+    let protection = FileProtectionType.completeUntilFirstUserAuthentication
+    var report: [[String: String]] = []
+    do {
+      try manager.createDirectory(at: directory, withIntermediateDirectories: true)
+      for name in ["目录", "accounts.json", "rooms-v1.json", "send-ledger.json"] {
+        let target = name == "目录" ? directory : directory.appendingPathComponent(name)
+        if name != "目录" && !manager.fileExists(atPath: target.path) {
+          report.append(["file":name, "status":"尚未创建"])
+          continue
+        }
+        let metadata = try target.resourceValues(forKeys: [.isRegularFileKey, .isSymbolicLinkKey, .isDirectoryKey])
+        guard metadata.isSymbolicLink != true,
+              name == "目录" ? metadata.isDirectory == true : metadata.isRegularFile == true else {
+          report.append(["file":name, "status":"无法核验文件类型"])
+          continue
+        }
+        let mode = name == "目录" ? 0o700 : 0o600
+        try manager.setAttributes([.protectionKey: protection, .posixPermissions: NSNumber(value: mode)], ofItemAtPath: target.path)
+        let attributes = try manager.attributesOfItem(atPath: target.path)
+        let observed = (attributes[.protectionKey] as? FileProtectionType)?.rawValue
+          ?? attributes[.protectionKey] as? String
+        let permissions = (attributes[.posixPermissions] as? NSNumber)?.intValue
+        report.append(["file":name, "status":observed == protection.rawValue && permissions == mode ? "已核验" : "保护属性无法核验"])
+      }
+      invoke.resolve(["files": report])
+    } catch {
+      invoke.reject("本机资料保护设置或读取失败")
+    }
+  }
+
   @objc public func readParkedTaskState(_ invoke: Invoke) throws {
     let args = try invoke.parseArgs(GetSessionCookiesArgs.self)
     DispatchQueue.main.async {

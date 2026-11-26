@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-hark-fingerprint-probe"
+description = "Enables the hark_fingerprint_probe command without any pre-configured scope."
+commands.allow = ["hark_fingerprint_probe"]
+
+[[permission]]
+identifier = "deny-hark-fingerprint-probe"
+description = "Denies the hark_fingerprint_probe command without any pre-configured scope."
+commands.deny = ["hark_fingerprint_probe"]

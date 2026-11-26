@@ -18,6 +18,18 @@ pub struct AccountCookie {
   pub same_site: Option<String>,
 }
 
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct SessionToken {
+  #[serde(rename = "type")]
+  _kind: String,
+  provider: String,
+  cookie_name: String,
+  domain: String,
+  token: String,
+  expiration_date: Option<f64>,
+}
+
 impl Drop for AccountCookie {
   fn drop(&mut self) {
     use zeroize::Zeroize;
@@ -46,12 +58,16 @@ pub fn parse(raw: &str, provider: &str, now: f64) -> Result<Vec<AccountCookie>, 
   }
   let cookies = if raw.starts_with('[') || raw.starts_with('{') {
     let value: serde_json::Value = serde_json::from_str(raw).map_err(|_| invalid())?;
-    let list = if value.is_array() {
-      value
+    if value["type"] == "session-cookie-token" {
+      let input: SessionToken = serde_json::from_value(value).map_err(|_| "会话 Token 缺少服务、Cookie 名称或来源域名".to_string())?;
+      if input.provider != provider || input.token.is_empty() { return Err("会话 Token 必须属于所选服务".into()); }
+      vec![AccountCookie { name:input.cookie_name, value:input.token, domain:input.domain,
+        path:"/".into(), secure:true, http_only:true, expiration_date:input.expiration_date, same_site:None }]
+    } else if value.is_array() {
+      serde_json::from_value(value).map_err(|_| invalid())?
     } else {
-      value.get("cookies").cloned().ok_or_else(invalid)?
-    };
-    serde_json::from_value(list).map_err(|_| invalid())?
+      serde_json::from_value(value.get("cookies").cloned().ok_or_else(invalid)?).map_err(|_| invalid())?
+    }
   } else if raw.contains('\t') {
     raw.lines().filter(|line| !line.trim().is_empty() && (!line.starts_with('#') || line.starts_with("#HttpOnly_")))
       .map(|line| {
@@ -186,6 +202,17 @@ mod tests {
     assert!(error(".muse.ai\tTRUE\t/\tTRUE\t200\tsession\tsample").contains("已过期"));
     assert!(error("broken").contains("格式"));
     assert!(parse("\u{feff}Cookie: session=sample", "muse", 300.0).is_ok());
+  }
+
+  #[test]
+  fn session_token_requires_explicit_provider_and_cookie_scope() {
+    let token = r#"{"type":"session-cookie-token","provider":"hark","cookieName":"__Host-session","domain":"app.hark.com","token":"sample","expirationDate":200}"#;
+    let result = parse(token, "hark", 100.0).unwrap();
+    assert!(result[0].secure && result[0].http_only);
+    assert_eq!(result[0].value, "sample");
+    assert!(parse(token, "muse", 100.0).is_err());
+    assert!(parse(token, "hark", 201.0).is_err());
+    assert!(parse("Bearer sample", "hark", 100.0).is_err());
   }
 
   #[test]

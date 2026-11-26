@@ -40,6 +40,7 @@ type ModalMode =
     };
 
 interface TaskObservation {
+  tier?: "live" | "watch" | "idle";
   activity: "idle" | "working" | "approval" | "unknown";
   source: "native" | "page" | null;
   observedAtMs: number | null;
@@ -391,6 +392,7 @@ interface SpikeWebviewProxyView {
 interface SpikeProxySettingView {
   enabled: boolean; display: string; hasCredentials: boolean;
   credentialAvailable: boolean | null;
+  poolEntryId?: string | null;
   /** 当前操作观察到的 WebView 下发结果。 */
   webview?: SpikeWebviewProxyView | null;
 }
@@ -1134,6 +1136,7 @@ async function processApprovalNotifications(): Promise<void> {
 }
 const taskRetryAt = new Map<string, number>();
 const pendingTaskActivity = new Map<string, TaskObservation>();
+const taskWatchFailures = new Map<string, number>();
 
 function applyTaskObservation(key: string, result: TaskObservation): void {
   const previous = latestTaskObservations.get(key);
@@ -1167,16 +1170,23 @@ async function refreshForegroundTask(): Promise<void> {
   const account = accounts[foregroundTaskIndex++ % accounts.length];
   foregroundTaskBusy = true;
   const key = `${account.providerId}:${account.uuid}`;
+  const previous = latestTaskObservations.get(key);
+  const tier = previous?.activity === "working" ? "live"
+    : previous?.activity === "idle" && !pendingTaskActivity.has(key) && snapshot.activeAccount?.uuid !== account.uuid ? "idle" : "watch";
   try {
     const result = await invoke<TaskObservation>("observe_account_tasks", {
-      uuid: account.uuid, providerId: account.providerId, automatic: true, timezone: Intl.DateTimeFormat().resolvedOptions().timeZone || "UTC",
+      uuid: account.uuid, providerId: account.providerId, automatic: true, tier, timezone: Intl.DateTimeFormat().resolvedOptions().timeZone || "UTC",
     });
     applyTaskObservation(key, result);
-    taskRetryAt.set(key, Date.now() + (pendingTaskActivity.has(key) || result.activity === "working" ? 15_000 :
-      result.activity === "unknown" ? 180_000 : 60_000));
+    if (result.activity === "unknown") throw new Error("暂无可用任务事件");
+    taskWatchFailures.delete(key);
+    taskRetryAt.set(key, Date.now() + (pendingTaskActivity.has(key) || result.activity === "working" ? 10_000 :
+      result.activity === "approval" ? 25_000 : 60_000));
   } catch {
     applyTaskObservation(key, { activity: "unknown", observedAtMs: null, source: null });
-    taskRetryAt.set(key, Date.now() + 120_000);
+    const failures = Math.min(5, (taskWatchFailures.get(key) ?? 0) + 1);
+    taskWatchFailures.set(key, failures);
+    taskRetryAt.set(key, Date.now() + Math.min(180_000, 15_000 * 2 ** failures));
   } finally {
     foregroundTaskBusy = false;
     if (modal.kind === "tasks" && modal.account.uuid === account.uuid) render();
@@ -1235,7 +1245,7 @@ function spikeDiagInnerHtml(accountUuid: string | undefined = pickWatchAccount()
         <div>${r.ok ? "✓ 诊断通过" : "✗ 诊断失败"}（阶段：${escapeHtml(r.phase)}）</div>
         <div>握手：${r.handshakeCompleted ? "✓ 完成" : "✗ 未完成"}</div>
         <div>ping：${r.pingStatus !== null ? `HTTP ${r.pingStatus}` : "—"}</div>
-        <div>CVM：${r.cvmDetected ? "已检测到" : "未检测到"}</div>
+        <div>CVM：${r.cvmDetected ? "服务要求设备证明，原生路径不可用" : r.handshakeCompleted ? "此连接未要求设备证明" : "未取得能力证据"}</div>
         ${r.error ? `<div>错误：${escapeHtml(r.error)}</div>` : ""}
       </div>`;
   } else if (spikeDiagnoseError) {
@@ -1884,13 +1894,53 @@ async function runSpikeFingerprint(view?: Extract<ModalMode, { kind: "tasks" }>,
 const automaticFingerprintCheckedAt = new Map<string, number>();
 let automaticFingerprintChecking = false;
 
+async function runHarkFingerprint(account: AccountRecord, automatic: boolean, view?: Extract<ModalMode, { kind: "tasks" }>): Promise<void> {
+  if (spikeFingerprintRunning) return;
+  try {
+    const ready = await invoke<boolean>("hark_fingerprint_ready", { uuid:account.uuid });
+    if (!ready) {
+      if (view && modal === view) {
+        view.note = "请先完成该账号的隔离发送验证，收到一条完整关联回复后才能检测 Hark 模型。";
+        render();
+      }
+      return;
+    }
+    if (!automatic && view) {
+      const confirmed = await askConfirm({
+        title:"检测 Hark 模型", desc:`将使用「${account.alias}」的隔离会话依次发送三条计数题。收到完整回复后才会发下一条，会消耗账号额度。`,
+        confirmLabel:"开始检测",
+      });
+      await setModal(view);
+      if (!confirmed) return;
+    }
+    if (document.hidden || spikeFingerprintRunning || (automatic && modal.kind !== "none")) return;
+    const task = { accountUuid:account.uuid, taskId:createSpikeTaskId() };
+    spikeFingerprintTask = task;
+    spikeFingerprintRunning = true;
+    if (view && modal === view) { view.note = "Hark 正在单发、等待关联回复并在本地评分…"; render(); }
+    try {
+      const response = await invoke<{ result: { usedSamples:number }; stopReason?:string }>("hark_fingerprint_probe", {
+        uuid:account.uuid, taskId:task.taskId, automatic, timezone:Intl.DateTimeFormat().resolvedOptions().timeZone || "UTC",
+      });
+      if (view) view.note = `Hark 采样 ${response.result.usedSamples}/3${response.stopReason ? " · " + response.stopReason : ""}`;
+    } finally {
+      spikeFingerprintRunning = false;
+      spikeFingerprintTask = null;
+    }
+  } catch (error) {
+    if (view) view.note = String(error);
+  } finally {
+    if (view && modal === view) render();
+  }
+}
+
 async function triggerAutomaticFingerprint(): Promise<void> {
   if (snapshot?.platform !== "ios" || document.hidden || !navigator.onLine || spikeFingerprintRunning
     || automaticFingerprintChecking || modal.kind !== "none") return;
   const now = Date.now();
   const due = snapshot.accounts.find((account) => {
     const settings = account.fingerprintSettings;
-    if (account.providerId !== "muse" || account.authState !== "authenticated" || !settings?.intervalDays
+    if (account.authState !== "authenticated" || !settings?.intervalDays
       || now - (automaticFingerprintCheckedAt.get(account.uuid) ?? 0) < 300_000) return false;
     const last = Math.max(settings.lastAutomaticAttemptMs ?? 0, account.fingerprintHistory?.[0]?.recordedAtMs ?? 0);
     return now >= last + settings.intervalDays * 86_400_000;
@@ -1899,6 +1949,7 @@ async function triggerAutomaticFingerprint(): Promise<void> {
   automaticFingerprintCheckedAt.set(due.uuid, now);
   automaticFingerprintChecking = true;
   try {
+    if (due.providerId === "hark") { await runHarkFingerprint(due, true); return; }
     const quota = due.quotaObservation;
     if (quota?.stale !== false || quota.percentUsed == null || now - quota.checkedAtMs > 600_000
       || (quota.resetsAtMs != null && quota.resetsAtMs <= now)) {
@@ -2595,14 +2646,15 @@ function renderTasks(view: Extract<ModalMode, { kind: "tasks" }>): string {
         <div class="modal-title" id="account-task-title">任务 · ${escapeHtml(account.alias)}</div>
         <div role="status">${checking ? "正在检测…" : escapeHtml(status[observation?.activity ?? "unknown"])}</div>
         ${observation?.observedAtMs ? `<div class="modal-desc">最近一次成功检测 ${new Date(observation.observedAtMs).toLocaleString()} · ${observation.source === "native" ? "原生" : "停驻页面"}</div>` : ""}
+        ${observation?.tier ? `<div class="modal-desc">监听档位 · ${{live:"持续观察",watch:"短时监听",idle:"空闲抽查"}[observation.tier]}</div>` : ""}
         ${current?.pendingApprovalCount != null ? `<div class="modal-desc">待审批 ${current.pendingApprovalCount} 项</div>` : ""}
         ${recent ? `<div class="modal-desc">最近发现回复 ${new Date(recent).toLocaleString()}</div>` : ""}
         ${current?.museUnreadStatus ? `<div class="modal-desc">回前台补查 · ${unreadStatus[current.museUnreadStatus] ?? "暂不可判定"}</div>` : ""}
         ${account.providerId === "muse" && isSpikeBuild ? `<div class="modal-desc" id="badge-timing-line" style="user-select:text;-webkit-user-select:text">${escapeHtml(badgeTimingLine(account.uuid))}</div>` : ""}
         ${note ? `<div class="modal-desc">${escapeHtml(note)}</div>` : ""}
-        ${account.providerId === "muse" ? `
+        ${account.providerId === "muse" || account.providerId === "hark" ? `
           <details class="hark-reply" ${fingerprintRunning ? "open" : ""}><summary>模型指纹 ${records.length ? "· " + escapeHtml(records[0].model ?? "不可判定") : ""}</summary>
-            <div class="modal-desc">在隔离会话里发送三条探针并消耗该账号额度。结果是本地参考库候选。</div>
+            <div class="modal-desc">在隔离会话里发送三条探针并消耗该账号额度。结果是本地参考库候选。${account.providerId === "hark" ? "首次须通过同一账号的隔离发送和完整回复验证。" : ""}</div>
             ${fingerprintRunning ? `<div role="status">检测中 · 已取得 ${spikeFingerprintProgress?.samples ?? 0}/3 条样本</div>` : ""}
             ${records.map((record) => `<div class="modal-desc">${new Date(record.recordedAtMs).toLocaleString()} ·
               ${escapeHtml(record.model ?? "不可判定")} · ${record.validSamples}/3 条
@@ -2757,6 +2809,7 @@ function renderAccountBackup(view: Extract<ModalMode, { kind: "backup" }>): stri
           <button id="modal-cancel-btn" type="button" class="btn" ${disabled}>关闭</button>
           <button id="backup-export" type="button" class="btn primary" ${disabled}>导出备份</button>
           <button id="backup-preview" type="button" class="btn" ${disabled}>预览恢复</button>
+          <button id="backup-protection" type="button" class="btn" ${disabled}>检查本机文件保护</button>
           ${preview ? `<button id="backup-merge" type="button" class="btn" ${disabled}>合并</button><button id="backup-overwrite" type="button" class="btn" ${disabled}>覆盖冲突资料</button>` : ""}
           ${preview?.roomChecksum ? `<button id="backup-rooms-merge" type="button" class="btn" ${disabled}>合并房间与模板</button>
             <button id="backup-rooms-overwrite" type="button" class="btn" ${disabled}>覆盖同标识房间与模板</button>` : ""}
@@ -2831,6 +2884,9 @@ function renderProxyPool(view: Extract<ModalMode, { kind: "proxyPool" }>): strin
       <div class="modal-card proxy-pool-modal">
         <div class="modal-title" id="proxy-pool-title">代理池 · ${escapeHtml(account.alias)}</div>
         <div class="modal-desc">${setting?.enabled ? `当前 ${escapeHtml(setting.display)}` : "当前账号未启用代理"}</div>
+        ${setting?.poolEntryId && data ? `<div role="status">${data.entries.some((entry) => entry.id === setting.poolEntryId)
+          ? "当前设置绑定代理池条目。"
+          : "原池条目已删除或订阅内容已变化。当前保留此前账号配置，可手动选择新条目。"}</div>` : ""}
         <div class="proxy-pool-body">
           <label for="proxy-pool-input">代理 URI（每行一个）或 HTTPS 订阅</label>
           <div class="modal-desc">单个代理地址用「导入代理」。订阅请粘贴服务商的 HTTPS 下载链接，链接须直接返回纯文本，每行一个 http://、https:// 或 socks5:// 代理 URI。</div>
@@ -2961,7 +3017,8 @@ function renderCookieModal(view: Extract<ModalMode, { kind: "cookies" }>): strin
         <div class="modal-desc">已记录的登录状态 ${account.authState === "authenticated" ? "已登录" : account.authState === "logged_out" ? "需登录" : "未验证"}。</div>
         <div class="modal-desc" id="account-cookie-stored">${stored?.count ? `本机会话有 ${stored.count} 条 Cookie · 最早已知到期 ${stored.nextExpiry ? new Date(stored.nextExpiry * 1000).toLocaleString() : "未提供"}` : stored ? "暂未读到本机 Cookie。可打开此账号确认登录后再查看。" : "本机 Cookie 状态暂不可用。"}</div>
         <label for="account-cookie-input">Cookie</label>
-        <textarea id="account-cookie-input" class="modal-input account-cookie-input" placeholder="在这里粘贴 JSON、Netscape 或 Cookie 请求头" spellcheck="false" autocomplete="off" autocapitalize="off" ${busy ? "readonly" : ""}></textarea>
+        <textarea id="account-cookie-input" class="modal-input account-cookie-input" placeholder="粘贴 Cookie 或带来源的会话 Token JSON" spellcheck="false" autocomplete="off" autocapitalize="off" ${busy ? "readonly" : ""}></textarea>
+        <details><summary>会话 Token 格式</summary><div class="modal-desc">填写真实导出信息。JSON 需要 type 为 session-cookie-token、provider 为 muse 或 hark，以及 cookieName、domain、token。可填写 Unix 秒 expirationDate。</div></details>
         <div id="account-cookie-preview" role="status">${preview ? `
           共 ${preview.count} 条 · ${escapeHtml(preview.domains.join("、"))}
           <div>最早已知到期 ${preview.nextExpiry ? new Date(preview.nextExpiry * 1000).toLocaleString() : "未提供"}</div>
@@ -3208,7 +3265,7 @@ function renderModal(provider: ProviderInfo): string {
           <div class="modal-desc">每个账号拥有独立隔离的登录态。备注可留空，登录成功后将自动显示邮箱名称。</div>
           <input id="modal-alias-input" class="modal-input" maxlength="60" placeholder="备注名称（留空则自动获取登录邮箱）" value="${escapeHtml(modal.draft)}" />
           ${snapshot?.platform === "ios" ? `<label for="add-cookie-input">导入 Cookie（可选）</label>
-            <textarea id="add-cookie-input" class="modal-input account-cookie-input" placeholder="粘贴 JSON、Netscape 或 Cookie 请求头" autocomplete="off" autocapitalize="off" spellcheck="false"></textarea>
+            <textarea id="add-cookie-input" class="modal-input account-cookie-input" placeholder="粘贴 Cookie 或带来源的会话 Token JSON" autocomplete="off" autocapitalize="off" spellcheck="false"></textarea>
             <button id="add-cookie-preview" class="btn" type="button">预览 Cookie</button>` : ""}
           <div id="add-account-result" role="status"></div>
           <div class="modal-footer">
@@ -4500,10 +4557,13 @@ function bindDelegatedEvents(): void {
         }
         break;
       case "account-fingerprint-start":
-        if (modal.kind === "tasks" && modal.account.providerId === "muse") await runSpikeFingerprint(modal);
+        if (modal.kind === "tasks") {
+          if (modal.account.providerId === "muse") await runSpikeFingerprint(modal);
+          else await runHarkFingerprint(modal.account, false, modal);
+        }
         break;
       case "account-fingerprint-save": {
-        if (modal.kind !== "tasks" || modal.account.providerId !== "muse") break;
+        if (modal.kind !== "tasks") break;
         const view = modal;
         const model = document.querySelector<HTMLInputElement>("#account-fingerprint-model");
         const period = document.querySelector<HTMLInputElement>("#account-fingerprint-period");
@@ -4517,7 +4577,7 @@ function bindDelegatedEvents(): void {
         if (button) button.disabled = true;
         try {
           snapshot = await invoke<ManagerSnapshot>("set_muse_fingerprint_settings", {
-            uuid: view.account.uuid, manualModel: model?.value.trim() || null, intervalDays: days || null,
+            uuid: view.account.uuid, providerId:view.account.providerId, manualModel: model?.value.trim() || null, intervalDays: days || null,
           });
           if (modal === view) {
             render();
@@ -4611,6 +4671,16 @@ function bindDelegatedEvents(): void {
         break;
       case "backup-preview":
         if (modal.kind === "backup") await accountBackupAction(modal, "preview");
+        break;
+      case "backup-protection":
+        if (modal.kind === "backup") {
+          const view = modal;
+          try {
+            const result = await invoke<{ files:{file:string;status:string}[] }>("local_data_protection");
+            view.message = result.files.map((entry) => `${entry.file} · ${entry.status}`).join(" ｜ ");
+          } catch (error) { view.message = String(error); }
+          if (modal === view) render();
+        }
         break;
       case "backup-merge":
         if (modal.kind === "backup") await accountBackupAction(modal, "merge");
@@ -4930,6 +5000,12 @@ async function bootstrap(): Promise<void> {
       .catch(() => { /* The active command also returns the authoritative room state. */ });
   });
 
+  await listen<number>("proxy-pool-binding-changed", ({ payload }) => {
+    if (!snapshot || !payload) return;
+    snapshot = { ...snapshot, notice: `${payload} 个账号的原代理池条目已变化。当前保留原账号代理配置。` };
+    render();
+  });
+
   await listen<ManagerSnapshot>("manager-state-changed", (event) => {
     const received = Date.now();
     saveScrollPosition();
@@ -5087,6 +5163,7 @@ async function bootstrap(): Promise<void> {
   // active again (foreground / focus). No periodic background sync.
   triggerAutoSync();
   if (snapshot.platform === "ios") {
+    void invoke("local_data_protection").catch(() => {});
     foregroundTaskTimer = window.setInterval(() => {
       void refreshForegroundTask();
       void triggerAutomaticFingerprint();
@@ -5107,7 +5184,13 @@ async function bootstrap(): Promise<void> {
       if (spikeLive?.running) void refreshSpikeLive();
       if (modal.kind === "tasks") void checkAccountTasks(modal);
       else void refreshForegroundTask();
-    }
+    } else if (snapshot?.platform === "ios") void invoke("stop_foreground_task_watch").catch(() => {});
+  });
+  window.addEventListener("offline", () => { if (snapshot?.platform === "ios") void invoke("stop_foreground_task_watch").catch(() => {}); });
+  window.addEventListener("online", () => {
+    taskRetryAt.clear();
+    taskWatchFailures.clear();
+    void refreshForegroundTask();
   });
   window.addEventListener("focus", () => triggerAutoSync());
   setTimeout(() => {

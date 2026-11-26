@@ -97,6 +97,7 @@ fn now() -> u64 {
 }
 
 impl ProxyPool {
+  pub fn contains(&self, id: Uuid) -> bool { self.entries.iter().any(|entry| entry.id == id) }
   pub fn read(secrets: &Secrets) -> Result<Self, String> {
     let Some(raw) = secrets.get(KEYCHAIN_KEY)?.map(Zeroizing::new) else { return Ok(Self::default()); };
     serde_json::from_str(&raw).map_err(|_| "代理池数据无法读取".into())
@@ -127,7 +128,8 @@ impl ProxyPool {
 
   pub fn push_restored(view: &mut PoolView, restored: &[ProxyPoolProfile]) {
     for row in restored {
-      if view.entries.iter().any(|entry| entry.endpoint == row.endpoint && entry.requires_auth == row.requires_auth) {
+      if view.entries.iter().any(|entry| entry.id == restored_entry_id(row)
+        || (row.entry_id.is_none() && entry.endpoint == row.endpoint && entry.requires_auth == row.requires_auth)) {
         continue;
       }
       view.entries.push(EntryView {
@@ -140,7 +142,7 @@ impl ProxyPool {
   #[cfg(target_os = "ios")]
   pub fn backup_metadata(&self) -> Result<Vec<ProxyPoolProfile>, String> {
     Ok(self.view()?.entries.into_iter().map(|entry| ProxyPoolProfile {
-      endpoint: entry.endpoint, requires_auth: entry.requires_auth,
+      entry_id:Some(entry.id), endpoint: entry.endpoint, requires_auth: entry.requires_auth,
     }).collect())
   }
 
@@ -249,6 +251,7 @@ async fn fetch_source(url: Url) -> Result<Vec<String>, String> {
 }
 
 pub fn restored_entry_id(entry: &ProxyPoolProfile) -> Uuid {
+  if let Some(id) = entry.entry_id { return id; }
   let key = format!("restored-proxy|{}|{}", entry.endpoint, entry.requires_auth);
   let digest = ring::digest::digest(&ring::digest::SHA256, key.as_bytes());
   let mut bytes = [0; 16];
@@ -259,6 +262,19 @@ pub fn restored_entry_id(entry: &ProxyPoolProfile) -> Uuid {
 #[cfg(test)]
 mod tests {
   use super::*;
+
+  #[test]
+  fn source_refresh_keeps_only_identical_credential_bindings() {
+    let mut pool = ProxyPool::default();
+    let source = Uuid::new_v4();
+    let initial = parse_lines("socks5://user:one@proxy.example:1080\nhttp://other.example:8888").unwrap();
+    pool.replace_entries(Some(source), initial).unwrap();
+    let original = pool.entries[0].id;
+    let stable = pool.entries[1].id;
+    pool.replace_entries(Some(source), parse_lines("socks5://user:two@proxy.example:1080\nhttp://other.example:8888").unwrap()).unwrap();
+    assert!(!pool.contains(original));
+    assert!(pool.contains(stable));
+  }
 
   #[test]
   fn validates_entire_batch_and_redacts_credentials() {

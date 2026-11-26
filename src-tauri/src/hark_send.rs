@@ -1,4 +1,4 @@
-use crate::{hark_native::checked_json, probe_cancel::CancelToken, send_ledger::SendLedger};
+use crate::{hark_native::checked_json, probe_cancel::CancelToken, send_ledger::{MissionGuard, SendLedger}};
 use reqwest::{header::{HeaderValue, ACCEPT, CONTENT_TYPE, COOKIE, ORIGIN, REFERER}, Client, Method, RequestBuilder};
 use serde::Serialize;
 use serde_json::{json, Value};
@@ -12,6 +12,8 @@ pub struct SendReport {
   pub confirmed: bool,
   pub response_seen: bool,
   pub http_status: Option<u16>,
+  #[serde(skip)]
+  pub completed_text: Option<String>,
 }
 
 pub(crate) struct Transport<'a> {
@@ -67,9 +69,9 @@ fn receipt(payload: &Value, conversation: &str, key: &str, reply: &str) -> bool 
 }
 
 pub(crate) async fn send_isolated(
-  transport: Transport<'_>, ledger: &SendLedger, account: &str, text: &str, mut token: CancelToken,
+  transport: &Transport<'_>, ledger: &SendLedger, mission: &MissionGuard<'_>, text: &str, token: &mut CancelToken,
+  collect_limit: std::time::Duration, diagnostic: bool,
 ) -> Result<SendReport, String> {
-  let mission = ledger.mission(account).map_err(|_| "该账号有其他发送任务或台账不可用")?;
   let setup = async {
     let old = transport.projects().await?;
     let main = transport.read(transport.request(Method::GET, "/conversations/main", &[("timezone", transport.timezone)])?).await?;
@@ -94,7 +96,8 @@ pub(crate) async fn send_isolated(
     _ = token.cancelled() => return Err("会话准备取消，尚未发送".into()),
     result = tokio::time::timeout(std::time::Duration::from_secs(35), setup) => result.map_err(|_| "会话准备超时，尚未发送")??,
   };
-  let send_id = mission.begin_hark_send(&conversation, &crate::rooms::digest_bytes(text.as_bytes())).map_err(|_| "无法写入发送台账")?;
+  let send_id = mission.begin_hark_send(&conversation, &crate::rooms::digest_bytes(text.as_bytes()), diagnostic)
+    .map_err(|_| "无法写入发送台账")?;
   let reply_id = response_id(&send_id)?;
   if token.is_cancelled() {
     ledger.fail(&send_id, "尚未发送".into());
@@ -115,27 +118,34 @@ pub(crate) async fn send_isolated(
     response = exchange => response,
   };
   let mut report = SendReport { conversation_id:conversation.clone(), send_id:send_id.clone(), confirmed:false,
-    response_seen:false, http_status:result.as_ref().map(|r|r.0) };
-  if result.and_then(|r| r.1).is_some_and(|payload| receipt(&payload, &conversation, &send_id, &reply_id)) {
+    response_seen:false, http_status:result.as_ref().map(|r|r.0), completed_text:None };
+  if !diagnostic && result.and_then(|r| r.1).is_some_and(|payload| receipt(&payload, &conversation, &send_id, &reply_id)) {
     ledger.confirm(&send_id);
     report.confirmed = true;
   }
-  if !token.is_cancelled() {
-    let manager = Uuid::new_v4().to_string();
-    let poll = transport.read(transport.request(Method::GET, "/sync/poll",
-      &[("conversationId", conversation.as_str()), ("manager", manager.as_str()),
-        ("v","2"), ("mode","in_tab"), ("dial","initial"), ("first","1")])?);
-    let snapshot = tokio::select! {
-      biased;
-      _ = token.cancelled() => None,
-      result = poll => result.ok(),
-    };
-    report.response_seen = snapshot.is_some_and(|data| crate::hark_native::bound_reply_seen(&data, &conversation, &reply_id));
-    if !report.confirmed && report.response_seen {
-      ledger.confirm(&send_id);
-      report.confirmed = true;
+  let _ = tokio::time::timeout(collect_limit, async {
+    while !token.is_cancelled() {
+      let manager = Uuid::new_v4().to_string();
+      let Ok(req) = transport.request(Method::GET, "/sync/poll",
+        &[("conversationId", conversation.as_str()), ("manager", manager.as_str()),
+          ("v","2"), ("mode","in_tab"), ("dial","initial"), ("first","1")]) else { break; };
+      let snapshot = tokio::select! {
+        biased;
+        _ = token.cancelled() => break,
+        result = transport.read(req) => result.ok(),
+      };
+      if let Some(data) = snapshot {
+        let (seen, completed_text) = crate::hark_native::bound_reply(&data, &conversation, &reply_id);
+        report.response_seen |= seen;
+        if !report.confirmed && seen && (!diagnostic || completed_text.is_some()) {
+          ledger.confirm(&send_id);
+          report.confirmed = true;
+        }
+        if completed_text.is_some() { report.completed_text = completed_text; break; }
+      }
+      tokio::time::sleep(std::time::Duration::from_secs(2)).await;
     }
-  }
+  }).await;
   if !report.confirmed { ledger.mark_unknown(&send_id, "未取得可关联的回执，禁止自动重发".into()); }
   if ledger.is_poisoned() { return Err("Hark 请求结果已产生，但台账写入失败。请核对隔离会话。".into()); }
   Ok(report)
@@ -148,12 +158,13 @@ mod tests {
 
   #[tokio::test]
   async fn sends_once_to_new_project_and_marks_an_unbound_ack_unknown() {
-    for created in ["new", "main"] {
+    for (created, completed) in [("new",false), ("main",false), ("new",true)] {
       let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
       let origin = format!("http://{}", listener.local_addr().unwrap());
       let server = tokio::spawn(async move {
         let rounds = if created == "new" { 6 } else { 3 };
         let mut title = String::new();
+        let mut reply_id = String::new();
         for index in 0..rounds {
           let (mut conn, _) = listener.accept().await.unwrap();
           let mut input = Vec::new();
@@ -187,24 +198,38 @@ mod tests {
               let payload: Value = serde_json::from_slice(&body).unwrap();
               assert_eq!(payload["conversationId"], "new");
               assert_ne!(payload["idempotencyKey"], payload["responseMessageId"]);
+              reply_id = payload["responseMessageId"].as_str().unwrap().into();
               json!({"conversationId":"main","responseMessageId":payload["responseMessageId"]})
             }
-            5 => { assert!(line.starts_with("GET /api/sync/poll?conversationId=new")); json!({"frames":[]}) }
+            5 => {
+              assert!(line.starts_with("GET /api/sync/poll?conversationId=new"));
+              if completed {
+                let frame = json!({"type":"snapshot","conversationId":"new","data":{"messages":[{
+                  "id":reply_id, "role":"assistant", "jobStatus":"completed", "content":"OK"
+                }]}}).to_string();
+                json!({"frames":[frame]})
+              } else { json!({"frames":[]}) }
+            }
             _ => unreachable!(),
           }.to_string();
           conn.write_all(format!("HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}", response.len(), response).as_bytes()).await.unwrap();
         }
       });
       let registry = crate::probe_cancel::ProbeCancel::new();
-      let (token, _guard) = registry.register("account", "hark");
+      let (mut token, _guard) = registry.register("account", "hark");
       let ledger = SendLedger::new();
+      let mission = ledger.mission("account").unwrap();
       let transport = Transport { client:Client::builder().no_proxy().timeout(std::time::Duration::from_secs(2)).build().unwrap(),
         cookie:HeaderValue::from_static("mock=1"), timezone:"UTC", origin:&origin };
-      let result = send_isolated(transport, &ledger, "account", "Test", token).await;
+      let result = send_isolated(&transport, &ledger, &mission, "Test", &mut token, std::time::Duration::from_millis(500), true).await;
       if created == "new" {
-        assert!(!result.unwrap().confirmed);
+        let report = result.unwrap();
+        assert_eq!(report.confirmed, completed);
+        assert_eq!(crate::hark_isolation_proved(&ledger, "account"), completed);
         assert_eq!(ledger.attempts().len(), 1);
-        assert_eq!(ledger.attempts()[0].status, crate::send_ledger::SendStatus::Unknown);
+        assert_eq!(report.completed_text.as_deref(), if completed { Some("OK") } else { None });
+        assert_eq!(ledger.attempts()[0].status,
+          if completed { crate::send_ledger::SendStatus::Confirmed } else { crate::send_ledger::SendStatus::Unknown });
       } else {
         assert!(result.is_err());
         assert!(ledger.attempts().is_empty());

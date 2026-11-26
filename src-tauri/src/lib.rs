@@ -350,13 +350,21 @@ async fn observe_account_tasks(
   uuid: String,
   timezone: String,
   automatic: Option<bool>,
+  tier: Option<String>,
 ) -> Result<serde_json::Value, String> {
   #[cfg(target_os = "ios")]
   {
+    let automatic = automatic.unwrap_or(false);
+    let (mode, watch_seconds) = match tier.as_deref().unwrap_or("watch") {
+      "live" => ("live", 18),
+      "watch" => ("watch", 5),
+      "idle" => ("idle", 2),
+      _ => return Err("任务监听档位无效".into()),
+    };
     let provider = providers::ProviderId::parse(&provider_id).ok_or("服务标识无效")?;
     let uuid = storage::normalize_uuid(&uuid).ok_or("账号标识无效")?;
     let proxy_lock = mgr.proxy_write_lock.lock().await;
-    let (mut token, _guard) = cancel.register(&uuid, "product_task_watch");
+    let (mut token, _guard) = cancel.register(&uuid, if automatic { "product_automatic_watch" } else { "product_task_watch" });
     let snapshot = mgr.get_snapshot().await;
     drop(proxy_lock);
     let account = snapshot.accounts.iter().find(|account| account.provider_id == provider && account.uuid == uuid
@@ -370,7 +378,7 @@ async fn observe_account_tasks(
       || !timezone.bytes().all(|b| b.is_ascii_alphanumeric() || b"/_+-".contains(&b)) {
       return Err("系统时区格式无效".into());
     }
-    if automatic.unwrap_or(false)
+    if automatic
       && (!account.task_notifications || !platform::ios::automatic_task_polling_available(&app).await?)
     {
       return Err("自动任务检测暂缓".into());
@@ -386,7 +394,7 @@ async fn observe_account_tasks(
       let native = Box::pin(async {
         match provider {
           providers::ProviderId::Muse => {
-            let probe = Box::pin(muse_native::watch_probe(&app, "muse", &uuid, 5, proxy.as_ref())).await
+            let probe = Box::pin(muse_native::watch_probe(&app, "muse", &uuid, watch_seconds, proxy.as_ref())).await
               .ok().filter(|probe| probe.status.is_some_and(|status| (200..300).contains(&status)));
             probe.map_or((None, Vec::new()), |probe| {
               (probe.ok.then_some(probe.summary.activity).flatten(), probe.completed_ids)
@@ -421,18 +429,21 @@ async fn observe_account_tasks(
           tokio::join!(native, approval_poll)
         })) => status.unwrap_or_default(),
       };
+      if automatic && !platform::ios::automatic_task_polling_available(&app).await? {
+        return Err("系统已暂停自动任务监听".into());
+      }
       mgr.record_task_observations(&app, provider, &uuid, &completed, approvals.as_deref()).await?;
       if let Some(activity) = native {
-        return Ok(serde_json::json!({ "activity": activity, "source": "native", "observedAtMs": storage::now_ms() }));
+        return Ok(serde_json::json!({ "activity": activity, "source": "native", "observedAtMs": storage::now_ms(), "tier":mode }));
       }
       if provider == providers::ProviderId::Muse && !token.is_cancelled() {
         let fallback = tokio::time::timeout(std::time::Duration::from_secs(3), platform::ios::read_parked_task_state(&app, &uuid))
           .await.ok().and_then(Result::ok).flatten();
         if let Some(activity) = fallback {
-          return Ok(serde_json::json!({ "activity": activity, "source": "page", "observedAtMs": storage::now_ms() }));
+          return Ok(serde_json::json!({ "activity": activity, "source": "page", "observedAtMs": storage::now_ms(), "tier":mode }));
         }
       }
-      Ok(serde_json::json!({ "activity": "unknown", "source": null, "observedAtMs": null }))
+      Ok(serde_json::json!({ "activity": "unknown", "source": null, "observedAtMs": null, "tier":mode }))
     });
     observation.await.map_err(|_| "任务检测未能完成".to_string())?
   }
@@ -440,6 +451,12 @@ async fn observe_account_tasks(
   {
     Err("此功能需要 iOS".into())
   }
+}
+
+#[tauri::command]
+async fn stop_foreground_task_watch(mgr: State<'_, Arc<SessionManager>>, cancel: State<'_, Arc<probe_cancel::ProbeCancel>>) -> Result<(), String> {
+  for account in mgr.get_snapshot().await.accounts { cancel.cancel_kind(&account.uuid, "product_automatic_watch"); }
+  Ok(())
 }
 
 #[tauri::command]
@@ -812,6 +829,18 @@ async fn preview_account_backup(
 }
 
 #[tauri::command]
+#[cfg_attr(not(target_os = "ios"), allow(unused_variables))]
+async fn local_data_protection(app: AppHandle) -> Result<serde_json::Value, String> {
+  #[cfg(target_os = "ios")]
+  {
+    let path = app.path().app_data_dir().map_err(|_| "无法读取应用目录")?;
+    platform::ios::enforce_local_data_protection(&app, path.to_str().ok_or("本机资料路径无效")?).await
+  }
+  #[cfg(not(target_os = "ios"))]
+  Err("此检查需要 iOS".into())
+}
+
+#[tauri::command]
 async fn restore_room_backup(
   app: AppHandle, room_gate: State<'_, rooms::RoomGate>, encrypted: String, password: String,
   overwrite: bool, room_checksum: String,
@@ -1042,7 +1071,7 @@ struct FingerprintGate(tokio::sync::Mutex<()>);
 
 #[tauri::command]
 async fn set_muse_fingerprint_settings(
-  app: AppHandle, uuid: String, manual_model: Option<String>, interval_days: Option<u8>,
+  app: AppHandle, uuid: String, provider_id: Option<String>, manual_model: Option<String>, interval_days: Option<u8>,
   mgr: State<'_, Arc<SessionManager>>, cancel: State<'_, Arc<probe_cancel::ProbeCancel>>,
 ) -> Result<ManagerSnapshot, String> {
   let uuid = storage::normalize_uuid(&uuid).ok_or("账号标识无效")?;
@@ -1051,7 +1080,8 @@ async fn set_muse_fingerprint_settings(
     || interval_days.is_some_and(|days| !(1..=90).contains(&days)) {
     return Err("模型名称最长 80 字，自动重测间隔为 1–90 天".into());
   }
-  let snapshot = mgr.save_muse_fingerprint_settings(&app, &uuid, manual_model, interval_days).await?;
+  let provider = providers::ProviderId::parse(provider_id.as_deref().unwrap_or("muse")).ok_or("服务标识无效")?;
+  let snapshot = mgr.save_fingerprint_settings(&app, provider, &uuid, manual_model, interval_days).await?;
   if interval_days.is_none() { cancel.cancel_kind(&uuid, "fingerprint_automatic"); }
   Ok(snapshot)
 }
@@ -1130,7 +1160,7 @@ async fn muse_native_fingerprint_probe(
     (guard, reason)
   };
   #[cfg(target_os = "ios")]
-  if automatic { mgr.claim_automatic_fingerprint(&uuid).await?; }
+  if automatic { mgr.claim_automatic_fingerprint(providers::ProviderId::Muse, &uuid).await?; }
 
   let result = Box::pin(muse_native::fingerprint_probe(
     &app,
@@ -1171,7 +1201,7 @@ async fn muse_native_fingerprint_probe(
     reference_sha256: scored.and_then(|record| record.reference_sha256.clone()),
     method: scored.filter(|record| !record.method.is_empty()).map(|record| record.method.clone()),
   };
-  mgr.archive_muse_fingerprint(&app, &uuid, entry).await
+  mgr.archive_fingerprint(&app, providers::ProviderId::Muse, &uuid, entry).await
     .map_err(|_| "检测已结束，但账号指纹记录未能保存".to_string())?;
   Ok(result)
 }
@@ -1226,16 +1256,112 @@ async fn hark_isolated_send_probe(
     }
     let timezone = storage::normalize_account_timezone(account.timezone.as_deref().unwrap_or(&timezone))?
       .unwrap_or_else(|| "UTC".into());
-    let (token, _guard) = cancel.register_task(&uuid, "hark_send", task_id);
+    let (mut token, _guard) = cancel.register_task(&uuid, "hark_send", task_id);
     drop(proxy_guard);
     let (client, cookie) = hark_native::account_http(&app, &uuid, account.proxy.as_ref()).await?;
     let transport = hark_send::Transport { client, cookie, timezone:&timezone, origin:"https://app.hark.com" };
     if token.is_cancelled() { return Err("已取消，未发送".into()); }
-    let report = Box::pin(hark_send::send_isolated(transport, &ledger, &uuid, "这是叠号的隔离测试。请只回复 OK。", token)).await?;
+    let mission = ledger.mission(&uuid).map_err(|_| "该账号有其他发送任务或台账不可用")?;
+    let report = Box::pin(hark_send::send_isolated(&transport, &ledger, &mission, "这是叠号的隔离测试。请只回复 OK。", &mut token,
+      std::time::Duration::from_secs(55), true)).await?;
     serde_json::to_value(report).map_err(|_| "无法呈现诊断结果".into())
   }
   #[cfg(not(target_os = "ios"))]
   Err("Hark 隔离验证需要 iOS".into())
+}
+
+#[tauri::command]
+fn hark_fingerprint_ready(uuid: String, ledger: State<'_, Arc<send_ledger::SendLedger>>) -> bool {
+  let Some(uuid) = storage::normalize_uuid(&uuid) else { return false; };
+  hark_isolation_proved(&ledger, &uuid)
+}
+
+fn hark_isolation_proved(ledger: &send_ledger::SendLedger, uuid: &str) -> bool {
+  ledger.attempts().iter().any(|entry| entry.account_uuid == uuid
+    && entry.kind == send_ledger::SendKind::HarkVerifiedProbe && entry.status == send_ledger::SendStatus::Confirmed)
+}
+
+#[tauri::command]
+#[cfg_attr(not(target_os = "ios"), allow(unused_variables))]
+async fn hark_fingerprint_probe(
+  app: AppHandle, uuid: String, timezone: String, task_id: uuid::Uuid, automatic: bool,
+  mgr: State<'_, Arc<SessionManager>>, ledger: State<'_, Arc<send_ledger::SendLedger>>,
+  cancel: State<'_, Arc<probe_cancel::ProbeCancel>>, gate: State<'_, FingerprintGate>, rooms_gate: State<'_, rooms::RoomGate>,
+) -> Result<serde_json::Value, String> {
+  #[cfg(target_os = "ios")]
+  {
+    use muse_native_client::fingerprint::{self, FingerprintDetector, FingerprintResult, Sample};
+    use storage::{AuthState, FingerprintRecord};
+    use std::time::Duration;
+    let uuid = storage::normalize_uuid(&uuid).ok_or("账号标识无效")?;
+    if !hark_isolation_proved(&ledger, &uuid) {
+      return Err("该 Hark 账号需要先完成隔离发送验证并收到本轮的完整关联回复".into());
+    }
+    let _exclusive = gate.0.try_lock().map_err(|_| "已有房间或指纹任务运行")?;
+    let proxy_guard = mgr.proxy_write_lock.lock().await;
+    let snapshot = mgr.get_snapshot().await;
+    let provider = providers::ProviderId::Hark;
+    let account = snapshot.accounts.iter().find(|account| account.uuid == uuid
+      && account.provider_id == provider && account.auth_state == AuthState::Authenticated).ok_or("请先登录该 Hark 账号")?;
+    if snapshot.conflicts.iter().any(|item| item.uuid == uuid) || snapshot.pending_cleanup.iter().any(|key| key.uuid == uuid) {
+      return Err("请先处理账号归属或清理状态".into());
+    }
+    if automatic {
+      let _rooms = rooms_gate.0.lock().await;
+      let path = app.path().app_data_dir().map_err(|_| "无法读取应用目录")?.join("rooms-v1.json");
+      if rooms::apply(&path, rooms::Command::List, &snapshot.accounts, false)?.has_active_room() {
+        return Err("房间正在运行，自动重测暂缓".into());
+      }
+    }
+    let timezone = storage::normalize_account_timezone(account.timezone.as_deref().unwrap_or(&timezone))?
+      .unwrap_or_else(|| "UTC".into());
+    let (mut token, _guard) = cancel.register_task(&uuid, if automatic { "fingerprint_automatic" } else { "fingerprint" }, task_id);
+    drop(proxy_guard);
+    let worker = Arc::clone(cancel.inner());
+    let account_id = uuid.clone();
+    let interrupted = tauri::ipc::Channel::new(move |_| { worker.cancel_task(&account_id, task_id); Ok(()) });
+    let _foreground = platform::ios::keep_fingerprint_foreground(&app, task_id.to_string(), interrupted)
+      .await.map_err(|_| "Hark 指纹需要在前台运行")?;
+    if automatic { mgr.claim_automatic_fingerprint(provider, &uuid).await?; }
+    let detector = tokio::task::spawn_blocking(FingerprintDetector::load).await
+      .map_err(|_| "指纹参考库加载任务失败")?.map_err(|e| e.to_string())?;
+    let (client, cookie) = hark_native::account_http(&app, &uuid, account.proxy.as_ref()).await?;
+    let transport = hark_send::Transport { client, cookie, timezone:&timezone, origin:"https://app.hark.com" };
+    let probes = fingerprint::generate_probes().map_err(|e| e.to_string())?;
+    let mission = ledger.mission(&uuid).map_err(|_| "该账号有其他发送任务或台账不可用")?;
+    let mut samples = Vec::new();
+    let mut stop_reason = None;
+    for probe in probes {
+      if token.is_cancelled() { stop_reason = Some("指纹已停止".to_string()); break; }
+      match Box::pin(hark_send::send_isolated(&transport, &ledger, &mission, &probe.prompt, &mut token,
+        Duration::from_secs(90), false)).await {
+        Ok(report) if report.confirmed => {
+          if let Some(text) = report.completed_text.filter(|text| fingerprint::check_sample(text, probe.expected_count).accepted) {
+            samples.push(Sample { text, expected_count:probe.expected_count });
+          } else { stop_reason = Some("未收到足以入样的本轮完整回复，后续探针已停止".into()); break; }
+        }
+        Ok(_) => { stop_reason = Some("发送结果未知，后续探针已停止".into()); break; }
+        Err(error) => { stop_reason = Some(error); break; }
+      }
+    }
+    let result = tokio::task::spawn_blocking(move || detector.score(&samples).unwrap_or_else(|e| FingerprintResult::indeterminate(e.to_string(), String::new())))
+      .await.map_err(|_| "本地评分任务失败")?;
+    let entry = FingerprintRecord {
+      task_id, recorded_at_ms:storage::now_ms(), verdict:result.verdict.as_str().into(),
+      model:(!result.prediction.is_empty()).then(|| result.prediction.clone()),
+      family:(!result.family_prediction.is_empty()).then(|| result.family_prediction.clone()),
+      probability_ppm:result.probability.filter(|p| result.identification && result.calibrated && (0.0..=1.0).contains(p))
+        .map(|p| (p * 1_000_000.0).round() as u32),
+      valid_samples:result.used_samples,
+      reference_built_at:(!result.reference_built_at.is_empty()).then(|| result.reference_built_at.clone()),
+      reference_sha256:result.reference_sha256.clone(),
+      method:Some(format!("hark-isolated/{}", result.method)),
+    };
+    mgr.archive_fingerprint(&app, provider, &uuid, entry).await?;
+    Ok(serde_json::json!({"result":result,"stopReason":stop_reason}))
+  }
+  #[cfg(not(target_os = "ios"))]
+  Err("Hark 指纹需要 iOS".into())
 }
 
 #[tauri::command]
@@ -1328,6 +1454,7 @@ pub struct WebviewProxyView {
 #[derive(serde::Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ProxySettingView {
+  pub pool_entry_id: Option<uuid::Uuid>,
   pub enabled: bool,
   pub display: String,
   pub has_credentials: bool,
@@ -1381,6 +1508,12 @@ async fn manage_proxy_pool(
   let dir = app.path().app_data_dir().map_err(|_| "无法读取应用目录")?;
   let secrets = secrets::Secrets::new(&dir);
   let mut pool = proxy_pool::ProxyPool::read(&secrets)?;
+  let before = if matches!(action.as_str(), "remove" | "subscribe" | "refresh") {
+    mgr.get_snapshot().await.accounts.into_iter().filter_map(|account| {
+      let id = account.proxy.and_then(|proxy| proxy.pool_entry_id)?;
+      pool.contains(id).then_some(id)
+    }).collect::<Vec<_>>()
+  } else { Vec::new() };
   let input = input.map(zeroize::Zeroizing::new);
   match action.as_str() {
     "list" => {}
@@ -1409,6 +1542,11 @@ async fn manage_proxy_pool(
   }
   let mut view = pool.view()?;
   proxy_pool::ProxyPool::push_restored(&mut view, &mgr.restored_proxy_metadata().await);
+  let missing = before.into_iter().filter(|id| !pool.contains(*id)).count();
+  if missing != 0 {
+    use tauri::Emitter;
+    let _ = app.emit("proxy-pool-binding-changed", missing);
+  }
   Ok(view)
 }
 
@@ -1422,8 +1560,8 @@ async fn apply_proxy_pool_entry(
   uuid: String,
   entry_id: uuid::Uuid,
 ) -> Result<ProxySettingView, String> {
+  let _guard = gate.0.lock().await;
   let entry = {
-    let _guard = gate.0.lock().await;
     let dir = app.path().app_data_dir().map_err(|_| "无法读取应用目录")?;
     let secrets = secrets::Secrets::new(&dir);
     let pool = proxy_pool::ProxyPool::read(&secrets)?;
@@ -1439,7 +1577,7 @@ async fn apply_proxy_pool_entry(
       }
     }
   };
-  muse_native_set_account_proxy(app, provider_id, uuid, entry.endpoint, entry.username, entry.password, true, mgr, cancel).await
+  save_account_proxy(app, provider_id, uuid, entry.endpoint, entry.username, entry.password, true, mgr, cancel, Some(entry_id)).await
 }
 
 #[tauri::command]
@@ -1492,6 +1630,15 @@ async fn muse_native_set_account_proxy(
   mgr: State<'_, Arc<SessionManager>>,
   cancel: State<'_, Arc<probe_cancel::ProbeCancel>>,
 ) -> Result<ProxySettingView, String> {
+  save_account_proxy(app, provider_id, uuid, uri, username, password, enabled, mgr, cancel, None).await
+}
+
+async fn save_account_proxy(
+  app: AppHandle, provider_id: String, uuid: String, uri: String,
+  username: Option<String>, password: Option<String>, enabled: bool,
+  mgr: State<'_, Arc<SessionManager>>, cancel: State<'_, Arc<probe_cancel::ProbeCancel>>,
+  pool_entry_id: Option<uuid::Uuid>,
+) -> Result<ProxySettingView, String> {
   let pid = providers::ProviderId::parse(&provider_id)
     .ok_or_else(|| format!("未知 provider: {provider_id}"))?;
   let _write = mgr.proxy_write_lock.lock().await;
@@ -1502,6 +1649,12 @@ async fn muse_native_set_account_proxy(
     || !snapshot.accounts.iter().any(|account| account.provider_id == pid && account.uuid == uuid)
   {
     return Err("该账号不可用，未修改代理".to_string());
+  }
+  if let Some(id) = pool_entry_id {
+    if snapshot.accounts.iter().any(|account| account.uuid != uuid && account.proxy.as_ref()
+      .is_some_and(|proxy| proxy.pool_entry_id == Some(id))) {
+      return Err("该池条目已绑定另一个账号，请选择其他代理".into());
+    }
   }
   let uri = uri.trim().to_string();
   if let Some(ui) = uri_userinfo(&uri) {
@@ -1523,6 +1676,7 @@ async fn muse_native_set_account_proxy(
 
   // 先构造并校验设置，再落凭据，避免把半成品写进 Keychain。
   let setting = storage::ProxySetting {
+    pool_entry_id,
     uri: uri.clone(),
     username,
     credential_ref: if has_user { Some(reference.clone()) } else { None },
@@ -1576,6 +1730,7 @@ async fn muse_native_set_account_proxy(
   }
 
   Ok(ProxySettingView {
+    pool_entry_id,
     enabled: setting.enabled,
     display: setting.display_safe(),
     has_credentials: setting.credential_ref.is_some(),
@@ -1601,6 +1756,7 @@ async fn muse_native_get_account_proxy(
   let dir = app.path().app_data_dir().map_err(|e| e.to_string())?;
   let secrets = secrets::Secrets::new(&dir);
   Ok(setting.map(|s| ProxySettingView {
+    pool_entry_id: s.pool_entry_id,
     enabled: s.enabled,
     display: s.display_safe(),
     has_credentials: s.credential_ref.is_some(),
@@ -1836,6 +1992,7 @@ pub fn run() {
       preview_account_cookies,
       export_account_backup,
       preview_account_backup,
+      local_data_protection,
       restore_account_backup,
       restore_room_backup,
       transfer_account_cookies,
@@ -1850,9 +2007,12 @@ pub fn run() {
       muse_native_diagnose,
       muse_native_watch_probe,
       observe_account_tasks,
+      stop_foreground_task_watch,
       set_account_task_notifications,
       hark_native_watch_probe,
       hark_isolated_send_probe,
+      hark_fingerprint_ready,
+      hark_fingerprint_probe,
       hark_recover_replies,
       muse_native_approvals_probe,
       decide_muse_approval,

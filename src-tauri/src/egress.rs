@@ -603,6 +603,7 @@ mod tests {
     let secrets = Secrets::new(&dir);
     assert!(!AccountEgress::resolve(None, &secrets).unwrap().is_proxy());
     let disabled = ProxySetting {
+      pool_entry_id: None,
       uri: "socks5://h:1080".to_string(),
       username: None,
       credential_ref: None,
@@ -617,6 +618,7 @@ mod tests {
     let dir = std::env::temp_dir().join(format!("egress-test-{}", uuid::Uuid::new_v4()));
     let secrets = Secrets::new(&dir);
     let setting = ProxySetting {
+      pool_entry_id: None,
       uri: "socks5://alice@p.example:1080".to_string(),
       username: None,
       credential_ref: Some("missing-ref".to_string()),
@@ -633,6 +635,7 @@ mod tests {
     let secrets = Secrets::new(&dir);
     secrets.set("ref-1", "p@ss").unwrap();
     let setting = ProxySetting {
+      pool_entry_id: None,
       uri: "socks5://alice@p.example:1080".to_string(),
       username: None,
       credential_ref: Some("ref-1".to_string()),

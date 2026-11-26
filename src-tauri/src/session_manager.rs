@@ -1097,6 +1097,9 @@ impl SessionManager {
     }
     let mut updated = locked.store.clone();
     for entry in backup.proxy_pool {
+      if updated.restored_proxy_pool.iter().any(|old| crate::proxy_pool::restored_entry_id(old) == crate::proxy_pool::restored_entry_id(&entry) && old != &entry) {
+        return Err("备份含已存在但资料不同的代理池标识".into());
+      }
       if !updated.restored_proxy_pool.contains(&entry) {
         updated.restored_proxy_pool.push(entry);
       }
@@ -1132,6 +1135,11 @@ impl SessionManager {
         muse_unread_counts: Default::default(), muse_unread_status: None,
         task_notifications: false, task_notice_keys: Vec::new(), pending_approval_count: None, proxy,
       });
+    }
+    let mut seen_pool = std::collections::HashSet::new();
+    if updated.accounts.iter().filter_map(|account| account.proxy.as_ref().and_then(|proxy| proxy.pool_entry_id))
+      .any(|id| !seen_pool.insert(id)) {
+      return Err("备份会让两个账号使用同一代理池条目，已保留原资料".into());
     }
     save_store_atomic(&locked.store_path, &updated)?;
     locked.store = updated;
@@ -2184,13 +2192,13 @@ impl SessionManager {
     Ok(Self::snapshot_from_locked(&locked))
   }
 
-  pub async fn archive_muse_fingerprint(
-    &self, app: &AppHandle, uuid: &str, entry: crate::storage::FingerprintRecord,
+  pub async fn archive_fingerprint(
+    &self, app: &AppHandle, provider: ProviderId, uuid: &str, entry: crate::storage::FingerprintRecord,
   ) -> Result<(), String> {
     let mut locked = self.inner.lock().await;
     let index = locked.store.accounts.iter().position(|account| {
-      account.provider_id == ProviderId::Muse && account.uuid == uuid
-    }).ok_or("原 Muse 账号已经移除")?;
+      account.provider_id == provider && account.uuid == uuid
+    }).ok_or("原账号已经移除")?;
     let history = &mut locked.store.accounts[index].fingerprint_history;
     if history.iter().any(|record| record.task_id == entry.task_id) { return Ok(()); }
     let previous = history.clone();
@@ -2206,14 +2214,14 @@ impl SessionManager {
     Ok(())
   }
 
-  pub async fn save_muse_fingerprint_settings(
-    &self, app: &AppHandle, uuid: &str, manual_model: Option<String>, interval_days: Option<u8>,
+  pub async fn save_fingerprint_settings(
+    &self, app: &AppHandle, provider: ProviderId, uuid: &str, manual_model: Option<String>, interval_days: Option<u8>,
   ) -> Result<ManagerSnapshot, String> {
     let mut locked = self.inner.lock().await;
     if locked.conflicts.iter().any(|item| item.uuid == uuid) { return Err("请先处理账号归属冲突".into()); }
     let index = locked.store.accounts.iter().position(|account| {
-      account.provider_id == ProviderId::Muse && account.uuid == uuid
-    }).ok_or("Muse 账号不存在")?;
+      account.provider_id == provider && account.uuid == uuid
+    }).ok_or("账号不存在")?;
     let previous = locked.store.accounts[index].fingerprint_settings.clone();
     let settings = &mut locked.store.accounts[index].fingerprint_settings;
     settings.manual_model = manual_model;
@@ -2229,11 +2237,11 @@ impl SessionManager {
   }
 
   #[cfg(target_os = "ios")]
-  pub async fn claim_automatic_fingerprint(&self, uuid: &str) -> Result<(), String> {
+  pub async fn claim_automatic_fingerprint(&self, provider: ProviderId, uuid: &str) -> Result<(), String> {
     let mut locked = self.inner.lock().await;
     let now = crate::storage::now_ms();
     let index = locked.store.accounts.iter().position(|account| {
-      account.provider_id == ProviderId::Muse && account.uuid == uuid
+      account.provider_id == provider && account.uuid == uuid
         && account.auth_state == crate::storage::AuthState::Authenticated
     }).ok_or("Muse 账号不可用")?;
     let account = &mut locked.store.accounts[index];

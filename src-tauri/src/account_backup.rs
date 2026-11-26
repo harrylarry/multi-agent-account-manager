@@ -28,6 +28,8 @@ pub struct AccountBackup {
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ProxyPoolProfile {
+  #[serde(default, skip_serializing_if = "Option::is_none")]
+  pub entry_id: Option<uuid::Uuid>,
   pub endpoint: String,
   pub requires_auth: bool,
 }
@@ -48,6 +50,8 @@ pub struct Profile {
   pub proxy_requires_auth: bool,
   #[serde(default)]
   pub proxy_enabled: bool,
+  #[serde(default, skip_serializing_if = "Option::is_none")]
+  pub proxy_pool_entry_id: Option<uuid::Uuid>,
 }
 
 impl Profile {
@@ -57,12 +61,14 @@ impl Profile {
     if let Some(existing) = existing.filter(|setting| self.proxy_endpoint.is_some() && safe_proxy_endpoint(setting) == self.proxy_endpoint) {
       if !self.proxy_requires_auth || existing.credential_ref.is_some() {
         let mut same = existing.clone();
+        if self.proxy_pool_entry_id.is_some() { same.pool_entry_id = self.proxy_pool_entry_id; }
         // A metadata restore never disables an enabled route.
         same.enabled |= self.proxy_enabled;
         return Some(same);
       }
     }
     Some(ProxySetting {
+      pool_entry_id: self.proxy_pool_entry_id,
       uri:self.proxy_endpoint.clone().unwrap_or_default(),
       username:None,
       credential_ref:self.proxy_requires_auth.then(|| format!("proxy-restore-{}", self.uuid)),
@@ -104,7 +110,7 @@ pub fn preview(backup: &AccountBackup, current: &[AccountRecord]) -> RestorePrev
       existing += 1;
       let projection = serde_json::json!([
         account.uuid, account.provider_id, account.alias, account.group, account.timezone, account.last_muse_thread,
-        account.proxy.as_ref().and_then(safe_proxy_endpoint),
+        account.proxy.as_ref().and_then(safe_proxy_endpoint), account.proxy.as_ref().and_then(|proxy| proxy.pool_entry_id),
       ]);
       digest.update(projection.to_string().as_bytes());
       if account.provider_id != profile.provider_id {
@@ -134,27 +140,27 @@ pub fn from_accounts(
   proxy_pool: Vec<ProxyPoolProfile>,
   expires_at_ms: Option<u64>,
 ) -> AccountBackup {
+  let profiles = accounts.iter().map(|account| {
+    let proxy = account.proxy.as_ref().filter(|_| include_proxy_endpoints);
+    let endpoint = proxy.and_then(safe_proxy_endpoint);
+    let pool_entry_id = proxy.and_then(|setting| setting.pool_entry_id).filter(|id| {
+      proxy_pool.iter().any(|entry| crate::proxy_pool::restored_entry_id(entry) == *id && Some(&entry.endpoint) == endpoint.as_ref())
+    });
+    Profile {
+      provider_id: account.provider_id, uuid: account.uuid.clone(), alias: account.alias.clone(),
+      group: account.group.clone().filter(|_| include_groups), timezone: account.timezone.clone(),
+      last_muse_thread: account.last_muse_thread, created_at_ms: account.created_at_ms,
+      proxy_endpoint: endpoint, proxy_requires_auth: proxy.is_some_and(|setting| setting.credential_ref.is_some()),
+      proxy_enabled: proxy.is_some_and(|setting| setting.enabled), proxy_pool_entry_id: pool_entry_id,
+    }
+  }).collect();
   AccountBackup {
     includes_groups: include_groups,
     includes_proxy_endpoints: include_proxy_endpoints,
     proxy_pool,
     expires_at_ms,
     rooms: None,
-    accounts: accounts.iter().map(|account| {
-      let proxy = account.proxy.as_ref().filter(|_| include_proxy_endpoints);
-      Profile {
-        provider_id: account.provider_id,
-        uuid: account.uuid.clone(),
-        alias: account.alias.clone(),
-        group: account.group.clone().filter(|_| include_groups),
-        timezone: account.timezone.clone(),
-        last_muse_thread: account.last_muse_thread,
-        created_at_ms: account.created_at_ms,
-        proxy_endpoint: proxy.and_then(safe_proxy_endpoint),
-        proxy_requires_auth: proxy.is_some_and(|setting| setting.credential_ref.is_some()),
-        proxy_enabled: proxy.is_some_and(|setting| setting.enabled),
-      }
-    }).collect(),
+    accounts: profiles,
   }
 }
 
@@ -210,6 +216,7 @@ pub fn decrypt(encoded: &str, password: &str) -> Result<AccountBackup, String> {
     validate_proxy_endpoint(&entry.endpoint)?;
   }
   let mut seen = std::collections::HashSet::new();
+  let mut bindings = std::collections::HashSet::new();
   for profile in &backup.accounts {
     if normalize_uuid(&profile.uuid).as_deref() != Some(&profile.uuid)
       || !seen.insert(&profile.uuid) || profile.alias.trim().is_empty() || profile.alias.chars().count() > 160
@@ -221,6 +228,12 @@ pub fn decrypt(encoded: &str, password: &str) -> Result<AccountBackup, String> {
     }
     if let Some(endpoint) = &profile.proxy_endpoint {
       validate_proxy_endpoint(endpoint)?;
+    }
+    if let Some(id) = profile.proxy_pool_entry_id {
+      if !bindings.insert(id) || !backup.proxy_pool.iter().any(|entry| crate::proxy_pool::restored_entry_id(entry) == id
+        && profile.proxy_endpoint.as_ref() == Some(&entry.endpoint) && entry.requires_auth == profile.proxy_requires_auth) {
+        return Err("备份含无效或重复的账号代理引用".into());
+      }
     }
   }
   Ok(backup)
@@ -247,7 +260,7 @@ mod tests {
     let blocked = profile.restored_proxy(None).unwrap();
     assert!(blocked.enabled);
     assert!(blocked.validate().is_err());
-    let active = ProxySetting { uri:"socks5://old.example:1234".into(), username:Some("proxy-user".into()),
+    let active = ProxySetting { pool_entry_id: None, uri:"socks5://old.example:1234".into(), username:Some("proxy-user".into()),
       credential_ref:Some("existing-key".into()), enabled:true };
     profile.proxy_endpoint = Some("socks5://new.example:1234".into());
     let new = profile.restored_proxy(Some(&active)).unwrap();
