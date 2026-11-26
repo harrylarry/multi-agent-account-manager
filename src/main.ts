@@ -1,6 +1,8 @@
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 import "./styles.css";
+import "./iphone.css";
+import { iphoneIcon } from "./iphone-icons";
 import type {
   AccountKey,
   AccountRecord,
@@ -15,13 +17,13 @@ import type {
 
 type ModalMode =
   | { kind: "none" }
-  | { kind: "add"; providerId: ProviderId; draft: string; cookiePreview: boolean; pending: boolean }
+  | { kind: "add"; providerId: ProviderId; draft: string; cookiePreview: boolean; pending: boolean; cookieMethod?: boolean }
   | { kind: "rename"; account: AccountRecord; draft: string; groupDraft: string; timezoneDraft: string }
   | { kind: "remove"; account: AccountRecord }
   | { kind: "tasks"; account: AccountRecord; checking: boolean; note: string; quotaChecking: boolean }
   | { kind: "harkReplies"; account: AccountRecord; reading: boolean; result: HarkRecovery | null; error: string }
   | { kind: "backup"; busy: boolean; encrypted: string; fileName: string; preview: BackupPreview | null; message: string; mode: BackupMode; includeGroups: boolean; includeProxy: boolean; expiryDays: number; lanCode?: string; lanShare?: {code:string;png:string;seconds:number} }
-  | { kind: "proxyPool"; account: AccountRecord; data: ProxyPoolView | null; setting: SpikeProxySettingView | null; busy: boolean; message: string }
+  | { kind: "proxyPool"; account: AccountRecord | null; data: ProxyPoolView | null; setting: SpikeProxySettingView | null; busy: boolean; message: string }
   | { kind: "sessions"; account: AccountRecord; loading: boolean; items: MuseSession[] | null; error: string }
   | { kind: "cookies"; account: AccountRecord; busy: boolean; preview: CookiePreview | null; message: string; imported: boolean; stored: Pick<CookiePreview, "count" | "nextExpiry"> | null }
   | { kind: "approvals"; account: AccountRecord; loading: boolean; result: SpikeApprovalsResult | null; fetchedAt: number | null; decisionMessage: string }
@@ -126,6 +128,10 @@ const ICON_UPDATE = `<svg width="15" height="15" viewBox="0 0 24 24" fill="none"
 const ICON_DRAG = `<svg width="16" height="16" viewBox="0 0 24 24" fill="currentColor"><circle cx="9" cy="6" r="1.6"/><circle cx="15" cy="6" r="1.6"/><circle cx="9" cy="12" r="1.6"/><circle cx="15" cy="12" r="1.6"/><circle cx="9" cy="18" r="1.6"/><circle cx="15" cy="18" r="1.6"/></svg>`;
 
 let snapshot: ManagerSnapshot | null = null;
+let iphonePage: "accounts" | "manage" = "accounts";
+let iphoneDetail: AccountKey | null = null;
+let iphoneSearchOpen = false;
+const iphoneProxyFaults = new Map<string, "blocked" | "unreachable">();
 let modal: ModalMode = { kind: "none" };
 // 应用内确认框的 resolver：由 askConfirm 设置，确认/取消/被顶掉时结算。
 let confirmResolver: ((ok: boolean) => void) | null = null;
@@ -722,8 +728,8 @@ function avatarWrapHtml(acc: AccountRecord, d: DerivedRowState): string {
     acc.autoAlias ? "pending-identity" : acc.providerId,
   ].join(" ");
   const avatarNodeHtml = acc.avatarUrl
-    ? `<div class="avatar has-photo"><img src="${escapeHtml(acc.avatarUrl)}" class="avatar-photo" alt="" draggable="false" /></div>`
-    : `<div class="${avatarClass}">${escapeHtml(d.avatarText)}</div>`;
+    ? `<span class="avatar has-photo"><img src="${escapeHtml(acc.avatarUrl)}" class="avatar-photo" alt="" draggable="false" /></span>`
+    : `<span class="${avatarClass}">${escapeHtml(d.avatarText)}</span>`;
   return `${avatarNodeHtml}
 ${d.switching ? `<span class="avatar-spinner"></span>` : ""}
 ${d.active ? `<span class="status-dot ${d.isLoggedOut ? "offline" : ""}"></span>` : ""}
@@ -888,6 +894,7 @@ function renderQuotaDetailPanel(
 
 function saveScrollPosition(): void {
   if (!snapshot) return;
+  if (snapshot.platform === "ios" && (iphonePage !== "accounts" || iphoneDetail || spikeWorkspaceOpen)) return;
   const listEl = document.querySelector<HTMLElement>(".account-list");
   if (listEl) {
     scrollOffsets[snapshot.selectedProviderId] = listEl.scrollTop;
@@ -900,6 +907,119 @@ function restoreScrollPosition(): void {
   if (listEl) {
     listEl.scrollTop = scrollOffsets[snapshot.selectedProviderId] ?? 0;
   }
+}
+
+function iphoneAccountKey(account: AccountKey): string {
+  return `${account.providerId}:${account.uuid}`;
+}
+
+function iphoneProxyProblem(account: AccountRecord): string {
+  const issue = iphoneProxyFaults.get(iphoneAccountKey(account));
+  return issue === "blocked" ? "代理已阻断" : issue === "unreachable" ? "代理连接失败" : "";
+}
+
+function iphoneAccountStatus(account: AccountRecord, row: DerivedRowState): string {
+  if (row.switching) return "正在打开";
+  const proxy = iphoneProxyProblem(account);
+  if (proxy) return proxy;
+  if (row.isLoggedOut) return "需要重新登录";
+  if (row.hasUnreadReply) return "回复未读";
+  if (account.pendingApprovalCount && account.providerId === "muse") return "待审批";
+  if (latestTaskObservations.get(iphoneAccountKey(account))?.activity === "working") return "正在生成";
+  return row.active ? "当前会话" : account.authState === "authenticated" ? "已登录" : "登录状态待确认";
+}
+
+function iphoneQuota(account: AccountRecord): string {
+  const observed = account.quotaObservation;
+  const used = observed?.percentUsed ?? account.quotaDetail?.planUsedPercent;
+  if (account.authState === "logged_out" || typeof used !== "number" || !Number.isFinite(used)) return "";
+  return `<span>${Math.round(Math.min(100, Math.max(0, used)))}%</span><small>${observed?.stale ? "上次用量" : "已用"}</small>`;
+}
+
+function iphoneMenuItem(icon: Parameters<typeof iphoneIcon>[0], label: string, target: string, extra = ""): string {
+  return `<button type="button" class="iphone-item" ${target}>${iphoneIcon(icon)}<span>${label}</span>${extra}<span class="iphone-chevron" aria-hidden="true">›</span></button>`;
+}
+
+function iphoneAccountDetail(account: AccountRecord, provider: ProviderInfo, state: ManagerSnapshot): string {
+  const uuid = escapeHtml(account.uuid);
+  const authenticated = account.authState === "authenticated";
+  const target = (action: string) => `data-iphone-account="${uuid}" data-account-action="${action}"`;
+  const row = deriveRowState(account, state, effectiveSwitchingKey(state));
+  return `
+    <button type="button" class="iphone-back" data-iphone-page="accounts">‹ 账号</button>
+    <h1 tabindex="-1">${escapeHtml(account.alias)}</h1>
+    <p class="iphone-caption">${escapeHtml(provider.shortName)}${account.group ? ` · ${escapeHtml(account.group)}` : ""}</p>
+    <div class="iphone-detail-summary"><div><strong>${iphoneAccountStatus(account, row)}</strong><small>${account.quotaObservation?.checkedAtMs ? `额度更新于 ${escapeHtml(new Date(account.quotaObservation.checkedAtMs).toLocaleString())}` : "额度尚未同步"}</small></div><div class="iphone-quota">${iphoneQuota(account)}</div></div>
+    ${authenticated ? `<section class="iphone-section"><h2>会话与任务</h2><div class="iphone-group">
+      ${provider.id === "muse" ? iphoneMenuItem("chat", "会话", `data-sessions-uuid="${uuid}"`) : ""}
+      ${iphoneMenuItem("task", "任务与通知", target("tasks"))}
+      ${provider.id === "muse" ? iphoneMenuItem("approval", "审批", `data-approvals-uuid="${uuid}"`) : iphoneMenuItem("chat", "回复补同步", target("replies"))}
+      ${iphoneMenuItem("quota", "额度与模型指纹", target("models"))}
+    </div></section>` : ""}
+    <section class="iphone-section"><h2>连接与账号</h2><div class="iphone-group">
+      ${iphoneMenuItem("login", "登录恢复", `data-cookies-uuid="${uuid}"`)}
+      ${iphoneMenuItem("proxy", "账号代理", target("proxy"))}
+      ${iphoneMenuItem("manage", "备注、分组与时区", `data-rename-uuid="${uuid}"`)}
+    </div></section>
+    <button type="button" class="iphone-remove" data-remove-uuid="${uuid}">从本机移除账号</button>`;
+}
+
+function iphoneAttention(accounts: AccountRecord[]): string {
+  const items = accounts.flatMap((account) => {
+    const uuid = escapeHtml(account.uuid);
+    const name = escapeHtml(account.alias);
+    const item = (icon: Parameters<typeof iphoneIcon>[0], tone: string, label: string, action: string, target: string) =>
+      `<button class="iphone-alert ${tone}" type="button" ${target}><span class="iphone-symbol">${iphoneIcon(icon)}</span><span><strong>${name}</strong><small>${label}</small></span><span class="iphone-alert-link">${action} ›</span></button>`;
+    const proxy = iphoneProxyProblem(account);
+    return [
+      ...(proxy ? [item("proxy", "is-blocked", proxy, "检查", `data-iphone-account="${uuid}" data-account-action="proxy"`)] : []),
+      ...(account.authState === "logged_out" ? [item("login", "is-attention", "需要重新登录", "恢复", `data-cookies-uuid="${uuid}"`)] : []),
+      ...(account.providerId === "muse" && account.authState === "authenticated" && (account.pendingApprovalCount ?? 0) > 0
+        ? [item("approval", "is-attention", `${account.pendingApprovalCount} 项待审批`, "查看", `data-approvals-uuid="${uuid}"`)] : []),
+    ];
+  });
+  return items.length ? `<h2>需要处理 <small>${items.length}</small></h2><div class="iphone-group">${items.join("")}</div>` : "";
+}
+
+function syncIphoneViews(state: ManagerSnapshot, provider: ProviderInfo): void {
+  const shell = document.querySelector<HTMLElement>(".iphone-shell");
+  if (!shell) return;
+  const detailAccount = state.accounts.find((account) => isSameKey(iphoneDetail, account) && account.providerId === provider.id);
+  const page = detailAccount ? "detail" : iphonePage;
+  shell.dataset.iphoneView = spikeWorkspaceOpen && provider.id === "muse" ? "diagnostics" : page;
+  for (const button of shell.querySelectorAll<HTMLButtonElement>(".iphone-nav [data-iphone-page]")) {
+    if (button.dataset.iphonePage === (page === "detail" ? "accounts" : page)) button.setAttribute("aria-current", "page");
+    else button.removeAttribute("aria-current");
+  }
+  const detail = shell.querySelector<HTMLElement>(".iphone-account-detail");
+  const detailHtml = detailAccount ? iphoneAccountDetail(detailAccount, provider, state) : "";
+  if (detail && detail.dataset.content !== detailHtml) {
+    detail.dataset.content = detailHtml;
+    detail.innerHTML = detailHtml;
+  }
+  const attention = shell.querySelector<HTMLElement>(".iphone-attention");
+  if (attention && page === "accounts") {
+    const html = reorderMode ? "" : iphoneAttention(state.accounts.filter((account) => account.providerId === provider.id));
+    if (attention.dataset.content !== html) {
+      attention.dataset.content = html;
+      attention.innerHTML = html;
+    }
+    attention.hidden = !html;
+    const accounts = new Map(state.accounts.filter((account) => account.providerId === provider.id).map((account) => [account.uuid, account]));
+    const switching = effectiveSwitchingKey(state);
+    for (const row of shell.querySelectorAll<HTMLElement>(".iphone-status")) {
+      const account = accounts.get(row.dataset.uuid ?? "");
+      if (!account) continue;
+      const html = iphoneAccountStatus(account, deriveRowState(account, state, switching));
+      if (row.dataset.content !== html) {
+        row.dataset.content = html;
+        row.innerHTML = html;
+      }
+    }
+  }
+  const filters = shell.querySelector<HTMLElement>(".account-filters");
+  if (filters) filters.hidden = !(iphoneSearchOpen || accountFilters[provider.id].query || accountFilters[provider.id].group !== null);
+  shell.querySelector("#iphone-search-btn")?.setAttribute("aria-expanded", String(Boolean(filters && !filters.hidden)));
 }
 
 function rerenderPreservingScroll(): void {
@@ -1021,7 +1141,7 @@ async function setModal(next: ModalMode): Promise<void> {
     }
   }
   render();
-  if (next.kind === "add" || next.kind === "rename") {
+  if ((next.kind === "add" && snapshot?.platform !== "ios") || next.kind === "rename") {
     const input = document.querySelector<HTMLInputElement>("#modal-alias-input");
     if (input) {
       input.focus();
@@ -1185,7 +1305,8 @@ async function refreshForegroundTask(): Promise<void> {
     taskRetryAt.set(key, Date.now() + Math.min(180_000, 15_000 * 2 ** failures));
   } finally {
     foregroundTaskBusy = false;
-    if (modal.kind === "tasks" && modal.account.uuid === account.uuid) render();
+    if (snapshot?.platform === "ios") syncIphoneViews(snapshot, currentProvider(snapshot));
+    if (modal.kind === "tasks" && isSameKey(account, modal.account)) render();
   }
 }
 
@@ -1635,6 +1756,7 @@ function setSpikeWorkspaceOpen(open: boolean): void {
   workspace.hidden = !open;
   accounts.hidden = open;
   if (open) syncDiagProxyView();
+  if (snapshot?.platform === "ios") syncIphoneViews(snapshot, currentProvider(snapshot));
   document.getElementById(open ? "spike-workspace-title" : "spike-open-btn")?.focus({ preventScroll: true });
 }
 
@@ -2927,8 +3049,8 @@ function renderProxyPool(view: Extract<ModalMode, { kind: "proxyPool" }>): strin
   return `
     <div class="inline-modal" role="dialog" aria-modal="true" aria-labelledby="proxy-pool-title">
       <div class="modal-card proxy-pool-modal">
-        <div class="modal-title" id="proxy-pool-title">代理池 · ${escapeHtml(account.alias)}</div>
-        <div class="modal-desc">${setting?.enabled ? `当前 ${escapeHtml(setting.display)}` : "当前账号未启用代理"}</div>
+        <div class="modal-title" id="proxy-pool-title">${account ? `账号代理 · ${escapeHtml(account.alias)}` : "代理池"}</div>
+        <div class="modal-desc">${setting?.enabled ? `当前 ${escapeHtml(setting.display)}` : account ? busy ? "正在读取账号代理…" : message ? "请核对操作结果。" : "当前账号未启用代理" : "从账号详情选择该账号要使用的代理。"}</div>
         ${snapshot?.platform === "ios" && iosNetworkPrefs ? `<div class="proxy-pool-actions">
           <label><input id="ios-proxy-retention" type="checkbox" ${iosNetworkPrefs.isolate ? "checked" : ""} ${disabled}> 同平台同出口只保留最近使用的页面</label>
           <label for="ios-quota-interval">前台自动额度同步</label>
@@ -2949,7 +3071,7 @@ function renderProxyPool(view: Extract<ModalMode, { kind: "proxyPool" }>): strin
           </div>`).join("") ?? ""}
           ${data?.entries.map((entry) => `<div class="proxy-pool-row">
             <div>${escapeHtml(entry.endpoint)}${entry.missingCredentials ? "<small>待补认证</small>" : entry.requiresAuth ? "<small>需要认证</small>" : ""}</div>
-            <div>${entry.missingCredentials ? "" : action("用此代理", "apply", entry.id)}${entry.sourceId ? "" : action("移除", "remove", entry.id)}</div>
+            <div>${!account || entry.missingCredentials ? "" : action("用此代理", "apply", entry.id)}${entry.sourceId ? "" : action("移除", "remove", entry.id)}</div>
           </div>`).join("") ?? ""}
         </div>
         ${message ? `<div role="status">${escapeHtml(message)}</div>` : ""}
@@ -2960,20 +3082,30 @@ function renderProxyPool(view: Extract<ModalMode, { kind: "proxyPool" }>): strin
     </div>`;
 }
 
+async function openProxyPool(account: AccountRecord | null): Promise<void> {
+  const view: Extract<ModalMode, { kind: "proxyPool" }> = {
+    kind: "proxyPool", account, data: null, setting: null, busy: false, message: "",
+  };
+  await setModal(view);
+  if (modal === view) await proxyPoolAction(view, "list", null);
+}
+
 async function proxyPoolAction(view: Extract<ModalMode, { kind: "proxyPool" }>, action: string, entryId: string | null): Promise<void> {
   if (modal !== view || view.busy) return;
   const input = document.querySelector<HTMLTextAreaElement>("#proxy-pool-input");
   const secret = input?.value.trim() ?? "";
   if (input) input.value = "";
-  const { providerId, uuid } = view.account;
+  const account = view.account;
+  if (!account && (action === "apply" || action === "clear" || action === "measure")) return;
+  const target = account ? { providerId: account.providerId, uuid: account.uuid } : null;
   if (action === "apply" || action === "remove-source" || action === "clear") {
     const confirm = action === "apply" ? {
       title: "更换账号代理",
-      desc: `将所选代理用于「${view.account.alias}」，已打开的会话需要重新打开。`,
+      desc: `将所选代理用于「${account?.alias}」，已打开的会话需要重新打开。`,
       confirmLabel: "应用",
     } : action === "clear" ? {
       title: "清除账号代理",
-      desc: `清除后「${view.account.alias}」将使用系统网络。`,
+      desc: `清除后「${account?.alias}」将使用系统网络。`,
       confirmLabel: "清除",
       danger: true,
     } : {
@@ -2993,15 +3125,20 @@ async function proxyPoolAction(view: Extract<ModalMode, { kind: "proxyPool" }>, 
   view.message = "处理中…";
   render();
   try {
-    if (action === "apply") {
-      view.setting = await invoke<SpikeProxySettingView>("apply_proxy_pool_entry", { providerId, uuid, entryId });
+    if (action === "apply" && target) {
+      view.setting = await invoke<SpikeProxySettingView>("apply_proxy_pool_entry", { ...target, entryId });
+      const key = iphoneAccountKey(target);
+      if (view.setting.webview?.quarantined || view.setting.credentialAvailable === false) iphoneProxyFaults.set(key, "blocked");
+      else iphoneProxyFaults.delete(key);
       view.message = proxySaveSummary(view.setting).join(" · ");
-    } else if (action === "clear") {
-      await invoke("muse_native_clear_account_proxy", { providerId, uuid });
+    } else if (action === "clear" && target) {
+      await invoke("muse_native_clear_account_proxy", target);
       view.setting = null;
+      iphoneProxyFaults.delete(iphoneAccountKey(target));
       view.message = "账号代理已清除。";
-    } else if (action === "measure") {
-      const result = await invoke<{ milliseconds: number; status: number }>("measure_account_proxy", { providerId, uuid });
+    } else if (action === "measure" && target) {
+      const result = await invoke<{ milliseconds: number; status: number }>("measure_account_proxy", target);
+      iphoneProxyFaults.delete(iphoneAccountKey(target));
       view.message = `代理 HTTPS · HTTP ${result.status} · ${result.milliseconds} ms`;
     } else {
       const poolAction = action === "remove-source" ? "remove" : action;
@@ -3009,12 +3146,18 @@ async function proxyPoolAction(view: Extract<ModalMode, { kind: "proxyPool" }>, 
         action: poolAction, entryId, input: poolAction === "import" || poolAction === "subscribe" ? secret : null,
       });
       if (action === "list") {
-        view.setting = await invoke<SpikeProxySettingView | null>("muse_native_get_account_proxy", { providerId, uuid });
+        if (target) {
+          view.setting = await invoke<SpikeProxySettingView | null>("muse_native_get_account_proxy", target);
+          const key = iphoneAccountKey(target);
+          if (!view.setting?.enabled) iphoneProxyFaults.delete(key);
+          else if (view.setting.webview?.quarantined || view.setting.credentialAvailable === false) iphoneProxyFaults.set(key, "blocked");
+        }
         if (snapshot?.platform === "ios") await updateIosNetworkPreferences(null, null);
       }
       view.message = "";
     }
   } catch (error) {
+    if (action === "measure" && target) iphoneProxyFaults.set(iphoneAccountKey(target), "unreachable");
     view.message = String(error);
   } finally {
     view.busy = false;
@@ -3187,8 +3330,8 @@ async function submitNewAccount(view: Extract<ModalMode, { kind: "add" }>, previ
   if (view.pending || modal !== view) return;
   const input = document.querySelector<HTMLTextAreaElement>("#add-cookie-input");
   const status = document.getElementById("add-account-result");
-  const cookieInput = input?.value.trim() || null;
-  if ((previewOnly && !cookieInput) || (!previewOnly && cookieInput && !view.cookiePreview)) {
+  const cookieInput = view.cookieMethod ? input?.value.trim() || null : null;
+  if ((view.cookieMethod && !cookieInput) || (!previewOnly && cookieInput && !view.cookiePreview)) {
     if (status) status.textContent = cookieInput ? "请先预览这份 Cookie。" : "请先粘贴 Cookie。";
     return;
   }
@@ -3233,15 +3376,36 @@ function renderModal(provider: ProviderInfo): string {
     return renderUpdateModal();
   }
   if (modal.kind === "add") {
+    if (snapshot?.platform === "ios") {
+      const providerId = modal.providerId;
+      const service = snapshot.providers.find((item) => item.id === providerId) ?? provider;
+      return `<div class="inline-modal iphone-screen-modal" role="dialog" aria-modal="true" aria-labelledby="iphone-add-title">
+        <div class="modal-card">
+          <button id="modal-cancel-btn" type="button" class="iphone-back">‹ 返回</button>
+          <h1 id="iphone-add-title" tabindex="-1">添加账号</h1>
+          <p class="iphone-caption">${escapeHtml(service.shortName)}</p>
+          <label for="modal-alias-input">账号备注 <small>可选</small></label>
+          <input id="modal-alias-input" class="modal-input" maxlength="60" placeholder="登录后可自动填写" value="${escapeHtml(modal.draft)}" />
+          <div class="iphone-add-methods" role="group" aria-label="登录方式">
+            <button type="button" data-add-method="web" aria-pressed="${!modal.cookieMethod}">${iphoneIcon("globe")}<span>网页登录</span></button>
+            <button type="button" data-add-method="cookie" aria-pressed="${Boolean(modal.cookieMethod)}">${iphoneIcon("cookie")}<span>导入 Cookie</span></button>
+          </div>
+          <div id="iphone-add-cookie-fields" ${modal.cookieMethod ? "" : "hidden"}>
+            <label for="add-cookie-input">Cookie 或带来源的会话 Token JSON</label>
+            <textarea id="add-cookie-input" class="modal-input account-cookie-input" placeholder="粘贴登录数据" autocomplete="off" autocapitalize="off" spellcheck="false"></textarea>
+            <button id="add-cookie-preview" class="btn" type="button">预览 Cookie</button>
+          </div>
+          <div id="add-account-result" role="status"></div>
+          <div class="modal-footer"><button id="modal-confirm-btn" class="btn primary" type="button">${modal.cookieMethod ? "导入并打开" : "创建并打开"}</button></div>
+        </div>
+      </div>`;
+    }
     return `
       <div class="inline-modal" role="dialog" aria-modal="true">
         <div class="modal-card">
           <div class="modal-title">新增 ${escapeHtml(provider.shortName)} 账号</div>
           <div class="modal-desc">每个账号拥有独立隔离的登录态。备注可留空，登录成功后将自动显示邮箱名称。</div>
           <input id="modal-alias-input" class="modal-input" maxlength="60" placeholder="备注名称（留空则自动获取登录邮箱）" value="${escapeHtml(modal.draft)}" />
-          ${snapshot?.platform === "ios" ? `<label for="add-cookie-input">导入 Cookie（可选）</label>
-            <textarea id="add-cookie-input" class="modal-input account-cookie-input" placeholder="粘贴 Cookie 或带来源的会话 Token JSON" autocomplete="off" autocapitalize="off" spellcheck="false"></textarea>
-            <button id="add-cookie-preview" class="btn" type="button">预览 Cookie</button>` : ""}
           <div id="add-account-result" role="status"></div>
           <div class="modal-footer">
             <button id="modal-cancel-btn" class="btn" type="button">取消</button>
@@ -3272,8 +3436,6 @@ function renderModal(provider: ProviderInfo): string {
               <input id="modal-timezone-input" class="modal-input" maxlength="96" placeholder="例如 Europe/Paris" value="${customTimezone ? escapeHtml(timezone) : ""}" autocomplete="off" spellcheck="false" />
             </div>` : ""}
           <div class="modal-footer">
-            ${snapshot?.platform === "ios" && modal.account.authState === "authenticated" ? '<button id="account-task-btn" class="btn" type="button">任务</button>' : ""}
-            ${snapshot?.platform === "ios" ? '<button id="account-proxy-pool" class="btn" type="button">代理池</button>' : ""}
             <button id="modal-cancel-btn" class="btn" type="button">取消</button>
             <button id="modal-confirm-btn" class="btn primary" type="button">保存</button>
           </div>
@@ -3334,6 +3496,7 @@ function renderMiddleContent(state: ManagerSnapshot, provider: ProviderInfo): st
   const providerAccounts = state.accounts.filter((a) => a.providerId === provider.id);
   const switchingKey = effectiveSwitchingKey(state);
   const isMobile = isMobilePlatform(state.platform);
+  const iphone = state.platform === "ios";
 
   const noticeHtml = state.notice
     ? `
@@ -3415,6 +3578,20 @@ function renderMiddleContent(state: ManagerSnapshot, provider: ProviderInfo): st
     listBody = providerAccounts
       .map((acc, idx) => {
         const d = deriveRowState(acc, state, switchingKey);
+        if (iphone) {
+          const uuid = escapeHtml(acc.uuid);
+          return `<div class="${rowClassFor(d)}" data-switch-uuid="${uuid}">
+            <div class="account-header">
+              <span class="drag-handle" aria-hidden="true">${ICON_DRAG}</span>
+              <button class="iphone-open-account" type="button">
+                <span class="avatar-wrap">${avatarWrapHtml(acc, d)}</span>
+                <span class="account-meta"><span class="account-alias">${escapeHtml(acc.alias)}</span><span class="iphone-status" data-uuid="${uuid}">${iphoneAccountStatus(acc, d)}</span></span>
+                <span class="iphone-quota">${iphoneQuota(acc)}</span>
+              </button>
+              <button type="button" class="iphone-info" data-iphone-account="${uuid}" data-account-action="detail" aria-label="${escapeHtml(acc.alias)}详情">${iphoneIcon("info")}</button>
+            </div>
+          </div>`;
+        }
         const isMac = navigator.userAgent.includes("Mac");
         const shortcutHint =
           !isMobile && idx < 9
@@ -3437,9 +3614,6 @@ function renderMiddleContent(state: ManagerSnapshot, provider: ProviderInfo): st
                 ${subHtmlFor(acc, d, isMobile)}
               </div>
               <div class="row-ops">
-                ${state.platform === "ios" && provider.id === "muse" && acc.authState === "authenticated" ? `<button class="action-icon-btn account-approval-btn" data-sessions-uuid="${escapeHtml(acc.uuid)}" type="button">会话</button>` : ""}
-                ${state.platform === "ios" ? `<button class="action-icon-btn account-approval-btn" data-cookies-uuid="${escapeHtml(acc.uuid)}" type="button">登录恢复</button>` : ""}
-                ${state.platform === "ios" && provider.id === "muse" && acc.authState === "authenticated" ? `<button class="action-icon-btn account-approval-btn" data-approvals-uuid="${escapeHtml(acc.uuid)}" type="button">审批</button>` : ""}
                 <button class="action-icon-btn" data-rename-uuid="${escapeHtml(acc.uuid)}" title="编辑账号备注与分组" aria-label="编辑账号备注与分组" type="button">${ICON_EDIT}</button>
                 <button class="action-icon-btn danger" data-remove-uuid="${escapeHtml(acc.uuid)}" title="从本机移除" type="button">${ICON_TRASH}</button>
               </div>
@@ -3479,6 +3653,53 @@ function renderMiddleContent(state: ManagerSnapshot, provider: ProviderInfo): st
     isSpikeBuild && provider.id === "muse"
       ? `<span class="spike-badge" title="Spike 版">Spike</span>`
       : "";
+
+  if (iphone) {
+    return `
+      <div id="spike-account-view" class="spike-account-view">
+        <header class="iphone-top">
+          <span class="iphone-brand"><img src="/logos/app-logo.svg" alt="">叠号</span>
+          ${providerAccounts.length && !inReorder ? `<button type="button" id="iphone-search-btn" class="iphone-icon-button" aria-label="搜索与分组" aria-expanded="false">${iphoneIcon("search")}</button>` : ""}
+        </header>
+        <div class="iphone-heading">
+          <h1>账号</h1>
+          <div class="iphone-services" role="group" aria-label="选择服务">
+            ${state.providers.map((item) => `<button type="button" data-provider="${escapeHtml(item.id)}" aria-pressed="${item.id === provider.id}">${escapeHtml(item.shortName)}</button>`).join("")}
+          </div>
+        </div>
+        ${noticeHtml}${conflictsHtml}${filtersHtml}
+        <div class="account-list${inReorder ? " reorder-mode" : ""}">
+          <section class="iphone-attention" aria-label="需要处理" hidden></section>
+          <div class="iphone-list-title"><h2>全部账号 <small>${providerAccounts.length}</small></h2>
+            ${inReorder ? '<button type="button" id="reorder-done-btn">完成</button>' : providerAccounts.length > 1 ? '<button type="button" id="iphone-reorder-btn">排序</button>' : ""}
+          </div>
+          ${listBody}<div id="account-filter-empty" class="empty-list" hidden>没有匹配的账号</div>
+        </div>
+      </div>
+      <div class="iphone-account-detail iphone-scroll"></div>
+      <section class="iphone-management iphone-scroll" aria-labelledby="iphone-management-title">
+        <div class="iphone-top"><span class="iphone-brand">叠号</span>${spikeBadgeHtml}</div>
+        <h1 id="iphone-management-title" tabindex="-1">管理</h1>
+        <section class="iphone-section"><h2>连接与数据</h2><div class="iphone-group">
+          ${iphoneMenuItem("proxy", "代理池", 'id="iphone-proxy-pool-btn"')}
+          ${iphoneMenuItem("backup", "备份与迁移", 'id="account-backup-btn"')}
+          ${iphoneMenuItem("quota", "刷新额度", 'id="sync-all-btn"')}
+        </div></section>
+        <section class="iphone-section"><h2>应用</h2><div class="iphone-group">
+          ${museDiagnostics ? iphoneMenuItem("pulse", "原生诊断", 'id="spike-open-btn"') : ""}
+          ${iphoneMenuItem("add", "检查更新", 'id="check-update-btn"', hasUpdate ? '<span class="update-dot"></span>' : "")}
+          ${iphoneMenuItem("globe", "打开官网", 'id="open-site-btn"')}
+        </div></section>
+        ${provider.id === "hark" ? spikeDiagHtml : ""}
+      </section>
+      ${museDiagnostics ? spikeDiagHtml : ""}
+      <nav class="iphone-nav" aria-label="叠号导航">
+        <button type="button" data-iphone-page="accounts">${iphoneIcon("account")}<span>账号</span></button>
+        <button type="button" data-iphone-page="manage">${iphoneIcon("manage")}<span>管理</span></button>
+        <button type="button" id="add-account-btn" class="iphone-add" ${provider.enabled ? "" : "disabled"}>${iphoneIcon("add")}<span>添加</span></button>
+      </nav>
+      <div id="modal-root"></div>`;
+  }
 
   return `
     ${museDiagnostics ? `<div id="spike-account-view" class="spike-account-view" ${spikeWorkspaceOpen ? "hidden" : ""}>` : ""}
@@ -3596,17 +3817,17 @@ function structuralSignature(state: ManagerSnapshot, provider: ProviderInfo): st
           `${p.id}:${p.enabled ? 1 : 0}:${p.name}:${p.shortName}:${p.statusText}`
       )
       .join(","),
-    JSON.stringify(providerAccounts.map((a) => [a.uuid, a.group, a.authState === "authenticated"])),
+    JSON.stringify(providerAccounts.map((a) => state.platform === "ios" ? [a.uuid, a.group] : [a.uuid, a.group, a.authState === "authenticated"])),
     // 0.1.21: hasUnreadReply is NOT here — it already lives in
     // avatarSigFor, so patchRows updates the unread dot in place
     // instead of rebuilding the whole list when a reply arrives.
-    providerAccounts
+    state.platform === "ios" ? "" : providerAccounts
       .map(
         (a) =>
           `${a.uuid}:${a.authState === "logged_out" ? 0 : a.quotaDetail ? 1 : 0}`
       )
       .join(","),
-    switchingKey
+    state.platform !== "ios" && switchingKey
       ? `${switchingKey.providerId}:${switchingKey.uuid}:${switchingAcc?.alias ?? ""}`
       : "",
     // 0.1.21: modal.kind / modal.account are NOT here — the modal is
@@ -3697,6 +3918,7 @@ function renderModalRoot(provider: ProviderInfo): void {
   lastModalMount = mount;
   lastModalKey = key;
   mount.innerHTML = html;
+  if (snapshot?.platform === "ios" && modal.kind === "add") mount.querySelector<HTMLElement>("#iphone-add-title")?.focus({ preventScroll: true });
 }
 
 // 0.1.21: updateState left the structural signature with the modal, so
@@ -3781,6 +4003,14 @@ function patchRow(
   const aliasEl = row.querySelector<HTMLElement>(".account-alias");
   if (aliasEl && aliasEl.textContent !== acc.alias) {
     aliasEl.textContent = acc.alias;
+  }
+  if (state.platform === "ios") {
+    const quota = row.querySelector<HTMLElement>(".iphone-quota");
+    const html = iphoneQuota(acc);
+    if (quota && quota.innerHTML !== html) quota.innerHTML = html;
+    row.querySelector(".iphone-info")?.setAttribute("aria-label", `${acc.alias}详情`);
+    patchState.set(acc.uuid, { avatarSig, subVariant: d.subVariant, detailHtml: "" });
+    return;
   }
 
   // Alert badge (auth-status / quota-warning), last child of the alias row.
@@ -3891,6 +4121,7 @@ function render(): void {
     }
     renderModalRoot(provider);
     syncUpdateButton();
+    if (snapshot.platform === "ios") syncIphoneViews(snapshot, provider);
     return;
   }
   // A structural change arriving mid-drag must not rebuild the list
@@ -3902,8 +4133,11 @@ function render(): void {
   lastStructuralSig = sig;
 
   const isMobile = isMobilePlatform(snapshot.platform);
+  const iphoneModal = snapshot.platform === "ios" && modal.kind !== "none" ? root.querySelector("#modal-root") : null;
 
-  if (isMobile) {
+  if (snapshot.platform === "ios") {
+    root.innerHTML = `<div class="mobile-shell iphone-shell"><div class="middle-column iphone-column">${renderMiddleContent(snapshot, provider)}</div></div>`;
+  } else if (isMobile) {
     root.innerHTML = `
       <div class="mobile-shell">
         <div class="mobile-tabs">
@@ -3966,9 +4200,14 @@ function render(): void {
   // 0.1.21: refill the modal container after the full rebuild — the
   // container itself is recreated with #app, renderModalRoot() notices
   // the new mount and writes the modal HTML into it.
+  if (iphoneModal) root.querySelector("#modal-root")?.replaceWith(iphoneModal);
   renderModalRoot(provider);
   seedPatchState(snapshot, provider);
   applyAccountFilter(snapshot, provider);
+  if (snapshot.platform === "ios") {
+    syncIphoneViews(snapshot, provider);
+    restoreScrollPosition();
+  }
   root.querySelectorAll<HTMLDetailsElement>("#spike-workspace details[data-spike-section]").forEach((section) => {
     section.open = spikeSections.includes(section.dataset.spikeSection);
   });
@@ -4103,8 +4342,62 @@ function bindDelegatedEvents(): void {
 
   root.addEventListener("click", async (ev) => {
     if (!snapshot) return;
-    const target = ev.target as HTMLElement;
+    if (!(ev.target instanceof Element)) return;
+    const target = ev.target;
     const provider = currentProvider(snapshot);
+    const iphoneNav = target.closest<HTMLElement>("[data-iphone-page]");
+    if (iphoneNav && modal.kind === "none") {
+      const page = iphoneNav.dataset.iphonePage;
+      if (page === "accounts" || page === "manage") {
+        if (iphonePage === "accounts" && !iphoneDetail) saveScrollPosition();
+        iphonePage = page;
+        iphoneDetail = null;
+        syncIphoneViews(snapshot, provider);
+        if (page === "accounts") restoreScrollPosition();
+      }
+      return;
+    }
+    const iphoneAction = target.closest<HTMLElement>("[data-iphone-account]");
+    if (iphoneAction) {
+      if (modal.kind !== "none" || reorderMode || busy) return;
+      const account = snapshot.accounts.find((entry) => entry.providerId === provider.id && entry.uuid === iphoneAction.dataset.iphoneAccount);
+      if (!account) return;
+      const action = iphoneAction.dataset.accountAction;
+      if (action === "detail") {
+        saveScrollPosition();
+        iphoneDetail = { providerId: account.providerId, uuid: account.uuid };
+        syncIphoneViews(snapshot, provider);
+        const detail = document.querySelector<HTMLElement>(".iphone-account-detail");
+        if (detail) detail.scrollTop = 0;
+        detail?.querySelector("h1")?.focus({ preventScroll: true });
+      } else if (action === "proxy") {
+        await openProxyPool(account);
+      } else if (account.authState === "authenticated" && action === "replies" && account.providerId === "hark") {
+        const view: Extract<ModalMode, { kind: "harkReplies" }> = { kind: "harkReplies", account, reading: false, result: null, error: "" };
+        await setModal(view);
+        if ((modal as ModalMode) === view) await loadHarkReplies(view);
+      } else if (account.authState === "authenticated" && (action === "tasks" || action === "models")) {
+        const view: Extract<ModalMode, { kind: "tasks" }> = { kind: "tasks", account, checking: false, note: "", quotaChecking: false };
+        await setModal(view);
+        if ((modal as ModalMode) === view) {
+          if (action === "models") document.querySelector<HTMLElement>("#account-fingerprint-settings")?.setAttribute("open", "");
+          else await checkAccountTasks(view);
+        }
+      }
+      return;
+    }
+    const method = target.closest<HTMLElement>("[data-add-method]");
+    if (method && modal.kind === "add" && !modal.pending) {
+      modal.cookieMethod = method.dataset.addMethod === "cookie";
+      root.querySelectorAll<HTMLElement>("[data-add-method]").forEach((button) => button.setAttribute("aria-pressed", String(button === method)));
+      const fields = root.querySelector<HTMLElement>("#iphone-add-cookie-fields");
+      if (fields) fields.hidden = !modal.cookieMethod;
+      const confirm = root.querySelector("#modal-confirm-btn");
+      if (confirm) confirm.textContent = modal.cookieMethod ? "导入并打开" : "创建并打开";
+      const result = root.querySelector("#add-account-result");
+      if (result) result.textContent = modal.cookiePreview && modal.cookieMethod ? "已预览 Cookie。" : "";
+      return;
+    }
 
     // Most specific first; each branch returns after handling (this is
     // what stopPropagation used to do for the row-op buttons).
@@ -4354,7 +4647,7 @@ function bindDelegatedEvents(): void {
         return;
       }
       const uuid = row.dataset.switchUuid;
-      if (!uuid) return;
+      if (!uuid || (snapshot.platform === "ios" && !target.closest(".iphone-open-account"))) return;
       if (
         snapshot.activeAccount?.providerId === provider.id &&
         snapshot.activeAccount?.uuid === uuid &&
@@ -4391,7 +4684,23 @@ function bindDelegatedEvents(): void {
       }
       case "add-account-btn":
       case "stage-add-btn":
+        if (modal.kind !== "none" || reorderMode || !provider.enabled) break;
         await setModal({ kind: "add", providerId: provider.id, draft: "", cookiePreview: false, pending: false });
+        break;
+      case "iphone-search-btn": {
+        const filters = root.querySelector<HTMLElement>(".account-filters");
+        iphoneSearchOpen = Boolean(filters?.hidden);
+        syncIphoneViews(snapshot, provider);
+        if (iphoneSearchOpen) root.querySelector<HTMLInputElement>("#account-search")?.focus();
+        break;
+      }
+      case "iphone-reorder-btn":
+        reorderMode = true;
+        reorderProviderId = provider.id;
+        rerenderPreservingScroll();
+        break;
+      case "iphone-proxy-pool-btn":
+        if (modal.kind === "none") await openProxyPool(null);
         break;
       case "dismiss-notice-btn":
         await callCommand("dismiss_notice");
@@ -4418,15 +4727,6 @@ function bindDelegatedEvents(): void {
         reorderProviderId = null;
         render();
         restoreScrollPosition();
-        break;
-      case "account-task-btn":
-        if (modal.kind === "rename") {
-          const view: Extract<ModalMode, { kind: "tasks" }> = {
-            kind: "tasks", account: modal.account, checking: false, note: "", quotaChecking: false,
-          };
-          await setModal(view);
-          await checkAccountTasks(view);
-        }
         break;
       case "account-task-refresh":
         if (modal.kind === "tasks") await checkAccountTasks(modal);
@@ -4570,15 +4870,6 @@ function bindDelegatedEvents(): void {
       case "backup-overwrite":
         if (modal.kind === "backup") await accountBackupAction(modal, "overwrite");
         break;
-      case "account-proxy-pool":
-        if (modal.kind === "rename") {
-          const view: Extract<ModalMode, { kind: "proxyPool" }> = {
-            kind: "proxyPool", account: modal.account, data: null, setting: null, busy: false, message: "",
-          };
-          await setModal(view);
-          await proxyPoolAction(view, "list", null);
-        }
-        break;
       case "muse-sessions-refresh":
         if (modal.kind === "sessions" && !modal.loading) await loadMuseSessions(modal);
         break;
@@ -4680,7 +4971,7 @@ function bindDelegatedEvents(): void {
       "[data-switch-uuid]"
     );
     if (!row) return;
-    if ((ev.target as HTMLElement).closest("button")) return;
+    if ((ev.target as HTMLElement).closest("button:not(.iphone-open-account)")) return;
     if (reorderMode) {
       if (dragRow) return;
       ev.preventDefault();
@@ -4715,7 +5006,7 @@ function bindDelegatedEvents(): void {
         "[data-switch-uuid]"
       );
       if (!row) return;
-      if ((ev.target as HTMLElement).closest("button")) return;
+      if ((ev.target as HTMLElement).closest("button:not(.iphone-open-account)")) return;
       if (ev.touches.length !== 1) return;
       ev.preventDefault();
       dragTouchId = ev.touches[0].identifier;
