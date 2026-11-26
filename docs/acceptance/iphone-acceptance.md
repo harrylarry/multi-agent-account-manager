@@ -8,6 +8,8 @@
 
 ### 多账号稳定性回归
 
+使用 Spike 0.1.26 `c70c8ba` 覆盖安装。IPA SHA-256 为 `528bff3a92460619c19125881009937efd0db31dbfa3d99552e38d40a98af8a5`。已通过 CI、iOS 打包并下载校验，覆盖安装后的清理和多账号行为待 iPhone 验证。[下载](https://github.com/harrylarry/multi-agent-account-manager/actions/runs/45853722650/artifacts/15134982656) · [CI](https://github.com/harrylarry/multi-agent-account-manager/actions/runs/45853718396)
+
 1. 覆盖安装新版 Spike。重启后，Muse 顶部只有账号、诊断及备份等入口。检查两个已有账号的备注、分组、登录态与代理配置。
 2. 在不同 Muse 会话之间快速切换，再与 Hark 切换，逐次核对打开的是所选账号。强退 App 后重开，再核对最近使用账号及登录隔离。
 3. 用带代理的测试账号先确认正确代理密码能连通。保存错误代理密码时，应出现阻断，不能以直连加载。此时切到另一个有独立出口的账号，核对它仍可打开。恢复正确密码后重试。

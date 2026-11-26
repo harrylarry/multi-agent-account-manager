@@ -6,6 +6,8 @@
 
 iOS 打开会话和自动额度同步用同一代理写锁读取并下发最新配置；额度回写会重查账号归属、代理与时区。并发的自动额度触发合并。当前回归优先核对 Muse/Hark 切换、代理故障阻断和重启后的登录隔离。[真机步骤](../acceptance/iphone-acceptance.md#多账号稳定性回归)
 
+`c70c8ba` 已通过 81 项主 crate、110 项 Muse 协议测试、前端构建、嵌入脚本和两个移动 WebKit 视口的模拟回归。iOS CI、Xcode 和 IPA 下载校验通过。真机覆盖升级、清理和并发切换保持 `UNVERIFIED`。[iOS 构建](https://github.com/harrylarry/multi-agent-account-manager/actions/runs/45853722650)
+
 2026-11-25 接续快照。任务状态和原始证据以 [PR #16 接续记录](https://github.com/harrylarry/multi-agent-account-manager/pull/16#issuecomment-7130670517)、[Issue #13](https://github.com/harrylarry/multi-agent-account-manager/issues/13) 和 [Issue #14](https://github.com/harrylarry/multi-agent-account-manager/issues/14) 为准。范围与验收门禁见[开发计划 v2.1](../叠号开发计划-严谨执行版-v2.1-2026-11-23.md)与[开发决策记录](../开发决策记录.md)。
 
 ## Phase 0 技术 Spike
@@ -34,7 +36,7 @@ Windows 主 crate 67 项、muse-native 110 项、嵌入脚本 13 项与构建检
 
 同一 SHA 的 Xcode IPA 构建通过，ZIP 与 GitHub SHA-256 一致。已核验内部 IPA、Spike Bundle ID 和 iOS 17.0 最低版本。真机按联合清单保留逐项 `UNVERIFIED`。[iOS 打包](https://github.com/harrylarry/multi-agent-account-manager/actions/runs/45646166968) · [验收包及校验值](../acceptance/iphone-acceptance.md#v22-ac-联合验收)
 
-## 下一步
+## 历史批次与验收记录
 
 房间按 2026-11-26 新裁决支持先创建长期房间，再在房间发消息。创建选择 Muse 成员和一名指挥，名称可选。发送先写入房间记录，指挥按当前消息直接回应或提交绑定本次派发的结构化分工。App 自动校验并依次派活，给后续成员传共享发言与当前审核必需材料。任务级确认、会话隔离、丢 ACK 停止、每任务轮次门禁及既有模板房间继续运行。真机尚未验证。[房间复测](../acceptance/iphone-acceptance.md#长期房间与指挥自动派发)
 
