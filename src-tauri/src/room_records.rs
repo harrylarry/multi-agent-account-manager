@@ -71,22 +71,32 @@ impl Room {
 
   #[cfg(any(target_os = "ios", test))]
   pub(super) fn record_completed_step(&mut self) {
-    if let Some(entry) = self.attempts.last().and_then(Self::brief_step) {
+    if let Some(entry) = self.attempts.last().and_then(|step| Self::brief_step(step, self.conversation.as_ref())) {
       self.records.brief.push(entry);
     }
   }
 
   pub(super) fn restore_brief(&mut self) {
     if self.records.brief.is_empty() && !self.attempts.is_empty() {
-      self.records.brief.extend(self.attempts.iter().filter_map(Self::brief_step));
+      self.records.brief.extend(self.attempts.iter().filter_map(|step| Self::brief_step(step, self.conversation.as_ref())));
       if self.phase == Phase::Finalized { self.record_final_decision(); }
+    }
+    if let Some(chat) = &self.conversation {
+      for entry in &mut self.records.brief {
+        if matches!(entry.kind, BriefKind::Dependency) {
+          entry.text = chat.reply(entry.attempt_id).unwrap_or("指挥的分工未通过校验").chars().take(420).collect();
+        }
+      }
     }
   }
 
-  fn brief_step(step: &RoomAttempt) -> Option<BriefEntry> {
+  fn brief_step(step: &RoomAttempt, chat: Option<&conversation::Conversation>) -> Option<BriefEntry> {
     let delivery = step.delivery.as_ref()?;
     let (kind, text) = match (step.stage, step.review.as_ref()) {
-      (Some(Stage::Plan), _) => (BriefKind::Dependency, delivery.text.as_str()),
+      (Some(Stage::Plan), _) => (BriefKind::Dependency, match chat {
+        Some(chat) => chat.reply(step.id).unwrap_or("指挥的分工未通过校验"),
+        None => delivery.text.as_str(),
+      }),
       (Some(Stage::Review), Some(verdict)) if verdict.approved() => (BriefKind::Decision, verdict.reason()),
       (Some(Stage::Review), Some(verdict)) => (BriefKind::Todo, verdict.reason()),
       (Some(Stage::Review), None) => (BriefKind::Todo, "需要核对未能识别的审核回执"),

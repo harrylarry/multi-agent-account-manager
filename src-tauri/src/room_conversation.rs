@@ -11,6 +11,8 @@ pub(super) struct Conversation {
   messages: Vec<Message>,
   route: Vec<Assignment>,
   replies: BTreeMap<Uuid, String>,
+  #[serde(default)]
+  sessions: BTreeMap<String, Uuid>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -43,7 +45,7 @@ impl RoomBook {
       required_artifact: None,
     };
     self.add_draft(draft, template, &[], accounts, Some(Conversation {
-      commander, messages: Vec::new(), route: Vec::new(), replies: BTreeMap::new(),
+      commander, messages: Vec::new(), route: Vec::new(), replies: BTreeMap::new(), sessions: BTreeMap::new(),
     }))
   }
 }
@@ -66,6 +68,22 @@ impl Conversation {
   }
 
   pub(super) fn last_approved(&self) -> Option<Uuid> { self.messages.iter().rev().find_map(|message| message.approved_attempt) }
+
+  #[cfg(any(target_os = "ios", test))]
+  pub(super) fn session(&self, member: &str) -> Option<String> { self.sessions.get(member).map(Uuid::to_string) }
+
+  #[cfg(any(target_os = "ios", test))]
+  pub(super) fn bind_session(&mut self, member: &str, session: &str) -> Result<(), String> {
+    let session = Uuid::parse_str(session).map_err(|_| "房间隔离会话标识无效")?;
+    if self.sessions.get(member).is_some_and(|saved| *saved != session)
+      || self.sessions.iter().any(|(account, saved)| account != member && *saved == session) {
+      return Err("房间成员的隔离会话关联冲突，已停止发送".into());
+    }
+    self.sessions.insert(member.to_owned(), session);
+    Ok(())
+  }
+
+  pub(super) fn reply(&self, attempt: Uuid) -> Option<&str> { self.replies.get(&attempt).map(String::as_str) }
 }
 
 impl Room {
@@ -138,7 +156,7 @@ impl Room {
       Stage::Work | Stage::Discuss | Stage::Review => {
         let item = chat.route.get(self.relay.next.checked_sub(1)?)?;
         if item.stage != stage { return None; }
-        let mut prompt = format!("按指挥分工处理本轮。分工：{}。保留原用户目标，只使用房间交给你的材料。", item.instruction);
+        let mut prompt = format!("按指挥分工处理本轮。分工：{}。保留原用户目标。本轮回复请直接包含实际产出或明确说明无法完成的部分，进度说明不能代替交付。", item.instruction);
         if stage == Stage::Review {
           prompt.push_str(&format!("\n独立审核当前轮的全部执行产出。只回复 JSON，decision 使用 approve 或 return，reason 写清理由：{{\"reviewId\":\"{attempt}\",\"decision\":\"approve\",\"reason\":\"填写实际审核理由\"}}"));
         }

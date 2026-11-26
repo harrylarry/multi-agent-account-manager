@@ -717,9 +717,10 @@ pub fn begin_dispatch(
       save_json_atomic(path, &book)?;
       return Ok(None);
     }
+    let session_id = room.conversation.as_ref().and_then(|chat| chat.session(&member_uuid));
     let attempt = RoomAttempt {
       id: attempt_id, worker_id: Some(attempt_id), account_uuid: member_uuid, goal_revision: room.goal_revision,
-      session_id: None, send_id: None, user_message_id: None, status: "prepared".into(), delivery: None,
+      session_id, send_id: None, user_message_id: None, status: "prepared".into(), delivery: None,
       stage, review: None, remote_cancel_acknowledged: None,
     };
     room.attempts.push(attempt.clone());
@@ -777,6 +778,7 @@ pub fn record(path: &Path, dispatch: &Dispatch, event: Milestone) -> Result<Room
     .ok_or("该回复属于旧轮次")?;
   match event {
     Milestone::Ready { session, send_id } if phase == Phase::Dispatching && attempt.send_id.is_none() => {
+      if let Some(chat) = &mut room.conversation { chat.bind_session(&attempt.account_uuid, &session)?; }
       attempt.session_id = Some(session);
       attempt.send_id = Some(send_id);
       attempt.status = "prepared".into();
@@ -975,7 +977,8 @@ mod tests {
       assert_eq!(dispatch.attempt.stage, Some(stage));
       assert_eq!(dispatch.attempt.account_uuid, account);
       assert!(begin_dispatch(&self.path, self.id, revision, &self.accounts, false).is_err());
-      record(&self.path, &dispatch, Milestone::Ready { session:Uuid::new_v4().to_string(), send_id:dispatch.attempt.id.to_string() }).unwrap();
+      let session = dispatch.attempt.session_id.clone().unwrap_or_else(|| Uuid::new_v4().to_string());
+      record(&self.path, &dispatch, Milestone::Ready { session, send_id:dispatch.attempt.id.to_string() }).unwrap();
       record(&self.path, &dispatch, Milestone::Acknowledged { user_message_id:Uuid::new_v4().to_string() }).unwrap();
       dispatch
     }
@@ -1055,21 +1058,26 @@ mod tests {
     }).unwrap();
     post(&fixture, "ordinary question");
     let first = fixture.send(Stage::Plan, "a");
+    assert!(first.attempt.session_id.is_none());
     fixture.reply(&first, &serde_json::json!({"turnId":first.attempt.id,"reply":"a direct answer","steps":[]}).to_string());
     assert_eq!(fixture.get().phase, Phase::Created);
+    let commander_session = fixture.get().attempts[0].session_id.clone().unwrap();
     post(&fixture, "worked task");
     let plan = fixture.send(Stage::Plan, "a");
+    assert_eq!(plan.attempt.session_id.as_deref(), Some(commander_session.as_str()));
     assert!(plan.prompt.contains("a direct answer"));
     fixture.reply(&plan, &serde_json::json!({"turnId":plan.attempt.id,"reply":"route the work","steps":[
       {"member":2,"stage":"work","instruction":"Draft it"},{"member":3,"stage":"review","instruction":"Check it"},
     ]}).to_string());
     let work = fixture.send(Stage::Work, "b");
+    assert!(work.attempt.session_id.is_none());
     assert!(work.prompt.contains("Draft it") && work.prompt.contains("route the work"));
     fixture.reply(&work,"specific work output");
     let audit = fixture.send(Stage::Review, "c");
     assert!(audit.prompt.contains("specific work output"));
     fixture.audit(&audit, "approve");
     let final_step = fixture.send(Stage::Publish, "a");
+    assert_eq!(final_step.attempt.session_id.as_deref(), Some(commander_session.as_str()));
     fixture.reply(&final_step, "verified summary");
     fixture.command(Command::Confirm { id:fixture.id, revision:fixture.get().revision }).unwrap();
     let postponed = post(&fixture, "next question");

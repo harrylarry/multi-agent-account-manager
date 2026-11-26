@@ -899,6 +899,21 @@ pub(crate) async fn read_fingerprint_history(
   session_id: &str,
   user_id: &str,
 ) -> Result<Option<String>, String> {
+  read_history_with(egress, cookies, session_id, user_id, muse_native_client::collect::completed_history_reply).await
+}
+
+#[cfg(target_os = "ios")]
+pub(crate) async fn read_room_history(
+  egress: &crate::egress::AccountEgress, cookies: &SessionCookies, session_id: &str, user_id: &str,
+) -> Result<Option<String>, String> {
+  read_history_with(egress, cookies, session_id, user_id, muse_native_client::collect::completed_room_history_reply).await
+}
+
+#[cfg(not(target_os = "android"))]
+async fn read_history_with(
+  egress: &crate::egress::AccountEgress, cookies: &SessionCookies, session_id: &str, user_id: &str,
+  completed_reply: fn(&[u8], &str, &str) -> Option<String>,
+) -> Result<Option<String>, String> {
   let query = url::form_urlencoded::Serializer::new(String::new())
     .append_pair("session_id", session_id)
     .append_pair("limit", "50")
@@ -918,7 +933,7 @@ pub(crate) async fn read_fingerprint_history(
   if !(200..300).contains(&status) {
     return Err(format!("history_http_{status}"));
   }
-  Ok(muse_native_client::collect::completed_history_reply(&body, session_id, user_id))
+  Ok(completed_reply(&body, session_id, user_id))
 }
 
 #[cfg(not(target_os = "android"))]

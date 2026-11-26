@@ -2,7 +2,7 @@ use std::{path::Path, time::Duration};
 use zeroize::Zeroizing;
 use crate::{
   egress::resolve_for_app,
-  muse_native::{allocate_isolated_session, fetch_session_cookies, read_fingerprint_history},
+  muse_native::{allocate_isolated_session, fetch_session_cookies, read_room_history},
   probe_cancel::CancelToken,
   rooms::{self, Dispatch, Milestone, RoomBook, RoomGate},
   send_ledger::SendLedger,
@@ -32,7 +32,7 @@ pub async fn run(
     let result = tokio::select! {
       biased;
       _ = token.cancelled() => None,
-      result = tokio::time::timeout(Duration::from_secs(24), Box::pin(read_fingerprint_history(&egress, &cookies, session, user_id))) =>
+      result = tokio::time::timeout(Duration::from_secs(24), Box::pin(read_room_history(&egress, &cookies, session, user_id))) =>
         result.ok().and_then(Result::ok).flatten(),
     };
     return finish(gate, path, dispatch, result.map_or(Milestone::Uncertain, |text| Milestone::Complete {
@@ -46,7 +46,10 @@ pub async fn run(
   };
   let setup = Box::pin(async {
     let mut gateway = Box::pin(egress.connect(&cookies)).await.map_err(|_| ())?;
-    let session = allocate_isolated_session(&mut gateway).await.map_err(|_| ())?;
+    let session = match &dispatch.attempt.session_id {
+      Some(session) => session.clone(),
+      None => allocate_isolated_session(&mut gateway).await.map_err(|_| ())?,
+    };
     if uuid::Uuid::parse_str(&session).is_err() { return Err(()); }
     let route = muse_native_client::chat_send::IsolatedProbeRoute::new(session);
     let mut subscription = gateway.subscribe_isolated_probe(&route).await.map_err(|_| ())?;
@@ -111,7 +114,7 @@ pub async fn run(
   let live = tokio::select! {
     biased;
     _ = token.cancelled() => None,
-    result = subscription.collect(&ack, session, Duration::from_secs(95), Duration::from_secs(10), || {}) => Some(result),
+    result = subscription.collect(&ack, session, Duration::from_secs(360), Duration::from_secs(10), || {}) => Some(result),
   };
   if let Some(live) = live.filter(|reply| reply.done && !reply.text.trim().is_empty()) {
     return finish(gate, path, dispatch, Milestone::Complete { text: live.text, source: "stream" }).await;
@@ -119,7 +122,7 @@ pub async fn run(
   let history = tokio::select! {
     biased;
     _ = token.cancelled() => None,
-    result = tokio::time::timeout(Duration::from_secs(22), Box::pin(read_fingerprint_history(&egress, &cookies, session, &ack.message_id))) =>
+    result = tokio::time::timeout(Duration::from_secs(22), Box::pin(read_room_history(&egress, &cookies, session, &ack.message_id))) =>
       result.ok().and_then(Result::ok).flatten(),
   };
   if token.is_cancelled() {
