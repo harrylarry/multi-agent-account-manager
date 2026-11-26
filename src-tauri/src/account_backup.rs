@@ -54,7 +54,7 @@ impl Profile {
   pub fn restored_proxy(&self, existing: Option<&ProxySetting>) -> Option<ProxySetting> {
     let had_proxy = self.proxy_endpoint.is_some() || self.proxy_enabled;
     if !had_proxy { return existing.cloned(); }
-    if let Some(existing) = existing.filter(|setting| setting.display_safe() == self.proxy_endpoint.as_deref().unwrap_or("")) {
+    if let Some(existing) = existing.filter(|setting| self.proxy_endpoint.is_some() && safe_proxy_endpoint(setting) == self.proxy_endpoint) {
       if !self.proxy_requires_auth || existing.credential_ref.is_some() {
         let mut same = existing.clone();
         // A metadata restore never disables an enabled route.
@@ -69,6 +69,14 @@ impl Profile {
       enabled:self.proxy_enabled || existing.is_some_and(|setting| setting.enabled),
     })
   }
+}
+
+fn safe_proxy_endpoint(setting: &ProxySetting) -> Option<String> {
+  let endpoint = muse_native_client::proxy::ProxyConfig::parse_endpoint(&setting.uri).ok()?;
+  let host = if endpoint.host.contains(':') && !endpoint.host.starts_with('[') {
+    format!("[{}]", endpoint.host)
+  } else { endpoint.host };
+  Some(format!("{}://{host}:{}", endpoint.scheme, endpoint.port))
 }
 
 #[derive(Serialize)]
@@ -96,7 +104,7 @@ pub fn preview(backup: &AccountBackup, current: &[AccountRecord]) -> RestorePrev
       existing += 1;
       let projection = serde_json::json!([
         account.uuid, account.provider_id, account.alias, account.group, account.timezone, account.last_muse_thread,
-        account.proxy.as_ref().map(ProxySetting::display_safe),
+        account.proxy.as_ref().and_then(safe_proxy_endpoint),
       ]);
       digest.update(projection.to_string().as_bytes());
       if account.provider_id != profile.provider_id {
@@ -105,7 +113,7 @@ pub fn preview(backup: &AccountBackup, current: &[AccountRecord]) -> RestorePrev
         conflicts.push(profile.alias.clone());
       }
       if backup.includes_proxy_endpoints && (profile.proxy_enabled || profile.proxy_endpoint.is_some())
-        && account.proxy.as_ref().map(ProxySetting::display_safe) != profile.proxy_endpoint {
+        && account.proxy.as_ref().and_then(safe_proxy_endpoint) != profile.proxy_endpoint {
         conflicts.push(format!("{}（代理端点不同）", profile.alias));
       }
     } else {
@@ -142,7 +150,7 @@ pub fn from_accounts(
         timezone: account.timezone.clone(),
         last_muse_thread: account.last_muse_thread,
         created_at_ms: account.created_at_ms,
-        proxy_endpoint: proxy.filter(|setting| setting.validate().is_ok()).map(ProxySetting::display_safe),
+        proxy_endpoint: proxy.and_then(safe_proxy_endpoint),
         proxy_requires_auth: proxy.is_some_and(|setting| setting.credential_ref.is_some()),
         proxy_enabled: proxy.is_some_and(|setting| setting.enabled),
       }
