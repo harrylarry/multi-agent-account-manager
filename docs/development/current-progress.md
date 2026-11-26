@@ -53,6 +53,8 @@ Muse 红点的设备回执有延迟或不亮症状，暂无可定位的完整分
 
 局域网、摄像头权限、实际两机接收与出口释放为真机 `UNVERIFIED`。[iPhone 复测](../acceptance/iphone-acceptance.md#局域网加密备份和同出口保留策略) · [Apple 局域网权限](https://developer.apple.com/documentation/technotes/tn3179-understanding-local-network-privacy)
 
+`bc85566` 已通过 94 项主 crate 测试、前端及嵌入脚本测试。TCP 回环覆盖错误配对密钥拒绝和篡改密文拒绝。320×568、390×844 的 WebKit 用模拟 IPC 核对扫码、显式接收、未自动恢复及本机代理偏好。Quick checks 和 Xcode 打包皆通过。已下载并核对归档哈希、IPA、Bundle ID 和权限声明。[CI](https://github.com/harrylarry/multi-agent-account-manager/actions/runs/45810614186) · [iOS 构建](https://github.com/harrylarry/multi-agent-account-manager/actions/runs/45810616659) · [下载和步骤](../acceptance/iphone-acceptance.md#局域网加密备份和同出口保留策略)
+
 本轮收尾范围包括代理池账号持久引用与一对一占用、订阅变更提醒和元数据恢复；账号资料的 iOS 目录及文件保护检查；Muse 的前台 Live/Watch/Idle 监听窗口、掉线退避和系统暂停；以及 Hark 手动和按账号启用的自动指纹检测。Hark 只有在同账号的隔离发送探针取得完整、同会话和同回执的回复并持久落账后才解锁指纹发送。探针严格串行，结果不明、取消、未完成或无效样本均停止后续发送。新增带服务、真实 Cookie 名称和来源域名的会话 Token 导入，走同一预览和写入验证链。
 
 `c285088` 为联合验收候选，`CI_PASSED`。主 crate 89 项、嵌入脚本 13 项、前端和移动 WebKit 回归通过。Hark HTTP 回环核对一发、主会话不发、串会话回执不确认为成功，以及完整关联回复解锁。订阅认证参数变化保留原账号配置，备份保存非敏感绑定元数据。iOS 构建通过，已核验 IPA、ZIP 与最低版本。设备能力和服务端实际行为仍为 `UNVERIFIED`。[CI](https://github.com/harrylarry/multi-agent-account-manager/actions/runs/45770836204) · [iOS 构建](https://github.com/harrylarry/multi-agent-account-manager/actions/runs/45770837066)

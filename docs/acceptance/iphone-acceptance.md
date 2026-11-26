@@ -269,6 +269,8 @@ Spike `0.1.26`，构建提交 `f43cf9c0f66f7eb48ee4e54a4926aa067ac2a32e`。IPA S
 
 ## 局域网加密备份和同出口保留策略
 
+Spike `0.1.26`，构建提交 `bc85566c29ba4966333317696589850fd585474c`。下载 ZIP 并解压后，IPA SHA-256 为 `348a72c0f3426bf0277724d82b2343fc330c8eb83d09e38b972236bf84a1d54b`。已核验局域网及相机用途声明、Spike Bundle ID 与最低 iOS 17.0。`CI_PASSED`，两机真机 `UNVERIFIED`。[下载](https://github.com/harrylarry/multi-agent-account-manager/actions/runs/45810616659/artifacts/15114007121) · [Xcode](https://github.com/harrylarry/multi-agent-account-manager/actions/runs/45810616659) · [Quick checks](https://github.com/harrylarry/multi-agent-account-manager/actions/runs/45810614186)
+
 1. 两台装同版 Spike 的 iPhone 连同一 Wi-Fi。发送端点「备份 → 同一 Wi-Fi 传账号备份」，输入至少 8 字符的测试口令，点「用下方口令生成配对码」。接收端进同一菜单，扫屏幕码或手动填码，点「接收加密备份」。在接收端允许系统局域网权限，若首次连接因权限提示中断，可以在配对有效期内重按接收。
 2. 接收后输入错误口令预览，核对原账号资料仍在。输入正确口令预览并合并，核对账号、分组和时区。新恢复的代理账号需要认证时，补录代理凭据前打开会话应阻断。新设备登录态由各自 Cookie 容器管理。
 3. 重用已接收的配对码、超过两分钟、发送端退出备份或切到后台，均应无法取得新的备份。关闭接收端相机权限后，验证手动输入仍可用。更换 Wi-Fi，确认原配对无法接收。
