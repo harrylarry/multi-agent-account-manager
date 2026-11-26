@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-share-room-artifact"
+description = "Enables the share_room_artifact command without any pre-configured scope."
+commands.allow = ["share_room_artifact"]
+
+[[permission]]
+identifier = "deny-share-room-artifact"
+description = "Denies the share_room_artifact command without any pre-configured scope."
+commands.deny = ["share_room_artifact"]

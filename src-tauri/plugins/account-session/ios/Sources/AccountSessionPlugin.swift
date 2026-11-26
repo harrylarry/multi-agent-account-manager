@@ -85,6 +85,60 @@ private struct TransferProfileCookiesArgs: Decodable {
 private struct TaskNotificationArgs: Decodable {
   let identifier: String
   let kind: String
+  let approval: ApprovalNotice?
+}
+
+private struct ApprovalNotice: Decodable {
+  let uuid: String
+  let approvalId: String
+  let sessionScopeId: String
+  let expiresAtMs: Int64
+  let allow: Bool
+  let deny: Bool
+}
+
+private final class ApprovalNotificationDelegate: NSObject, UNUserNotificationCenterDelegate {
+  static let shared = ApprovalNotificationDelegate()
+  static let queueKey = "diehao.local-approval-actions"
+  static let allow = "diehao.approval.allow-once"
+  static let deny = "diehao.approval.deny"
+  static func configure() {
+    let center = UNUserNotificationCenter.current()
+    center.delegate = shared
+    let allow = UNNotificationAction(identifier: Self.allow, title: "允许一次", options: [.foreground, .authenticationRequired])
+    let deny = UNNotificationAction(identifier: Self.deny, title: "拒绝", options: [.foreground, .authenticationRequired, .destructive])
+    center.setNotificationCategories([
+      UNNotificationCategory(identifier: "diehao.approval.both", actions: [allow, deny], intentIdentifiers: []),
+      UNNotificationCategory(identifier: "diehao.approval.allow", actions: [allow], intentIdentifiers: []),
+      UNNotificationCategory(identifier: "diehao.approval.deny", actions: [deny], intentIdentifiers: []),
+    ])
+  }
+
+  func userNotificationCenter(_ center: UNUserNotificationCenter, didReceive response: UNNotificationResponse,
+                              withCompletionHandler completionHandler: @escaping () -> Void) {
+    let info = response.notification.request.content.userInfo
+    let decision = response.actionIdentifier == Self.allow ? "allow_once" : response.actionIdentifier == Self.deny ? "deny" : ""
+    guard !decision.isEmpty, let uuid = info["uuid"] as? String, let approvalId = info["approvalId"] as? String,
+          let sessionScopeId = info["sessionScopeId"] as? String, let expiry = info["expiresAtMs"] as? NSNumber else {
+      completionHandler()
+      return
+    }
+    DispatchQueue.main.async {
+      let store = UserDefaults.standard
+      var queue = store.array(forKey: Self.queueKey) as? [[String: Any]] ?? []
+      if !queue.contains(where: { $0["uuid"] as? String == uuid && $0["approvalId"] as? String == approvalId }) {
+        queue.append(["uuid":uuid, "approvalId":approvalId, "sessionScopeId":sessionScopeId,
+                      "expiresAtMs":expiry, "decision":decision])
+        store.set(Array(queue.suffix(16)), forKey: Self.queueKey)
+      }
+      completionHandler()
+    }
+  }
+
+  func userNotificationCenter(_ center: UNUserNotificationCenter, willPresent notification: UNNotification,
+                              withCompletionHandler completionHandler: @escaping (UNNotificationPresentationOptions) -> Void) {
+    completionHandler(notification.request.content.categoryIdentifier.hasPrefix("diehao.approval.") ? [.banner, .list, .sound] : [])
+  }
 }
 
 private struct ShareAccountBackupArgs: Decodable {
@@ -376,7 +430,7 @@ class AccountSessionPlugin: Plugin {
   @objc public func postTaskNotification(_ invoke: Invoke) throws {
     let args = try invoke.parseArgs(TaskNotificationArgs.self)
     DispatchQueue.main.async {
-      guard UIApplication.shared.applicationState != .active else {
+      guard UIApplication.shared.applicationState != .active || args.approval != nil else {
         invoke.resolve()
         return
       }
@@ -384,8 +438,27 @@ class AccountSessionPlugin: Plugin {
       content.title = "叠号"
       content.body = args.kind == "approval" ? "有待处理的审批。" : "检测到任务回复。"
       content.sound = .default
+      if let approval = args.approval {
+        content.categoryIdentifier = approval.allow && approval.deny ? "diehao.approval.both"
+          : approval.allow ? "diehao.approval.allow" : "diehao.approval.deny"
+        content.userInfo = ["uuid":approval.uuid, "approvalId":approval.approvalId,
+                            "sessionScopeId":approval.sessionScopeId, "expiresAtMs":approval.expiresAtMs]
+      }
       let request = UNNotificationRequest(identifier: args.identifier, content: content, trigger: nil)
       UNUserNotificationCenter.current().add(request) { _ in invoke.resolve() }
+    }
+  }
+
+  @objc public func takeApprovalNotificationActions(_ invoke: Invoke) {
+    DispatchQueue.main.async {
+      guard UIApplication.shared.applicationState == .active else {
+        invoke.resolve(["actions": []])
+        return
+      }
+      let store = UserDefaults.standard
+      let actions = store.array(forKey: ApprovalNotificationDelegate.queueKey) ?? []
+      store.removeObject(forKey: ApprovalNotificationDelegate.queueKey)
+      invoke.resolve(["actions": actions])
     }
   }
 
@@ -441,6 +514,44 @@ class AccountSessionPlugin: Plugin {
       }
       controller.completionWithItemsHandler = { _, shared, _, _ in
         try? FileManager.default.removeItem(at: file)
+        invoke.resolve(["shared": shared])
+      }
+      presenter.present(controller, animated: true)
+    }
+  }
+
+  @objc public func shareRoomArtifact(_ invoke: Invoke) throws {
+    struct Args: Decodable { let name: String; let contents: String }
+    let args = try invoke.parseArgs(Args.self)
+    DispatchQueue.main.async {
+      guard !args.name.isEmpty, args.name.utf8.count <= 400,
+            !args.name.contains("/"), !args.name.contains("\\"), !args.name.contains(":"),
+            args.name != ".", args.name != "..", args.contents.utf8.count <= 350_000,
+            let decoded = Data(base64Encoded: args.contents), decoded.count <= 262_144, !decoded.isEmpty,
+            let root = UIApplication.shared.connectedScenes.compactMap({ $0 as? UIWindowScene })
+              .first(where: { $0.activationState == .foregroundActive })?.keyWindow?.rootViewController else {
+        invoke.reject("无法打开房间附件分享")
+        return
+      }
+      let folder = FileManager.default.temporaryDirectory.appendingPathComponent("diehao-" + UUID().uuidString, isDirectory: true)
+      let file = folder.appendingPathComponent(args.name, isDirectory: false)
+      do {
+        try FileManager.default.createDirectory(at: folder, withIntermediateDirectories: false)
+        try decoded.write(to: file, options: [.atomic, .completeFileProtection])
+      } catch {
+        try? FileManager.default.removeItem(at: folder)
+        invoke.reject("无法创建分享附件")
+        return
+      }
+      var presenter = root
+      while let next = presenter.presentedViewController { presenter = next }
+      let controller = UIActivityViewController(activityItems: [file], applicationActivities: nil)
+      if let popover = controller.popoverPresentationController {
+        popover.sourceView = presenter.view
+        popover.sourceRect = CGRect(x: presenter.view.bounds.midX, y: presenter.view.bounds.midY, width: 1, height: 1)
+      }
+      controller.completionWithItemsHandler = { _, shared, _, _ in
+        try? FileManager.default.removeItem(at: folder)
         invoke.resolve(["shared": shared])
       }
       presenter.present(controller, animated: true)
@@ -835,5 +946,6 @@ public func initPlugin() -> Plugin {
   // 0.1.15: start the task watcher at plugin init so the parked-page
   // sweep is running from the first session on.
   TaskWatcher.shared.start()
+  ApprovalNotificationDelegate.configure()
   return AccountSessionPlugin()
 }

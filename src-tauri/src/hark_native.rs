@@ -345,22 +345,19 @@ pub async fn recover(
 }
 
 #[cfg(target_os = "ios")]
-async fn read_account(
+pub(crate) async fn account_http(
   app: &tauri::AppHandle,
   uuid: &str,
   setting: Option<&crate::storage::ProxySetting>,
-  timezone: &str,
-  collect_replies: bool,
-) -> HarkProbe {
+) -> Result<(reqwest::Client, reqwest::header::HeaderValue), String> {
   use muse_native_client::cookie::{SessionCookie, SessionCookies};
   use reqwest::header::HeaderValue;
   use std::time::Duration;
   use zeroize::Zeroizing;
 
-  let ready = async {
     let egress = crate::egress::resolve_for_app(app, setting)?;
     let client = egress
-      .http_client(Duration::from_secs(18), false)
+      .http_client_no_retry(Duration::from_secs(18))
       .map_err(|e| e.to_string())?;
     let cookies = tokio::time::timeout(
       Duration::from_secs(10),
@@ -385,10 +382,15 @@ async fn read_account(
     let mut header =
       HeaderValue::from_str(&cookie).map_err(|_| "Hark 登录态格式无效".to_string())?;
     header.set_sensitive(true);
-    Ok::<_, String>((client, header))
-  }
-  .await;
-  match ready {
+    Ok((client, header))
+}
+
+#[cfg(target_os = "ios")]
+async fn read_account(
+  app: &tauri::AppHandle, uuid: &str, setting: Option<&crate::storage::ProxySetting>,
+  timezone: &str, collect_replies: bool,
+) -> HarkProbe {
+  match account_http(app, uuid, setting).await {
     Ok((client, header)) => run_probe(client, header, timezone, "https://app.hark.com", collect_replies).await,
     Err(e) => HarkProbe {
       error: Some(e),
@@ -508,7 +510,7 @@ async fn run_probe(
 }
 
 #[cfg(any(target_os = "ios", test))]
-async fn checked_json(mut response: reqwest::Response) -> Result<serde_json::Value, String> {
+pub(crate) async fn checked_json(mut response: reqwest::Response) -> Result<serde_json::Value, String> {
   if !response.status().is_success() {
     return Err(format!("Hark HTTP {}", response.status().as_u16()));
   }
@@ -524,6 +526,15 @@ async fn checked_json(mut response: reqwest::Response) -> Result<serde_json::Val
     body.extend(bytes);
   }
   serde_json::from_slice(&body).map_err(|_| "Hark JSON 响应无法解析".to_string())
+}
+
+#[cfg(any(target_os = "ios", test))]
+pub(crate) fn bound_reply_seen(payload: &serde_json::Value, conversation: &str, reply: &str) -> bool {
+  let mut tracker = SyncTracker { conversation:conversation.to_owned(), collect_replies:true, polling:true, ..Default::default() };
+  for frame in payload["frames"].as_array().into_iter().flatten().filter_map(serde_json::Value::as_str) {
+    tracker.apply_frame(frame);
+  }
+  tracker.states.contains_key(reply)
 }
 
 #[cfg(any(target_os = "ios", test))]

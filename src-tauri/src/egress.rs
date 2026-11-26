@@ -131,7 +131,17 @@ impl AccountEgress {
     timeout: Duration,
     follow_redirects: bool,
   ) -> Result<reqwest::Client, EgressError> {
+    self.http_client_with_policy(timeout, follow_redirects, true)
+  }
+
+  #[cfg(target_os = "ios")]
+  pub fn http_client_no_retry(&self, timeout: Duration) -> Result<reqwest::Client, EgressError> {
+    self.http_client_with_policy(timeout, false, false)
+  }
+
+  fn http_client_with_policy(&self, timeout: Duration, follow_redirects: bool, allow_retry: bool) -> Result<reqwest::Client, EgressError> {
     let mut builder = reqwest::Client::builder().timeout(timeout);
+    if !allow_retry { builder = builder.retry(reqwest::retry::never()); }
     if !follow_redirects {
       builder = builder.redirect(reqwest::redirect::Policy::none());
     }
@@ -278,6 +288,16 @@ pub enum AccountSubscription {
 }
 
 impl AccountSubscription {
+  #[cfg(target_os = "ios")]
+  pub async fn send_room_message(
+    &mut self, text: &str, route: &IsolatedProbeRoute, attachments: &[chat_send::ChatAttachment],
+    timeout: Duration, cancel: &mut tokio::sync::watch::Receiver<bool>,
+  ) -> SendAttemptResult {
+    match self {
+      Self::Direct(s) => chat_send::send_with_attachments_on_subscription(s, text, route, attachments, timeout, cancel).await,
+      Self::Proxied(s) => chat_send::send_with_attachments_on_subscription(s, text, route, attachments, timeout, cancel).await,
+    }
+  }
   #[cfg(target_os = "ios")]
   pub async fn cancel_isolated_turn(&mut self, route: &IsolatedProbeRoute) -> bool {
     match self {

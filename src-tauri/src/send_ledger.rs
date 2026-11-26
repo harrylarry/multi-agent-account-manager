@@ -56,6 +56,7 @@ pub enum SendKind {
   Message,
   FingerprintProbe,
   RoomMessage,
+  HarkMessage,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -627,6 +628,10 @@ impl<'a> MissionGuard<'a> {
   #[cfg(target_os = "ios")]
   pub fn begin_room_send(&self, conversation_id: &str, digest: &str) -> Result<String, SendError> {
     self.ledger.begin_mission_attempt(&self.mission_id, &self.account_uuid, conversation_id, digest, SendKind::RoomMessage)
+  }
+  #[cfg(any(target_os = "ios", test))]
+  pub fn begin_hark_send(&self, conversation_id: &str, digest: &str) -> Result<String, SendError> {
+    self.ledger.begin_mission_attempt(&self.mission_id, &self.account_uuid, conversation_id, digest, SendKind::HarkMessage)
   }
   #[allow(dead_code)] // 调用方目前只用 begin_probe，保留 id 读取供诊断
   pub fn mission_id(&self) -> &str {

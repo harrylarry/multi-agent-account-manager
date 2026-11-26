@@ -1110,6 +1110,9 @@ impl SessionManager {
           return Err("备份含归属冲突，未修改任何账号".into());
         }
         if overwrite {
+          if backup.includes_proxy_endpoints {
+            record.proxy = saved.restored_proxy(record.proxy.as_ref());
+          }
           record.alias = saved.alias;
           record.auto_alias = false;
           record.timezone = saved.timezone;
@@ -1118,13 +1121,7 @@ impl SessionManager {
         }
         continue;
       }
-      let proxy = saved.proxy_endpoint.map(|uri| ProxySetting {
-        uri,
-        username: None,
-        // A missing credential intentionally blocks egress until explicit setup.
-        credential_ref: saved.proxy_requires_auth.then(|| format!("proxy-{}", saved.uuid)),
-        enabled: saved.proxy_enabled,
-      });
+      let proxy = saved.restored_proxy(None);
       updated.accounts.push(AccountRecord {
         provider_id: saved.provider_id, uuid: saved.uuid, alias: saved.alias,
         group: saved.group, timezone: saved.timezone, last_muse_thread: saved.last_muse_thread,
@@ -1276,7 +1273,15 @@ impl SessionManager {
         account.last_task_reply_at_ms = Some(now_ms());
       }
       if account.task_notifications {
-        notices.push((kind, key));
+        let action = pending.into_iter().flatten().find(|item| provider == ProviderId::Muse && kind == "approval"
+          && item.id == id && item.status == "pending" && item.expires_at_ms > now_ms() as i64
+          && !item.session_scope_id.is_empty()).and_then(|item| {
+          let allow = item.choices.iter().any(|choice| choice.decision == "allow_once" && choice.scope.is_none());
+          let deny = item.choices.iter().any(|choice| choice.decision == "deny" && choice.scope.is_none());
+          (allow || deny).then(|| serde_json::json!({"uuid":uuid, "approvalId":item.id,
+            "sessionScopeId":item.session_scope_id, "expiresAtMs":item.expires_at_ms, "allow":allow, "deny":deny}))
+        });
+        notices.push((kind, key, action));
       }
     }
     account.pending_approval_count = pending.map(|items| items.len());
@@ -1290,8 +1295,8 @@ impl SessionManager {
     drop(locked);
     self.emit_snapshot(app, &snapshot);
     let _ = crate::platform::ios::set_unread_badge(app, any_unread).await;
-    for (kind, key) in notices {
-      crate::platform::ios::post_task_notification(app, &key, kind).await;
+    for (kind, key, action) in notices {
+      crate::platform::ios::post_task_notification(app, &key, kind, action).await;
     }
     Ok(())
   }

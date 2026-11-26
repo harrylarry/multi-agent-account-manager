@@ -63,7 +63,13 @@ pub async fn run(
   };
   let session = route.session_id();
   // The room goal stays in its room file. The shared journal receives a digest.
-  let send_id = match mission.begin_room_send(session, &rooms::sha256(&dispatch.prompt)) {
+  let mut digest_material = rooms::sha256(&dispatch.prompt);
+  for file in &dispatch.attachments {
+    digest_material.push_str(&rooms::sha256(&file.filename));
+    digest_material.push_str(&rooms::sha256(file.mime_type));
+    digest_material.push_str(&rooms::sha256(&file.data_base64));
+  }
+  let send_id = match mission.begin_room_send(session, &rooms::sha256(&digest_material)) {
     Ok(id) => id,
     Err(_) => return finish(gate, path, dispatch, Milestone::FailedBeforeSending).await,
   };
@@ -75,7 +81,7 @@ pub async fn run(
     ledger.fail(&send_id, "尚未发送".into());
     return finish(gate, path, dispatch, Milestone::FailedBeforeSending).await;
   }
-  let tracked = subscription.send_on_subscription(&dispatch.prompt, &route, Duration::from_secs(30), token.receiver()).await;
+  let tracked = subscription.send_room_message(&dispatch.prompt, &route, &dispatch.attachments, Duration::from_secs(30), token.receiver()).await;
   let ack = match tracked.outcome {
     Ok(ack) if ack.session_id.as_deref() == Some(session) => {
       ledger.confirm(&send_id);

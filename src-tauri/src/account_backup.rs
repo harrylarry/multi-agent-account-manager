@@ -21,6 +21,8 @@ pub struct AccountBackup {
   pub proxy_pool: Vec<ProxyPoolProfile>,
   #[serde(default)]
   pub expires_at_ms: Option<u64>,
+  #[serde(default, skip_serializing_if = "Option::is_none")]
+  pub rooms: Option<crate::rooms::RoomBook>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
@@ -48,6 +50,27 @@ pub struct Profile {
   pub proxy_enabled: bool,
 }
 
+impl Profile {
+  pub fn restored_proxy(&self, existing: Option<&ProxySetting>) -> Option<ProxySetting> {
+    let had_proxy = self.proxy_endpoint.is_some() || self.proxy_enabled;
+    if !had_proxy { return existing.cloned(); }
+    if let Some(existing) = existing.filter(|setting| setting.display_safe() == self.proxy_endpoint.as_deref().unwrap_or("")) {
+      if !self.proxy_requires_auth || existing.credential_ref.is_some() {
+        let mut same = existing.clone();
+        // A metadata restore never disables an enabled route.
+        same.enabled |= self.proxy_enabled;
+        return Some(same);
+      }
+    }
+    Some(ProxySetting {
+      uri:self.proxy_endpoint.clone().unwrap_or_default(),
+      username:None,
+      credential_ref:self.proxy_requires_auth.then(|| format!("proxy-restore-{}", self.uuid)),
+      enabled:self.proxy_enabled || existing.is_some_and(|setting| setting.enabled),
+    })
+  }
+}
+
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct RestorePreview {
@@ -55,6 +78,9 @@ pub struct RestorePreview {
   pub existing: usize,
   pub conflicts: Vec<String>,
   pub proxy_pool_count: usize,
+  pub room_count: usize,
+  pub template_count: usize,
+  pub room_checksum: Option<String>,
   pub checksum: String,
 }
 
@@ -78,12 +104,18 @@ pub fn preview(backup: &AccountBackup, current: &[AccountRecord]) -> RestorePrev
       } else if account.alias != profile.alias || account.timezone != profile.timezone || (backup.includes_groups && account.group != profile.group) {
         conflicts.push(profile.alias.clone());
       }
+      if backup.includes_proxy_endpoints && (profile.proxy_enabled || profile.proxy_endpoint.is_some())
+        && account.proxy.as_ref().map(ProxySetting::display_safe) != profile.proxy_endpoint {
+        conflicts.push(format!("{}（代理端点不同）", profile.alias));
+      }
     } else {
       added += 1;
       digest.update(profile.uuid.as_bytes());
     }
   }
-  RestorePreview { added, existing, conflicts, proxy_pool_count: backup.proxy_pool.len(), checksum: STANDARD.encode(digest.finish().as_ref()) }
+  let (room_count, template_count) = backup.rooms.as_ref().map_or((0,0), crate::rooms::RoomBook::archive_counts);
+  RestorePreview { added, existing, conflicts, proxy_pool_count: backup.proxy_pool.len(), room_count, template_count, room_checksum:None,
+    checksum: STANDARD.encode(digest.finish().as_ref()) }
 }
 
 #[cfg(target_os = "ios")]
@@ -99,6 +131,7 @@ pub fn from_accounts(
     includes_proxy_endpoints: include_proxy_endpoints,
     proxy_pool,
     expires_at_ms,
+    rooms: None,
     accounts: accounts.iter().map(|account| {
       let proxy = account.proxy.as_ref().filter(|_| include_proxy_endpoints);
       Profile {
@@ -158,6 +191,7 @@ pub fn decrypt(encoded: &str, password: &str) -> Result<AccountBackup, String> {
     .open_in_place(nonce, aead::Aad::from(&header), &mut data[HEADER..])
     .map_err(|_| "口令错误或备份已损坏")?;
   let backup: AccountBackup = serde_json::from_slice(body).map_err(|_| "备份数据无效")?;
+  if let Some(rooms) = &backup.rooms { rooms.validate_archive()?; }
   if backup.expires_at_ms.is_some_and(|deadline| deadline <= crate::storage::now_ms()) {
     return Err("这份加密备份已超过设定的恢复期限".into());
   }
@@ -197,8 +231,28 @@ mod tests {
   use super::*;
 
   #[test]
+  fn restored_proxy_never_drops_an_enabled_route_or_reuses_a_different_host_secret() {
+    let mut profile: Profile = serde_json::from_value(serde_json::json!({
+      "providerId":"muse","uuid":"00000000-0000-4000-8000-000000000001","alias":"test","createdAtMs":0,
+      "proxyEnabled":true,"proxyRequiresAuth":true,
+    })).unwrap();
+    let blocked = profile.restored_proxy(None).unwrap();
+    assert!(blocked.enabled);
+    assert!(blocked.validate().is_err());
+    let active = ProxySetting { uri:"socks5://old.example:1234".into(), username:Some("proxy-user".into()),
+      credential_ref:Some("existing-key".into()), enabled:true };
+    profile.proxy_endpoint = Some("socks5://new.example:1234".into());
+    let new = profile.restored_proxy(Some(&active)).unwrap();
+    assert!(new.enabled);
+    assert_ne!(new.credential_ref, active.credential_ref);
+    assert!(new.validate().is_err());
+    profile.proxy_endpoint = Some(active.uri.clone());
+    assert_eq!(profile.restored_proxy(Some(&active)).unwrap().credential_ref, active.credential_ref);
+  }
+
+  #[test]
   fn account_backup_roundtrip_rejects_wrong_password_and_tampering() {
-    let backup = AccountBackup { accounts: Vec::new(), includes_groups: true, includes_proxy_endpoints: false, proxy_pool: Vec::new(), expires_at_ms: None };
+    let backup = AccountBackup { accounts: Vec::new(), includes_groups: true, includes_proxy_endpoints: false, proxy_pool: Vec::new(), expires_at_ms: None, rooms:None };
     let encoded = encrypt(&backup, "test-password").unwrap();
     assert!(decrypt(&encoded, "bad-password").is_err());
     assert!(decrypt(&encoded, "test-password").unwrap().includes_groups);

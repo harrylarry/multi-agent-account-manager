@@ -22,7 +22,7 @@ type ModalMode =
   | { kind: "remove"; account: AccountRecord }
   | { kind: "tasks"; account: AccountRecord; checking: boolean; note: string; quotaChecking: boolean }
   | { kind: "harkReplies"; account: AccountRecord; reading: boolean; result: HarkRecovery | null; error: string }
-  | { kind: "backup"; busy: boolean; encrypted: string; fileName: string; preview: BackupPreview | null; message: string; mode: BackupMode; includeGroups: boolean; includeProxy: boolean; expiryDays: number }
+  | { kind: "backup"; busy: boolean; encrypted: string; fileName: string; preview: BackupPreview | null; message: string; mode: BackupMode; includeGroups: boolean; includeProxy: boolean; includeRooms: boolean; expiryDays: number }
   | { kind: "proxyPool"; account: AccountRecord; data: ProxyPoolView | null; setting: SpikeProxySettingView | null; busy: boolean; message: string }
   | { kind: "sessions"; account: AccountRecord; loading: boolean; items: MuseSession[] | null; error: string }
   | { kind: "cookies"; account: AccountRecord; busy: boolean; preview: CookiePreview | null; message: string; imported: boolean; stored: Pick<CookiePreview, "count" | "nextExpiry"> | null }
@@ -91,6 +91,9 @@ interface BackupPreview {
   existing: number;
   conflicts: string[];
   proxyPoolCount: number;
+  roomCount?: number;
+  templateCount?: number;
+  roomChecksum?: string | null;
   checksum: string;
 }
 
@@ -1115,6 +1118,20 @@ async function callCommand(
 let foregroundTaskIndex = 0;
 let foregroundTaskBusy = false;
 let foregroundTaskTimer: number | null = null;
+let processingApprovalNotification = false;
+
+async function processApprovalNotifications(): Promise<void> {
+  if (snapshot?.platform !== "ios" || document.hidden || processingApprovalNotification) return;
+  processingApprovalNotification = true;
+  try {
+    const messages = await invoke<string[]>("process_approval_notification_actions");
+    if (messages?.length && snapshot) {
+      snapshot = { ...snapshot, notice: messages.join(" · ") };
+      render();
+    }
+  } catch { /* The built-in approval list remains available. */ }
+  finally { processingApprovalNotification = false; }
+}
 const taskRetryAt = new Map<string, number>();
 const pendingTaskActivity = new Map<string, TaskObservation>();
 
@@ -2624,6 +2641,7 @@ function renderTasks(view: Extract<ModalMode, { kind: "tasks" }>): string {
           ${account.providerId === "muse" ? `<button id="account-quota-refresh" class="btn" type="button" ${view.quotaChecking ? "disabled" : ""}>刷新额度</button>` : ""}
           ${account.providerId === "hark" ? `<button id="account-task-open" class="btn" type="button">打开会话查看审批</button>` : ""}
           ${account.providerId === "hark" ? `<button id="hark-replies-open" class="btn" type="button">补同步回复</button>` : ""}
+          ${account.providerId === "hark" && isSpikeBuild ? '<button id="hark-isolated-send" class="btn" type="button">验证隔离发送</button>' : ""}
           <button id="account-task-refresh" class="btn primary" type="button" ${checking ? "disabled" : ""}>刷新</button>
         </div>
       </div>
@@ -2698,7 +2716,7 @@ async function checkAccountTasks(view: Extract<ModalMode, { kind: "tasks" }>): P
 }
 
 function renderAccountBackup(view: Extract<ModalMode, { kind: "backup" }>): string {
-  const { busy, fileName, preview, message, mode, includeGroups, includeProxy } = view;
+  const { busy, fileName, preview, message, mode, includeGroups, includeProxy, includeRooms } = view;
   const disabled = busy ? "disabled" : "";
   return `
     <div class="inline-modal" role="dialog" aria-modal="true" aria-labelledby="account-backup-title">
@@ -2709,12 +2727,13 @@ function renderAccountBackup(view: Extract<ModalMode, { kind: "backup" }>): stri
           <label for="backup-mode">备份范围</label>
           <select id="backup-mode" class="modal-input" ${disabled}>
             <option value="light" ${mode === "light" ? "selected" : ""}>轻量（账号、备注及分组）</option>
-            <option value="full" ${mode === "full" ? "selected" : ""}>全量（含代理池及账号代理端点）</option>
+            <option value="full" ${mode === "full" ? "selected" : ""}>全量（含代理资料、房间和模板）</option>
             <option value="custom" ${mode === "custom" ? "selected" : ""}>自定义</option>
           </select>
           ${mode === "custom" ? `<div class="proxy-pool-actions">
             <label><input id="backup-include-groups" type="checkbox" ${includeGroups ? "checked" : ""} ${disabled} />分组</label>
             <label><input id="backup-include-proxy" type="checkbox" ${includeProxy ? "checked" : ""} ${disabled} />账号代理端点</label>
+            <label><input id="backup-include-rooms" type="checkbox" ${includeRooms ? "checked" : ""} ${disabled} />房间、附件和模板</label>
           </div>` : ""}
           <label for="backup-expiry">导出有效期</label>
           <select id="backup-expiry" class="modal-input" ${disabled}>
@@ -2729,6 +2748,7 @@ function renderAccountBackup(view: Extract<ModalMode, { kind: "backup" }>): stri
           <input id="backup-password" type="password" autocomplete="off" class="modal-input" ${disabled} />
           ${preview ? `<div class="approval-items">
             <div>新增 ${preview.added} · 已有 ${preview.existing} · 代理池 ${preview.proxyPoolCount} 条</div>
+            ${preview.roomChecksum ? `<div>房间 ${preview.roomCount ?? 0} · 自定义模板 ${preview.templateCount ?? 0} · 可独立恢复</div>` : ""}
             ${preview.conflicts.map((conflict) => `<div>冲突 · ${escapeHtml(conflict)}</div>`).join("")}
           </div>` : ""}
         </div>
@@ -2738,26 +2758,30 @@ function renderAccountBackup(view: Extract<ModalMode, { kind: "backup" }>): stri
           <button id="backup-export" type="button" class="btn primary" ${disabled}>导出备份</button>
           <button id="backup-preview" type="button" class="btn" ${disabled}>预览恢复</button>
           ${preview ? `<button id="backup-merge" type="button" class="btn" ${disabled}>合并</button><button id="backup-overwrite" type="button" class="btn" ${disabled}>覆盖冲突资料</button>` : ""}
+          ${preview?.roomChecksum ? `<button id="backup-rooms-merge" type="button" class="btn" ${disabled}>合并房间与模板</button>
+            <button id="backup-rooms-overwrite" type="button" class="btn" ${disabled}>覆盖同标识房间与模板</button>` : ""}
         </div>
       </div>
     </div>`;
 }
 
-async function accountBackupAction(view: Extract<ModalMode, { kind: "backup" }>, action: "export" | "preview" | "merge" | "overwrite"): Promise<void> {
+async function accountBackupAction(view: Extract<ModalMode, { kind: "backup" }>, action: "export" | "preview" | "merge" | "overwrite" | "rooms-merge" | "rooms-overwrite"): Promise<void> {
   if (modal !== view || view.busy) return;
   const passwordInput = document.querySelector<HTMLInputElement>("#backup-password");
   const password = passwordInput?.value ?? "";
   if (passwordInput) passwordInput.value = "";
-  if (action === "overwrite" && !await askConfirm({
+  const overwrite = action === "overwrite" || action === "rooms-overwrite";
+  if (overwrite && !await askConfirm({
     title: "覆盖冲突资料",
-    desc: "备份中的备注和分组会替换匹配账号的同名资料。",
+    desc: action === "rooms-overwrite" ? "备份会替换标识相同的本机房间和模板。操作会保存为独立的一次恢复。"
+      : "备份会更新匹配账号的备注、设置及所选代理资料。新代理需要凭据时将保持阻断。",
     confirmLabel: "覆盖",
     danger: true,
   })) {
     if ((modal as ModalMode).kind === "none") await setModal(view);
     return;
   }
-  if (action === "overwrite") await setModal(view);
+  if (overwrite) await setModal(view);
   view.busy = true;
   view.message = "处理中…";
   render();
@@ -2766,19 +2790,26 @@ async function accountBackupAction(view: Extract<ModalMode, { kind: "backup" }>,
       const shared = await invoke<boolean>("export_account_backup", {
         password, expiryDays: view.expiryDays, includeGroups: view.mode !== "custom" || view.includeGroups,
         includeProxyEndpoints: view.mode === "full" || (view.mode === "custom" && view.includeProxy),
+        includeRooms: view.mode === "full" || (view.mode === "custom" && view.includeRooms),
       });
       view.message = shared ? "备份已导出。" : "已取消导出。";
     } else if (action === "preview") {
       if (!view.encrypted) throw new Error("请先选择备份文件");
       view.preview = await invoke<BackupPreview>("preview_account_backup", { encrypted: view.encrypted, password });
       view.message = "";
+    } else if ((action === "rooms-merge" || action === "rooms-overwrite") && view.preview?.roomChecksum) {
+      await invoke("restore_room_backup", { encrypted:view.encrypted, password, overwrite, roomChecksum:view.preview.roomChecksum });
+      view.preview = { ...view.preview, roomChecksum:null };
+      view.message = "房间和模板已恢复。";
     } else if (view.preview) {
       snapshot = await invoke<ManagerSnapshot>("restore_account_backup", {
         encrypted: view.encrypted, password, overwrite: action === "overwrite", previewChecksum: view.preview.checksum,
       });
-      view.preview = null;
-      view.encrypted = "";
-      view.fileName = "";
+      if (!view.preview.roomChecksum) {
+        view.preview = null;
+        view.encrypted = "";
+        view.fileName = "";
+      }
       view.message = "账号资料已恢复。";
     }
   } catch (error) {
@@ -3080,7 +3111,7 @@ async function submitNewAccount(view: Extract<ModalMode, { kind: "add" }>, previ
   }
 }
 
-async function updateRooms(view: RoomsView, command: { action?: string; id?: string; revision?: number }): Promise<void> {
+async function updateRooms(view: RoomsView, command: { action?: string; id?: string; revision?: number; [key: string]: unknown }): Promise<void> {
   if (modal !== view) return;
   if (command.action === "interrupt" || (command.action === "supplement" && view.busy)) {
     try {
@@ -4313,6 +4344,55 @@ function bindDelegatedEvents(): void {
 
     const roomAction = target.closest<HTMLElement>("[data-room-action]");
     if (roomAction && modal.kind === "rooms") {
+      const view = modal;
+      const roomActionName = roomAction.dataset.roomAction;
+      const roomStatus = document.getElementById("room-result");
+      if (["list_binding", "bind_session", "save_file", "save_link", "verify_commit", "share_artifact", "open_artifact_link"].includes(roomActionName ?? "")) {
+        if (view.busy) return;
+        const metadata = roomCommand(roomAction);
+        try {
+          if (roomActionName === "share_artifact") {
+            await invoke("share_room_artifact", { room:metadata.id, artifact:roomAction.dataset.roomArtifact });
+          } else if (roomActionName === "open_artifact_link") {
+            await invoke("open_external_url", { url:roomAction.dataset.roomUrl });
+          } else if (roomActionName === "list_binding" || roomActionName === "bind_session") {
+            const panel = roomAction.closest("[data-room-bind]");
+            const account = panel?.querySelector<HTMLSelectElement>("[data-binding-account]");
+            const threads = panel?.querySelector<HTMLSelectElement>("[data-binding-thread]");
+            if (!account?.value || !threads) throw new Error("请先选择房间成员。");
+            const uuid = account.value;
+            if (roomActionName === "list_binding") {
+              threads.replaceChildren();
+              if (roomStatus) roomStatus.textContent = "正在读取该账号会话…";
+              const items = await invoke<MuseSession[]>("list_muse_sessions", { uuid });
+              if (account.value !== uuid || !threads.isConnected) return;
+              threads.dataset.bindingOwner = uuid;
+              threads.replaceChildren(...items.map((session) => new Option(session.title || "无标题", session.id)));
+              if (roomStatus) roomStatus.textContent = items.length ? `取得 ${items.length} 条会话` : "该账号没有可绑定的会话";
+            } else {
+              if (!threads.value || threads.dataset.bindingOwner !== uuid) throw new Error("请读取当前账号的会话后再确认。");
+              await updateRooms(view, { ...metadata, accountUuid:uuid, threadId:threads.value });
+            }
+          } else {
+            const form = roomAction.closest("[data-room-materials]");
+            let input: { kind:string; url?:string; name?:string; base64?:string };
+            if (roomActionName === "save_file") {
+              const file = form?.querySelector<HTMLInputElement>("[data-artifact-file]")?.files?.[0];
+              if (!file || file.size > 256 * 1024 || file.size === 0) throw new Error("请选择 1 字节至 256 KiB 的文件。");
+              const bytes = new Uint8Array(await file.arrayBuffer());
+              let raw = "";
+              for (let offset = 0; offset < bytes.length; offset += 16_384) raw += String.fromCharCode(...bytes.subarray(offset, offset + 16_384));
+              input = { kind:"file", name:file.name, base64:btoa(raw) };
+            } else {
+              const url = form?.querySelector<HTMLInputElement>("[data-artifact-link]")?.value.trim();
+              if (!url) throw new Error("请输入 HTTPS 链接。");
+              input = { kind:roomActionName === "verify_commit" ? "code_change" : "link", url };
+            }
+            await updateRooms(view, { ...metadata, action:"save_artifact", input });
+          }
+        } catch (error) { if (roomStatus) roomStatus.textContent = String(error); }
+        return;
+      }
       if (roomAction.dataset.roomAction === "refresh_assignment_quota") {
         const status = document.getElementById("room-result");
         if (status) status.textContent = "正在通过各账号原生线路刷新 Muse 额度…";
@@ -4464,6 +4544,27 @@ function bindDelegatedEvents(): void {
           await loadHarkReplies(view);
         }
         break;
+      case "hark-isolated-send": {
+        if (modal.kind !== "tasks" || modal.account.providerId !== "hark" || modal.checking) break;
+        const view = modal;
+        const confirmed = await askConfirm({
+          title:"验证 Hark 隔离发送", desc:"将在这个测试账号新建项目，核对独立会话后发送一条测试消息。结果不明时会留在发送台账供核对。",
+          confirmLabel:"新建隔离会话并测试",
+        });
+        await setModal(view);
+        if (!confirmed) break;
+        view.checking = true;
+        view.note = "正在核验 Hark 隔离会话、发送与回复…";
+        render();
+        try {
+          const result = await invoke<{ conversationId:string; sendId:string; confirmed:boolean; responseSeen:boolean; httpStatus?:number }>("hark_isolated_send_probe", {
+            uuid:view.account.uuid, timezone:Intl.DateTimeFormat().resolvedOptions().timeZone || "UTC", taskId:createSpikeTaskId(),
+          });
+          view.note = `隔离会话 …${result.conversationId.slice(-8)} · 发送 ${result.confirmed ? "CONFIRMED" : "UNKNOWN"} · HTTP ${result.httpStatus ?? "—"} · 回复关联 ${result.responseSeen ? "已观察" : "未观察"}`;
+        } catch (error) { view.note = String(error); }
+        finally { view.checking = false; if (modal === view) render(); }
+        break;
+      }
       case "hark-replies-retry":
         if (modal.kind === "harkReplies") await loadHarkReplies(modal);
         break;
@@ -4496,7 +4597,7 @@ function bindDelegatedEvents(): void {
       case "account-backup-btn":
         if (modal.kind === "none") await setModal({
           kind: "backup", busy: false, encrypted: "", fileName: "", preview: null, message: "",
-          mode: "light", includeGroups: true, includeProxy: false, expiryDays: 0,
+          mode: "light", includeGroups: true, includeProxy: false, includeRooms: false, expiryDays: 0,
         });
         break;
       case "rooms-open-btn": {
@@ -4516,6 +4617,10 @@ function bindDelegatedEvents(): void {
         break;
       case "backup-overwrite":
         if (modal.kind === "backup") await accountBackupAction(modal, "overwrite");
+        break;
+      case "backup-rooms-merge":
+      case "backup-rooms-overwrite":
+        if (modal.kind === "backup") await accountBackupAction(modal, id === "backup-rooms-merge" ? "rooms-merge" : "rooms-overwrite");
         break;
       case "account-proxy-pool":
         if (modal.kind === "rename") {
@@ -4712,6 +4817,8 @@ function bindDelegatedEvents(): void {
         view.includeGroups = input.checked;
       } else if (input.id === "backup-include-proxy") {
         view.includeProxy = input.checked;
+      } else if (input.id === "backup-include-rooms") {
+        view.includeRooms = input.checked;
       } else if (input.id === "backup-file") {
         const file = input.files?.[0];
         view.preview = null;
@@ -4983,15 +5090,18 @@ async function bootstrap(): Promise<void> {
     foregroundTaskTimer = window.setInterval(() => {
       void refreshForegroundTask();
       void triggerAutomaticFingerprint();
+      void processApprovalNotifications();
     }, 15_000);
     window.addEventListener("pagehide", () => {
       if (foregroundTaskTimer !== null) window.clearInterval(foregroundTaskTimer);
     }, { once: true });
     void refreshForegroundTask();
+    void processApprovalNotifications();
   }
   document.addEventListener("visibilitychange", () => {
     if (!document.hidden) {
       triggerAutoSync();
+      void processApprovalNotifications();
       // 回前台立刻取一次存活探针状态：后台期间定时器不会运行，
       // 界面上的秒数是旧的，必须以真实快照为准。
       if (spikeLive?.running) void refreshSpikeLive();

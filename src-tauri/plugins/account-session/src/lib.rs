@@ -841,6 +841,17 @@ pub async fn share_account_backup(app: &AppHandle, contents: &str) -> Result<boo
 }
 
 #[cfg(target_os = "ios")]
+pub async fn share_room_artifact(app: &AppHandle, name: &str, contents: &str) -> Result<bool, String> {
+  #[derive(Deserialize)]
+  struct ShareResult { shared: bool }
+  let bridge = app.state::<IosSessionBridge<tauri::Wry>>();
+  let response: ShareResult = bridge.0.run_mobile_plugin_async(
+    "shareRoomArtifact", serde_json::json!({ "name": name, "contents": contents }),
+  ).await.map_err(|e| e.to_string())?;
+  Ok(response.shared)
+}
+
+#[cfg(target_os = "ios")]
 pub async fn read_parked_task_state(app: &AppHandle, uuid: &str) -> Result<Option<String>, String> {
   #[derive(Deserialize)]
   struct TaskState { activity: Option<String> }
@@ -863,11 +874,21 @@ pub async fn task_notification_permission(app: &AppHandle) -> Result<bool, Strin
 }
 
 #[cfg(target_os = "ios")]
-pub async fn post_task_notification(app: &AppHandle, identifier: &str, kind: &str) {
+pub async fn post_task_notification(app: &AppHandle, identifier: &str, kind: &str, approval: Option<serde_json::Value>) {
   let bridge = app.state::<IosSessionBridge<tauri::Wry>>();
   let _ = bridge.0.run_mobile_plugin_async::<serde_json::Value>(
-    "postTaskNotification", serde_json::json!({ "identifier": identifier, "kind": kind }),
+    "postTaskNotification", serde_json::json!({ "identifier": identifier, "kind": kind, "approval": approval }),
   ).await;
+}
+
+#[cfg(target_os = "ios")]
+pub async fn take_approval_notification_actions(app: &AppHandle) -> Result<Vec<serde_json::Value>, String> {
+  #[derive(Deserialize)]
+  struct Pending { actions: Vec<serde_json::Value> }
+  let bridge = app.state::<IosSessionBridge<tauri::Wry>>();
+  let result: Pending = bridge.0.run_mobile_plugin_async("takeApprovalNotificationActions", serde_json::json!({}))
+    .await.map_err(|e| e.to_string())?;
+  Ok(result.actions)
 }
 
 #[cfg(target_os = "ios")]

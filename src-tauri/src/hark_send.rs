@@ -1,0 +1,215 @@
+use crate::{hark_native::checked_json, probe_cancel::CancelToken, send_ledger::SendLedger};
+use reqwest::{header::{HeaderValue, ACCEPT, CONTENT_TYPE, COOKIE, ORIGIN, REFERER}, Client, Method, RequestBuilder};
+use serde::Serialize;
+use serde_json::{json, Value};
+use uuid::Uuid;
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SendReport {
+  pub conversation_id: String,
+  pub send_id: String,
+  pub confirmed: bool,
+  pub response_seen: bool,
+  pub http_status: Option<u16>,
+}
+
+pub(crate) struct Transport<'a> {
+  pub client: Client,
+  pub cookie: HeaderValue,
+  pub timezone: &'a str,
+  pub origin: &'a str,
+}
+
+impl Transport<'_> {
+  fn request(&self, method: Method, path: &str, query: &[(&str, &str)]) -> Result<RequestBuilder, String> {
+    let mut url = url::Url::parse(&format!("{}/api{path}", self.origin)).map_err(|_| "Hark 端点无效")?;
+    if !query.is_empty() { url.query_pairs_mut().extend_pairs(query); }
+    Ok(self.client.request(method, url)
+      .header(COOKIE, self.cookie.clone()).header(ACCEPT, "application/json")
+      .header(ORIGIN, self.origin).header(REFERER, format!("{}/", self.origin))
+      .header("X-Hark-Timezone", self.timezone))
+  }
+
+  async fn read(&self, req: RequestBuilder) -> Result<Value, String> {
+    checked_json(req.send().await.map_err(|e| crate::egress::safe_http_error("Hark 隔离会话", &e))?).await
+  }
+
+  async fn projects(&self) -> Result<Value, String> {
+    self.read(self.request(Method::GET, "/conversations", &[])?).await
+  }
+}
+
+fn project_id(value: &Value) -> Option<&str> {
+  value["conversationId"].as_str().or_else(|| value["conversation_id"].as_str())
+    .or_else(|| value["conversation"]["id"].as_str()).or_else(|| value["id"].as_str())
+    .filter(|id| !id.is_empty() && id.len() <= 128
+      && id.bytes().all(|b| b.is_ascii_alphanumeric() || b"_-".contains(&b)))
+}
+
+fn projects(list: &Value) -> Result<&[Value], String> {
+  list.as_array().or_else(|| list["conversations"].as_array()).map(Vec::as_slice)
+    .ok_or("Hark 会话列表格式无法核验".into())
+}
+
+fn response_id(send_id: &str) -> Result<String, String> {
+  Uuid::parse_str(send_id).map(|uuid| Uuid::from_u128(uuid.as_u128() ^ 1).to_string())
+    .map_err(|_| "发送标识无效".into())
+}
+
+fn receipt(payload: &Value, conversation: &str, key: &str, reply: &str) -> bool {
+  let scope = payload["conversationId"].as_str().or_else(|| payload["conversation_id"].as_str());
+  if payload["ok"] == false || payload["success"] == false || !payload["error"].is_null()
+    || scope.is_some_and(|id| id != conversation) { return false; }
+  let exact = payload["responseMessageId"].as_str() == Some(reply)
+    || payload["response_message_id"].as_str() == Some(reply) || payload["idempotencyKey"].as_str() == Some(key);
+  exact || (scope == Some(conversation) && payload["userMessageId"].as_str().is_some_and(|id| !id.is_empty()))
+}
+
+pub(crate) async fn send_isolated(
+  transport: Transport<'_>, ledger: &SendLedger, account: &str, text: &str, mut token: CancelToken,
+) -> Result<SendReport, String> {
+  let mission = ledger.mission(account).map_err(|_| "该账号有其他发送任务或台账不可用")?;
+  let setup = async {
+    let old = transport.projects().await?;
+    let main = transport.read(transport.request(Method::GET, "/conversations/main", &[("timezone", transport.timezone)])?).await?;
+    let main_id = project_id(&main).or_else(|| main["main"]["id"].as_str()).ok_or("Hark 主会话不可核验")?;
+    let prior = projects(&old)?;
+    let title = format!("叠号隔离验证 {}", &Uuid::new_v4().simple().to_string()[..8]);
+    let created = transport.read(transport.request(Method::POST, "/conversations", &[])?
+      .header(CONTENT_TYPE,"application/json").body(json!({"title":title,"timezone":transport.timezone,"autoTitle":false}).to_string())).await?;
+    let id = project_id(&created).filter(|id| *id != main_id
+      && !prior.iter().any(|project| project_id(project) == Some(id))).ok_or("Hark 未证实新建的是独立会话")?;
+    for _ in 0..3 {
+      let refreshed = transport.projects().await?;
+      if projects(&refreshed)?.iter().any(|project| project_id(project) == Some(id) && project["title"].as_str() == Some(&title)) {
+        return Ok(id.to_owned());
+      }
+      tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+    }
+    Err("无法在账号列表核验新建隔离会话，尚未发送".to_string())
+  };
+  let conversation = tokio::select! {
+    biased;
+    _ = token.cancelled() => return Err("会话准备取消，尚未发送".into()),
+    result = tokio::time::timeout(std::time::Duration::from_secs(35), setup) => result.map_err(|_| "会话准备超时，尚未发送")??,
+  };
+  let send_id = mission.begin_hark_send(&conversation, &crate::rooms::digest_bytes(text.as_bytes())).map_err(|_| "无法写入发送台账")?;
+  let reply_id = response_id(&send_id)?;
+  if token.is_cancelled() {
+    ledger.fail(&send_id, "尚未发送".into());
+    return Err("发送已取消".into());
+  }
+  ledger.mark_in_flight_in(&send_id, Some(&conversation)).map_err(|_| "无法持久化发送状态")?;
+  let request = transport.request(Method::POST, "/messages/send", &[("cid", &conversation)])?
+    .header(CONTENT_TYPE,"application/json").body(json!({"timezone":transport.timezone,"conversationId":conversation,"message":text,
+      "idempotencyKey":send_id,"responseMessageId":reply_id}).to_string());
+  let exchange = async {
+    let response = request.send().await.ok()?;
+    let status = response.status().as_u16();
+    Some((status, checked_json(response).await.ok()))
+  };
+  let result = tokio::select! {
+    biased;
+    _ = token.cancelled() => None,
+    response = exchange => response,
+  };
+  let mut report = SendReport { conversation_id:conversation.clone(), send_id:send_id.clone(), confirmed:false,
+    response_seen:false, http_status:result.as_ref().map(|r|r.0) };
+  if result.and_then(|r| r.1).is_some_and(|payload| receipt(&payload, &conversation, &send_id, &reply_id)) {
+    ledger.confirm(&send_id);
+    report.confirmed = true;
+  }
+  if !token.is_cancelled() {
+    let manager = Uuid::new_v4().to_string();
+    let poll = transport.read(transport.request(Method::GET, "/sync/poll",
+      &[("conversationId", conversation.as_str()), ("manager", manager.as_str()),
+        ("v","2"), ("mode","in_tab"), ("dial","initial"), ("first","1")])?);
+    let snapshot = tokio::select! {
+      biased;
+      _ = token.cancelled() => None,
+      result = poll => result.ok(),
+    };
+    report.response_seen = snapshot.is_some_and(|data| crate::hark_native::bound_reply_seen(&data, &conversation, &reply_id));
+    if !report.confirmed && report.response_seen {
+      ledger.confirm(&send_id);
+      report.confirmed = true;
+    }
+  }
+  if !report.confirmed { ledger.mark_unknown(&send_id, "未取得可关联的回执，禁止自动重发".into()); }
+  if ledger.is_poisoned() { return Err("Hark 请求结果已产生，但台账写入失败。请核对隔离会话。".into()); }
+  Ok(report)
+}
+
+#[cfg(test)]
+mod tests {
+  use super::*;
+  use tokio::{io::{AsyncReadExt, AsyncWriteExt}, net::TcpListener};
+
+  #[tokio::test]
+  async fn sends_once_to_new_project_and_marks_an_unbound_ack_unknown() {
+    for created in ["new", "main"] {
+      let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+      let origin = format!("http://{}", listener.local_addr().unwrap());
+      let server = tokio::spawn(async move {
+        let rounds = if created == "new" { 6 } else { 3 };
+        let mut title = String::new();
+        for index in 0..rounds {
+          let (mut conn, _) = listener.accept().await.unwrap();
+          let mut input = Vec::new();
+          let (end, len) = loop {
+            input.push(conn.read_u8().await.unwrap());
+            if input.ends_with(b"\r\n\r\n") {
+              let header = String::from_utf8_lossy(&input);
+              let len = header.lines().find_map(|line| {
+                let (name, raw) = line.split_once(':')?;
+                name.eq_ignore_ascii_case("Content-Length").then(|| raw.trim().parse::<usize>().unwrap())
+              }).unwrap_or(0);
+              break (input.len(), len);
+            }
+          };
+          let mut body = vec![0; len];
+          conn.read_exact(&mut body).await.unwrap();
+          let line = std::str::from_utf8(&input[..end]).unwrap().lines().next().unwrap();
+          let response = match index {
+            0 => { assert!(line.starts_with("GET /api/conversations ")); json!([{"id":"main"}]) }
+            1 => { assert!(line.starts_with("GET /api/conversations/main?")); json!({"conversationId":"main"}) }
+            2 => {
+              assert!(line.starts_with("POST /api/conversations "));
+              let payload: Value = serde_json::from_slice(&body).unwrap();
+              assert_eq!(payload["autoTitle"], false);
+              title = payload["title"].as_str().unwrap().into();
+              json!({"conversationId":created})
+            }
+            3 => json!([{"id":"main"},{"id":"new","title":title}]),
+            4 => {
+              assert!(line.starts_with("POST /api/messages/send?cid=new "));
+              let payload: Value = serde_json::from_slice(&body).unwrap();
+              assert_eq!(payload["conversationId"], "new");
+              assert_ne!(payload["idempotencyKey"], payload["responseMessageId"]);
+              json!({"conversationId":"main","responseMessageId":payload["responseMessageId"]})
+            }
+            5 => { assert!(line.starts_with("GET /api/sync/poll?conversationId=new")); json!({"frames":[]}) }
+            _ => unreachable!(),
+          }.to_string();
+          conn.write_all(format!("HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}", response.len(), response).as_bytes()).await.unwrap();
+        }
+      });
+      let registry = crate::probe_cancel::ProbeCancel::new();
+      let (token, _guard) = registry.register("account", "hark");
+      let ledger = SendLedger::new();
+      let transport = Transport { client:Client::builder().no_proxy().timeout(std::time::Duration::from_secs(2)).build().unwrap(),
+        cookie:HeaderValue::from_static("mock=1"), timezone:"UTC", origin:&origin };
+      let result = send_isolated(transport, &ledger, "account", "Test", token).await;
+      if created == "new" {
+        assert!(!result.unwrap().confirmed);
+        assert_eq!(ledger.attempts().len(), 1);
+        assert_eq!(ledger.attempts()[0].status, crate::send_ledger::SendStatus::Unknown);
+      } else {
+        assert!(result.is_err());
+        assert!(ledger.attempts().is_empty());
+      }
+      server.await.unwrap();
+    }
+  }
+}

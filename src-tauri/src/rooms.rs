@@ -11,6 +11,8 @@ mod relay;
 mod assignment;
 #[path = "room_records.rs"]
 mod records;
+#[path = "room_artifacts.rs"]
+mod artifacts;
 use relay::{Hold, Relay, Stage, Verdict};
 
 #[derive(Default)]
@@ -39,6 +41,10 @@ struct Template {
   title: String,
   flow: Flow,
   min_participants: usize,
+  #[serde(default)]
+  workflow: Vec<Stage>,
+  #[serde(default)]
+  work_seats: Option<usize>,
 }
 
 impl Template {
@@ -47,7 +53,7 @@ impl Template {
       ("review", "评审", Flow::Review, 2), ("compare", "群发对比", Flow::Compare, 2),
       ("solo", "单账号任务", Flow::Solo, 1)]
       .into_iter().map(|(id, title, flow, min_participants)| Self {
-        id: id.into(), title: title.into(), version: 1, flow, min_participants,
+        id: id.into(), title: title.into(), version: 1, flow, min_participants, workflow: Vec::new(), work_seats:None,
       }).collect()
   }
 }
@@ -66,6 +72,8 @@ pub struct RoomDraft {
   members: Vec<Member>,
   #[serde(default)]
   automatic: bool,
+  #[serde(default)]
+  required_artifact: Option<ArtifactKind>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -98,6 +106,10 @@ struct Room {
   assignment: assignment::Assignment,
   #[serde(default)]
   records: records::RoomRecords,
+  #[serde(default)]
+  artifacts: Vec<artifacts::Artifact>,
+  #[serde(default)]
+  bindings: Vec<artifacts::Binding>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -131,9 +143,11 @@ pub struct Delivery {
   pub sha256: String,
 }
 
-#[derive(Clone, Copy, Debug, Serialize, Deserialize)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
-enum ArtifactKind { Text, Link, File, CodeChange }
+pub enum ArtifactKind { Text, Link, File, CodeChange }
+
+pub use artifacts::{commit_coordinates, ArtifactInput};
 
 #[derive(Clone, Copy)]
 enum Signal { Prepare, Valid, PlanReady, Written, Reply, Assembled, Confirm, Rework, Recover, Abandon, Pause, Resume, Stop, Unknown, Failed }
@@ -204,9 +218,11 @@ impl Room {
     }
     let count = |role| members.iter().filter(|member| member.roles.contains(&role)).count();
     let flow_ok = match self.template.flow {
-      Flow::Build => (1..=2).contains(&count(Role::Executor)) && count(Role::Reviewer) == 1 && count(Role::Discussant) == 0,
+      Flow::Build => self.template.work_seats.map_or_else(|| (1..=2).contains(&count(Role::Executor)), |seats| count(Role::Executor) == seats)
+        && count(Role::Reviewer) == 1 && count(Role::Discussant) == 0,
       Flow::Review => count(Role::Executor) == 1 && count(Role::Reviewer) == 1 && count(Role::Discussant) == 0,
-      Flow::Brainstorm => (3..=5).contains(&count(Role::Discussant)) && count(Role::Reviewer) == 0 && count(Role::Executor) == 0,
+      Flow::Brainstorm => self.template.work_seats.map_or_else(|| (3..=5).contains(&count(Role::Discussant)), |seats| count(Role::Discussant) == seats)
+        && count(Role::Reviewer) == 0 && count(Role::Executor) == 0,
       Flow::Compare => count(Role::Executor) == members.len() && count(Role::Reviewer) == 0 && count(Role::Discussant) == 0,
       Flow::Solo => members.len() == 1 && count(Role::Executor) == 1 && count(Role::Reviewer) == 0 && count(Role::Discussant) == 0,
     };
@@ -228,6 +244,37 @@ pub struct RoomBook {
 }
 
 impl RoomBook {
+  pub fn archive_checksum(&self) -> Result<String, String> {
+    let data = serde_json::to_vec(self).map_err(|_| "房间资料无法核验")?;
+    Ok(digest_bytes(&data))
+  }
+  pub fn archive_counts(&self) -> (usize, usize) { (self.rooms.len(), self.custom_templates.len()) }
+
+  pub fn validate_archive(&self) -> Result<(), String> {
+    let unique = self.rooms.iter().map(|room| room.id).collect::<HashSet<_>>().len() == self.rooms.len();
+    if self.version != 1 || self.rooms.len() > 100 || self.custom_templates.len() > 32 || !unique {
+      return Err("房间归档版本、容量或标识无效".into());
+    }
+    for room in &self.rooms {
+      if room.attempts.len() > 64 || room.draft.members.len() > 12 || !(1..=24).contains(&room.draft.round_limit) {
+        return Err("房间归档含无效轮次或成员".into());
+      }
+      relay::validate_workflow(room.template.flow, &room.template.workflow)?;
+      room.validate_archived_artifacts()?;
+    }
+    let builtin = Template::builtin();
+    let mut custom_ids = HashSet::new();
+    for template in &self.custom_templates {
+      if !custom_ids.insert(&template.id) || builtin.iter().any(|entry| entry.id == template.id)
+        || template.title.is_empty() || template.title.chars().count() > 60 || template.version == 0
+        || !(1..=12).contains(&template.min_participants) {
+        return Err("备份含无效自定义模板".into());
+      }
+      relay::validate_workflow(template.flow, &template.workflow)?;
+    }
+    Ok(())
+  }
+
   #[cfg(target_os = "ios")]
   pub fn has_active_room(&self) -> bool { self.rooms.iter().any(Room::in_progress) }
 
@@ -259,6 +306,26 @@ impl RoomBook {
   }
 }
 
+pub fn restore_archive(path: &Path, mut archive: RoomBook, overwrite: bool, checksum: &str) -> Result<(), String> {
+  archive.validate_archive()?;
+  let mut current = read(path, false)?;
+  if current.archive_checksum()? != checksum { return Err("房间资料已变化，请重新预览".into()); }
+  if current.rooms.iter().any(Room::in_progress) { return Err("请先结束当前活跃房间再恢复记录".into()); }
+  for mut room in archive.rooms.drain(..) {
+    if room.in_progress() { room.set_phase(Phase::Stopped); }
+    if let Some(index) = current.rooms.iter().position(|item| item.id == room.id) {
+      if overwrite { current.rooms[index] = room; }
+    } else { current.rooms.push(room); }
+  }
+  for template in archive.custom_templates.drain(..) {
+    if let Some(index) = current.custom_templates.iter().position(|item| item.id == template.id) {
+      if overwrite { current.custom_templates[index] = template; }
+    } else { current.custom_templates.push(template); }
+  }
+  current.validate_archive()?;
+  save_json_atomic(path, &current)
+}
+
 #[derive(Deserialize)]
 #[serde(tag = "action", rename_all = "snake_case", rename_all_fields = "camelCase")]
 pub enum Command {
@@ -278,7 +345,12 @@ pub enum Command {
   DiscardRoster { id: Uuid, revision: u64 },
   Abandon { id: Uuid, revision: u64 },
   Interrupt { id: Uuid },
-  SaveTemplate { title: String, base_id: String, min_participants: usize },
+  SaveTemplate { title: String, base_id: String, min_participants: usize,
+    #[serde(default)] edit_id: Option<String>, #[serde(default)] version: Option<u32>,
+    #[serde(default)] workflow: Vec<Stage>, #[serde(default)] work_seats: Option<usize> },
+  SaveArtifact { id: Uuid, revision: u64, input: artifacts::ArtifactInput },
+  BindSession { id: Uuid, revision: u64, account_uuid: String, thread_id: Uuid },
+  UnbindSession { id: Uuid, revision: u64, account_uuid: String, thread_id: Uuid },
 }
 
 fn read(path: &Path, recover: bool) -> Result<RoomBook, String> {
@@ -307,6 +379,10 @@ fn read(path: &Path, recover: bool) -> Result<RoomBook, String> {
 }
 
 pub fn apply(path: &Path, command: Command, accounts: &[AccountRecord], recover: bool) -> Result<RoomBook, String> {
+  apply_verified(path, command, accounts, recover, None)
+}
+
+pub fn apply_verified(path: &Path, command: Command, accounts: &[AccountRecord], recover: bool, evidence: Option<String>) -> Result<RoomBook, String> {
   let mut book = read(path, recover)?;
   match command {
     Command::List => return Ok(book),
@@ -326,6 +402,7 @@ pub fn apply(path: &Path, command: Command, accounts: &[AccountRecord], recover:
         attempts: Vec::new(), goal_revision: 0, rework_note: String::new(), approved_at_ms: None,
         relay: Relay::default(),
         assignment: assignment::Assignment::default(), records: records::RoomRecords::default(),
+        artifacts: Vec::new(), bindings: Vec::new(),
       };
       room.records.references = book.resolve_references(None, &references)?;
       if room.draft.automatic || room.draft.members.iter().any(|member| member.roles.is_empty()) {
@@ -343,17 +420,42 @@ pub fn apply(path: &Path, command: Command, accounts: &[AccountRecord], recover:
       if room.in_progress() { return Err("请先结束活跃房间".into()); }
       book.rooms.retain(|room| room.id != id);
     }
-    Command::SaveTemplate { title, base_id, min_participants } => {
+    Command::SaveTemplate { title, base_id, min_participants, edit_id, version, workflow, work_seats } => {
       let title = title.trim();
       let base = book.templates.iter().find(|item| item.id == base_id).ok_or("基础流程不存在")?;
       let maximum = match base.flow { Flow::Solo => 1, Flow::Brainstorm => 5, _ => 12 };
       if title.is_empty() || title.chars().count() > 60 || !(base.min_participants..=maximum).contains(&min_participants)
-        || book.custom_templates.len() >= 32 || book.templates.iter().any(|item| item.title == title) {
+        || (edit_id.is_none() && book.custom_templates.len() >= 32)
+        || book.templates.iter().any(|item| item.title == title && edit_id.as_deref() != Some(&item.id)) {
         return Err("请检查模板名称、人数要求或重名".into());
       }
-      let template = Template { id: Uuid::new_v4().to_string(), version: 1, title: title.into(), flow: base.flow, min_participants };
+      relay::validate_workflow(base.flow, &workflow)?;
+      if work_seats.is_some_and(|seats| match base.flow {
+        Flow::Build => !(1..=2).contains(&seats),
+        Flow::Brainstorm => !(3..=5).contains(&seats),
+        _ => true,
+      }) { return Err("执行人数仅代码开发可设为 1–2 人，讨论人数仅头脑风暴可设为 3–5 人".into()); }
+      let (id, next_version) = match &edit_id {
+        Some(id) => {
+          let existing = book.custom_templates.iter().find(|item| &item.id == id && version == Some(item.version))
+            .ok_or("模板已改变，重新打开后再编辑")?;
+          (id.clone(), existing.version.checked_add(1).ok_or("模板版本已达上限")?)
+        }
+        None => (Uuid::new_v4().to_string(), 1),
+      };
+      let template = Template { id, version: next_version, title: title.into(), flow: base.flow, min_participants, workflow, work_seats };
+      book.templates.retain(|item| item.id != template.id);
+      book.custom_templates.retain(|item| item.id != template.id);
       book.templates.push(template.clone());
       book.custom_templates.push(template);
+    }
+    Command::SaveArtifact { id, revision, input } => room_at_revision(&mut book, id, revision)?.save_artifact(input, evidence)?,
+    Command::BindSession { id, revision, account_uuid, thread_id } => {
+      let title = evidence.ok_or("会话归属尚未核验")?;
+      room_at_revision(&mut book, id, revision)?.bind_session(account_uuid, thread_id, title, accounts)?;
+    }
+    Command::UnbindSession { id, revision, account_uuid, thread_id } => {
+      room_at_revision(&mut book, id, revision)?.unbind_session(&account_uuid, thread_id)?;
     }
     Command::Supplement { id, revision, note } => {
       let room = room_at_revision(&mut book, id, revision)?;
@@ -397,7 +499,7 @@ pub fn apply(path: &Path, command: Command, accounts: &[AccountRecord], recover:
         return Err("已有一个活跃房间，请先停止该房间".into());
       }
       let room = room_at_revision(&mut book, id, revision)?;
-      if matches!(signal, Signal::Confirm) && !room.can_finalize() {
+      if matches!(signal, Signal::Confirm) && (!room.can_finalize() || !room.has_required_artifact()) {
         return Err("没有已回收并核验来源的交付物".into());
       }
       if room.template.flow != Flow::Solo && matches!(signal, Signal::Rework) {
@@ -435,6 +537,7 @@ pub struct Dispatch {
   pub run_id: Uuid,
   pub attempt: RoomAttempt,
   pub prompt: String,
+  pub attachments: Vec<muse_native_client::chat_send::ChatAttachment>,
 }
 
 #[cfg(any(target_os = "ios", test))]
@@ -448,6 +551,7 @@ pub fn begin_dispatch(
   let room = room_at_revision(&mut book, id, revision)?;
   let run_id = room.run_id.ok_or("请先校验并准备房间")?;
   let mut prompt = String::new();
+  let mut attachments = Vec::new();
   let attempt = if recover {
     let mut attempt = room.attempts.last().filter(|attempt| attempt.session_id.is_some() && attempt.user_message_id.is_some())
       .cloned().ok_or("没有可核对的服务端回执，打开会话人工核对或结束该房间")?;
@@ -486,8 +590,9 @@ pub fn begin_dispatch(
     } else {
       prompt = room.solo_prompt();
       room.append_record_context(&mut prompt, true);
-      if prompt.len() > 64 * 1024 { return Err("引用与任务材料过长，请减少引用".into()); }
+      room.append_artifact_context(&mut prompt);
     }
+    attachments = room.prepare_attachments(&mut prompt)?;
     room.transition(Signal::PlanReady)?;
     if room.phase != Phase::Dispatching {
       room.relay.hold = Some(Hold::RoundLimit);
@@ -503,7 +608,7 @@ pub fn begin_dispatch(
     attempt
   };
   save_json_atomic(path, &book)?;
-  Ok(Some(Dispatch { room_id: id, run_id, attempt, prompt }))
+  Ok(Some(Dispatch { room_id: id, run_id, attempt, prompt, attachments }))
 }
 
 #[cfg(any(target_os = "ios", test))]
@@ -576,6 +681,7 @@ pub fn record(path: &Path, dispatch: &Dispatch, event: Milestone) -> Result<Room
         room.transition(Signal::Assembled)?;
       }
       room.record_completed_step();
+      room.capture_long_delivery();
     }
     Milestone::FailedBeforeSending if phase == Phase::Dispatching => {
       attempt.status = "not_sent".into();
@@ -601,8 +707,10 @@ pub fn record(path: &Path, dispatch: &Dispatch, event: Milestone) -> Result<Room
 }
 
 #[cfg(any(target_os = "ios", test))]
-pub fn sha256(text: &str) -> String {
-  ring::digest::digest(&ring::digest::SHA256, text.as_bytes()).as_ref()
+pub fn sha256(text: &str) -> String { digest_bytes(text.as_bytes()) }
+
+pub fn digest_bytes(bytes: &[u8]) -> String {
+  ring::digest::digest(&ring::digest::SHA256, bytes).as_ref()
     .iter().map(|byte| format!("{byte:02x}")).collect()
 }
 
@@ -615,11 +723,12 @@ mod tests {
     Room {
       id: Uuid::new_v4(), revision: 0, draft: RoomDraft {
         name: "Test".into(), goal: "Goal".into(), template_id: template.id.clone(),
-        round_limit: limit, members: Vec::new(), automatic: false,
+        round_limit: limit, members: Vec::new(), automatic: false, required_artifact: None,
       }, template, phase: Phase::Created, rounds: 0, returned: 0, run_id: None, steps: Vec::new(),
       attempts: Vec::new(), goal_revision: 0, rework_note: String::new(), approved_at_ms: None,
       relay: Relay::default(),
       assignment: assignment::Assignment::default(), records: records::RoomRecords::default(),
+      artifacts: Vec::new(), bindings: Vec::new(),
     }
   }
 
@@ -773,6 +882,44 @@ mod tests {
     ("a", &[Role::Executor]),
     ("b", &[Role::Commander, Role::Reviewer, Role::Publisher]),
   ];
+
+  #[test]
+  fn long_handoff_preserves_full_markdown_and_explicit_files_in_one_draft() {
+    use base64::{engine::general_purpose::STANDARD, Engine};
+    let fixture = RelayFixture::new(Flow::Review, 8, REVIEW_ROLES);
+    let state = fixture.command(Command::Pause { id:fixture.id, revision:fixture.get().revision }).unwrap();
+    fixture.command(Command::SaveArtifact { id:fixture.id, revision:state.rooms[0].revision,
+      input:ArtifactInput::File { name:"evidence.txt".into(), base64:STANDARD.encode("supplied bytes") } }).unwrap();
+    let paused = fixture.get();
+    fixture.command(Command::Resume { id:fixture.id, revision:paused.revision }).unwrap();
+    let work = fixture.send(Stage::Work, "a");
+    assert_eq!(STANDARD.decode(&work.attachments[0].data_base64).unwrap(), b"supplied bytes");
+    let long = "complete output\n".repeat(1024);
+    fixture.reply(&work, &long);
+    let book = read(&fixture.path, false).unwrap();
+    let value = serde_json::to_value(&book.rooms[0]).unwrap();
+    let id = Uuid::parse_str(value["artifacts"][1]["id"].as_str().unwrap()).unwrap();
+    let (_, download) = book.artifact_for_export(fixture.id, id).unwrap();
+    assert_eq!(STANDARD.decode(download).unwrap(), long.as_bytes());
+    let audit = fixture.send(Stage::Review, "b");
+    let context = audit.attachments.iter().find(|item| item.filename == "room-turn.md").unwrap();
+    assert!(String::from_utf8(STANDARD.decode(&context.data_base64).unwrap()).unwrap().contains(&long));
+  }
+
+  #[test]
+  fn rejects_template_audit_bypass_and_unverified_foreign_binding() {
+    assert!(relay::validate_workflow(Flow::Review, &[Stage::Work, Stage::Publish]).is_err());
+    assert!(relay::validate_workflow(Flow::Review, &[Stage::Plan, Stage::Work, Stage::Review, Stage::Summarize, Stage::Publish]).is_ok());
+    let fixture = RelayFixture::new(Flow::Review, 8, REVIEW_ROLES);
+    let paused = fixture.command(Command::Pause { id:fixture.id, revision:fixture.get().revision }).unwrap();
+    let revision = paused.rooms[0].revision;
+    let make = |account_uuid: &str| Command::BindSession { id:fixture.id, revision, account_uuid:account_uuid.into(), thread_id:Uuid::new_v4() };
+    assert!(fixture.command(make("a")).is_err());
+    assert!(apply_verified(&fixture.path, make("d"), &fixture.accounts, false, Some("Other".into())).is_err());
+    assert!(apply_verified(&fixture.path, make("a"), &fixture.accounts, false, Some("Owned".into())).is_ok());
+    let bad_commit = "https://github.com/a/b/commit/123";
+    assert!(commit_coordinates(bad_commit).is_err());
+  }
 
   #[test]
   fn automatic_assignment_uses_comparable_quota_and_preserves_fixed_roles_on_failure() {

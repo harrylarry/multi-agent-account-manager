@@ -4,7 +4,31 @@ const MAX_REVIEW_RETURNS: u8 = 3;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
-pub(super) enum Stage { Plan, Work, Review, Discuss, Summarize, Publish }
+pub enum Stage { Plan, Work, Review, Discuss, Summarize, Publish }
+
+fn default_workflow(flow: Flow) -> &'static [Stage] {
+  use Stage::*;
+  match flow {
+    Flow::Build => &[Plan, Work, Review, Publish],
+    Flow::Review => &[Work, Review, Publish],
+    Flow::Brainstorm => &[Discuss, Summarize, Publish],
+    Flow::Compare => &[Work, Publish],
+    Flow::Solo => &[],
+  }
+}
+
+pub(super) fn validate_workflow(flow: Flow, workflow: &[Stage]) -> Result<(), String> {
+  use Stage::*;
+  if workflow.is_empty() { return Ok(()); }
+  let mut expected = default_workflow(flow).to_vec();
+  if expected.is_empty() { return Err("单账号模板只支持一次派发".into()); }
+  if workflow.first() == Some(&Plan) && !expected.contains(&Plan) { expected.insert(0, Plan); }
+  if workflow.contains(&Summarize) && !expected.contains(&Summarize) {
+    expected.insert(expected.len() - 1, Summarize);
+  }
+  if workflow != expected { return Err("流程必须保留原模板必需阶段与顺序。可在开头增加指挥拆解，或在交付前增加指挥汇总。".into()); }
+  Ok(())
+}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -80,28 +104,19 @@ impl Room {
   #[cfg(any(target_os = "ios", test))]
   pub(super) fn stage_members(&self) -> Vec<(Stage, &str)> {
     let mut steps = Vec::new();
-    let mut append = |stage, role| {
+    let workflow = if self.template.workflow.is_empty() { default_workflow(self.template.flow) }
+      else { &self.template.workflow };
+    for &stage in workflow {
+      let role = match stage {
+        Stage::Plan | Stage::Summarize => Role::Commander,
+        Stage::Work => Role::Executor,
+        Stage::Review => Role::Reviewer,
+        Stage::Discuss => Role::Discussant,
+        Stage::Publish => Role::Publisher,
+      };
       steps.extend(self.draft.members.iter().filter(|member| member.roles.contains(&role))
         .map(|member| (stage, member.uuid.as_str())));
-    };
-    match self.template.flow {
-      Flow::Build => {
-        append(Stage::Plan, Role::Commander);
-        append(Stage::Work, Role::Executor);
-        append(Stage::Review, Role::Reviewer);
-      }
-      Flow::Review => {
-        append(Stage::Work, Role::Executor);
-        append(Stage::Review, Role::Reviewer);
-      }
-      Flow::Brainstorm => {
-        append(Stage::Discuss, Role::Discussant);
-        append(Stage::Summarize, Role::Commander);
-      }
-      Flow::Compare => append(Stage::Work, Role::Executor),
-      Flow::Solo => return steps,
     }
-    append(Stage::Publish, Role::Publisher);
     steps
   }
 
@@ -246,7 +261,7 @@ impl Room {
       (_, Stage::Work) => "你是执行者。按目标及已分派子任务提交完整产出。如有审核打回，请逐点修改。用实际可核对的证据说明外部产出；没有外部验证时只交付原文、方案或标明待交付。",
       (_, Stage::Review) => "你是独立审核者。逐项检查本轮提交的所有产出与用户要求，仅返回下面 JSON 对象。通过用 approve，打回用 return，reason 写清依据或具体修改要求。审核不等于用户定稿。",
       (_, Stage::Discuss) => "你是讨论者。给出自己的观点，补充或质疑前面的发言，并明确假设与待解决问题。",
-      (_, Stage::Summarize) => "你是指挥者。汇总各位讨论者的发现，保留分歧、证据与待办。",
+      (_, Stage::Summarize) => "你是指挥者。汇总成员产出，保留分歧、证据、审核限制与待办。",
       (Flow::Compare, Stage::Publish) => "你是上传者。横向比较每份独立回答，指出差异与限制，整理成用户可确认的文字交付。",
       (_, Stage::Publish) => "你是上传者。整理已有产出作为用户待确认的完整文字交付，保留审核的限制与证据。不要单方面更改已审内容或声称已经写入外部文件、上传、提交或定稿。",
     };
@@ -256,6 +271,7 @@ impl Room {
     );
     for note in &self.relay.notes { prompt.push_str(&format!("\n\n用户补充要求：\n{note}")); }
     self.append_record_context(&mut prompt, !(self.template.flow == Flow::Compare && stage == Stage::Work));
+    self.append_artifact_context(&mut prompt);
     if stage == Stage::Review {
       prompt.push_str(&format!("\n\n{{\"reviewId\":\"{attempt_id}\",\"decision\":\"approve\",\"reason\":\"填写实际审核理由\"}}"));
     }
@@ -266,7 +282,7 @@ impl Room {
       prompt.push_str(&format!("\n\n固定执行席位：共 {count} 位。"));
       if let Some(index) = execution { prompt.push_str(&format!(" 你是第 {} 位执行者。", index + 1)); }
     }
-    if stage == Stage::Work && self.template.flow == Flow::Compare { return (prompt.len() <= 64 * 1024).then_some(prompt); }
+    if stage == Stage::Work && self.template.flow == Flow::Compare { return Some(prompt); }
     let current = self.attempts.get(self.relay.revision_from..)?;
     let cycle_start = self.relay.cycle_from.checked_sub(self.relay.revision_from)?;
     let previous_cycle = current.get(..cycle_start)?;
@@ -281,7 +297,8 @@ impl Room {
         Stage::Plan => false,
         Stage::Work => step.stage == Some(Stage::Plan) || last_review == Some(step.id) || last_work == Some(step.id),
         Stage::Review => in_cycle && step.stage == Some(Stage::Work),
-        Stage::Discuss | Stage::Summarize => step.stage == Some(Stage::Discuss),
+        Stage::Discuss => step.stage == Some(Stage::Discuss),
+        Stage::Summarize => step.stage == Some(Stage::Discuss) || (in_cycle && matches!(step.stage, Some(Stage::Work | Stage::Review))),
         Stage::Publish => in_cycle && matches!(step.stage, Some(Stage::Work | Stage::Review | Stage::Summarize))
           || (self.template.flow == Flow::Brainstorm && step.stage == Some(Stage::Discuss)),
       };
@@ -303,7 +320,7 @@ impl Room {
         prompt.push_str(&format!("\n\n阶段 {:?}，记录 {}，SHA-256 {}：\n{}", step.stage, step.id, delivery.sha256, delivery.text));
       }
     }
-    (prompt.len() <= 64 * 1024).then_some(prompt)
+    Some(prompt)
   }
 }
 

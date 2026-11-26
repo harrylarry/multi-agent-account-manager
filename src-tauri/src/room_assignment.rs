@@ -113,9 +113,9 @@ impl Room {
   fn pick_members(&self, accounts: &[AccountRecord], group: &[Candidate<'_>], fixed: &[Member], target: usize) -> Option<Vec<Member>> {
       let mut members = fixed.to_vec();
       let mut seats = match self.template.flow {
-        Flow::Build => vec![(Role::Executor, if target >= 4 { 2 } else { 1 }), (Role::Reviewer, 1)],
+        Flow::Build => vec![(Role::Executor, self.template.work_seats.unwrap_or(if target >= 4 { 2 } else { 1 })), (Role::Reviewer, 1)],
         Flow::Review => vec![(Role::Executor, 1), (Role::Reviewer, 1)],
-        Flow::Brainstorm => vec![(Role::Discussant, target)],
+        Flow::Brainstorm => vec![(Role::Discussant, self.template.work_seats.unwrap_or(target))],
         Flow::Compare => vec![(Role::Executor, target)],
         Flow::Solo => unreachable!(),
       };

@@ -517,7 +517,27 @@ pub async fn send_on_subscription<S: AsyncRead + AsyncWrite + Unpin>(
   timeout: Duration,
   cancel: &mut watch::Receiver<bool>,
 ) -> SendAttemptResult {
-  let req = chat_stream_request(text, &route.node_id, Some(route.session_id()));
+  send_with_attachments_on_subscription(subscription, text, route, &[], timeout, cancel).await
+}
+
+#[derive(Clone, Debug)]
+pub struct ChatAttachment {
+  pub filename: String,
+  pub mime_type: &'static str,
+  pub data_base64: String,
+}
+
+pub async fn send_with_attachments_on_subscription<S: AsyncRead + AsyncWrite + Unpin>(
+  subscription: &mut Subscription<S>, text: &str, route: &IsolatedProbeRoute,
+  attachments: &[ChatAttachment], timeout: Duration, cancel: &mut watch::Receiver<bool>,
+) -> SendAttemptResult {
+  let mut params = build_params(text, &route.node_id, Some(route.session_id()));
+  if let Some(items) = params["items"].as_array_mut() {
+    items.extend(attachments.iter().map(|attachment| json!({
+      "type":"file", "filename":attachment.filename, "mime_type":attachment.mime_type, "data_base64":attachment.data_base64,
+    })));
+  }
+  let req = daemon_post("/chat/stream", params);
   let (on_wire, wrote_frames, response) = subscription.open_parallel(req, Some(cancel)).await;
   let outcome = match response {
     Ok(mut source) => {

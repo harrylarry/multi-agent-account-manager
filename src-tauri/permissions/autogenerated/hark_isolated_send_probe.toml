@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-hark-isolated-send-probe"
+description = "Enables the hark_isolated_send_probe command without any pre-configured scope."
+commands.allow = ["hark_isolated_send_probe"]
+
+[[permission]]
+identifier = "deny-hark-isolated-send-probe"
+description = "Denies the hark_isolated_send_probe command without any pre-configured scope."
+commands.deny = ["hark_isolated_send_probe"]

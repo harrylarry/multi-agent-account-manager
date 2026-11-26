@@ -23,18 +23,20 @@ const holdReasons: Record<string, string> = {
 };
 
 interface Member { uuid: string; roles: string[] }
-interface Template { id: string; title: string; version: number; minParticipants: number; flow: string }
-interface Attempt { accountUuid: string; status: string; sessionId: string | null; userMessageId: string | null;
+interface Template { id: string; title: string; version: number; minParticipants: number; flow: string; workflow?: string[] }
+interface Attempt { id?: string; accountUuid: string; status: string; sessionId: string | null; userMessageId: string | null;
   remoteCancelAcknowledged?: boolean;
   stage?: string; review?: { decision: "approve" | "return"; reason: string };
   delivery: { kind: string; text: string; capturedAtMs: number; source: string; sha256: string } | null }
 interface Room {
   id: string; revision: number; phase: string; rounds: number; returned: number;
-  draft: { name: string; goal: string; roundLimit: number; members: Member[]; automatic?: boolean };
+  draft: { name: string; goal: string; roundLimit: number; members: Member[]; automatic?: boolean; requiredArtifact?: string };
   template: Template;
   steps: { phase: string; atMs: number }[];
   attempts: Attempt[];
   approvedAtMs: number | null;
+  artifacts?: { id:string; kind:string; name:string; sha256:string; byteCount:number; url?:string; verifiedCommit?:string; attemptId?:string }[];
+  bindings?: { accountUuid:string; threadId:string; title:string }[];
   assignment?: {
     quotaWindow?: string; fixed?: string[];
     basis?: (Member & { remaining?: number; model?: string; modelSource?: string; fixed?: boolean })[];
@@ -75,6 +77,7 @@ export function markRoomSuggestions(book: RoomBook | null, goal: string): void {
 export function renderRooms(view: RoomsView, accounts: AccountRecord[], esc: (text: string) => string): string {
   const muse = accounts.filter((account) => account.providerId === "muse");
   const options = view.book?.templates.map((item) => `<option value="${esc(item.id)}">${esc(item.title)} · 至少 ${item.minParticipants} 人</option>`).join("") ?? "";
+  const customTemplates = view.book?.templates.filter((item) => !["development","brainstorm","review","compare","solo"].includes(item.id)) ?? [];
   const name = (uuid: string) => esc(muse.find((account) => account.uuid === uuid)?.alias ?? "原成员");
   const memberLine = (member: Member) => `${name(member.uuid)} · ${member.roles.map((role) => roles.find(([id]) => id === role)?.[1] ?? "").join("、")}`;
   const referenceOptions = (target?: Room) => (view.book?.rooms ?? [])
@@ -125,6 +128,35 @@ export function renderRooms(view: RoomsView, accounts: AccountRecord[], esc: (te
                 return `<div>${memberLine(member)}${room.assignment?.fixed?.includes(member.uuid) ? " · 已固定" : ""}${basis?.remaining != null ? ` · 分派时剩余 ${basis.remaining}%` : ""}
                   ${basis?.model ? ` · ${basis.modelSource === "manual" ? "手动模型" : "指纹候选"} ${esc(basis.model)}` : ""}</div>`;
               }).join("")}
+              ${room.draft.requiredArtifact && room.draft.requiredArtifact !== "text" ? `<div class="modal-desc">定稿需要 ${({link:"HTTPS 链接",file:"校验文件",code_change:"已核验的公开提交"} as Record<string,string>)[room.draft.requiredArtifact]}</div>` : ""}
+              ${room.artifacts?.length ? `<details><summary>交付凭证（${room.artifacts.length}）</summary>
+                ${room.artifacts.map((item) => `<div class="hark-reply"><div>${esc(item.name)} · ${item.byteCount} 字节</div>
+                  <div class="modal-desc" style="overflow-wrap:anywhere">SHA-256 ${esc(item.sha256)}</div>
+                  ${item.verifiedCommit ? `<div class="modal-desc">GitHub 已核验提交 ${esc(item.verifiedCommit)}</div>` : ""}
+                  ${item.url ? `<div class="hark-reply-text">${esc(item.url)}</div>
+                    <button type="button" class="btn" data-room-action="open_artifact_link" data-room-url="${esc(item.url)}">打开凭证链接</button>`
+                    : `<button type="button" class="btn" data-room-action="share_artifact" data-room-artifact="${esc(item.id)}" data-room-id="${room.id}">核验并分享文件</button>`}
+                </div>`).join("")}</details>` : ""}
+              ${room.bindings?.length ? `<details><summary>绑定会话（${room.bindings.length}）</summary>
+                ${room.bindings.map((binding) => `<div>${name(binding.accountUuid)} · ${esc(binding.title)}
+                  <button type="button" class="btn" data-room-action="open_source" data-room-account="${esc(binding.accountUuid)}" data-room-session="${esc(binding.threadId)}">打开绑定会话</button>
+                  ${["created","paused"].includes(room.phase) ? `<button type="button" class="btn" data-room-action="unbind_session" data-room-id="${room.id}" data-room-revision="${room.revision}" data-room-account="${esc(binding.accountUuid)}" data-room-session="${esc(binding.threadId)}">解除绑定</button>` : ""}
+                </div>`).join("")}</details>` : ""}
+              ${["created","paused"].includes(room.phase) ? `
+                <details data-room-materials><summary>添加交付凭证</summary>
+                  <label>文件（最多 256 KiB）<input type="file" data-artifact-file></label>
+                  <button type="button" class="btn" data-room-action="save_file" data-room-id="${room.id}" data-room-revision="${room.revision}">保存并校验文件</button>
+                  <label>HTTPS 链接或 GitHub 公开提交<input type="url" class="modal-input" data-artifact-link></label>
+                  <button type="button" class="btn" data-room-action="save_link" data-room-id="${room.id}" data-room-revision="${room.revision}">保存链接</button>
+                  <button type="button" class="btn" data-room-action="verify_commit" data-room-id="${room.id}" data-room-revision="${room.revision}">在线核验提交</button>
+                </details>
+                <details data-room-bind><summary>绑定已有 Muse 会话</summary>
+                  <label>账号<select class="modal-input" data-binding-account>${room.draft.members.map((member) => `<option value="${esc(member.uuid)}">${name(member.uuid)}</option>`).join("")}</select></label>
+                  <button type="button" class="btn" data-room-action="list_binding">读取该账号会话</button>
+                  <label>会话<select class="modal-input" data-binding-thread></select></label>
+                  <button type="button" class="btn" data-room-action="bind_session" data-room-id="${room.id}" data-room-revision="${room.revision}">确认绑定</button>
+                  <div class="modal-desc">绑定用于快速打开已有会话。接力仍在每轮的独立会话里发送。</div>
+                </details>` : ""}
               ${room.assignment?.changes?.length ? `<details><summary>自动换人（${room.assignment.changes.length}）</summary>
                 ${room.assignment.changes.map((change) => `<div>${name(change.from)} → ${name(change.to)} · ${new Date(change.atMs).toLocaleString()}</div>`).join("")}</details>` : ""}
               <details><summary>运行简报</summary>
@@ -148,7 +180,9 @@ export function renderRooms(view: RoomsView, accounts: AccountRecord[], esc: (te
               ${room.relay?.pendingNote ? '<div role="status">已记录补充要求。当前回复入账后暂停，等待你继续。</div>' : ""}
               ${room.relay?.notes?.length ? `<details><summary>用户补充（${room.relay.notes.length}）</summary>${room.relay.notes.map((note) => `<div class="hark-reply-text">${esc(note)}</div>`).join("")}</details>` : ""}
               ${room.attempts?.map((step, index) => step.delivery ? `<details data-room-step="${index}"><summary>第 ${index + 1} 次派发 · ${step.stage ? stageNames[step.stage] : "文字交付"}${step.review ? step.review.decision === "approve" ? "通过" : "打回" : ""}</summary>
-                <div class="hark-reply-text">${esc(step.review?.reason ?? step.delivery.text)}</div>
+                <div class="hark-reply-text">${esc(step.review?.reason ?? (step.id && room.artifacts?.some((item) => item.attemptId === step.id)
+                  ? step.delivery.text.slice(0, 1200) + "…\n完整正文见交付凭证中的 Markdown 附件。"
+                  : step.delivery.text))}</div>
                 <div class="modal-desc">${name(step.accountUuid)}
                   · ${step.delivery.source === "history" ? "会话历史" : "实时订阅"} · ${new Date(step.delivery.capturedAtMs).toLocaleString()}</div>
                 <div class="modal-desc" style="overflow-wrap:anywhere">SHA-256 ${esc(step.delivery.sha256)}</div>
@@ -185,6 +219,9 @@ export function renderRooms(view: RoomsView, accounts: AccountRecord[], esc: (te
               <label for="room-goal">任务目标和参考资料</label><textarea id="room-goal" class="modal-input" maxlength="8000"></textarea>
               <label for="room-template">模板</label><select id="room-template" class="modal-input">${options}</select>
               <label for="room-round-limit">轮次上限</label><input id="room-round-limit" class="modal-input" type="number" min="1" max="24" value="8">
+              <label for="room-required-artifact">定稿要求</label><select id="room-required-artifact" class="modal-input">
+                <option value="">文字回复</option><option value="link">HTTPS 链接</option><option value="file">校验文件</option><option value="code_change">已核验的 GitHub 公开提交</option>
+              </select>
               <label for="room-assignment">成员分派</label><select id="room-assignment" class="modal-input">
                 <option value="manual">手选成员与角色</option><option value="automatic">自动分派与换人</option>
               </select>
@@ -198,6 +235,14 @@ export function renderRooms(view: RoomsView, accounts: AccountRecord[], esc: (te
               <label for="room-template-title">模板名称</label><input id="room-template-title" class="modal-input" maxlength="60">
               <label for="room-template-base">基础流程</label><select id="room-template-base" class="modal-input">${options}</select>
               <label for="room-template-min">至少几人</label><input id="room-template-min" class="modal-input" type="number" min="1" max="12" value="2">
+              <label for="room-template-workflow">自定义阶段顺序</label>
+              <input id="room-template-workflow" class="modal-input" placeholder="执行,审核,交付">
+              <div class="modal-desc">阶段对应各自角色。留空沿用基础模板。可用阶段为拆解、执行、审核、讨论、汇总、交付。</div>
+              <label for="room-template-seats">执行或讨论人数（可选）</label>
+              <input id="room-template-seats" class="modal-input" type="number" min="1" max="5" placeholder="默认模板人数">
+              <label for="room-template-edit">编辑版本</label><select id="room-template-edit" class="modal-input">
+                <option value="">新建</option>${customTemplates.map((item) => `<option value="${esc(item.id)}" data-version="${item.version}">${esc(item.title)} · v${item.version}</option>`).join("")}
+              </select>
               <button type="button" class="btn" data-room-action="save_template">保存模板</button>
             </details>` : ""}
         </div>
@@ -223,12 +268,19 @@ export function roomCommand(button: HTMLElement): { action?: string; id?: string
     if (action === "propose_roster") return { action, id: button.dataset.roomId, revision: Number(button.dataset.roomRevision), members };
     return { action, references: sourceIds(panel), draft: { name: value("room-name"), goal: value("room-goal"),
       templateId: value("room-template"), roundLimit: Number(value("room-round-limit")), members,
-      automatic } };
+      automatic, requiredArtifact: value("room-required-artifact") || null } };
   }
-  if (action === "save_template") return { action, title: value("room-template-title"),
-    baseId: value("room-template-base"), minParticipants: Number(value("room-template-min")) };
+  if (action === "save_template") {
+    const names: Record<string,string> = { 拆解:"plan", 执行:"work", 审核:"review", 讨论:"discuss", 汇总:"summarize", 交付:"publish" };
+    const workflow = value("room-template-workflow").split(/[,，、]/).map((part) => part.trim()).filter(Boolean).map((part) => names[part] ?? part);
+    const edit = document.querySelector<HTMLSelectElement>("#room-template-edit")?.selectedOptions[0];
+    return { action, title:value("room-template-title"), baseId:value("room-template-base"),
+      minParticipants:Number(value("room-template-min")), workflow, workSeats:Number(value("room-template-seats")) || null, editId:edit?.value || null,
+      version: edit?.value ? Number(edit.dataset.version) : null };
+  }
   return { action, id: button.dataset.roomId, revision: Number(button.dataset.roomRevision),
     ...(action === "rework" || action === "supplement" ? { note: value(`rework-${button.dataset.roomId}`) } : {}),
     ...(action === "confirm_roster" ? { proposalId: button.dataset.roomProposal } : {}),
+    ...(action === "unbind_session" ? { accountUuid:button.dataset.roomAccount, threadId:button.dataset.roomSession } : {}),
     ...(action === "set_references" ? { sourceIds: sourceIds(button.closest("[data-room-references]")) } : {}) };
 }
