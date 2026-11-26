@@ -36,7 +36,11 @@ Windows 主 crate 67 项、muse-native 110 项、嵌入脚本 13 项与构建检
 
 本批补齐 v4 房间模板的执行、讨论席位及可选阶段。手选、自动分派、换人和备份共用模板校验。指挥与上传各一人，审核启用时仍须一名独立审核者。编辑模板回填旧值并创建新版本，已有房间固定原版本。房间正文按派发顺序显示角色、成员与时间，保留可展开的来源和摘要。iOS 通知审批逐项读取并在处理返回后出队，重启仍由审批台账阻止重复写入。[联合复测](../acceptance/iphone-acceptance.md#自定义角色模板房间消息与通知审批)
 
+联合候选提交 `f43cf9c` 为 `CI_PASSED`。92 项主 crate、110 项 Muse native、13 项嵌入脚本、前端构建及两个移动视口 WebKit 流程通过。iOS Rust target、Swift 和 Xcode 构建通过。下载后校验了 ZIP、IPA、Bundle ID 和最低 iOS 版本，真机为 `UNVERIFIED`。[Quick checks](https://github.com/harrylarry/multi-agent-account-manager/actions/runs/45801370345) · [iOS 构建](https://github.com/harrylarry/multi-agent-account-manager/actions/runs/45801405405)
+
 Muse 红点的设备回执有延迟或不亮症状，暂无可定位的完整分段计时。移动 WebKit 用模拟快照验证了收到状态后渲染头像以及计时关联，不能说明设备上游投递和补查的耗时。此次保持监测行为。VM 续租、CVM、长后台实时通知仍缺服务端或系统可观测证据，前台补查已实现。Hark 需要同账号的真实隔离回执解锁指纹，再验证三个有效样本。私有提交核验和裸 Bearer 登录兑换取决于授权或服务契约，临时分享的口令分通道交互仍有产品裁决。Phase 5 可选项另行排期。
+
+上游 `v0.2.0` 对比 `v0.1.10` 新增跨设备加密同步、二维码、局域网与 Cloudflare 中转，以及可配置代理保活。同步载荷新增账号 Cookie，涉及既有备份范围、登录隔离与中转信任边界，列入 v2.2 的独立评估。上游保活参数不提供本分支在 iOS 挂起期间运行的验证证据。[上游差异](https://github.com/ldjx7/multi-agent-account-manager/compare/v0.1.10...v0.2.0)
 
 本轮收尾范围包括代理池账号持久引用与一对一占用、订阅变更提醒和元数据恢复；账号资料的 iOS 目录及文件保护检查；Muse 的前台 Live/Watch/Idle 监听窗口、掉线退避和系统暂停；以及 Hark 手动和按账号启用的自动指纹检测。Hark 只有在同账号的隔离发送探针取得完整、同会话和同回执的回复并持久落账后才解锁指纹发送。探针严格串行，结果不明、取消、未完成或无效样本均停止后续发送。新增带服务、真实 Cookie 名称和来源域名的会话 Token 导入，走同一预览和写入验证链。
 

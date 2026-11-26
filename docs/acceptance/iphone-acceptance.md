@@ -260,6 +260,8 @@ Spike `0.1.26`，构建提交 `e598f3ca9171038794ae898edb051d3b591ca165`。IPA S
 
 ## 自定义角色模板、房间消息与通知审批
 
+Spike `0.1.26`，构建提交 `f43cf9c0f66f7eb48ee4e54a4926aa067ac2a32e`。IPA SHA-256 为 `8767e6deb944c8e548b9cb6febfb751b30af7844a8c36dea77d73a02852aa31f`。下载 ZIP 后解压，校验内部 IPA。`CI_PASSED`，真机 `UNVERIFIED`。[下载](https://github.com/harrylarry/multi-agent-account-manager/actions/runs/45801405405/artifacts/15107877233) · [Xcode](https://github.com/harrylarry/multi-agent-account-manager/actions/runs/45801405405) · [Quick checks](https://github.com/harrylarry/multi-agent-account-manager/actions/runs/45801370345)
+
 1. 在 Muse 账号列表点「房间 → 自定义模板」，基础流程选「评审」，至少三人，执行者两人。开启讨论，设置两名讨论者。保存后再选择此版本，核对名称、阶段和席位回填。改一项再保存，确认旧房间仍保留原版本，新房间使用新版。
 2. 用该模板建房。手选 A 指挥兼执行、B 执行兼讨论、C 审核兼讨论及上传。试给 B 勾审核，保存应被拒绝，撤销再保存。另有至少三名登录状态和新鲜额度均可用的 Muse 账号时，用自动模式验证相同席位与独立审核。实际派发后，按房间消息的成员、角色和次序核对，「消息来源」应能查看摘要与关联会话。
 3. 有真实的待审批样本时，通过系统通知点「允许一次」或「拒绝」，确认返回 App 后只处理同一账号与同一审批。若中途退出后重开，结果不明时去服务会话核对，确认没有重复提交。
