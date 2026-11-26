@@ -428,6 +428,9 @@ pub fn apply_verified(path: &Path, command: Command, accounts: &[AccountRecord],
         return Err("请先结束当前房间再开新话题".into());
       }
       let (mut draft, template) = (source.draft.clone(), source.template.clone());
+      if draft.automatic {
+        draft.members.retain(|member| source.assignment.fixed.contains(&member.uuid));
+      }
       draft.name = name;
       draft.goal = goal;
       let reference = [id];
@@ -979,6 +982,15 @@ mod tests {
     fixed.draft.members = vec![Member { uuid:"c".into(), roles:vec![Role::Executor] }];
     fixed.assign_initial(&accounts).unwrap();
     assert_eq!(fixed.draft.members[0].roles, vec![Role::Executor]);
+    let mut stopped = fixed.clone();
+    stopped.set_phase(Phase::Stopped);
+    let revision = stopped.revision;
+    book.rooms = vec![stopped];
+    save_json_atomic(&fixture.path, &book).unwrap();
+    let next = apply(&fixture.path, Command::NewTopic { id:fixture.id, revision,
+      name:"New activity".into(), goal:"New goal".into(), include_final:false }, &accounts, false).unwrap();
+    assert_eq!(next.rooms[0].assignment.fixed, vec!["c"]);
+    assert!(next.rooms[0].draft.members.len() > 1);
     accounts[2].quota_observation.as_mut().unwrap().stale = true;
     assert!(!fixed.resolve_automatic_step(&accounts).unwrap());
     assert_eq!(fixed.next_step(), Some((Stage::Work, "c")));

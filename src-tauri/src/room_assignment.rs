@@ -4,7 +4,7 @@ use std::collections::BTreeMap;
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 #[serde(default, rename_all = "camelCase")]
 pub(super) struct Assignment {
-  fixed: Vec<String>,
+  pub(super) fixed: Vec<String>,
   quota_window: Option<String>,
   excluded: Vec<String>,
   basis: Vec<AssignmentBasis>,

@@ -209,7 +209,7 @@ export function renderRooms(view: RoomsView, accounts: AccountRecord[], esc: (te
                 ${actions.map(([action, label]) => `<button type="button" class="btn" data-room-action="${action}" data-room-id="${room.id}" data-room-revision="${room.revision}">${label}</button>`).join("")}
               </div>
               ${["finalized","stopped","failed"].includes(room.phase) ? `<details data-room-topic><summary>开新话题</summary>
-                <p class="modal-desc">沿用分工和模板。新话题使用新的隔离会话。</p>
+                <p class="modal-desc">沿用模板和分派方式。自动模式只保留你确认的固定角色，其余成员重新分派。</p>
                 <label>话题名称<input class="modal-input" data-topic-name maxlength="80"></label>
                 <label>任务目标<textarea class="modal-input" data-topic-goal maxlength="8000"></textarea></label>
                 ${room.phase === "finalized" ? '<label><input type="checkbox" data-topic-reference> 引用这次定稿</label>' : ""}
