@@ -208,6 +208,12 @@ export function renderRooms(view: RoomsView, accounts: AccountRecord[], esc: (te
               <div class="proxy-pool-actions">
                 ${actions.map(([action, label]) => `<button type="button" class="btn" data-room-action="${action}" data-room-id="${room.id}" data-room-revision="${room.revision}">${label}</button>`).join("")}
               </div>
+              ${["finalized","stopped","failed"].includes(room.phase) ? `<details data-room-topic><summary>开新话题</summary>
+                <p class="modal-desc">沿用分工和模板。新话题使用新的隔离会话。</p>
+                <label>话题名称<input class="modal-input" data-topic-name maxlength="80"></label>
+                <label>任务目标<textarea class="modal-input" data-topic-goal maxlength="8000"></textarea></label>
+                ${room.phase === "finalized" ? '<label><input type="checkbox" data-topic-reference> 引用这次定稿</label>' : ""}
+                <button type="button" class="btn" data-room-action="new_topic" data-room-id="${room.id}" data-room-revision="${room.revision}">保存新话题</button></details>` : ""}
               ${["created","stopped","failed","finalized"].includes(room.phase) ? `<details data-room-delete><summary>删除房间记录</summary>
                 <label><input type="checkbox"> 确认删除本机记录。其他房间已引用的节选会保留。</label>
                 <button type="button" class="btn" data-room-action="delete_record" data-room-id="${room.id}" data-room-revision="${room.revision}">删除本机记录</button></details>` : ""}
@@ -257,6 +263,13 @@ export function roomCommand(button: HTMLElement): { action?: string; id?: string
   const value = (id: string) => document.querySelector<HTMLInputElement | HTMLTextAreaElement | HTMLSelectElement>(`#${id}`)?.value ?? "";
   const sourceIds = (scope: Element | null) =>
     Array.from(scope?.querySelectorAll<HTMLInputElement>("[data-room-reference]:checked") ?? [], (input) => input.value);
+  if (action === "new_topic") {
+    const panel = button.closest("[data-room-topic]");
+    return { action, id: button.dataset.roomId, revision: Number(button.dataset.roomRevision),
+      name: panel?.querySelector<HTMLInputElement>("[data-topic-name]")?.value ?? "",
+      goal: panel?.querySelector<HTMLTextAreaElement>("[data-topic-goal]")?.value ?? "",
+      includeFinal: Boolean(panel?.querySelector("[data-topic-reference]:checked")) };
+  }
   if (action === "create" || action === "propose_roster") {
     const panel = button.closest("[data-room-new], [data-room-roster]");
     const automatic = action === "create" && value("room-assignment") === "automatic";

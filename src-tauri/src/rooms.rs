@@ -13,6 +13,8 @@ mod assignment;
 mod records;
 #[path = "room_artifacts.rs"]
 mod artifacts;
+#[path = "backup_restore.rs"]
+pub(crate) mod backup_restore;
 use relay::{Hold, Relay, Stage, Verdict};
 
 #[derive(Default)]
@@ -306,7 +308,7 @@ impl RoomBook {
   }
 }
 
-pub fn restore_archive(path: &Path, mut archive: RoomBook, overwrite: bool, checksum: &str) -> Result<(), String> {
+pub(crate) fn prepare_restore(path: &Path, mut archive: RoomBook, overwrite: bool, checksum: &str) -> Result<RoomBook, String> {
   archive.validate_archive()?;
   let mut current = read(path, false)?;
   if current.archive_checksum()? != checksum { return Err("房间资料已变化，请重新预览".into()); }
@@ -323,7 +325,7 @@ pub fn restore_archive(path: &Path, mut archive: RoomBook, overwrite: bool, chec
     } else { current.custom_templates.push(template); }
   }
   current.validate_archive()?;
-  save_json_atomic(path, &current)
+  Ok(current)
 }
 
 #[derive(Deserialize)]
@@ -331,6 +333,7 @@ pub fn restore_archive(path: &Path, mut archive: RoomBook, overwrite: bool, chec
 pub enum Command {
   List,
   Create { draft: RoomDraft, #[serde(default)] references: Vec<Uuid> },
+  NewTopic { id: Uuid, revision: u64, name: String, goal: String, include_final: bool },
   SetReferences { id: Uuid, revision: u64, source_ids: Vec<Uuid> },
   DeleteRecord { id: Uuid, revision: u64 },
   Prepare { id: Uuid, revision: u64 },
@@ -354,6 +357,7 @@ pub enum Command {
 }
 
 fn read(path: &Path, recover: bool) -> Result<RoomBook, String> {
+  backup_restore::recover(path)?;
   let mut book = match std::fs::read(path) {
     Ok(data) => serde_json::from_slice::<RoomBook>(&data).map_err(|_| "房间文件损坏，已保留原文件")?,
     Err(error) if error.kind() == std::io::ErrorKind::NotFound => RoomBook {
@@ -382,20 +386,16 @@ pub fn apply(path: &Path, command: Command, accounts: &[AccountRecord], recover:
   apply_verified(path, command, accounts, recover, None)
 }
 
-pub fn apply_verified(path: &Path, command: Command, accounts: &[AccountRecord], recover: bool, evidence: Option<String>) -> Result<RoomBook, String> {
-  let mut book = read(path, recover)?;
-  match command {
-    Command::List => return Ok(book),
-    Command::Create { mut draft, references } => {
+impl RoomBook {
+  fn add_draft(&mut self, mut draft: RoomDraft, template: Template, references: &[Uuid], accounts: &[AccountRecord]) -> Result<(), String> {
       draft.name = draft.name.trim().into();
       draft.goal = draft.goal.trim().into();
       if draft.name.is_empty() || draft.name.chars().count() > 80 || draft.goal.is_empty()
         || draft.goal.chars().count() > 8000 || !(1..=24).contains(&draft.round_limit)
         || draft.members.len() > 12 || draft.members.iter().any(|member| member.roles.len() > 5)
-        || book.rooms.len() >= 100 {
+        || self.rooms.len() >= 100 {
         return Err("请检查房间名称、目标、成员和 1–24 轮上限".into());
       }
-      let template = book.templates.iter().find(|item| item.id == draft.template_id).ok_or("模板不存在")?.clone();
       let mut room = Room {
         id: Uuid::new_v4(), revision: 0, draft, template, phase: Phase::Created,
         rounds: 0, returned: 0, run_id: None, steps: vec![Transition { at_ms: now_ms(), phase: Phase::Created }],
@@ -404,12 +404,34 @@ pub fn apply_verified(path: &Path, command: Command, accounts: &[AccountRecord],
         assignment: assignment::Assignment::default(), records: records::RoomRecords::default(),
         artifacts: Vec::new(), bindings: Vec::new(),
       };
-      room.records.references = book.resolve_references(None, &references)?;
+      room.records.references = self.resolve_references(None, references)?;
       if room.draft.automatic || room.draft.members.iter().any(|member| member.roles.is_empty()) {
         room.assign_initial(accounts)?;
       }
       else { room.validate(accounts)?; }
-      book.rooms.insert(0, room);
+      self.rooms.insert(0, room);
+      Ok(())
+  }
+}
+
+pub fn apply_verified(path: &Path, command: Command, accounts: &[AccountRecord], recover: bool, evidence: Option<String>) -> Result<RoomBook, String> {
+  let mut book = read(path, recover)?;
+  match command {
+    Command::List => return Ok(book),
+    Command::Create { draft, references } => {
+      let template = book.templates.iter().find(|item| item.id == draft.template_id).ok_or("模板不存在")?.clone();
+      book.add_draft(draft, template, &references, accounts)?;
+    }
+    Command::NewTopic { id, revision, name, goal, include_final } => {
+      let source = room_at_revision(&mut book, id, revision)?;
+      if !matches!(source.phase, Phase::Finalized | Phase::Stopped | Phase::Failed) {
+        return Err("请先结束当前房间再开新话题".into());
+      }
+      let (mut draft, template) = (source.draft.clone(), source.template.clone());
+      draft.name = name;
+      draft.goal = goal;
+      let reference = [id];
+      book.add_draft(draft, template, if include_final { &reference } else { &[] }, accounts)?;
     }
     Command::SetReferences { id, revision, source_ids } => {
       let references = book.resolve_references(Some(id), &source_ids)?;
@@ -966,6 +988,8 @@ mod tests {
   fn only_finalized_explicit_references_enter_context_and_can_be_removed() {
     let fixture = RelayFixture::new(Flow::Review, 8, REVIEW_ROLES);
     assert!(read(&fixture.path, false).unwrap().resolve_references(None, &[fixture.id]).is_err());
+    assert!(fixture.command(Command::NewTopic { id:fixture.id, revision:fixture.get().revision,
+      name:"Next topic".into(), goal:"New goal".into(), include_final:false }).is_err());
     let work = fixture.send(Stage::Work, "a");
     fixture.reply(&work, "Draft");
     let review = fixture.send(Stage::Review, "b");
@@ -976,8 +1000,18 @@ mod tests {
     let book = read(&fixture.path, false).unwrap();
     assert!(serde_json::to_string(&book).unwrap().contains("用户已确认本次交付定稿"));
     assert!(book.resolve_references(Some(fixture.id), &[fixture.id]).is_err());
-    let draft = fixture.get().draft;
-    let target = fixture.command(Command::Create { draft, references:vec![fixture.id] }).unwrap().rooms[0].id;
+    let source = fixture.get();
+    let book = fixture.command(Command::NewTopic { id:fixture.id, revision:source.revision,
+      name:"Next topic".into(), goal:"New goal".into(), include_final:true }).unwrap();
+    let new_room = &book.rooms[0];
+    let target = new_room.id;
+    assert_ne!(target, source.id);
+    assert_eq!(new_room.draft.goal, "New goal");
+    assert_eq!(new_room.template.version, source.template.version);
+    assert_eq!(new_room.phase, Phase::Created);
+    assert!(new_room.bindings.is_empty() && new_room.attempts.is_empty() && new_room.artifacts.is_empty());
+    assert!(new_room.run_id.is_none());
+    assert_eq!(book.rooms[1].revision, source.revision);
     let state = fixture.command(Command::Prepare { id:target, revision:0 }).unwrap();
     let step = begin_dispatch(&fixture.path, target, state.rooms[0].revision, &fixture.accounts, false).unwrap().unwrap();
     assert!(step.prompt.contains("ACCEPTED PROJECT CONCLUSION"));

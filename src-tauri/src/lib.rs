@@ -841,32 +841,20 @@ async fn local_data_protection(app: AppHandle) -> Result<serde_json::Value, Stri
 }
 
 #[tauri::command]
-async fn restore_room_backup(
-  app: AppHandle, room_gate: State<'_, rooms::RoomGate>, encrypted: String, password: String,
-  overwrite: bool, room_checksum: String,
-) -> Result<(), String> {
-  let password = zeroize::Zeroizing::new(password);
-  let backup = tokio::task::spawn_blocking(move || account_backup::decrypt(&encrypted, &password))
-    .await.map_err(|_| "备份解密操作失败")??;
-  let archive = backup.rooms.ok_or("备份不含房间资料")?;
-  let _guard = room_gate.0.lock().await;
-  let path = app.path().app_data_dir().map_err(|_| "无法读取应用目录")?.join("rooms-v1.json");
-  rooms::restore_archive(&path, archive, overwrite, &room_checksum)
-}
-
-#[tauri::command]
 async fn restore_account_backup(
   app: AppHandle,
   mgr: State<'_, Arc<SessionManager>>,
+  room_gate: State<'_, rooms::RoomGate>,
   encrypted: String,
   password: String,
   overwrite: bool,
   preview_checksum: String,
+  room_checksum: Option<String>,
 ) -> Result<ManagerSnapshot, String> {
   let password = zeroize::Zeroizing::new(password);
   let backup = tokio::task::spawn_blocking(move || account_backup::decrypt(&encrypted, &password))
     .await.map_err(|_| "备份解密操作失败".to_string())??;
-  mgr.restore_account_backup(&app, backup, overwrite, &preview_checksum).await
+  mgr.restore_account_backup(&app, &room_gate, backup, overwrite, &preview_checksum, room_checksum.as_deref()).await
 }
 
 #[tauri::command]
@@ -1994,7 +1982,6 @@ pub fn run() {
       preview_account_backup,
       local_data_protection,
       restore_account_backup,
-      restore_room_backup,
       transfer_account_cookies,
       inspect_account_cookies,
       list_muse_sessions,

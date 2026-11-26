@@ -478,7 +478,7 @@ class AccountSessionPlugin: Plugin {
     var report: [[String: String]] = []
     do {
       try manager.createDirectory(at: directory, withIntermediateDirectories: true)
-      for name in ["目录", "accounts.json", "rooms-v1.json", "send-ledger.json"] {
+      for name in ["目录", "accounts.json", "rooms-v1.json", "send-ledger.json", "backup-restore-v1.json"] {
         let target = name == "目录" ? directory : directory.appendingPathComponent(name)
         if name != "目录" && !manager.fileExists(atPath: target.path) {
           report.append(["file":name, "status":"尚未创建"])

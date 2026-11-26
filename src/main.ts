@@ -2800,7 +2800,7 @@ function renderAccountBackup(view: Extract<ModalMode, { kind: "backup" }>): stri
           <input id="backup-password" type="password" autocomplete="off" class="modal-input" ${disabled} />
           ${preview ? `<div class="approval-items">
             <div>新增 ${preview.added} · 已有 ${preview.existing} · 代理池 ${preview.proxyPoolCount} 条</div>
-            ${preview.roomChecksum ? `<div>房间 ${preview.roomCount ?? 0} · 自定义模板 ${preview.templateCount ?? 0} · 可独立恢复</div>` : ""}
+            ${preview.roomChecksum ? `<div>房间 ${preview.roomCount ?? 0} · 自定义模板 ${preview.templateCount ?? 0} · 随账号一起恢复</div>` : ""}
             ${preview.conflicts.map((conflict) => `<div>冲突 · ${escapeHtml(conflict)}</div>`).join("")}
           </div>` : ""}
         </div>
@@ -2811,23 +2811,21 @@ function renderAccountBackup(view: Extract<ModalMode, { kind: "backup" }>): stri
           <button id="backup-preview" type="button" class="btn" ${disabled}>预览恢复</button>
           <button id="backup-protection" type="button" class="btn" ${disabled}>检查本机文件保护</button>
           ${preview ? `<button id="backup-merge" type="button" class="btn" ${disabled}>合并</button><button id="backup-overwrite" type="button" class="btn" ${disabled}>覆盖冲突资料</button>` : ""}
-          ${preview?.roomChecksum ? `<button id="backup-rooms-merge" type="button" class="btn" ${disabled}>合并房间与模板</button>
-            <button id="backup-rooms-overwrite" type="button" class="btn" ${disabled}>覆盖同标识房间与模板</button>` : ""}
         </div>
       </div>
     </div>`;
 }
 
-async function accountBackupAction(view: Extract<ModalMode, { kind: "backup" }>, action: "export" | "preview" | "merge" | "overwrite" | "rooms-merge" | "rooms-overwrite"): Promise<void> {
+async function accountBackupAction(view: Extract<ModalMode, { kind: "backup" }>, action: "export" | "preview" | "merge" | "overwrite"): Promise<void> {
   if (modal !== view || view.busy) return;
   const passwordInput = document.querySelector<HTMLInputElement>("#backup-password");
   const password = passwordInput?.value ?? "";
   if (passwordInput) passwordInput.value = "";
-  const overwrite = action === "overwrite" || action === "rooms-overwrite";
+  const overwrite = action === "overwrite";
   if (overwrite && !await askConfirm({
     title: "覆盖冲突资料",
-    desc: action === "rooms-overwrite" ? "备份会替换标识相同的本机房间和模板。操作会保存为独立的一次恢复。"
-      : "备份会更新匹配账号的备注、设置及所选代理资料。新代理需要凭据时将保持阻断。",
+    desc: "备份会更新匹配账号的备注、设置及所选代理资料。新代理需要凭据时将保持阻断。"
+      + (view.preview?.roomChecksum ? "同标识房间和模板也会在本次操作中覆盖。" : ""),
     confirmLabel: "覆盖",
     danger: true,
   })) {
@@ -2850,20 +2848,15 @@ async function accountBackupAction(view: Extract<ModalMode, { kind: "backup" }>,
       if (!view.encrypted) throw new Error("请先选择备份文件");
       view.preview = await invoke<BackupPreview>("preview_account_backup", { encrypted: view.encrypted, password });
       view.message = "";
-    } else if ((action === "rooms-merge" || action === "rooms-overwrite") && view.preview?.roomChecksum) {
-      await invoke("restore_room_backup", { encrypted:view.encrypted, password, overwrite, roomChecksum:view.preview.roomChecksum });
-      view.preview = { ...view.preview, roomChecksum:null };
-      view.message = "房间和模板已恢复。";
     } else if (view.preview) {
       snapshot = await invoke<ManagerSnapshot>("restore_account_backup", {
-        encrypted: view.encrypted, password, overwrite: action === "overwrite", previewChecksum: view.preview.checksum,
+        encrypted: view.encrypted, password, overwrite, previewChecksum: view.preview.checksum,
+        roomChecksum: view.preview.roomChecksum,
       });
-      if (!view.preview.roomChecksum) {
-        view.preview = null;
-        view.encrypted = "";
-        view.fileName = "";
-      }
-      view.message = "账号资料已恢复。";
+      view.message = view.preview.roomChecksum ? "账号、房间和模板已恢复。" : "账号资料已恢复。";
+      view.preview = null;
+      view.encrypted = "";
+      view.fileName = "";
     }
   } catch (error) {
     if (action !== "export") view.preview = null;
@@ -4687,10 +4680,6 @@ function bindDelegatedEvents(): void {
         break;
       case "backup-overwrite":
         if (modal.kind === "backup") await accountBackupAction(modal, "overwrite");
-        break;
-      case "backup-rooms-merge":
-      case "backup-rooms-overwrite":
-        if (modal.kind === "backup") await accountBackupAction(modal, id === "backup-rooms-merge" ? "rooms-merge" : "rooms-overwrite");
         break;
       case "account-proxy-pool":
         if (modal.kind === "rename") {

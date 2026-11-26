@@ -294,6 +294,8 @@ pub struct AccountsStoreFile {
   pub approval_attempts: BTreeMap<String, bool>,
   #[serde(default, skip_serializing_if = "Vec::is_empty")]
   pub restored_proxy_pool: Vec<crate::account_backup::ProxyPoolProfile>,
+  #[serde(default, skip_serializing_if = "Option::is_none")]
+  pub(crate) backup_restore_id: Option<Uuid>,
 }
 
 impl Default for AccountsStoreFile {
@@ -305,6 +307,7 @@ impl Default for AccountsStoreFile {
       pending_cleanup: Vec::new(),
       approval_attempts: BTreeMap::new(),
       restored_proxy_pool: Vec::new(),
+      backup_restore_id: None,
     }
   }
 }
@@ -565,6 +568,7 @@ fn migrate_from_value(root: Value) -> Result<(AccountsStoreFile, bool), String> 
       pending_cleanup,
       approval_attempts,
       restored_proxy_pool: obj.get("restoredProxyPool").and_then(|value| serde_json::from_value(value.clone()).ok()).unwrap_or_default(),
+      backup_restore_id: obj.get("backupRestoreId").and_then(Value::as_str).and_then(|value| Uuid::parse_str(value).ok()),
     },
     is_legacy,
   ))

@@ -1082,11 +1082,14 @@ impl SessionManager {
   pub async fn restore_account_backup(
     &self,
     app: &AppHandle,
+    room_gate: &crate::rooms::RoomGate,
     backup: crate::account_backup::AccountBackup,
     overwrite: bool,
     preview_checksum: &str,
+    room_checksum: Option<&str>,
   ) -> Result<ManagerSnapshot, String> {
     let _proxy_guard = self.proxy_write_lock.lock().await;
+    let _room_guard = room_gate.0.lock().await;
     let mut locked = self.inner.lock().await;
     if locked.active_slot.is_some() || !locked.store.pending_cleanup.is_empty() || !locked.conflicts.is_empty() {
       return Err("请关闭会话并完成账号清理或冲突处理后再恢复".into());
@@ -1095,6 +1098,12 @@ impl SessionManager {
     if preview.checksum != preview_checksum {
       return Err("账号数据已变化，请重新预览".into());
     }
+    let room_path = locked.store_path.with_file_name("rooms-v1.json");
+    let restored_rooms = match (backup.rooms, room_checksum) {
+      (Some(archive), Some(checksum)) => Some(crate::rooms::prepare_restore(&room_path, archive, overwrite, checksum)?),
+      (None, None) => None,
+      _ => return Err("恢复范围已变化，请重新预览".into()),
+    };
     let mut updated = locked.store.clone();
     for entry in backup.proxy_pool {
       if updated.restored_proxy_pool.iter().any(|old| crate::proxy_pool::restored_entry_id(old) == crate::proxy_pool::restored_entry_id(&entry) && old != &entry) {
@@ -1141,7 +1150,11 @@ impl SessionManager {
       .any(|id| !seen_pool.insert(id)) {
       return Err("备份会让两个账号使用同一代理池条目，已保留原资料".into());
     }
-    save_store_atomic(&locked.store_path, &updated)?;
+    if let Some(book) = restored_rooms {
+      crate::rooms::backup_restore::commit(&locked.store_path, &mut updated, &room_path, &book)?;
+    } else {
+      save_store_atomic(&locked.store_path, &updated)?;
+    }
     locked.store = updated;
     let snapshot = Self::snapshot_from_locked(&locked);
     drop(locked);
