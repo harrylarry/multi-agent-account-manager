@@ -19,7 +19,7 @@ import type {
 type ModalMode =
   | { kind: "none" }
   | { kind: "compose"; providerId: ProviderId; uuid: string; pending: boolean }
-  | { kind: "add"; providerId: ProviderId; draft: string; cookiePreview: boolean; pending: boolean }
+  | { kind: "add"; providerId: ProviderId; draft: string; pending: boolean }
   | { kind: "rename"; account: AccountRecord; draft: string; groupDraft: string; timezoneDraft: string }
   | { kind: "remove"; account: AccountRecord }
   | { kind: "tasks"; account: AccountRecord; section?: "tasks" | "quota" | "models"; checking: boolean; note: string; quotaChecking: boolean }
@@ -50,7 +50,7 @@ interface TaskObservation {
 }
 
 interface HarkRecovery {
-  replies: { id: string; text: string; completed: boolean; updatedByPoll: boolean; card: { title: string; body: string } | null }[];
+  replies: { id: string; text: string; completed: boolean; updatedByPoll: boolean; artifacts?: { name: string; mediaType: string | null }[]; card: { title: string; body: string } | null }[];
   streamEnd: string | null;
   pollStatus: number | null;
   error: string | null;
@@ -2950,9 +2950,10 @@ function renderHarkReplies(view: Extract<ModalMode, { kind: "harkReplies" }>): s
         <div class="proxy-pool-body">
           ${result?.replies.map((reply) => `
             <details class="hark-reply">
-              <summary>${escapeHtml(reply.card?.title ?? reply.text.slice(0, 84))} · ${reply.completed ? "已完成" : "未确认完成"}${reply.updatedByPoll ? " · 轮询补回" : ""}</summary>
+              <summary>${escapeHtml(reply.card?.title ?? (reply.text.slice(0, 84) || "文件"))} · ${reply.completed ? "已完成" : "未确认完成"}${reply.updatedByPoll ? " · 轮询补回" : ""}</summary>
               ${reply.text ? `<div class="hark-reply-text">${escapeHtml(reply.text)}</div>` : ""}
               ${reply.card ? `<details><summary>展开卡片内容</summary><div class="hark-reply-text">${escapeHtml(reply.card.body)}</div></details>` : ""}
+              ${reply.artifacts?.length ? `<ul>${reply.artifacts.map((file) => `<li>${escapeHtml(file.name)}${file.mediaType ? ` <small>${escapeHtml(file.mediaType)}</small>` : ""}</li>`).join("")}</ul>` : ""}
             </details>`).join("") ?? ""}
         </div>
         <div class="modal-footer">
@@ -3199,14 +3200,15 @@ function renderProxyPool(view: Extract<ModalMode, { kind: "proxyPool" }>): strin
           <div class="proxy-pool-actions">${action("导入代理", "import")}${action("添加订阅", "subscribe")}</div>` :
           `<label for="proxy-pool-selection">账号代理</label>
           <select id="proxy-pool-selection" class="modal-input" ${disabled}>
-            <option value="">${setting?.enabled && !setting.poolEntryId ? "保留现有代理" : "不启用代理"}</option>
+            ${setting?.enabled && !setting.poolEntryId ? `<option value="legacy" ${view.selected === "legacy" ? "selected" : ""}>保留现有代理</option>` : ""}
+            <option value="" ${!view.selected ? "selected" : ""}>不启用代理</option>
             ${data?.entries.filter((entry) => !entry.missingCredentials).map((entry) =>
               `<option value="${escapeHtml(entry.id)}" ${view.selected === entry.id ? "selected" : ""}>${escapeHtml(entry.endpoint)}</option>`).join("") ?? ""}
           </select>
           ${data && !data.entries.length ? '<p class="modal-desc">代理池为空，可在「管理 → 代理池」添加。</p>' : ""}
           <div class="proxy-pool-actions">
-            ${view.selected ? action("检测代理", "measure-entry", view.selected) : setting?.enabled ? action("检测代理", "measure") : ""}
-            ${view.selected ? action("保存设置", "apply", view.selected) : setting?.enabled && setting.poolEntryId ? action("保存设置", "clear") : ""}
+            ${view.selected && view.selected !== "legacy" ? action("检测代理", "measure-entry", view.selected) : view.selected === "legacy" ? action("检测代理", "measure") : ""}
+            ${view.selected && view.selected !== "legacy" ? action("保存设置", "apply", view.selected) : !view.selected && setting?.enabled ? action("保存设置", "clear") : ""}
           </div>`}
           ${!account ? data?.sources.map((source) => `<div class="proxy-pool-row">
             <div>${escapeHtml(source.host)}<small>上次刷新 ${new Date(source.refreshedAt * 1000).toLocaleString()}</small></div>
@@ -3303,7 +3305,7 @@ async function proxyPoolAction(view: Extract<ModalMode, { kind: "proxyPool" }>, 
       if (action === "list") {
         if (target) {
           view.setting = await invoke<SpikeProxySettingView | null>("muse_native_get_account_proxy", target);
-          view.selected = view.setting?.poolEntryId ?? "";
+          view.selected = view.setting?.poolEntryId ?? (view.setting?.enabled ? "legacy" : "");
           const key = iphoneAccountKey(target);
           if (!view.setting?.enabled) iphoneProxyFaults.delete(key);
           else if (view.setting.webview?.quarantined || view.setting.credentialAvailable === false) iphoneProxyFaults.set(key, "blocked");
@@ -3486,7 +3488,7 @@ async function submitApproval(
   }
 }
 
-async function submitNewAccount(view: Extract<ModalMode, { kind: "add" }>, previewOnly: boolean): Promise<void> {
+async function submitNewAccount(view: Extract<ModalMode, { kind: "add" }>): Promise<void> {
   if (view.pending || modal !== view) return;
   const input = document.querySelector<HTMLTextAreaElement>("#add-cookie-input");
   const status = document.getElementById("add-account-result");
@@ -3496,10 +3498,6 @@ async function submitNewAccount(view: Extract<ModalMode, { kind: "add" }>, previ
     ? document.querySelector<HTMLInputElement>("#add-custom-timezone")?.value.trim() : timeSelect?.value;
   const language = document.querySelector<HTMLSelectElement>("#add-language")?.value;
   const proxyEntryId = document.querySelector<HTMLSelectElement>("#add-proxy")?.value || null;
-  if (previewOnly && !cookieInput) {
-    if (status) status.textContent = "请先粘贴 Cookie。";
-    return;
-  }
   if (timeSelect?.value === "custom" && !timezone) {
     if (status) status.textContent = "请输入 IANA 时区。";
     return;
@@ -3508,21 +3506,13 @@ async function submitNewAccount(view: Extract<ModalMode, { kind: "add" }>, previ
   view.pending = true;
   if (input) input.readOnly = true;
   for (const button of controls) button.disabled = true;
-  if (status) status.textContent = previewOnly ? "正在校验…" : "正在创建账号…";
+  if (status) status.textContent = "正在创建账号…";
   try {
-    if (previewOnly) {
-      const checked = await invoke<CookiePreview>("preview_account_cookies", { providerId: view.providerId, raw: cookieInput });
-      if (input?.isConnected && input.value.trim() === cookieInput) {
-        view.cookiePreview = true;
-        if (status) status.textContent = `可导入 ${checked.count} 条 · ${checked.domains.join("、")}`;
-      }
-    } else {
-      snapshot = await invoke<ManagerSnapshot>("add_account", {
-        providerId: view.providerId, alias: view.draft.trim(), cookieInput, timezone, language, proxyEntryId,
-      });
-      if (input) input.value = "";
-      if (modal === view) await setModal({ kind: "none" });
-    }
+    snapshot = await invoke<ManagerSnapshot>("add_account", {
+      providerId: view.providerId, alias: view.draft.trim(), cookieInput, timezone, language, proxyEntryId,
+    });
+    if (input) input.value = "";
+    if (modal === view) await setModal({ kind: "none" });
   } catch (error) {
     if (status) status.textContent = String(error);
   } finally {
@@ -3532,17 +3522,17 @@ async function submitNewAccount(view: Extract<ModalMode, { kind: "add" }>, previ
   }
 }
 
-async function submitIphoneConversation(view: Extract<ModalMode, { kind: "compose" }>): Promise<void> {
+async function submitIphoneConversation(view: Extract<ModalMode, { kind: "compose" }>, verify = false): Promise<void> {
   if (modal !== view || view.pending || view.providerId !== "muse" || !snapshot) return;
   const { uuid, providerId } = view;
   const draft = iphoneConversationDraft.get(uuid);
-  if (!draft?.text.trim() || draft.status === "UNKNOWN" || !snapshot.accounts.some((item) =>
+  if (!draft?.text.trim() || (draft.status === "UNKNOWN") !== verify || !snapshot.accounts.some((item) =>
     item.uuid === uuid && item.providerId === providerId && item.authState === "authenticated")) return;
   view.pending = true;
   await setModal(view);
   try {
     if (!draft.threadId) {
-      const result = await invoke<{ status: string; sessionId: string | null }>("send_new_muse_conversation", { uuid, text: draft.text });
+      const result = await invoke<{ status: string; sessionId: string | null }>(verify ? "check_new_muse_conversation" : "send_new_muse_conversation", { uuid, text: draft.text });
       draft.status = result.status;
       if (result.status === "CONFIRMED" && result.sessionId) draft.threadId = result.sessionId;
       else if (!["DEFINITIVELY_FAILED", "BUSY"].includes(result.status)) draft.status = "UNKNOWN";
@@ -3570,7 +3560,7 @@ function renderIphoneConversation(view: Extract<ModalMode, { kind: "compose" }>)
   const confirmed = Boolean(draft?.threadId);
   const waiting = view.pending;
   const supported = view.providerId === "muse";
-  const status = waiting ? "正在发送…" : !supported ? "Hark 的新会话网页定位仍待验证。" : unknown
+  const status = waiting ? (unknown ? "正在核对网页历史…" : "正在发送…") : !supported ? "Hark 的新会话网页定位仍待验证。" : unknown
     ? "发送结果待核对。请在该账号的网页查看会话。"
     : confirmed ? "消息已确认，重新打开会话。" : draft?.status === "DEFINITIVELY_FAILED"
       ? "消息未发出。检查该账号的登录与代理后可重试。"
@@ -3589,7 +3579,8 @@ function renderIphoneConversation(view: Extract<ModalMode, { kind: "compose" }>)
       <textarea class="modal-input" id="iphone-first-message" maxlength="16000" rows="5" ${waiting || unknown || confirmed || !view.uuid ? "readonly" : ""}>${escapeHtml(draft?.text ?? "")}</textarea>
       <p role="status" class="iphone-caption">${escapeHtml(status)}</p>
       <div class="modal-footer">
-        ${unknown ? '<button type="button" class="btn" id="iphone-compose-check">打开账号核对</button>' : ""}
+        ${unknown ? `<button type="button" class="btn" id="iphone-compose-verify" ${waiting ? "disabled" : ""}>检查发送结果</button>
+          <button type="button" class="btn" id="iphone-compose-check" ${waiting ? "disabled" : ""}>打开账号核对</button>` : ""}
         <button type="button" class="btn primary" id="iphone-compose-send" ${!supported || waiting || unknown || !draft?.text.trim() ? "disabled" : ""}>${confirmed ? "打开会话" : "发送并打开"}</button>
       </div>
     </div>
@@ -5057,6 +5048,9 @@ function bindDelegatedEvents(): void {
       case "iphone-compose-send":
         if (modal.kind === "compose") await submitIphoneConversation(modal);
         break;
+      case "iphone-compose-verify":
+        if (modal.kind === "compose") await submitIphoneConversation(modal, true);
+        break;
       case "iphone-compose-check":
         if (modal.kind === "compose" && !modal.pending && modal.uuid) {
           const key = { uuid: modal.uuid, providerId: modal.providerId };
@@ -5068,7 +5062,7 @@ function bindDelegatedEvents(): void {
       case "stage-add-btn": {
         iphoneMenuOpen = false;
         if (modal.kind !== "none" || reorderMode || !provider.enabled) break;
-        const view: Extract<ModalMode, { kind: "add" }> = { kind: "add", providerId: provider.id, draft: "", cookiePreview: false, pending: false };
+        const view: Extract<ModalMode, { kind: "add" }> = { kind: "add", providerId: provider.id, draft: "", pending: false };
         await setModal(view);
         if (snapshot.platform === "ios") {
           try {
@@ -5291,9 +5285,6 @@ function bindDelegatedEvents(): void {
         if ((modal.kind === "add" || modal.kind === "compose") && modal.pending) break;
         await setModal({ kind: "none" });
         break;
-      case "add-cookie-preview":
-        if (modal.kind === "add") await submitNewAccount(modal, true);
-        break;
       case "modal-confirm-btn": {
         const currentModal = modal;
         if (currentModal.kind === "confirm") {
@@ -5304,7 +5295,7 @@ function bindDelegatedEvents(): void {
           await setModal({ kind: "none" });
           resolve?.(true);
         } else if (currentModal.kind === "add") {
-          await submitNewAccount(currentModal, false);
+          await submitNewAccount(currentModal);
         } else if (currentModal.kind === "rename") {
           const alias = currentModal.draft.trim();
           if (!alias) break;
@@ -5425,7 +5416,6 @@ root.addEventListener("change", async (ev) => {
     if (modal.kind === "add" && field instanceof HTMLSelectElement && !modal.pending) {
       if (field.id === "add-provider" && (field.value === "muse" || field.value === "hark")) {
         modal.providerId = field.value;
-        modal.cookiePreview = false;
         const cookie = document.querySelector<HTMLTextAreaElement>("#add-cookie-input");
         if (cookie) cookie.value = "";
         const result = document.getElementById("add-account-result");
@@ -5552,7 +5542,6 @@ root.addEventListener("change", async (ev) => {
       return;
     }
     if (input.id === "add-cookie-input" && modal.kind === "add") {
-      modal.cookiePreview = false;
       const status = document.getElementById("add-account-result");
       if (status) status.textContent = "";
       return;

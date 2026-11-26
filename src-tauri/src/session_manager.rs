@@ -2077,15 +2077,16 @@ impl SessionManager {
         Ok((setting, password))
       }).transpose()?;
       let key = AccountKey { provider_id, uuid: uuid.clone() };
-      #[cfg(target_os = "ios")]
-      if let Some(cookies) = cookies {
-        // Reserve a cleanup record before creating a WebKit profile so an
-        // interrupted import cannot leave an untracked credential store.
+      let needs_cleanup = cookies.is_some() || proxy.as_ref().is_some_and(|(_, password)| password.is_some());
+      if needs_cleanup {
         locked.store.pending_cleanup.push(key.clone());
         if let Err(error) = save_store_atomic(&locked.store_path, &locked.store) {
           locked.store.pending_cleanup.pop();
           return Err(error);
         }
+      }
+      #[cfg(target_os = "ios")]
+      if let Some(cookies) = cookies {
         let written = crate::platform::ios::transfer_profile_cookies(app, provider_id.as_str(), &uuid, Some(cookies), false).await;
         if written.as_ref().map(|entry| entry.count).ok() != Some(cookies.len()) {
           if crate::platform::ios::delete_profile(app, &uuid).await.is_ok() {
@@ -2096,16 +2097,13 @@ impl SessionManager {
           }
           return Err(written.err().unwrap_or_else(|| "未能核对 Cookie 写入，账号未创建".into()));
         }
-        locked.store.pending_cleanup.retain(|entry| entry != &key);
       }
       let proxy_secrets = crate::secrets::Secrets::new(locked.store_path.parent().ok_or("无法定位凭据目录")?);
       if let Some((setting, Some(password))) = &proxy {
         let reference = setting.credential_ref.as_deref().ok_or("缺少代理凭据标识")?;
-        if let Err(error) = proxy_secrets.set(reference, password) {
-          if cookies.is_some() { locked.store.pending_cleanup.push(key); }
-          return Err(error);
-        }
+        proxy_secrets.set(reference, password)?;
       }
+      if needs_cleanup { locked.store.pending_cleanup.retain(|entry| entry != &key); }
       locked.store.accounts.push(AccountRecord {
         provider_id,
         uuid: uuid.clone(),
@@ -2138,7 +2136,7 @@ impl SessionManager {
         if let Some(reference) = proxy.as_ref().and_then(|(setting, _)| setting.credential_ref.as_deref()) {
           let _ = proxy_secrets.delete(reference);
         }
-        if cookies.is_some() { locked.store.pending_cleanup.push(key); }
+        if needs_cleanup { locked.store.pending_cleanup.push(key); }
         return Err(error);
       }
       locked.selected_provider_id = provider_id;
@@ -2310,8 +2308,11 @@ impl SessionManager {
 
     if self.delete_profile_for_key(app, &uuid).await.is_ok() {
       let mut locked = self.inner.lock().await;
-      locked.store.pending_cleanup.retain(|k| k != &key);
-      let _ = save_store_atomic(&locked.store_path, &locked.store);
+      let secrets = crate::secrets::Secrets::new(&locked.app_data_dir);
+      if secrets.delete(&format!("proxy-{uuid}")).is_ok() {
+        locked.store.pending_cleanup.retain(|k| k != &key);
+        let _ = save_store_atomic(&locked.store_path, &locked.store);
+      }
     }
 
     #[cfg(target_os = "ios")]

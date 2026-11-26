@@ -66,6 +66,49 @@ async fn request(gateway: &mut crate::egress::AccountGateway, path: &str) -> Res
 }
 
 #[cfg(target_os = "ios")]
+pub async fn verify_first_message(
+  egress: &crate::egress::AccountEgress, cookies: &muse_native_client::cookie::SessionCookies,
+  session_id: Uuid, digest: &str,
+) -> Result<bool, String> {
+  let mut gateway = Box::pin(egress.connect(cookies)).await.map_err(|_| "无法连接 Muse 会话网关")?;
+  let path = format!("/chat/history?limit=30&transcript_mode=messages&session_id={session_id}");
+  Ok(matches_first_message(&request(&mut gateway, &path).await?, session_id, digest))
+}
+
+#[cfg(any(target_os = "ios", test))]
+fn matches_first_message(body: &[u8], session_id: Uuid, digest: &str) -> bool {
+  let Ok(raw) = serde_json::from_slice::<Value>(body) else { return false; };
+  let result = raw.get("result").unwrap_or(&raw);
+  if raw["ok"] == false || raw["has_more"] == true || result["has_more"] == true || !raw["error"].is_null() {
+    return false;
+  }
+  let session = session_id.to_string();
+  if result["session_id"].as_str().is_some_and(|id| id != session) { return false; }
+  let Some(rows) = ["chat_events", "messages"].iter().find_map(|key| result[*key].as_array())
+    else { return false; };
+  let mut matched = None;
+  for row in rows {
+    let payload = row.get("payload").unwrap_or(row);
+    let is_user = row["event_name"] == "message.user" || payload["role"] == "user";
+    if !is_user { continue; }
+    if payload["session_id"].as_str().or_else(|| result["session_id"].as_str()) != Some(session.as_str()) {
+      return false;
+    }
+    let Some(id) = row["message_id"].as_str().or_else(|| payload["id"].as_str()).filter(|id| !id.is_empty())
+      else { return false; };
+    let parts = payload["content"].as_array().filter(|parts| !parts.is_empty()).and_then(|parts| {
+      parts.iter().map(|part| (part["type"] == "text").then(|| part["text"].as_str()).flatten())
+        .collect::<Option<Vec<_>>>().map(|parts| parts.concat())
+    });
+    let text = payload["text"].as_str().or_else(|| payload["content"].as_str()).or(parts.as_deref());
+    if text.map(crate::send_ledger::SendLedger::new_muse_conversation_digest).as_deref() != Some(digest)
+      || matched.is_some_and(|previous| previous != id) { return false; }
+    matched = Some(id);
+  }
+  matched.is_some()
+}
+
+#[cfg(target_os = "ios")]
 pub async fn fetch_unread(
   egress: &crate::egress::AccountEgress,
   cookies: &muse_native_client::cookie::SessionCookies,
@@ -213,6 +256,23 @@ pub fn parse_list(raw: &[u8]) -> Result<Vec<MuseSession>, String> {
 #[cfg(test)]
 mod tests {
   use super::*;
+
+  #[test]
+  fn reconciliation_requires_exact_text_and_the_allocated_session() {
+    let session = Uuid::new_v4();
+    let digest = crate::send_ledger::SendLedger::new_muse_conversation_digest("test message");
+    let mut response = serde_json::json!({"ok":true,"result":{"session_id":session,"chat_events":[
+      {"event_name":"message.user","message_id":"user-1","payload":{"text":"test message"}}
+    ]}});
+    let verify = |response: &Value, id| matches_first_message(response.to_string().as_bytes(), id, &digest);
+    assert!(verify(&response, session));
+    assert!(!verify(&response, Uuid::new_v4()));
+    response["result"]["chat_events"][0]["payload"]["text"] = "another message".into();
+    assert!(!verify(&response, session));
+    response["result"]["chat_events"][0]["payload"]["text"] = "test message".into();
+    response["result"]["has_more"] = true.into();
+    assert!(!verify(&response, session));
+  }
 
   #[test]
   fn history_requires_a_public_completed_reply_in_the_parked_thread_after_leaving() {

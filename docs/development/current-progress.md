@@ -2,10 +2,10 @@
 
 ## iPhone 导航与账号流程重构
 
-2026-11-27 用户确认[最终方案](iphone-ui-final-plan.md)。继续使用 [PR #16](https://github.com/harrylarry/multi-agent-account-manager/pull/16) 和 spike/native-methods。首批代码从 5dcb013 推进至 6b6f715，后续提交补充代理只读检测、Hark 会话索引、按账号审批回写、文件凭据备份、同服务额度刷新和防重复发送回归。6b6f715 的 Quick checks 在 Rust iOS 交叉编译暴露 sha2 目标依赖差异，后续改用现有跨目标的 ring。
+2026-11-27 用户确认[最终方案](iphone-ui-final-plan.md)。继续使用 [PR #16](https://github.com/harrylarry/multi-agent-account-manager/pull/16) 和 spike/native-methods。首批代码从 5dcb013 推进至 6b6f715，后续提交补充代理只读检测、Hark 会话索引、按账号审批回写、文件凭据备份、同服务额度刷新和防重复发送回归。6b6f715 的 Quick checks 在 Rust iOS 交叉编译暴露 sha2 目标依赖差异，后续改用现有跨目标的 ring。8da7420 的两条 iOS 流水线暴露文件备份新字段在 iOS 专用构造分支的遗漏，已补齐后重新验证。
 
 - 原生玻璃、账号切换与返回路径、新增账号、按服务会话缓存、搜索及 Muse 发送待真机验证。应用最低 iOS 26。
-- Hark 只读会话列表已接入。恢复的主会话卡片沿用既有协议。指定 Hark 会话的网页落点及回到原会话待真实证据，产品发送与直达暂保留门禁。
+- Hark 只读会话列表已接入。主会话回复补同步保留现有卡片，并读取已知附件字段中的文件名和类型。指定 Hark 会话的网页落点及回到原会话待真实证据，产品发送与直达暂保留门禁。
 - 加密文件备份可选择包含账号 Cookie 和账号代理密码。恢复前列出账号及凭据类型，写入新增账号前登记清理记录，保留已有账号凭据。设备上的错误密码、过期 Cookie、重复 UUID、恢复中断和回滚待验收。
 - Muse 产物字段与稳定的账号、会话关联待取证。Muse 空间、Hark 看板继续暂缓。
 - 通过 CI 和 iOS 打包前，旧 IPA 不作为本轮交付。完整的候选版本、SHA-256 和真机步骤记入[真机验收指南](../acceptance/iphone-acceptance.md)。

@@ -200,6 +200,7 @@ pub fn from_accounts(
     proxy_pool,
     expires_at_ms,
     accounts: profiles,
+    credentials: Vec::new(),
   }
 }
 

@@ -1096,6 +1096,49 @@ async fn send_new_muse_conversation(
   Err("此操作仅支持 iOS".into())
 }
 
+#[tauri::command]
+#[cfg_attr(not(target_os = "ios"), allow(unused_variables))]
+async fn check_new_muse_conversation(
+  app: AppHandle, uuid: String, text: String,
+  ledger: State<'_, Arc<send_ledger::SendLedger>>, mgr: State<'_, Arc<SessionManager>>,
+  cancel: State<'_, Arc<probe_cancel::ProbeCancel>>,
+) -> Result<NewConversationResult, String> {
+  #[cfg(target_os = "ios")]
+  {
+    let unknown = || NewConversationResult { status: "UNKNOWN".into(), session_id: None };
+    let uuid = storage::normalize_uuid(&uuid).ok_or("账号标识无效")?;
+    let Some(attempt) = ledger.pending_muse_conversation(&uuid, text.trim()) else { return Ok(unknown()); };
+    let Ok(session) = uuid::Uuid::parse_str(&attempt.conversation_id) else { return Ok(unknown()); };
+    let proxy_guard = mgr.proxy_write_lock.lock().await;
+    let (mut token, _guard) = cancel.register(&uuid, "verify_new_conversation");
+    let snapshot = mgr.get_snapshot().await;
+    drop(proxy_guard);
+    if snapshot.conflicts.iter().any(|item| item.uuid == uuid)
+      || snapshot.pending_cleanup.iter().any(|item| item.uuid == uuid) {
+      return Ok(unknown());
+    }
+    let Some(account) = snapshot.accounts.iter().find(|item| item.uuid == uuid
+      && item.provider_id == providers::ProviderId::Muse && item.auth_state == storage::AuthState::Authenticated)
+      else { return Ok(unknown()); };
+    let verified = tokio::select! {
+      biased;
+      _ = token.cancelled() => false,
+      result = tokio::time::timeout(std::time::Duration::from_secs(26), async {
+        let header = zeroize::Zeroizing::new(muse_native::cookie_header_for(&app, &uuid).await?);
+        if header.is_empty() { return Ok::<_, String>(false); }
+        let egress = egress::resolve_for_app(&app, account.proxy.as_ref())?;
+        let cookies = muse_native_client::cookie::SessionCookies::from_header(&header);
+        muse_sessions::verify_first_message(&egress, &cookies, session, &attempt.digest).await
+      }) => result.is_ok_and(|result| result.unwrap_or(false)),
+    };
+    if !verified { return Ok(unknown()); }
+    ledger.confirm(&attempt.send_id);
+    Ok(NewConversationResult { status: "CONFIRMED".into(), session_id: Some(session.to_string()) })
+  }
+  #[cfg(not(target_os = "ios"))]
+  Err("此操作仅支持 iOS".into())
+}
+
 /// B4：发送一条消息到隔离测试会话（单发锁 + 台账在 muse_native::send_probe）。
 #[tauri::command]
 async fn muse_native_send_probe(
@@ -2120,6 +2163,7 @@ pub fn run() {
       muse_native_quota_probe,
       muse_native_send_probe,
       send_new_muse_conversation,
+      check_new_muse_conversation,
       muse_native_fingerprint_probe,
       set_muse_fingerprint_settings,
       muse_native_proxy_probe,

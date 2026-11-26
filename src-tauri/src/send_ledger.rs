@@ -337,13 +337,27 @@ impl SendLedger {
     })
   }
 
+  pub fn new_muse_conversation_digest(text: &str) -> String {
+    ring::digest::digest(&ring::digest::SHA256, text.as_bytes()).as_ref()
+      .iter().map(|byte| format!("{byte:02x}")).collect()
+  }
+
+  #[cfg(target_os = "ios")]
+  pub fn pending_muse_conversation(&self, account_uuid: &str, text: &str) -> Option<SendAttempt> {
+    let digest = Self::new_muse_conversation_digest(text);
+    let state = self.state.lock().unwrap_or_else(|error| error.into_inner());
+    state.attempts.iter().rev().find(|attempt| {
+      attempt.kind == SendKind::NewMuseConversation && attempt.account_uuid == account_uuid
+        && attempt.status == SendStatus::Unknown && attempt.digest == digest
+    }).cloned()
+  }
+
   pub fn begin_new_muse_conversation(&self, account_uuid: &str, text: &str) -> Result<String, SendError> {
     self.commit(|state| {
       if let Some(mission) = state.missions.get(account_uuid) {
         return Err(SendError::Busy(mission.clone()));
       }
-      let digest: String = ring::digest::digest(&ring::digest::SHA256, text.as_bytes()).as_ref()
-        .iter().map(|byte| format!("{byte:02x}")).collect();
+      let digest = Self::new_muse_conversation_digest(text);
       if state.attempts.iter().any(|attempt| {
         attempt.kind == SendKind::NewMuseConversation
           && attempt.account_uuid == account_uuid

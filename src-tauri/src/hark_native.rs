@@ -53,12 +53,44 @@ pub struct HarkReply {
   card: Option<HarkCard>,
   completed: bool,
   updated_by_poll: bool,
+  artifacts: Vec<HarkArtifact>,
 }
 
 #[derive(Serialize)]
 struct HarkCard {
   title: String,
   body: String,
+}
+
+#[derive(PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct HarkArtifact {
+  name: String,
+  media_type: Option<String>,
+}
+
+#[cfg(any(target_os = "ios", test))]
+fn read_artifacts(fields: &serde_json::Value) -> Vec<HarkArtifact> {
+  let name_only = |value: &str| value.split(['?', '#']).next().unwrap_or("")
+    .rsplit(['/', '\\']).next().unwrap_or("").trim().chars()
+    .filter(|character| !character.is_control()).take(160).collect::<String>();
+  let mut artifacts = Vec::new();
+  for key in ["artifacts", "attachments", "files", "images", "videos"] {
+    let Some(items) = fields[key].as_array() else { continue; };
+    for item in items {
+      let name = ["name", "filename", "path", "filePath"].into_iter().find_map(|key| item[key].as_str());
+      let Some(name) = name.or_else(|| item.as_str()) else { continue; };
+      let name = name_only(name);
+      if name.is_empty() { continue; }
+      let media_type = ["mimeType", "mediaType", "contentType"].into_iter().find_map(|key| item[key].as_str())
+        .filter(|value| value.len() <= 60 && value.contains('/') && value.bytes().all(|byte| byte.is_ascii_alphanumeric() || b"/+.-".contains(&byte)))
+        .map(str::to_owned);
+      if artifacts.iter().any(|artifact: &HarkArtifact| artifact.name == name) { continue; }
+      artifacts.push(HarkArtifact { name, media_type });
+      if artifacts.len() >= 32 { return artifacts; }
+    }
+  }
+  artifacts
 }
 
 #[cfg(any(target_os = "ios", test))]
@@ -129,7 +161,8 @@ impl SyncTracker {
       fields[*key].as_str().filter(|value| !value.trim().is_empty())
     });
     let card = read_card(&fields["presentation"]);
-    if text.is_none() && card.is_none() && !self.replies.contains_key(id) { return; }
+    let artifacts = read_artifacts(fields);
+    if text.is_none() && card.is_none() && artifacts.is_empty() && !self.replies.contains_key(id) { return; }
     if !self.replies.contains_key(id) {
       if self.reply_order.len() >= MAX_REPLIES {
         self.replies.remove(&self.reply_order.remove(0));
@@ -156,6 +189,13 @@ impl SyncTracker {
       });
       if replace {
         reply.card = Some(card);
+        changed = true;
+      }
+    }
+    for artifact in artifacts {
+      if reply.artifacts.len() >= 32 { break; }
+      if !reply.artifacts.iter().any(|item| item.name == artifact.name) {
+        reply.artifacts.push(artifact);
         changed = true;
       }
     }
@@ -666,6 +706,20 @@ mod tests {
     assert!(!sse.updated_by_poll);
     assert!(!serde_json::to_string(&result).unwrap().contains("Card body"));
     server.await.unwrap();
+  }
+
+  #[test]
+  fn restored_reply_file_metadata_strips_urls_and_query_strings() {
+    let input = serde_json::json!({"artifacts": [
+      {"path":"https://app.hark.com/api/files/summary.pdf?sig=fixture", "mimeType":"application/pdf"},
+      {"name":"summary.pdf"},
+      {"downloadUrl":"https://app.hark.com/file?token=fixture"}
+    ]});
+    let files = read_artifacts(&input);
+    assert_eq!(files.len(), 1);
+    assert_eq!(files[0].name, "summary.pdf");
+    assert_eq!(files[0].media_type.as_deref(), Some("application/pdf"));
+    assert!(!serde_json::to_string(&files).unwrap().contains("fixture"));
   }
 
   #[test]
