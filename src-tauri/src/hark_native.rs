@@ -13,6 +13,16 @@ enum JobState {
   Failed,
 }
 
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct HarkSessionSummary {
+  pub(crate) id: String,
+  pub(crate) title: String,
+  pub(crate) updated_at_ms: Option<u64>,
+  pub(crate) pinned: bool,
+  pub(crate) archived: bool,
+}
+
 #[derive(Default, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct SyncSummary {

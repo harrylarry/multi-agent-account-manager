@@ -322,17 +322,24 @@
 }
 .iphone-shell .iphone-subpage .modal-card > * { flex-shrink: 0; }
 .iphone-shell .iphone-subpage .modal-title {
-  font-size: 25px;
+  font-size: 28px;
   font-weight: 700;
+  line-height: 1.18;
   overflow-wrap: anywhere;
 }
 .iphone-shell .iphone-subpage .iphone-back {
-  width: auto;
-  height: auto;
+  position: sticky;
+  top: -8px;
+  z-index: 2;
+  width: 44px;
+  height: 44px;
   padding: 0;
+  border-radius: 50%;
   border: 0;
-  background: transparent;
+  background: var(--dh-surface);
   color: var(--dh-blue);
+  font-size: 28px;
+  line-height: 1;
 }
 .iphone-disclosure {
   padding: 10px 12px;

@@ -1,5 +1,15 @@
 # 当前开发进度
 
+## iPhone 导航与账号流程重构
+
+2026-11-27 用户确认[最终方案](iphone-ui-final-plan.md)。继续使用 [PR #16](https://github.com/harrylarry/multi-agent-account-manager/pull/16) 和 spike/native-methods。首批代码从 5dcb013 推进至 6b6f715，后续提交补充代理只读检测、Hark 会话索引、按账号审批回写、文件凭据备份、同服务额度刷新和防重复发送回归。6b6f715 的 Quick checks 在 Rust iOS 交叉编译暴露 sha2 目标依赖差异，后续改用现有跨目标的 ring。
+
+- 原生玻璃、账号切换与返回路径、新增账号、按服务会话缓存、搜索及 Muse 发送待真机验证。应用最低 iOS 26。
+- Hark 只读会话列表已接入。恢复的主会话卡片沿用既有协议。指定 Hark 会话的网页落点及回到原会话待真实证据，产品发送与直达暂保留门禁。
+- 加密文件备份可选择包含账号 Cookie 和账号代理密码。恢复前列出账号及凭据类型，写入新增账号前登记清理记录，保留已有账号凭据。设备上的错误密码、过期 Cookie、重复 UUID、恢复中断和回滚待验收。
+- Muse 产物字段与稳定的账号、会话关联待取证。Muse 空间、Hark 看板继续暂缓。
+- 通过 CI 和 iOS 打包前，旧 IPA 不作为本轮交付。完整的候选版本、SHA-256 和真机步骤记入[真机验收指南](../acceptance/iphone-acceptance.md)。
+
 ## 当前优先级 · 多账号稳定性
 
 `95cf7b3` 已清理 iPhone 界面的重复入口并统一文案。账号详情分别提供任务与通知、额度、模型指纹与会话功能。共享代理池集中维护，单账号的选择、手动配置、停用与检测都在账号详情。Muse 诊断保留协议测试，Hark 诊断保留只读链路测试。前端构建、13 项脚本测试、小屏深色与标准屏浅色 WebKit 回归、Quick checks、iOS 构建和 IPA 校验已通过。真机重点复核子页返回、账号上下文与代理隔离。[下载与步骤](../acceptance/iphone-acceptance.md#iphone-界面与切号)

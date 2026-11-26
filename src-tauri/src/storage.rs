@@ -567,13 +567,20 @@ fn migrate_from_value(root: Value) -> Result<(AccountsStoreFile, bool), String> 
     Some(value) => serde_json::from_value(value.clone()).map_err(|_| "审批台账损坏".to_string())?,
   };
 
+  let mut account_groups: BTreeMap<String, Vec<String>> = obj.get("accountGroups").map(|value| serde_json::from_value(value.clone()).map_err(|_| "账号分组目录损坏".to_string())).transpose()?.unwrap_or_default();
+  for account in &accounts {
+    if let Some(group) = &account.group {
+      let names = account_groups.entry(account.provider_id.as_str().to_owned()).or_default();
+      if !names.contains(group) { names.push(group.clone()); }
+    }
+  }
   Ok((
     AccountsStoreFile {
       version: STORE_VERSION,
       accounts,
       last_committed,
       pending_cleanup,
-      account_groups: obj.get("accountGroups").map(|value| serde_json::from_value(value.clone()).map_err(|_| "账号分组目录损坏".to_string())).transpose()?.unwrap_or_default(),
+      account_groups,
       approval_attempts,
       restored_proxy_pool: obj.get("restoredProxyPool").and_then(|value| serde_json::from_value(value.clone()).ok()).unwrap_or_default(),
     },

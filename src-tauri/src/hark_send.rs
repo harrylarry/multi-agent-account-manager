@@ -1,4 +1,4 @@
-use crate::{hark_native::checked_json, probe_cancel::CancelToken, send_ledger::{MissionGuard, SendLedger}};
+use crate::{hark_native::{checked_json, HarkSessionSummary}, probe_cancel::CancelToken, send_ledger::{MissionGuard, SendLedger}};
 use reqwest::{header::{HeaderValue, ACCEPT, CONTENT_TYPE, COOKIE, ORIGIN, REFERER}, Client, Method, RequestBuilder};
 use serde::Serialize;
 use serde_json::{json, Value};
@@ -52,6 +52,24 @@ fn project_id(value: &Value) -> Option<&str> {
 fn projects(list: &Value) -> Result<&[Value], String> {
   list.as_array().or_else(|| list["conversations"].as_array()).map(Vec::as_slice)
     .ok_or("Hark 会话列表格式无法核验".into())
+}
+
+pub(crate) async fn list_projects(transport: &Transport<'_>) -> Result<Vec<HarkSessionSummary>, String> {
+  let response = transport.projects().await?;
+  let rows = projects(&response)?;
+  let mut result = Vec::new();
+  for row in rows {
+    let Some(id) = project_id(row) else { return Err("Hark 会话列表含无法核验的标识".into()); };
+    let conversation = row.get("conversation").unwrap_or(row);
+    let title = conversation["title"].as_str().filter(|title| !title.trim().is_empty()).unwrap_or("未命名会话");
+    let updated_at_ms = ["updatedAtMs", "updated_at_ms"].iter()
+      .find_map(|key| conversation[*key].as_u64()).filter(|time| *time <= 8_640_000_000_000_000);
+    result.push(HarkSessionSummary {
+      id: id.to_owned(), title: title.chars().take(500).collect(), updated_at_ms,
+      pinned: conversation["pinned"] == true, archived: conversation["archived"] == true,
+    });
+  }
+  Ok(result)
 }
 
 fn response_id(send_id: &str) -> Result<String, String> {

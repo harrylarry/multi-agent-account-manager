@@ -1,5 +1,5 @@
 import { invoke } from "@tauri-apps/api/core";
-import type { AccountRecord } from "./types";
+import type { AccountRecord, ProviderId } from "./types";
 
 export interface IphoneSession {
   id: string;
@@ -14,7 +14,7 @@ interface SessionList {
   fetchedAt: number;
 }
 
-const storageKey = "maam.iphone.muse-sessions.v1";
+const storageKey = "maam.iphone.sessions.v2";
 const records = new Map<string, SessionList>();
 const requests = new Map<string, Promise<void>>();
 const failures = new Set<string>();
@@ -25,17 +25,21 @@ function persist(): void {
   try { localStorage.setItem(storageKey, JSON.stringify([...records])); } catch { /* The in-memory list still works. */ }
 }
 
+const sessionAccountKey = (account: { providerId: ProviderId; uuid: string }) => account.providerId + ":" + account.uuid;
+
 export function reconcileIphoneSessions(accounts: AccountRecord[]): void {
   if (!loaded) {
     loaded = true;
     try {
+      localStorage.removeItem("maam.iphone.muse-sessions.v1");
       for (const [uuid, entry] of JSON.parse(localStorage.getItem(storageKey) ?? "[]") as [string, SessionList][]) {
         if (typeof uuid === "string" && entry && Number.isFinite(entry.fetchedAt) && Array.isArray(entry.items)
-          && entry.items.every((item) => item && typeof item.id === "string" && typeof item.title === "string")) records.set(uuid, entry);
+          && /^(muse|hark):/.test(uuid) && entry.items.every((item) => item && typeof item.id === "string"
+            && typeof item.title === "string" && (item.updatedAtMs === null || Number.isFinite(item.updatedAtMs)))) records.set(uuid, entry);
       }
     } catch { records.clear(); }
   }
-  eligible = new Set(accounts.filter((account) => account.providerId === "muse" && account.authState === "authenticated").map((account) => account.uuid));
+  eligible = new Set(accounts.filter((account) => account.authState === "authenticated").map(sessionAccountKey));
   let changed = false;
   for (const uuid of records.keys()) {
     if (!eligible.has(uuid)) changed = records.delete(uuid) || changed;
@@ -46,28 +50,30 @@ export function reconcileIphoneSessions(accounts: AccountRecord[]): void {
   if (changed) persist();
 }
 
-export function iphoneSessionsFor(uuid: string) {
-  return { items: records.get(uuid)?.items ?? [], pending: requests.has(uuid), failed: failures.has(uuid) };
+export function iphoneSessionsFor(account: AccountRecord) {
+  const key = sessionAccountKey(account);
+  return { items: records.get(key)?.items ?? [], pending: requests.has(key), failed: failures.has(key) };
 }
 
 export function updateIphoneSessions(account: AccountRecord, force: boolean, notify: () => void): Promise<void> | undefined {
   const uuid = account.uuid;
-  if (account.providerId !== "muse" || !eligible.has(uuid)) return;
-  const pending = requests.get(uuid);
+  const key = sessionAccountKey(account);
+  if (!eligible.has(key)) return;
+  const pending = requests.get(key);
   if (pending) return pending;
-  const cached = records.get(uuid);
-  if (!force && cached && !failures.has(uuid) && Date.now() - cached.fetchedAt < 30_000) return;
-  const work = invoke<IphoneSession[]>("list_muse_sessions", { uuid }).then((items) => {
-    if (requests.get(uuid) !== work || !eligible.has(uuid)) return;
-    records.set(uuid, { items: [...new Map(items.map((item) => [item.id, item])).values()], fetchedAt: Date.now() });
-    failures.delete(uuid);
+  const cached = records.get(key);
+  if (!force && cached && !failures.has(key) && Date.now() - cached.fetchedAt < 30_000) return;
+  const work = invoke<IphoneSession[]>(account.providerId === "muse" ? "list_muse_sessions" : "list_hark_sessions", { uuid }).then((items) => {
+    if (requests.get(key) !== work || !eligible.has(key)) return;
+    records.set(key, { items: [...new Map(items.map((item) => [item.id, item])).values()], fetchedAt: Date.now() });
+    failures.delete(key);
     persist();
   }).catch(() => {
-    if (requests.get(uuid) === work) failures.add(uuid);
+    if (requests.get(key) === work) failures.add(key);
   }).finally(() => {
-    if (requests.get(uuid) === work) requests.delete(uuid);
+    if (requests.get(key) === work) requests.delete(key);
     notify();
   });
-  requests.set(uuid, work);
+  requests.set(key, work);
   return work;
 }

@@ -76,9 +76,7 @@ async fn add_account(
   let cookies = cookie_input.map(|raw| parse_account_cookies(&provider_id, raw)).transpose()?;
   let pool = if let Some(id) = proxy_entry_id {
     let _guard = gate.0.lock().await;
-    let dir = app.path().app_data_dir().map_err(|_| "无法读取应用存储")?;
-    let secrets = secrets::Secrets::new(&dir);
-    Some((id, proxy_pool::ProxyPool::read(&secrets)?.selected(id)?))
+    Some((id, load_proxy_pool_entry(&app, &mgr, id).await?))
   } else {
     None
   };
@@ -165,12 +163,26 @@ async fn spike_ios_quota_sync_probe(
   }
   #[cfg(target_os = "ios")]
   {
-    app.state::<Arc<SessionManager>>().sync_ios_quotas(&app, true).await
+    app.state::<Arc<SessionManager>>().sync_ios_quotas(&app, true, None).await
   }
   #[cfg(not(target_os = "ios"))]
   {
     Err("此功能仅支持 iOS".into())
   }
+}
+
+#[tauri::command]
+#[cfg_attr(not(target_os = "ios"), allow(unused_variables))]
+async fn refresh_iphone_quotas(
+  app: AppHandle, mgr: State<'_, Arc<SessionManager>>, provider_id: String,
+) -> Result<Vec<session_manager::QuotaSyncDiagnostic>, String> {
+  #[cfg(target_os = "ios")]
+  {
+    let provider = providers::ProviderId::parse(&provider_id).ok_or("服务标识无效")?;
+    mgr.sync_ios_quotas(&app, true, Some(provider)).await
+  }
+  #[cfg(not(target_os = "ios"))]
+  Err("此功能需要 iOS".into())
 }
 
 #[tauri::command]
@@ -413,14 +425,23 @@ async fn muse_native_approvals_probe(
     return Err("审批查询需要已登录的 Muse 账号".to_string());
   }
   let (mut token, _guard) = cancel.register(&uuid, "approvals");
-  tokio::select! {
+  let result = tokio::select! {
     biased;
     _ = token.cancelled() => Err("审批查询已停止".into()),
     response = tokio::time::timeout(std::time::Duration::from_secs(60), async {
       let setting = account_proxy_setting(&mgr, &provider_id, &uuid).await;
       muse_native::approvals_probe(&app, &provider_id, &uuid, setting.as_ref()).await
     }) => response.map_err(|_| "审批查询超时".to_string())?,
+  };
+  let result = result?;
+  #[cfg(target_os = "ios")]
+  if result.ok && !token.is_cancelled() {
+    let now = storage::now_ms() as i64;
+    let count = result.items.iter().filter(|item| item.status == "pending"
+      && (item.expires_at_ms == 0 || item.expires_at_ms > now)).count();
+    mgr.update_muse_approval_count(&app, &uuid, count).await?;
   }
+  Ok(result)
 }
 
 #[derive(serde::Deserialize)]
@@ -659,6 +680,40 @@ async fn list_muse_sessions(
 
 #[tauri::command]
 #[cfg_attr(not(target_os = "ios"), allow(unused_variables))]
+async fn list_hark_sessions(
+  app: AppHandle, mgr: State<'_, Arc<SessionManager>>, cancel: State<'_, Arc<probe_cancel::ProbeCancel>>, uuid: String,
+) -> Result<Vec<hark_native::HarkSessionSummary>, String> {
+  #[cfg(target_os = "ios")]
+  {
+    let uuid = storage::normalize_uuid(&uuid).ok_or("账号标识无效")?;
+    let proxy_guard = mgr.proxy_write_lock.lock().await;
+    let (mut token, _guard) = cancel.register(&uuid, "hark_session_list");
+    let state = mgr.get_snapshot().await;
+    drop(proxy_guard);
+    if state.conflicts.iter().any(|account| account.uuid == uuid)
+      || state.pending_cleanup.iter().any(|account| account.uuid == uuid) {
+      return Err("账号当前不可用".into());
+    }
+    let account = state.accounts.iter().find(|account| account.uuid == uuid
+      && account.provider_id == providers::ProviderId::Hark && account.auth_state == storage::AuthState::Authenticated)
+      .ok_or("请先登录此 Hark 账号")?;
+    let timezone = account.timezone.as_deref().unwrap_or("UTC");
+    tokio::select! {
+      biased;
+      _ = token.cancelled() => Err("账号设置有变化，会话读取已停止".into()),
+      result = tokio::time::timeout(std::time::Duration::from_secs(25), async {
+        let (client, cookie) = hark_native::account_http(&app, &uuid, account.proxy.as_ref()).await?;
+        let transport = hark_send::Transport { client, cookie, timezone, origin: "https://app.hark.com" };
+        hark_send::list_projects(&transport).await
+      }) => result.map_err(|_| "Hark 会话读取超时")?,
+    }
+  }
+  #[cfg(not(target_os = "ios"))]
+  Err("此操作仅支持 iOS".into())
+}
+
+#[tauri::command]
+#[cfg_attr(not(target_os = "ios"), allow(unused_variables))]
 async fn open_muse_thread(
   app: AppHandle,
   mgr: State<'_, Arc<SessionManager>>,
@@ -686,9 +741,12 @@ async fn export_account_backup(
   include_groups: bool,
   include_proxy_endpoints: bool,
   expiry_days: Option<u8>,
+  include_credentials: Option<bool>,
 ) -> Result<bool, String> {
   #[cfg(target_os = "ios")]
   {
+    let include_credentials = include_credentials.unwrap_or(false);
+    let include_proxy_endpoints = include_proxy_endpoints || include_credentials;
     let snapshot = mgr.get_snapshot().await;
     let mut pool = Vec::new();
     if include_proxy_endpoints {
@@ -704,7 +762,8 @@ async fn export_account_backup(
       Some(days @ (1 | 7 | 30)) => Some(storage::now_ms() + u64::from(days) * 86_400_000),
       _ => return Err("备份有效期无效".into()),
     };
-    let backup = account_backup::from_accounts(&snapshot.accounts, include_groups, include_proxy_endpoints, pool, expiration);
+    let mut backup = account_backup::from_accounts(&snapshot.accounts, include_groups, include_proxy_endpoints, pool, expiration);
+    if include_credentials { mgr.add_backup_credentials(&app, &mut backup).await?; }
     let password = zeroize::Zeroizing::new(password);
     let encrypted = tokio::task::spawn_blocking(move || account_backup::encrypt(&backup, &password))
       .await.map_err(|_| "备份加密操作失败".to_string())??;
@@ -712,7 +771,7 @@ async fn export_account_backup(
   }
   #[cfg(not(target_os = "ios"))]
   {
-    let _ = (app, mgr, gate, password, include_groups, include_proxy_endpoints, expiry_days);
+    let _ = (app, mgr, gate, password, include_groups, include_proxy_endpoints, expiry_days, include_credentials);
     Err("此操作仅支持 iOS".into())
   }
 }
@@ -821,10 +880,14 @@ async fn restore_account_backup(
   password: String,
   overwrite: bool,
   preview_checksum: String,
+  confirmed_credentials: Option<bool>,
 ) -> Result<ManagerSnapshot, String> {
   let password = zeroize::Zeroizing::new(password);
   let backup = tokio::task::spawn_blocking(move || account_backup::decrypt(&encrypted, &password))
     .await.map_err(|_| "备份解密操作失败".to_string())??;
+  if !backup.credentials.is_empty() && confirmed_credentials != Some(true) {
+    return Err("请从文件重新预览并确认本次凭据恢复范围".into());
+  }
   mgr.restore_account_backup(&app, backup, overwrite, &preview_checksum).await
 }
 
@@ -1009,7 +1072,8 @@ async fn send_new_muse_conversation(
     if text.is_empty() || text.chars().count() > 16000 {
       return Err("请输入 1–16000 字的消息".into());
     }
-    let _proxy_guard = mgr.proxy_write_lock.lock().await;
+    let proxy_guard = mgr.proxy_write_lock.lock().await;
+    let (token, _guard) = cancel.register_task(&uuid, "new_muse_conversation", uuid::Uuid::new_v4());
     let snapshot = mgr.get_snapshot().await;
     if snapshot.conflicts.iter().any(|account| account.uuid == uuid)
       || snapshot.pending_cleanup.iter().any(|account| account.uuid == uuid) {
@@ -1021,7 +1085,7 @@ async fn send_new_muse_conversation(
     ).ok_or("账号未登录或已移除")?;
     let root = app.path().app_data_dir().map_err(|_| "无法读取应用存储")?;
     let secrets = secrets::Secrets::new(&root);
-    let (token, _guard) = cancel.register_task(&uuid, "new_muse_conversation", uuid::Uuid::new_v4());
+    drop(proxy_guard);
     let outcome = muse_native::send_muse_message(
       &app, &ledger, &uuid, text, "", None, account.proxy.as_ref(), &secrets, token, true,
     ).await;
@@ -1557,23 +1621,53 @@ async fn apply_proxy_pool_entry(
   entry_id: uuid::Uuid,
 ) -> Result<ProxySettingView, String> {
   let _guard = gate.0.lock().await;
-  let entry = {
-    let dir = app.path().app_data_dir().map_err(|_| "无法读取应用目录")?;
-    let secrets = secrets::Secrets::new(&dir);
-    let pool = proxy_pool::ProxyPool::read(&secrets)?;
-    match pool.selected(entry_id) {
-      Ok(entry) => entry,
-      Err(original) => {
-        let restored = mgr.restored_proxy_metadata().await.into_iter()
-          .find(|entry| proxy_pool::restored_entry_id(entry) == entry_id).ok_or(original)?;
-        if restored.requires_auth {
-          return Err("导入完整的代理认证信息后才能使用".into());
-        }
-        proxy_pool::ApplyEntry { endpoint: restored.endpoint, username: None, password: None }
-      }
-    }
-  };
+  let entry = load_proxy_pool_entry(&app, &mgr, entry_id).await?;
   save_account_proxy(app, provider_id, uuid, entry.endpoint, entry.username, entry.password, true, mgr, cancel, Some(entry_id)).await
+}
+
+async fn load_proxy_pool_entry(
+  app: &AppHandle, mgr: &SessionManager, entry_id: uuid::Uuid,
+) -> Result<proxy_pool::ApplyEntry, String> {
+  let dir = app.path().app_data_dir().map_err(|_| "无法读取应用目录")?;
+  let secrets = secrets::Secrets::new(&dir);
+  let pool = proxy_pool::ProxyPool::read(&secrets)?;
+  match pool.selected(entry_id) {
+    Ok(entry) => Ok(entry),
+    Err(original) => {
+      let restored = mgr.restored_proxy_metadata().await.into_iter()
+        .find(|entry| proxy_pool::restored_entry_id(entry) == entry_id).ok_or(original)?;
+      if restored.requires_auth { return Err("导入完整的代理认证信息后才能使用".into()); }
+      Ok(proxy_pool::ApplyEntry { endpoint: restored.endpoint, username: None, password: None })
+    }
+  }
+}
+
+#[tauri::command]
+#[cfg_attr(target_os = "android", allow(unused_variables))]
+async fn measure_proxy_pool_entry(
+  app: AppHandle, mgr: State<'_, Arc<SessionManager>>, gate: State<'_, proxy_pool::ProxyPoolGate>,
+  provider_id: String, entry_id: uuid::Uuid,
+) -> Result<serde_json::Value, String> {
+  #[cfg(not(target_os = "android"))]
+  {
+    let provider = providers::ProviderId::parse(&provider_id).ok_or("服务标识无效")?;
+    let entry = {
+      let _guard = gate.0.lock().await;
+      load_proxy_pool_entry(&app, &mgr, entry_id).await?
+    };
+    let password = entry.password.map(zeroize::Zeroizing::new);
+    let outbound = egress::AccountEgress::explicit_proxy(
+      &entry.endpoint, entry.username.as_deref(), password.as_ref().map(|secret| secret.as_str()),
+    ).map_err(|_| "代理格式或认证信息无效")?;
+    let client = outbound.http_client(std::time::Duration::from_secs(15), false)
+      .map_err(|_| "无法初始化代理测速")?;
+    let started = std::time::Instant::now();
+    let response = client.head(providers::get_provider(provider).info.entry_url).send().await
+      .map_err(|error| egress::safe_http_error("代理 HTTPS", &error))?;
+    Ok(serde_json::json!({ "milliseconds": started.elapsed().as_millis(), "status": response.status().as_u16() }))
+  }
+  #[cfg(target_os = "android")]
+  Err("此操作在 Android 上不可用".into())
 }
 
 #[tauri::command]
@@ -1992,6 +2086,7 @@ pub fn run() {
       resolve_uuid_conflict,
       dismiss_notice,
       trigger_quota_sync,
+      refresh_iphone_quotas,
       preview_account_cookies,
       export_account_backup,
       manage_lan_backup,
@@ -2003,6 +2098,7 @@ pub fn run() {
       inspect_account_cookies,
       list_muse_sessions,
       open_muse_thread,
+      list_hark_sessions,
       spike_ios_quota_sync_probe,
       reorder_accounts,
       check_for_updates,
@@ -2031,6 +2127,7 @@ pub fn run() {
       muse_native_get_account_proxy,
       manage_proxy_pool,
       measure_account_proxy,
+      measure_proxy_pool_entry,
       apply_proxy_pool_entry,
       muse_native_clear_account_proxy,
       muse_native_cancel_probe,

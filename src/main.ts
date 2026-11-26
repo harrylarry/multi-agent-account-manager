@@ -25,8 +25,8 @@ type ModalMode =
   | { kind: "tasks"; account: AccountRecord; section?: "tasks" | "quota" | "models"; checking: boolean; note: string; quotaChecking: boolean }
   | { kind: "harkDiagnostic"; account: AccountRecord }
   | { kind: "harkReplies"; account: AccountRecord; reading: boolean; result: HarkRecovery | null; error: string }
-  | { kind: "backup"; busy: boolean; encrypted: string; fileName: string; preview: BackupPreview | null; message: string; mode: BackupMode; includeGroups: boolean; includeProxy: boolean; expiryDays: number; lanCode?: string; lanShare?: {code:string;png:string;seconds:number} }
-  | { kind: "proxyPool"; account: AccountRecord | null; data: ProxyPoolView | null; setting: SpikeProxySettingView | null; busy: boolean; message: string }
+  | { kind: "backup"; busy: boolean; encrypted: string; fileName: string; preview: BackupPreview | null; message: string; mode: BackupMode; includeGroups: boolean; includeProxy: boolean; includeCredentials?: boolean; fromLan?: boolean; expiryDays: number; lanCode?: string; lanShare?: {code:string;png:string;seconds:number} }
+  | { kind: "proxyPool"; account: AccountRecord | null; data: ProxyPoolView | null; setting: SpikeProxySettingView | null; selected?: string; busy: boolean; message: string }
   | { kind: "sessions"; account: AccountRecord; loading: boolean; items: MuseSession[] | null; error: string }
   | { kind: "cookies"; account: AccountRecord; busy: boolean; preview: CookiePreview | null; message: string; imported: boolean; stored: Pick<CookiePreview, "count" | "nextExpiry"> | null }
   | { kind: "approvals"; account: AccountRecord; loading: boolean; result: SpikeApprovalsResult | null; fetchedAt: number | null; decisionMessage: string }
@@ -101,6 +101,7 @@ interface BackupPreview {
   conflicts: string[];
   proxyPoolCount: number;
   checksum: string;
+  credentials: { providerId: ProviderId; alias: string; cookieCount: number; proxyPassword: boolean; willRestore: boolean }[];
 }
 
 interface ProxyPoolView {
@@ -148,7 +149,9 @@ let iphoneDiagnosticAccount: AccountKey | null = null;
 let iphoneSearchOpen = false;
 let renderedModal: ModalMode | null = null;
 const iphoneConversationDraft = new Map<string, { text: string; status: string; threadId?: string }>();
-let iphoneQuotaRefresh = { running: false, message: "" };
+const iphoneQuotaRefresh: Record<ProviderId, { running: boolean; message: string }> = {
+  muse: { running: false, message: "" }, hark: { running: false, message: "" },
+};
 const iphoneProxyFaults = new Map<string, "blocked" | "unreachable">();
 let modal: ModalMode = { kind: "none" };
 // 应用内确认框的 resolver：由 askConfirm 设置，确认/取消/被顶掉时结算。
@@ -1010,19 +1013,22 @@ function renderIphonePanel(state: ManagerSnapshot, provider: ProviderInfo, page:
     const working = accounts.filter((account) => latestTaskObservations.get(iphoneAccountKey(account))?.activity === "working");
     return `<h1>总览</h1>${iphoneAttention(accounts) || '<section class="iphone-section"><h2>需要处理</h2><p>暂无待处理事项。</p></section>'}
       <section class="iphone-section"><h2>未读回复</h2>${unread.length ? `<div class="iphone-group">${unread.map((account) => accountLink(account, "chat")).join("")}</div>` : "<p>暂无未读回复。</p>"}</section>
-      <section class="iphone-section"><h2>进行中的任务</h2>${working.length ? `<div class="iphone-group">${working.map((account) => accountLink(account, "task")).join("")}</div>` : "<p>暂无已确认的进行中任务。</p>"}</section>`;
+      <section class="iphone-section"><h2>进行中的任务</h2>${working.length ? `<div class="iphone-group">${working.map((account) => iphoneMenuItem("task", escapeHtml(account.alias), `data-iphone-account="${escapeHtml(account.uuid)}" data-account-action="tasks"`)).join("")}</div>` : "<p>暂无已确认的进行中任务。</p>"}</section>`;
   }
   const query = page === "search" ? iphoneQuery.trim().toLocaleLowerCase() : "";
   const matches = (value: string) => value.toLocaleLowerCase().includes(query);
-  const synced = accounts.filter((account) => account.providerId === "muse" && account.authState === "authenticated")
-    .map((account) => ({ account, ...iphoneSessionsFor(account.uuid) }));
+  const synced = accounts.filter((account) => account.authState === "authenticated")
+    .map((account) => ({ account, ...iphoneSessionsFor(account) }));
   const pending = synced.some((entry) => entry.pending);
   const failures = synced.filter((entry) => entry.failed).map(({ account }) => escapeHtml(account.alias));
-  const sessions = synced.flatMap(({ account, items }) => items.filter((item) => matches(`${item.title} ${account.alias} Muse`)).map((item) => ({ account, item })))
+  const sessions = synced.flatMap(({ account, items }) => items.filter((item) => matches(`${item.title} ${account.alias} ${account.providerId}`)).map((item) => ({ account, item })))
     .sort((a, b) => (b.item.updatedAtMs ?? 0) - (a.item.updatedAtMs ?? 0));
-  const rows = sessions.map(({ account, item }) => iphoneMenuItem("chat",
-    `<strong>${escapeHtml(item.title)}</strong><small>${page === "search" ? "Muse · " : ""}${escapeHtml(account.alias)}</small>`,
-    `data-iphone-thread="${escapeHtml(item.id)}" data-owner-uuid="${escapeHtml(account.uuid)}"`)).join("");
+  const rows = sessions.map(({ account, item }) => {
+    const title = `<strong>${escapeHtml(item.title)}</strong><small>${page === "search" ? (account.providerId === "muse" ? "Muse · " : "Hark · ") : ""}${escapeHtml(account.alias)}</small>`;
+    return account.providerId === "muse"
+      ? iphoneMenuItem("chat", title, `data-iphone-thread="${escapeHtml(item.id)}" data-owner-uuid="${escapeHtml(account.uuid)}"`)
+      : `<div class="iphone-item">${iphoneIcon("chat")}<span>${title}</span><small>网页定位待验证</small></div>`;
+  }).join("");
   const matching = page === "search" ? accounts.filter((account) => matches(`${account.alias} ${account.group ?? ""} ${account.providerId}`)) : [];
   return `<h1 class="iphone-sr-only">${page === "search" ? "全局搜索" : "会话"}</h1>
     ${pending ? '<p class="iphone-caption" role="status">正在同步会话，已有结果仍可打开。</p>' : ""}
@@ -1031,16 +1037,16 @@ function renderIphonePanel(state: ManagerSnapshot, provider: ProviderInfo, page:
     <section class="iphone-section"><div class="iphone-list-title"><h2>${page === "search" ? "会话" : "最近会话"}</h2>
       ${page === "sessions" && !pending && !failures.length && synced.length ? '<button type="button" id="iphone-refresh-sessions">刷新</button>' : ""}</div>
       ${rows ? `<div class="iphone-group">${rows}</div>` : `<p class="iphone-caption">${pending || failures.length ? "可用数据中暂无会话。" : page === "search" ? "没有匹配的会话。" : "暂无可显示的会话。"}</p>`}</section>
-    ${accounts.some((account) => account.providerId === "hark") ? '<p class="iphone-caption">Hark 全量会话读取与网页定位尚未验证。</p>' : ""}`;
+    ${accounts.some((account) => account.providerId === "hark") ? '<p class="iphone-caption">Hark 会话可参与搜索，指定会话的网页定位待验证。</p>' : ""}`;
 }
 
 async function refreshIphoneSessionBatch(force = false, failedOnly = false): Promise<void> {
   if (!snapshot || (iphonePage !== "sessions" && iphonePage !== "search")) return;
   const request = ++iphonePanelRequest;
   const refreshView = () => { if (snapshot) syncIphoneViews(snapshot, currentProvider(snapshot)); };
-  const targets = snapshot.accounts.filter((account) => account.providerId === "muse" && account.authState === "authenticated"
+  const targets = snapshot.accounts.filter((account) => account.authState === "authenticated"
     && (iphonePage === "search" || account.providerId === snapshot?.selectedProviderId)
-    && (!failedOnly || iphoneSessionsFor(account.uuid).failed));
+    && (!failedOnly || iphoneSessionsFor(account).failed));
   for (const account of targets) {
     if (request !== iphonePanelRequest) break;
     const work = updateIphoneSessions(account, force, refreshView);
@@ -1127,6 +1133,14 @@ function syncIphoneViews(state: ManagerSnapshot, provider: ProviderInfo): void {
     if (button.dataset.iphonePage === (page === "detail" ? "accounts" : page)) button.setAttribute("aria-current", "page");
     else button.removeAttribute("aria-current");
   }
+  const quotaRefresh = iphoneQuotaRefresh[provider.id];
+  const quotaButton = shell.querySelector<HTMLButtonElement>("#sync-all-btn");
+  if (quotaButton) {
+    quotaButton.disabled = quotaRefresh.running;
+    quotaButton.textContent = quotaRefresh.running ? "正在刷新额度" : "刷新额度";
+  }
+  const quotaMessage = shell.querySelector("#iphone-quota-message");
+  if (quotaMessage) quotaMessage.textContent = quotaRefresh.message;
   const detail = shell.querySelector<HTMLElement>(".iphone-account-detail");
   const detailHtml = detailAccount ? iphoneAccountDetail(detailAccount, provider) : "";
   if (detail && detail.dataset.content !== detailHtml) {
@@ -2925,11 +2939,11 @@ function renderTasks(view: Extract<ModalMode, { kind: "tasks" }>): string {
 }
 
 function renderHarkReplies(view: Extract<ModalMode, { kind: "harkReplies" }>): string {
-  const { account, result, reading, error } = view;
+  const { result, reading, error } = view;
   return `
     <div class="inline-modal" role="dialog" aria-modal="true" aria-labelledby="hark-replies-title">
       <div class="modal-card proxy-pool-modal">
-        <div class="modal-title" id="hark-replies-title">回复补同步 · ${escapeHtml(account.alias)}</div>
+        <div class="modal-title" id="hark-replies-title">回复补同步</div>
         <div class="modal-desc" role="status">${reading ? "正在读取 Hark 主会话…" : result ? `已读取 ${result.replies.length} 条回复` : ""}</div>
         ${result?.pollStatus ? `<div class="modal-desc">轮询补查 HTTP ${result.pollStatus}</div>` : ""}
         ${error ? `<div class="modal-desc" role="alert">${escapeHtml(error)}</div>` : ""}
@@ -2998,7 +3012,7 @@ function renderAccountBackup(view: Extract<ModalMode, { kind: "backup" }>): stri
     <div class="inline-modal" role="dialog" aria-modal="true" aria-labelledby="account-backup-title">
       <div class="modal-card proxy-pool-modal">
         <div class="modal-title" id="account-backup-title">备份与迁移</div>
-        <div class="modal-desc">备份保存账号资料。恢复后需重新登录并补填代理密码。</div>
+        <div class="modal-desc">文件备份使用口令加密。可选择随文件保存登录凭据。</div>
         <div class="proxy-pool-body">
           ${snapshot?.platform === "ios" ? `<details ${view.lanShare || view.lanCode ? "open" : ""}>
             <summary>通过同一 Wi-Fi 迁移</summary>
@@ -3024,6 +3038,7 @@ function renderAccountBackup(view: Extract<ModalMode, { kind: "backup" }>): stri
             <label><input id="backup-include-groups" type="checkbox" ${includeGroups ? "checked" : ""} ${disabled} />分组</label>
             <label><input id="backup-include-proxy" type="checkbox" ${includeProxy ? "checked" : ""} ${disabled} />账号代理端点</label>
           </div>` : ""}
+          <label><input id="backup-include-credentials" type="checkbox" ${view.includeCredentials ? "checked" : ""} ${disabled}> 包含登录 Cookie 和代理密码</label>
           <label for="backup-expiry">导出有效期</label>
           <select id="backup-expiry" class="modal-input" ${disabled}>
             ${[[0, "长期保留"], [1, "1 天"], [7, "7 天"], [30, "30 天"]].map(([days, title]) =>
@@ -3039,6 +3054,9 @@ function renderAccountBackup(view: Extract<ModalMode, { kind: "backup" }>): stri
           ${preview ? `<div class="approval-items">
             <div>新增 ${preview.added} · 已有 ${preview.existing} · 代理池 ${preview.proxyPoolCount} 条</div>
             ${preview.conflicts.map((conflict) => `<div>冲突 · ${escapeHtml(conflict)}</div>`).join("")}
+            ${preview.credentials?.map((entry) => `<div>${escapeHtml(entry.alias)} · ${entry.providerId === "muse" ? "Muse" : "Hark"} ·
+              Cookie ${entry.cookieCount} 条${entry.proxyPassword ? " · 含代理密码" : ""} ·
+              ${entry.willRestore ? "恢复到新增账号" : "保留本机账号凭据"}</div>`).join("") ?? ""}
           </div>` : ""}
         </div>
         ${message ? `<div role="status">${escapeHtml(message)}</div>` : ""}
@@ -3089,6 +3107,7 @@ async function lanBackupAction(view: Extract<ModalMode, { kind: "backup" }>, act
       view.lanCode = undefined;
       view.encrypted = response.encrypted;
       view.fileName = "Wi-Fi 加密备份";
+      view.fromLan = true;
       view.preview = null;
       view.message = "已接收，请输入发送方口令并点「预览恢复」。";
     }
@@ -3102,16 +3121,25 @@ async function accountBackupAction(view: Extract<ModalMode, { kind: "backup" }>,
   const password = passwordInput?.value ?? "";
   if (passwordInput) passwordInput.value = "";
   const overwrite = action === "overwrite";
-  if (overwrite && !await askConfirm({
-    title: "覆盖冲突资料",
-    desc: "备份会更新匹配账号的备注、设置及所选代理资料。新代理需要凭据时将保持阻断。",
-    confirmLabel: "覆盖",
-    danger: true,
+  const hasCredentials = Boolean(view.preview?.credentials?.length);
+  const restore = action === "merge" || overwrite;
+  if (restore && hasCredentials && view.fromLan) {
+    view.message = "包含登录凭据的备份需要选择本机文件恢复。";
+    render();
+    return;
+  }
+  const confirm = restore && (overwrite || hasCredentials);
+  if (confirm && !await askConfirm({
+    title: hasCredentials ? "确认凭据恢复范围" : "覆盖冲突资料",
+    desc: hasCredentials ? "登录 Cookie 和代理密码只恢复到预览标示的新增账号。已有账号保留本机登录凭据。" :
+      "备份会更新匹配账号的备注、设置及所选代理资料。需要补充代理凭据的账号会保持阻断。",
+    confirmLabel: overwrite ? "确认覆盖" : "确认恢复",
+    danger: overwrite,
   })) {
     if ((modal as ModalMode).kind === "none") await setModal(view);
     return;
   }
-  if (overwrite) await setModal(view);
+  if (confirm) await setModal(view);
   view.busy = true;
   view.message = "处理中…";
   render();
@@ -3120,6 +3148,7 @@ async function accountBackupAction(view: Extract<ModalMode, { kind: "backup" }>,
       const shared = await invoke<boolean>("export_account_backup", {
         password, expiryDays: view.expiryDays, includeGroups: view.mode !== "custom" || view.includeGroups,
         includeProxyEndpoints: view.mode === "full" || (view.mode === "custom" && view.includeProxy),
+        includeCredentials: Boolean(view.includeCredentials),
       });
       view.message = shared ? "备份已导出。" : "已取消导出。";
     } else if (action === "preview") {
@@ -3128,7 +3157,7 @@ async function accountBackupAction(view: Extract<ModalMode, { kind: "backup" }>,
       view.message = "";
     } else if (view.preview) {
       snapshot = await invoke<ManagerSnapshot>("restore_account_backup", {
-        encrypted: view.encrypted, password, overwrite, previewChecksum: view.preview.checksum,
+        encrypted: view.encrypted, password, overwrite, previewChecksum: view.preview.checksum, confirmedCredentials: hasCredentials,
       });
       view.message = "账号资料已恢复。";
       view.preview = null;
@@ -3152,7 +3181,7 @@ function renderProxyPool(view: Extract<ModalMode, { kind: "proxyPool" }>): strin
   return `
     <div class="inline-modal" role="dialog" aria-modal="true" aria-labelledby="proxy-pool-title">
       <div class="modal-card proxy-pool-modal">
-        <div class="modal-title" id="proxy-pool-title">${account ? `账号代理 · ${escapeHtml(account.alias)}` : "代理池"}</div>
+        <div class="modal-title" id="proxy-pool-title">${account ? "账号代理" : "代理池"}</div>
         <div class="modal-desc">${setting?.enabled ? `当前 ${escapeHtml(setting.display)}` : account ? busy ? "正在读取账号代理…" : message ? "请核对操作结果。" : "当前账号未启用代理" : "从账号详情选择该账号要使用的代理。"}</div>
         ${!account && snapshot?.platform === "ios" && iosNetworkPrefs ? `<details class="iphone-disclosure"><summary>会话保留与额度刷新</summary><div class="proxy-pool-actions">
           <label><input id="ios-proxy-retention" type="checkbox" ${iosNetworkPrefs.isolate ? "checked" : ""} ${disabled}> 同一服务和代理出口仅保留最近使用的会话页面</label>
@@ -3165,30 +3194,28 @@ function renderProxyPool(view: Extract<ModalMode, { kind: "proxyPool" }>): strin
           : "原池条目已删除或订阅内容已变化。当前保留此前账号配置，可手动选择新条目。"}</div>` : ""}
         <div class="proxy-pool-body">
           ${!account ? `<label for="proxy-pool-input">代理地址或 HTTPS 订阅链接</label>
-          <div class="modal-desc">支持 HTTP、HTTPS 和 SOCKS5，每行一个代理地址。订阅链接须直接返回同样格式的纯文本。</div>
+          <div class="modal-desc">支持 HTTP、HTTPS 和 SOCKS5，代理地址可用换行或分号分隔。订阅链接须直接返回同样格式的纯文本。</div>
           <textarea id="proxy-pool-input" class="modal-input account-cookie-input" spellcheck="false" autocomplete="off" autocapitalize="off" ${disabled}></textarea>
           <div class="proxy-pool-actions">${action("导入代理", "import")}${action("添加订阅", "subscribe")}</div>` :
-          `<details class="iphone-disclosure"><summary>手动配置代理</summary>
-            <p class="modal-desc">密码存入系统钥匙串。代理不可用时，此账号的连接会被阻断。</p>
-            <label for="account-proxy-uri">代理地址</label>
-            <input id="account-proxy-uri" class="modal-input" placeholder="socks5://host:1080" autocomplete="off" autocapitalize="off" spellcheck="false" ${disabled}>
-            <label for="account-proxy-user">代理用户名（可选）</label>
-            <input id="account-proxy-user" class="modal-input" autocomplete="off" autocapitalize="off" spellcheck="false" ${disabled}>
-            <label for="account-proxy-password">代理密码（可选）</label>
-            <input id="account-proxy-password" class="modal-input" type="password" autocomplete="off" ${disabled}>
-            ${action("保存代理", "save")}
-          </details>
-          ${setting?.enabled ? `<div class="proxy-pool-actions">${action("检测连接", "measure")}${action("停用账号代理", "clear")}</div>` : ""}
-          <h2>从代理池选择</h2>
-          ${data && !data.entries.length ? '<p class="modal-desc">代理池为空，可在「管理 → 代理池」添加。</p>' : ""}`}
+          `<label for="proxy-pool-selection">账号代理</label>
+          <select id="proxy-pool-selection" class="modal-input" ${disabled}>
+            <option value="">${setting?.enabled && !setting.poolEntryId ? "保留现有代理" : "不启用代理"}</option>
+            ${data?.entries.filter((entry) => !entry.missingCredentials).map((entry) =>
+              `<option value="${escapeHtml(entry.id)}" ${view.selected === entry.id ? "selected" : ""}>${escapeHtml(entry.endpoint)}</option>`).join("") ?? ""}
+          </select>
+          ${data && !data.entries.length ? '<p class="modal-desc">代理池为空，可在「管理 → 代理池」添加。</p>' : ""}
+          <div class="proxy-pool-actions">
+            ${view.selected ? action("检测代理", "measure-entry", view.selected) : setting?.enabled ? action("检测代理", "measure") : ""}
+            ${view.selected ? action("保存设置", "apply", view.selected) : setting?.enabled && setting.poolEntryId ? action("保存设置", "clear") : ""}
+          </div>`}
           ${!account ? data?.sources.map((source) => `<div class="proxy-pool-row">
             <div>${escapeHtml(source.host)}<small>上次刷新 ${new Date(source.refreshedAt * 1000).toLocaleString()}</small></div>
             <div>${action("刷新", "refresh", source.id)}${action("删除订阅", "remove-source", source.id)}</div>
           </div>`).join("") ?? "" : ""}
-          ${data?.entries.map((entry) => `<div class="proxy-pool-row">
+          ${!account ? data?.entries.map((entry) => `<div class="proxy-pool-row">
             <div>${escapeHtml(entry.endpoint)}${entry.missingCredentials ? "<small>待补认证</small>" : entry.requiresAuth ? "<small>需要认证</small>" : ""}</div>
             <div>${!account || entry.missingCredentials ? "" : action("应用", "apply", entry.id)}${account || entry.sourceId ? "" : action("移除", "remove", entry.id)}</div>
-          </div>`).join("") ?? ""}
+          </div>`).join("") ?? "" : ""}
         </div>
         ${message ? `<div role="status">${escapeHtml(message)}</div>` : ""}
         <div class="modal-footer">
@@ -3212,24 +3239,11 @@ async function proxyPoolAction(view: Extract<ModalMode, { kind: "proxyPool" }>, 
   const secret = input?.value.trim() ?? "";
   if (input) input.value = "";
   const account = view.account;
-  if (account ? !["list", "apply", "clear", "measure", "save"].includes(action)
-    : ["apply", "clear", "measure", "save"].includes(action)) return;
-  const uri = document.querySelector<HTMLInputElement>("#account-proxy-uri")?.value.trim() ?? "";
-  const username = document.querySelector<HTMLInputElement>("#account-proxy-user")?.value.trim() || null;
-  const passwordInput = document.querySelector<HTMLInputElement>("#account-proxy-password");
-  const password = passwordInput?.value || null;
-  if (action === "save" && !uri) {
-    document.querySelector<HTMLInputElement>("#account-proxy-uri")?.focus();
-    return;
-  }
-  if (passwordInput && action === "save") passwordInput.value = "";
+  if (account ? !["list", "apply", "clear", "measure", "measure-entry"].includes(action)
+    : ["apply", "clear", "measure", "measure-entry"].includes(action)) return;
   const target = account ? { providerId: account.providerId, uuid: account.uuid } : null;
-  if (action === "apply" || action === "remove-source" || action === "clear" || action === "save") {
-    const confirm = action === "save" ? {
-      title: "保存账号代理",
-      desc: `将 ${redactProxyUri(uri)} 用于「${account?.alias}」。已打开的会话需重新打开。`,
-      confirmLabel: "确认保存",
-    } : action === "apply" ? {
+  if (action === "apply" || action === "remove-source" || action === "clear") {
+    const confirm = action === "apply" ? {
       title: "更换账号代理",
       desc: `将所选代理用于「${account?.alias}」，已打开的会话需要重新打开。`,
       confirmLabel: "确认应用",
@@ -3255,10 +3269,8 @@ async function proxyPoolAction(view: Extract<ModalMode, { kind: "proxyPool" }>, 
   view.message = "处理中…";
   render();
   try {
-    if ((action === "apply" || action === "save") && target) {
-      view.setting = action === "apply"
-        ? await invoke<SpikeProxySettingView>("apply_proxy_pool_entry", { ...target, entryId })
-        : await invoke<SpikeProxySettingView>("muse_native_set_account_proxy", { ...target, uri, username, password, enabled: true });
+    if (action === "apply" && target) {
+      view.setting = await invoke<SpikeProxySettingView>("apply_proxy_pool_entry", { ...target, entryId });
       if (target.providerId === "muse") {
         const diagnostic = spikeProxyAccount(target.uuid);
         diagnostic.loaded = false;
@@ -3276,9 +3288,12 @@ async function proxyPoolAction(view: Extract<ModalMode, { kind: "proxyPool" }>, 
       if (target.providerId === "muse") spikeProxyAccounts.delete(target.uuid);
       iphoneProxyFaults.delete(iphoneAccountKey(target));
       view.message = "已停用账号代理，将使用系统网络。";
-    } else if (action === "measure" && target) {
-      const result = await invoke<{ milliseconds: number; status: number }>("measure_account_proxy", target);
-      iphoneProxyFaults.delete(iphoneAccountKey(target));
+    } else if ((action === "measure" || action === "measure-entry") && target) {
+      const result = await invoke<{ milliseconds: number; status: number }>(
+        action === "measure-entry" ? "measure_proxy_pool_entry" : "measure_account_proxy",
+        action === "measure-entry" ? { providerId: target.providerId, entryId } : target,
+      );
+      if (action === "measure") iphoneProxyFaults.delete(iphoneAccountKey(target));
       view.message = `代理 HTTPS 可达 · HTTP ${result.status} · ${result.milliseconds} ms`;
     } else {
       const poolAction = action === "remove-source" ? "remove" : action;
@@ -3288,6 +3303,7 @@ async function proxyPoolAction(view: Extract<ModalMode, { kind: "proxyPool" }>, 
       if (action === "list") {
         if (target) {
           view.setting = await invoke<SpikeProxySettingView | null>("muse_native_get_account_proxy", target);
+          view.selected = view.setting?.poolEntryId ?? "";
           const key = iphoneAccountKey(target);
           if (!view.setting?.enabled) iphoneProxyFaults.delete(key);
           else if (view.setting.webview?.quarantined || view.setting.credentialAvailable === false) iphoneProxyFaults.set(key, "blocked");
@@ -3347,7 +3363,7 @@ function renderCookieModal(view: Extract<ModalMode, { kind: "cookies" }>): strin
   return `
     <div class="inline-modal" role="dialog" aria-modal="true" aria-labelledby="cookie-title">
       <div class="modal-card">
-        <div class="modal-title" id="cookie-title">登录恢复 · ${escapeHtml(account.alias)}</div>
+        <div class="modal-title" id="cookie-title">登录恢复</div>
         <div class="modal-desc">导入前先预览。导入后打开会话核对登录状态。</div>
         <div class="modal-desc">上次登录检查 · ${account.authState === "authenticated" ? "已登录" : account.authState === "logged_out" ? "需要重新登录" : "未验证"}</div>
         <div class="modal-desc" id="account-cookie-stored">${stored?.count ? `本机会话有 ${stored.count} 条 Cookie · 最早已知到期 ${stored.nextExpiry ? new Date(stored.nextExpiry * 1000).toLocaleString() : "未提供"}` : stored ? "暂未读到本机 Cookie。可打开此账号确认登录后再查看。" : "本机 Cookie 状态暂不可用。"}</div>
@@ -3533,8 +3549,11 @@ async function submitIphoneConversation(view: Extract<ModalMode, { kind: "compos
     }
     if (draft.threadId) {
       snapshot = await invoke<ManagerSnapshot>("open_muse_thread", { uuid, threadId: draft.threadId });
-      iphoneConversationDraft.delete(uuid);
-      await setModal({ kind: "none" });
+      const destination = snapshot.switchingAccount ?? snapshot.activeAccount;
+      if (destination?.uuid === uuid && destination.providerId === providerId) {
+        iphoneConversationDraft.delete(uuid);
+        await setModal({ kind: "none" });
+      }
     }
   } catch {
     if (!draft.threadId) draft.status = "UNKNOWN";
@@ -3646,7 +3665,7 @@ function renderModal(provider: ProviderInfo): string {
     return `
       <div class="inline-modal" role="dialog" aria-modal="true">
         <div class="modal-card">
-          <div class="modal-title">编辑账号</div>
+          <div class="modal-title">备注、分组、时区与语言</div>
           <label for="modal-alias-input">备注</label>
           <input id="modal-alias-input" class="modal-input" maxlength="60" placeholder="输入备注名称" value="${escapeHtml(modal.draft)}" />
           ${snapshot?.platform === "ios" ? (() => {
@@ -3922,9 +3941,11 @@ function renderMiddleContent(state: ManagerSnapshot, provider: ProviderInfo): st
           <div class="iphone-list-title"><h2>全部账号 <small>${providerAccounts.length}</small></h2>
             <div class="iphone-list-actions">
               ${inReorder ? '<button type="button" id="reorder-done-btn">完成</button>' : providerAccounts.length ? '<button type="button" id="iphone-search-btn" aria-expanded="false">筛选</button>' : ""}
+              ${!inReorder && providerAccounts.length && provider.id === "muse" ? '<button type="button" id="sync-all-btn">刷新额度</button>' : ""}
               ${!inReorder && providerAccounts.length > 1 ? '<button type="button" id="iphone-reorder-btn">排序</button>' : ""}
             </div>
           </div>
+          <p id="iphone-quota-message" class="iphone-caption" role="status"></p>
           ${listBody}<div id="account-filter-empty" class="empty-list" hidden>没有匹配的账号</div>
         </div>
       </div>
@@ -4186,7 +4207,11 @@ function renderModalRoot(provider: ProviderInfo): void {
       if (card && dialog && back) {
         dialog.classList.add("iphone-subpage");
         back.classList.add("iphone-back");
-        back.textContent = "‹ 返回";
+        back.textContent = "‹";
+        back.setAttribute("aria-label", "返回");
+        const title = card.querySelector<HTMLElement>(".modal-title");
+        title?.setAttribute("role", "heading");
+        title?.setAttribute("aria-level", "1");
         card.prepend(back);
         card.querySelectorAll("details").forEach((item, index) => {
           if (openSections[index]) item.open = true;
@@ -4681,7 +4706,7 @@ function bindDelegatedEvents(): void {
       const uuid = threadId ? openResult.dataset.ownerUuid : openResult.dataset.iphoneOpenAccount;
       const owner = threadId ? "muse" : openResult.dataset.owner;
       const account = snapshot.accounts.find((item) => item.uuid === uuid && item.providerId === owner);
-      if (!account || (threadId && !iphoneSessionsFor(account.uuid).items.some((item) => item.id === threadId))) return;
+      if (!account || (threadId && !iphoneSessionsFor(account).items.some((item) => item.id === threadId))) return;
       const key = { uuid: account.uuid, providerId: account.providerId };
       await callCommand(threadId ? "open_muse_thread" : "switch_account", threadId ? { uuid: key.uuid, threadId } : key, key);
       return;
@@ -4997,16 +5022,20 @@ function bindDelegatedEvents(): void {
         break;
       case "sync-all-btn": {
         if (snapshot.platform === "ios") {
-          if (iphoneQuotaRefresh.running || busy) break;
-          iphoneQuotaRefresh = { running: true, message: "正在请求刷新…" };
+          const refresh = iphoneQuotaRefresh[provider.id];
+          if (refresh.running || busy) break;
+          const eligible = snapshot.accounts.filter((account) => account.providerId === provider.id).length;
+          refresh.running = true;
+          refresh.message = "";
           syncIphoneViews(snapshot, provider);
           try {
-            await invoke("trigger_quota_sync", { force: true });
-            iphoneQuotaRefresh.message = "已请求刷新。各账号会在取得额度后更新。";
-          } catch {
-            iphoneQuotaRefresh.message = "无法请求刷新，请稍后重试。";
+            const rows = await invoke<{ quota: string }[]>("refresh_iphone_quotas", { providerId: provider.id });
+            const updated = rows.filter((row) => row.quota === "updated" || row.quota === "unchanged").length;
+            refresh.message = `额度已同步 ${updated} · 未取得 ${rows.length - updated} · 跳过 ${Math.max(0, eligible - rows.length)}`;
+          } catch (error) {
+            refresh.message = String(error);
           } finally {
-            iphoneQuotaRefresh.running = false;
+            refresh.running = false;
             if (snapshot) syncIphoneViews(snapshot, currentProvider(snapshot));
           }
           break;
@@ -5387,6 +5416,12 @@ function bindDelegatedEvents(): void {
 
 root.addEventListener("change", async (ev) => {
     const field = ev.target;
+    if (modal.kind === "proxyPool" && field instanceof HTMLSelectElement && field.id === "proxy-pool-selection") {
+      modal.selected = field.value;
+      modal.message = "";
+      await setModal(modal);
+      return;
+    }
     if (modal.kind === "add" && field instanceof HTMLSelectElement && !modal.pending) {
       if (field.id === "add-provider" && (field.value === "muse" || field.value === "hark")) {
         modal.providerId = field.value;
@@ -5467,9 +5502,12 @@ root.addEventListener("change", async (ev) => {
         view.includeGroups = input.checked;
       } else if (input.id === "backup-include-proxy") {
         view.includeProxy = input.checked;
+      } else if (input.id === "backup-include-credentials" && input instanceof HTMLInputElement) {
+        view.includeCredentials = input.checked;
       } else if (input.id === "backup-file") {
         const file = input.files?.[0];
         view.preview = null;
+        view.fromLan = false;
         view.encrypted = "";
         view.fileName = "";
         if (file && file.size <= 2_800_000) {
@@ -5749,6 +5787,7 @@ async function bootstrap(): Promise<void> {
     foregroundTaskTimer = window.setInterval(() => {
       void refreshForegroundTask();
       void processApprovalNotifications();
+      if (!document.hidden && navigator.onLine && iphonePage === "sessions") void refreshIphoneSessionBatch();
       if (!document.hidden && navigator.onLine && iosNetworkPrefs?.quotaMinutes && Date.now() - lastQuotaTimerTick >= 60_000) {
         lastQuotaTimerTick = Date.now();
         void invoke("trigger_quota_sync", { force:false }).catch(() => {});
@@ -5763,6 +5802,7 @@ async function bootstrap(): Promise<void> {
   document.addEventListener("visibilitychange", () => {
     if (!document.hidden) {
       triggerAutoSync();
+      void refreshIphoneSessionBatch();
       void processApprovalNotifications();
       // 回前台立刻取一次存活探针状态：后台期间定时器不会运行，
       // 界面上的秒数是旧的，必须以真实快照为准。

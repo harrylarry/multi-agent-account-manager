@@ -74,9 +74,19 @@ fn parse_lines(raw: &str) -> Result<Vec<String>, String> {
   if raw.len() > MAX_INPUT { return Err("代理列表过大".into()); }
   let mut unique = HashSet::new();
   let mut proxies = Vec::new();
-  for (index, line) in raw.split(['\n', ';', '；']).enumerate() {
-    let line = line.trim();
-    if line.is_empty() || line.starts_with('#') { continue; }
+  let mut entries = Vec::new();
+  for line in raw.lines().map(str::trim).filter(|line| !line.is_empty() && !line.starts_with('#')) {
+    let mut start = 0;
+    for (index, separator) in line.match_indices([';', '；']) {
+      let next = line[index + separator.len()..].trim_start();
+      if ["http://", "https://", "socks5://", "socks5h://"].iter().any(|scheme| next.starts_with(scheme)) {
+        entries.push(line[start..index].trim());
+        start = index + separator.len();
+      }
+    }
+    entries.push(line[start..].trim());
+  }
+  for (index, line) in entries.into_iter().enumerate() {
     let proxy = ProxyConfig::parse(line)
       .map_err(|_| format!("第 {} 条代理格式无效", index + 1))?;
     let rest = line.split_once("://").map(|(_, rest)| rest).unwrap_or_default();
@@ -262,6 +272,14 @@ pub fn restored_entry_id(entry: &ProxyPoolProfile) -> Uuid {
 #[cfg(test)]
 mod tests {
   use super::*;
+
+  #[test]
+  fn batch_import_understands_semicolons_and_preserves_userinfo() {
+    let input = "# comment; https://ignored.example:80\nhttp://u:pass;word@one.example:80; socks5://two.example:1080；https://three.example:443";
+    let rows = parse_lines(input).unwrap();
+    assert_eq!(rows.len(), 3);
+    assert_eq!(ProxyConfig::parse(&rows[0]).unwrap().password(), Some("pass;word"));
+  }
 
   #[test]
   fn source_refresh_keeps_only_identical_credential_bindings() {

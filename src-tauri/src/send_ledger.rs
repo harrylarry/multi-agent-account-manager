@@ -338,13 +338,12 @@ impl SendLedger {
   }
 
   pub fn begin_new_muse_conversation(&self, account_uuid: &str, text: &str) -> Result<String, SendError> {
-    use sha2::{Digest, Sha256};
-
     self.commit(|state| {
       if let Some(mission) = state.missions.get(account_uuid) {
         return Err(SendError::Busy(mission.clone()));
       }
-      let digest = format!("{:x}", Sha256::digest(text.as_bytes()));
+      let digest: String = ring::digest::digest(&ring::digest::SHA256, text.as_bytes()).as_ref()
+        .iter().map(|byte| format!("{byte:02x}")).collect();
       if state.attempts.iter().any(|attempt| {
         attempt.kind == SendKind::NewMuseConversation
           && attempt.account_uuid == account_uuid
@@ -698,6 +697,20 @@ mod tests {
     std::fs::rename(&dir, &moved).unwrap();
     std::fs::write(&dir, b"blocked").unwrap();
     moved
+  }
+
+  #[test]
+  fn new_conversation_only_blocks_the_unresolved_message_for_the_same_account() {
+    let ledger = SendLedger::new();
+    let send = ledger.begin_new_muse_conversation("account-a", "private message").unwrap();
+    assert_eq!(ledger.attempts()[0].digest.len(), 64);
+    assert!(!ledger.attempts()[0].digest.contains("private"));
+    ledger.mark_unknown(&send, "lost ACK".into());
+    assert!(matches!(ledger.begin_new_muse_conversation("account-a", "private message"), Err(SendError::Unknown(_))));
+    assert!(ledger.begin_new_muse_conversation("account-b", "private message").is_ok());
+    let other = ledger.begin_new_muse_conversation("account-a", "different message").unwrap();
+    ledger.fail(&other, "before write".into());
+    assert!(ledger.begin_new_muse_conversation("account-a", "different message").is_ok());
   }
 
   #[test]

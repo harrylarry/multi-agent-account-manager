@@ -7,6 +7,7 @@ use std::num::NonZeroU32;
 use zeroize::Zeroizing;
 
 const MAGIC: &[u8; 8] = b"MAAMBAK1";
+const CREDENTIAL_MAGIC: &[u8; 8] = b"MAAMBAK2";
 const HEADER: usize = 8 + 16 + 12;
 const MAX_BYTES: usize = 2 * 1024 * 1024;
 const ROUNDS: NonZeroU32 = NonZeroU32::new(600_000).unwrap();
@@ -21,6 +22,41 @@ pub struct AccountBackup {
   pub proxy_pool: Vec<ProxyPoolProfile>,
   #[serde(default)]
   pub expires_at_ms: Option<u64>,
+  #[serde(default, skip_serializing_if = "Vec::is_empty")]
+  pub credentials: Vec<BackupCredential>,
+}
+
+#[derive(Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct BackupCredential {
+  pub uuid: String,
+  pub cookies: Vec<crate::account_cookies::AccountCookie>,
+  pub proxy: Option<BackupProxySecret>,
+}
+
+#[derive(Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct BackupProxySecret {
+  pub username: String,
+  pub password: String,
+}
+
+impl Drop for BackupProxySecret {
+  fn drop(&mut self) {
+    use zeroize::Zeroize;
+    self.username.zeroize();
+    self.password.zeroize();
+  }
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CredentialPreview {
+  pub provider_id: ProviderId,
+  pub alias: String,
+  pub cookie_count: usize,
+  pub proxy_password: bool,
+  pub will_restore: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
@@ -93,6 +129,7 @@ pub struct RestorePreview {
   pub conflicts: Vec<String>,
   pub proxy_pool_count: usize,
   pub checksum: String,
+  pub credentials: Vec<CredentialPreview>,
 }
 
 pub fn preview(backup: &AccountBackup, current: &[AccountRecord]) -> RestorePreview {
@@ -100,7 +137,7 @@ pub fn preview(backup: &AccountBackup, current: &[AccountRecord]) -> RestorePrev
   let mut existing = 0;
   let mut conflicts = Vec::new();
   let mut digest = ring::digest::Context::new(&ring::digest::SHA256);
-  if let Ok(payload) = serde_json::to_vec(backup) { digest.update(&payload); }
+  if let Ok(payload) = serde_json::to_vec(backup) { digest.update(&Zeroizing::new(payload)); }
   for profile in &backup.accounts {
     let old = current.iter().find(|account| account.uuid == profile.uuid);
     if let Some(account) = old {
@@ -124,8 +161,15 @@ pub fn preview(backup: &AccountBackup, current: &[AccountRecord]) -> RestorePrev
       digest.update(profile.uuid.as_bytes());
     }
   }
+  let credentials = backup.credentials.iter().filter_map(|entry| {
+    let profile = backup.accounts.iter().find(|profile| profile.uuid == entry.uuid)?;
+    Some(CredentialPreview {
+      provider_id: profile.provider_id, alias: profile.alias.clone(), cookie_count: entry.cookies.len(),
+      proxy_password: entry.proxy.is_some(), will_restore: !current.iter().any(|account| account.uuid == entry.uuid),
+    })
+  }).collect();
   RestorePreview { added, existing, conflicts, proxy_pool_count: backup.proxy_pool.len(),
-    checksum: STANDARD.encode(digest.finish().as_ref()) }
+    checksum: STANDARD.encode(digest.finish().as_ref()), credentials }
 }
 
 #[cfg(target_os = "ios")]
@@ -175,7 +219,7 @@ pub fn encrypt(backup: &AccountBackup, password: &str) -> Result<String, String>
   let mut nonce = [0; 12];
   random.fill(&mut salt).and_then(|_| random.fill(&mut nonce)).map_err(|_| "无法生成随机数")?;
   let mut header = Vec::with_capacity(HEADER);
-  header.extend_from_slice(MAGIC);
+  header.extend_from_slice(if backup.credentials.is_empty() { MAGIC } else { CREDENTIAL_MAGIC });
   header.extend_from_slice(&salt);
   header.extend_from_slice(&nonce);
   let mut body = Zeroizing::new(serde_json::to_vec(backup).map_err(|_| "备份数据无法编码")?);
@@ -191,7 +235,7 @@ pub fn decrypt(encoded: &str, password: &str) -> Result<AccountBackup, String> {
   let encoded = encoded.trim();
   if encoded.len() > MAX_BYTES.div_ceil(3) * 4 { return Err("备份文件过大".into()); }
   let mut data = Zeroizing::new(STANDARD.decode(encoded).map_err(|_| "备份编码无效")?);
-  if data.len() < HEADER + 16 || data.len() > MAX_BYTES || &data[..8] != MAGIC {
+  if data.len() < HEADER + 16 || data.len() > MAX_BYTES || (&data[..8] != MAGIC && &data[..8] != CREDENTIAL_MAGIC) {
     return Err("备份版本或格式无法识别".into());
   }
   let header: [u8; HEADER] = data[..HEADER].try_into().map_err(|_| "备份头损坏")?;
@@ -199,7 +243,7 @@ pub fn decrypt(encoded: &str, password: &str) -> Result<AccountBackup, String> {
   let body = key(password, &header[8..24])?
     .open_in_place(nonce, aead::Aad::from(&header), &mut data[HEADER..])
     .map_err(|_| "口令错误或备份已损坏")?;
-  let backup: AccountBackup = serde_json::from_slice(body).map_err(|_| "备份数据无效")?;
+  let mut backup: AccountBackup = serde_json::from_slice(body).map_err(|_| "备份数据无效")?;
   if backup.expires_at_ms.is_some_and(|deadline| deadline <= crate::storage::now_ms()) {
     return Err("这份加密备份已超过设定的恢复期限".into());
   }
@@ -231,6 +275,29 @@ pub fn decrypt(encoded: &str, password: &str) -> Result<AccountBackup, String> {
       }
     }
   }
+  if !backup.credentials.is_empty() && &header[..8] != CREDENTIAL_MAGIC {
+    return Err("备份凭据版本不匹配".into());
+  }
+  let mut credentials_seen = std::collections::HashSet::new();
+  let now = crate::storage::now_ms() as f64 / 1000.0;
+  for entry in &mut backup.credentials {
+    let account = backup.accounts.iter().find(|account| account.uuid == entry.uuid)
+      .ok_or("备份凭据缺少账号归属")?;
+    if !credentials_seen.insert(entry.uuid.clone()) { return Err("备份账号凭据重复".into()); }
+    if let Some(proxy) = &entry.proxy {
+      if !backup.includes_proxy_endpoints || account.proxy_endpoint.is_none() || !account.proxy_requires_auth
+        || proxy.username.trim().is_empty() || proxy.password.is_empty()
+        || proxy.username.chars().any(char::is_control) || proxy.password.chars().any(char::is_control) {
+        return Err("备份代理凭据无效".into());
+      }
+    }
+    entry.cookies.retain(|cookie| cookie.expiration_date.is_none_or(|expiry| expiry > now));
+    if !entry.cookies.is_empty() {
+      let raw = Zeroizing::new(serde_json::to_string(&entry.cookies).map_err(|_| "备份 Cookie 无效")?);
+      entry.cookies = crate::account_cookies::parse(&raw, account.provider_id.as_str(), now)
+        .map_err(|_| "备份 Cookie 格式或账号域名无效")?;
+    }
+  }
   Ok(backup)
 }
 
@@ -245,6 +312,34 @@ fn validate_proxy_endpoint(endpoint: &str) -> Result<(), String> {
 #[cfg(test)]
 mod tests {
   use super::*;
+
+  #[test]
+  fn credential_backup_uses_separate_envelope_and_rejects_another_accounts_cookie_domain() {
+    let mut backup: AccountBackup = serde_json::from_value(serde_json::json!({
+      "accounts": [{
+        "providerId": "muse", "uuid": "b5d96444-a28d-43f1-8bda-6bb1f53278b3", "alias": "Test", "createdAtMs": 1,
+        "proxyRequiresAuth": true, "proxyEnabled": true, "proxyEndpoint": "http://example.test:8080"
+      }],
+      "includesGroups": true, "includesProxyEndpoints": true,
+      "credentials": [{
+        "uuid": "b5d96444-a28d-43f1-8bda-6bb1f53278b3",
+        "cookies": [{"name": "session", "value": "fixture_cookie", "domain": "muse.ai", "path": "/"}],
+        "proxy": {"username": "fixture_user", "password": "fixture_password"}
+      }]
+    })).unwrap();
+    let encrypted = encrypt(&backup, "test-password").unwrap();
+    let record = STANDARD.decode(&encrypted).unwrap();
+    assert_eq!(&record[..8], CREDENTIAL_MAGIC);
+    assert!(!record.windows(b"fixture_password".len()).any(|bytes| bytes == b"fixture_password"));
+    let recovered = decrypt(&encrypted, "test-password").unwrap();
+    let preview = preview(&recovered, &[]);
+    assert_eq!(preview.credentials[0].cookie_count, 1);
+    assert!(preview.credentials[0].will_restore);
+    assert!(!serde_json::to_string(&preview).unwrap().contains("fixture_"));
+    backup.credentials[0].cookies[0].domain = "hark.com".into();
+    let foreign = encrypt(&backup, "test-password").unwrap();
+    assert!(decrypt(&foreign, "test-password").is_err());
+  }
 
   #[test]
   fn restored_proxy_never_drops_an_enabled_route_or_reuses_a_different_host_secret() {
@@ -278,7 +373,7 @@ mod tests {
 
   #[test]
   fn account_backup_roundtrip_rejects_wrong_password_and_tampering() {
-    let backup = AccountBackup { accounts: Vec::new(), includes_groups: true, includes_proxy_endpoints: false, proxy_pool: Vec::new(), expires_at_ms: None };
+    let backup = AccountBackup { accounts: Vec::new(), includes_groups: true, includes_proxy_endpoints: false, proxy_pool: Vec::new(), expires_at_ms: None, credentials: Vec::new() };
     let encoded = encrypt(&backup, "test-password").unwrap();
     assert!(decrypt(&encoded, "bad-password").is_err());
     assert!(decrypt(&encoded, "test-password").unwrap().includes_groups);

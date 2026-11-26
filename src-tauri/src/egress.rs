@@ -100,9 +100,12 @@ impl AccountEgress {
       }
       None => None,
     };
-    // 组装含凭据的进程内 URI；随后立即 parse 掉，不保留明文副本。
-    let mut uri = compose_uri(&s.uri, username.as_deref(), password.as_deref());
-    let cfg = ProxyConfig::parse(&uri).map_err(|e| EgressError::Invalid(e.to_string()));
+    Self::explicit_proxy(&s.uri, username.as_deref(), password.as_deref())
+  }
+
+  pub fn explicit_proxy(base: &str, username: Option<&str>, password: Option<&str>) -> Result<Self, EgressError> {
+    let mut uri = compose_uri(base, username, password);
+    let cfg = ProxyConfig::parse(&uri).map_err(|error| EgressError::Invalid(error.to_string()));
     uri.zeroize();
     let cfg = cfg?;
     let display = cfg.display_safe();

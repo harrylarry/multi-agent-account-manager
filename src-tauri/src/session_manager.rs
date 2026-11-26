@@ -1082,6 +1082,51 @@ impl SessionManager {
     Ok((response, skipped))
   }
 
+  #[cfg(target_os = "ios")]
+  pub async fn add_backup_credentials(
+    &self, app: &AppHandle, backup: &mut crate::account_backup::AccountBackup,
+  ) -> Result<(), String> {
+    use crate::account_backup::{BackupCredential, BackupProxySecret};
+    let _sync = self.quota_sync_lock.lock().await;
+    let _proxy_guard = self.proxy_write_lock.lock().await;
+    let locked = self.inner.lock().await;
+    if locked.active_slot.is_some() || !locked.conflicts.is_empty() || !locked.store.pending_cleanup.is_empty() {
+      return Err("请关闭会话并处理账号冲突后再备份登录态".into());
+    }
+    let secrets = crate::secrets::Secrets::new(&locked.app_data_dir);
+    let now = now_ms() as f64 / 1000.0;
+    for profile in &backup.accounts {
+      let account = locked.store.accounts.iter().find(|account| account.uuid == profile.uuid
+        && account.provider_id == profile.provider_id).ok_or("备份期间账号有变化，请重新导出")?;
+      let scope = profile.provider_id.as_str();
+      let mut cookies = Vec::new();
+      if account.auth_state != AuthState::LoggedOut {
+        let summary = crate::platform::ios::transfer_profile_cookies(
+          app, scope, &profile.uuid, None::<&[crate::account_cookies::AccountCookie]>, true,
+        ).await?;
+        if summary.count != 0 {
+          let mut export = crate::platform::ios::transfer_profile_cookies(
+            app, scope, &profile.uuid, None::<&[crate::account_cookies::AccountCookie]>, false,
+          ).await?;
+          let raw = zeroize::Zeroizing::new(export.cookie_export_json.take().ok_or("无法读取账号 Cookie")?);
+          let entries = serde_json::from_str(&raw).map_err(|_| "不能读取账号 Cookie 格式")?;
+          let (validated, _, _) = crate::account_cookies::prepare_export(entries, scope, now)?;
+          cookies = crate::account_cookies::parse(&validated, scope, now)?;
+        }
+      }
+      let proxy = if let Some(setting) = account.proxy.as_ref().filter(|_| profile.proxy_requires_auth) {
+        let reference = setting.credential_ref.as_deref().ok_or("缺少代理凭据")?;
+        let username = setting.effective_username().ok_or("缺少代理用户名")?;
+        let password = secrets.get(reference)?.ok_or("钥匙串无代理密码，请检查账号代理设置")?;
+        Some(BackupProxySecret { username, password })
+      } else { None };
+      if !cookies.is_empty() || proxy.is_some() {
+        backup.credentials.push(BackupCredential { uuid: profile.uuid.clone(), cookies, proxy });
+      }
+    }
+    Ok(())
+  }
+
   pub async fn restore_account_backup(
     &self,
     app: &AppHandle,
@@ -1089,6 +1134,10 @@ impl SessionManager {
     overwrite: bool,
     preview_checksum: &str,
   ) -> Result<ManagerSnapshot, String> {
+    #[cfg(target_os = "ios")]
+    let _sync = self.quota_sync_lock.lock().await;
+    #[cfg(not(target_os = "ios"))]
+    if !backup.credentials.is_empty() { return Err("登录态恢复需要 iOS".into()); }
     let _proxy_guard = self.proxy_write_lock.lock().await;
     let mut locked = self.inner.lock().await;
     if locked.active_slot.is_some() || !locked.store.pending_cleanup.is_empty() || !locked.conflicts.is_empty() {
@@ -1099,6 +1148,8 @@ impl SessionManager {
       return Err("账号数据已变化，请重新预览".into());
     }
     let mut updated = locked.store.clone();
+    #[cfg(target_os = "ios")]
+    let mut staged = Vec::new();
     for entry in backup.proxy_pool {
       if updated.restored_proxy_pool.iter().any(|old| crate::proxy_pool::restored_entry_id(old) == crate::proxy_pool::restored_entry_id(&entry) && old != &entry) {
         return Err("备份含已存在但资料不同的代理池标识".into());
@@ -1116,18 +1167,32 @@ impl SessionManager {
           return Err("备份含归属冲突，未修改任何账号".into());
         }
         if overwrite {
-          if backup.includes_proxy_endpoints {
+          if backup.includes_proxy_endpoints && !backup.credentials.iter().any(|entry| entry.uuid == saved.uuid && entry.proxy.is_some()) {
             record.proxy = saved.restored_proxy(record.proxy.as_ref());
           }
           record.alias = saved.alias;
           record.auto_alias = false;
           record.timezone = saved.timezone;
+          record.language = saved.language;
           if saved.last_muse_thread.is_some() { record.last_muse_thread = saved.last_muse_thread; }
           if backup.includes_groups { record.group = saved.group; }
         }
         continue;
       }
-      let proxy = saved.restored_proxy(None);
+      #[allow(unused_mut)]
+      let mut proxy = saved.restored_proxy(None);
+      #[cfg(target_os = "ios")]
+      if let Some(data) = backup.credentials.iter().find(|data| data.uuid == saved.uuid) {
+        if let Some(secret) = &data.proxy {
+          let setting = proxy.as_mut().ok_or("缺少账号代理资料")?;
+          setting.username = Some(secret.username.clone());
+          setting.credential_ref = Some(format!("proxy-{}", saved.uuid));
+          setting.validate()?;
+        }
+        if !data.cookies.is_empty() || data.proxy.is_some() {
+          staged.push((AccountKey { provider_id: saved.provider_id, uuid: saved.uuid.clone() }, data));
+        }
+      }
       updated.accounts.push(AccountRecord {
         provider_id: saved.provider_id, uuid: saved.uuid, alias: saved.alias,
         group: saved.group, timezone: saved.timezone, language: saved.language, last_muse_thread: saved.last_muse_thread,
@@ -1139,11 +1204,59 @@ impl SessionManager {
         task_notifications: false, task_notice_keys: Vec::new(), pending_approval_count: None, proxy,
       });
     }
+    for account in &updated.accounts {
+      if let Some(group) = &account.group {
+        let names = updated.account_groups.entry(account.provider_id.as_str().to_owned()).or_default();
+        if !names.contains(group) { names.push(group.clone()); }
+      }
+    }
     let mut seen_pool = std::collections::HashSet::new();
     if updated.accounts.iter().filter_map(|account| account.proxy.as_ref().and_then(|proxy| proxy.pool_entry_id))
       .any(|id| !seen_pool.insert(id)) {
       return Err("备份会让两个账号使用同一代理池条目，已保留原资料".into());
     }
+    #[cfg(target_os = "ios")]
+    if !staged.is_empty() {
+      let existing = crate::platform::ios::check_capabilities(app).await?.profile_names;
+      if staged.iter().any(|(key, _)| existing.contains(&key.uuid)) {
+        return Err("本机已有未关联的独立会话资料，已停止恢复以保留原资料".into());
+      }
+      let secrets = crate::secrets::Secrets::new(&locked.app_data_dir);
+      let keys: Vec<_> = staged.iter().map(|(key, _)| key.clone()).collect();
+      locked.store.pending_cleanup = keys.clone();
+      if let Err(error) = save_store_atomic(&locked.store_path, &locked.store) {
+        locked.store.pending_cleanup.clear();
+        return Err(error);
+      }
+      let result = async {
+        for (key, data) in &staged {
+          if let Some(secret) = &data.proxy {
+            secrets.set(&format!("proxy-{}", key.uuid), &secret.password)?;
+          }
+          if !data.cookies.is_empty() {
+            let result = crate::platform::ios::transfer_profile_cookies(
+              app, key.provider_id.as_str(), &key.uuid, Some(&data.cookies), false,
+            ).await?;
+            if result.count != data.cookies.len() { return Err("Cookie 写入未核对".into()); }
+          }
+        }
+        save_store_atomic(&locked.store_path, &updated)
+      }.await;
+      if let Err(error) = result {
+        for key in keys {
+          let deleted = crate::platform::ios::delete_profile(app, &key.uuid).await;
+          let cleared = secrets.delete(&format!("proxy-{}", key.uuid));
+          if deleted.is_ok() && cleared.is_ok() {
+            locked.store.pending_cleanup.retain(|entry| entry != &key);
+          }
+        }
+        let _ = save_store_atomic(&locked.store_path, &locked.store);
+        return Err(error);
+      }
+    } else {
+      save_store_atomic(&locked.store_path, &updated)?;
+    }
+    #[cfg(not(target_os = "ios"))]
     save_store_atomic(&locked.store_path, &updated)?;
     locked.store = updated;
     let snapshot = Self::snapshot_from_locked(&locked);
@@ -1254,6 +1367,23 @@ impl SessionManager {
   }
 
   #[cfg(target_os = "ios")]
+  pub async fn update_muse_approval_count(&self, app: &AppHandle, uuid: &str, count: usize) -> Result<(), String> {
+    let mut locked = self.inner.lock().await;
+    let Some(index) = locked.store.accounts.iter().position(|account| account.provider_id == ProviderId::Muse
+      && account.uuid == uuid && account.auth_state == AuthState::Authenticated) else { return Ok(()); };
+    let previous = locked.store.accounts[index].pending_approval_count.replace(count);
+    if previous == Some(count) { return Ok(()); }
+    if let Err(error) = save_store_atomic(&locked.store_path, &locked.store) {
+      locked.store.accounts[index].pending_approval_count = previous;
+      return Err(error);
+    }
+    let state = Self::snapshot_from_locked(&locked);
+    drop(locked);
+    self.emit_snapshot(app, &state);
+    Ok(())
+  }
+
+  #[cfg(target_os = "ios")]
   pub async fn record_task_observations(
     &self,
     app: &AppHandle,
@@ -1295,7 +1425,7 @@ impl SessionManager {
         notices.push((kind, key, action));
       }
     }
-    account.pending_approval_count = pending.map(|items| items.len());
+    if let Some(items) = pending { account.pending_approval_count = Some(items.len()); }
     if *account == before { return Ok(()); }
     if let Err(error) = save_store_atomic(&locked.store_path, &locked.store) {
       locked.store.accounts[index] = before;
@@ -1606,6 +1736,8 @@ impl SessionManager {
       let deleted = self.delete_profile_for_key(app, &key.uuid).await;
       if deleted.is_ok() {
         let mut locked = self.inner.lock().await;
+        let secrets = crate::secrets::Secrets::new(&locked.app_data_dir);
+        if secrets.delete(&format!("proxy-{}", key.uuid)).is_err() { continue; }
         locked.store.pending_cleanup.retain(|k| k != &key);
         let _ = save_store_atomic(&locked.store_path, &locked.store);
       }
@@ -2463,7 +2595,7 @@ impl SessionManager {
       let mgr = Arc::clone(self);
       let app_handle = app.clone();
       tauri::async_runtime::spawn(async move {
-        let _ = mgr.sync_ios_quotas(&app_handle, false).await;
+        let _ = mgr.sync_ios_quotas(&app_handle, false, None).await;
       });
     }
 
@@ -2550,6 +2682,7 @@ impl SessionManager {
     &self,
     app: &AppHandle,
     fresh: bool,
+    provider_filter: Option<ProviderId>,
   ) -> Result<Vec<QuotaSyncDiagnostic>, String> {
     let _sync = self
       .quota_sync_lock
@@ -2560,7 +2693,8 @@ impl SessionManager {
       locked.store.accounts.iter().filter_map(|account| {
         let key = AccountKey { provider_id: account.provider_id, uuid: account.uuid.clone() };
         let provider = get_provider(key.provider_id);
-        if !provider.info.enabled || locked.store.pending_cleanup.contains(&key)
+        if provider_filter.is_some_and(|filter| filter != key.provider_id)
+          || !provider.info.enabled || locked.store.pending_cleanup.contains(&key)
           || locked.conflicts.iter().any(|entry| entry.uuid == key.uuid)
           || locked.active_slot.as_ref().is_some_and(|slot| slot.account_key == key)
         {
