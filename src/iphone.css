@@ -374,15 +374,32 @@
 .iphone-nav-tabs { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); border-radius: 24px; background: var(--dh-surface); }
 .iphone-page-exit { position: fixed; z-index: 8; background: var(--dh-page); pointer-events: none; }
 .iphone-compose-account { display: flex; align-items: center; gap: 9px; min-height: 44px; }
-.native-iphone-glass,
-.native-iphone-glass body,
-.native-iphone-glass #app,
-.native-iphone-glass .iphone-shell,
-.native-iphone-glass .iphone-shell [data-iphone-glass] { background: transparent; }
-@media (prefers-contrast: more) {
-  .native-iphone-glass .iphone-shell [data-iphone-glass] { background: var(--dh-surface); }
+/* Native bars overlay the WKWebView. Padding belongs to each scroller, so
+   the first and last items clear the bars while rows can scroll underneath. */
+.native-iphone-navigation .iphone-shell {
+  --iphone-top-clearance: var(--iphone-native-top, calc(env(safe-area-inset-top, 0px) + 62px));
+  --iphone-bottom-clearance: var(--iphone-native-bottom, calc(env(safe-area-inset-bottom, 0px) + 66px));
+  padding-block: 0;
 }
-
+.native-iphone-navigation .iphone-shell :is(.iphone-toolbar, .iphone-nav, .modal-card > #modal-cancel-btn.iphone-back) {
+  display: none;
+}
+.native-iphone-navigation .iphone-shell :is(.account-list, .iphone-scroll) {
+  padding-top: var(--iphone-top-clearance);
+  padding-bottom: calc(var(--iphone-bottom-clearance) + 12px);
+  scroll-padding-block: var(--iphone-top-clearance) var(--iphone-bottom-clearance);
+}
+.native-iphone-navigation .iphone-shell .spike-workspace {
+  padding-top: var(--iphone-top-clearance);
+  padding-bottom: var(--iphone-bottom-clearance);
+}
+.native-iphone-navigation .iphone-shell :is(.iphone-screen-modal, .iphone-subpage) .modal-card {
+  padding-top: var(--iphone-top-clearance);
+  padding-bottom: calc(var(--iphone-bottom-clearance) + 12px);
+}
+.native-iphone-navigation .iphone-shell .inline-modal:not(.iphone-screen-modal, .iphone-subpage) {
+  padding-top: max(16px, env(safe-area-inset-top, 0px));
+}
 .iphone-session-entry { border-bottom: 1px solid var(--dh-line); }
 .iphone-session-entry:last-child { border-bottom: 0; }
 .iphone-session-row { display: grid; grid-template-columns: minmax(0, 1fr) auto; align-items: center; }

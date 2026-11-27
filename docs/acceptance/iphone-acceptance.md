@@ -3,6 +3,13 @@
 当前 Spike 验收包是 **0.1.26**，Bundle ID 为 `com.ldjx.accountmanager.spike`，最低 iOS 26.0。开发状态与待验收范围见[当前进度](../development/current-progress.md)。
 
 
+## iPhone 原生玻璃导航
+
+1. 用 iPhone 覆盖安装。打开账号或会话列表，从两个玻璃栏之间上下滚动，观察头像、列表文字经过栏下时的折射和对比度是否连续。列表收尾处仍应能看见和点到最后一行。确认滚动过程中没有跳动、重影或网页导航重复出现。
+2. 轻按管理、总览、搜索、返回和底栏新建按钮，观察玻璃是否随实际控件一起响应。切换 Muse 和 Hark，确认菜单标题、列表与会话归属同步，切回时核对滚动位置。管理从左进入，总览和搜索从右进入，返回沿相反方向。开启「减少动态效果」后再试一次。
+3. 全局搜索输入中文和英文，试用清除与取消，再打开跨服务结果并返回核对查询和列表位置。点击右下新建对话，检查账号归属、键盘、草稿和返回，验玻璃时可以在发送前返回。需要验证发送时只用测试账号，发一条唯一短句。
+4. 分别用浅色和深色展示，打开「降低透明度」复测。进入账号详情和一个子页，检查返回键和滚动区域；确认弹窗、键盘和会话原生页出现时没有旧栏盖住页面。
+
 ## iPhone 最终方案 · 重构真机验收
 
 修正包 Spike 0.1.26 基于 `027e24b8ae29c7d0af4148fbcf988a978c1bac65`。解压后的 IPA SHA-256 为 `23f16cb0f1b4b47492cb3282daa073ecb0d29d5ad4b85d56b718baee0c932baa`。已下载并核对包标识、版本和最低 iOS 26.0。CI 与 Xcode 均通过，真机待验。[下载 IPA](https://github.com/harrylarry/multi-agent-account-manager/actions/runs/45918293892/artifacts/15163541954) · [Quick checks](https://github.com/harrylarry/multi-agent-account-manager/actions/runs/45918270002) · [iOS 构建](https://github.com/harrylarry/multi-agent-account-manager/actions/runs/45918293892)

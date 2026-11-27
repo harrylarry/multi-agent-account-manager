@@ -45,9 +45,14 @@ async fn get_manager_state(mgr: State<'_, Arc<SessionManager>>) -> Result<Manage
 
 #[tauri::command]
 #[cfg_attr(not(target_os = "ios"), allow(unused_variables))]
-async fn update_iphone_glass(app: AppHandle, layout: serde_json::Value) -> Result<serde_json::Value, String> {
+async fn update_iphone_glass(
+  app: AppHandle, webview: tauri::Webview, layout: serde_json::Value,
+  events: Option<tauri::ipc::JavaScriptChannelId>,
+) -> Result<serde_json::Value, String> {
   #[cfg(target_os = "ios")]
-  return crate::platform::ios::update_manager_glass(&app, layout).await;
+  return crate::platform::ios::update_manager_glass(
+    &app, layout, events.map(|channel| channel.channel_on(webview)),
+  ).await;
   #[cfg(not(target_os = "ios"))]
   Ok(serde_json::json!({ "ready": false }))
 }

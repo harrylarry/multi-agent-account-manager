@@ -922,7 +922,9 @@ pub async fn automatic_task_polling_available(app: &AppHandle) -> Result<bool, S
 }
 
 #[cfg(target_os = "ios")]
-pub async fn update_manager_glass(app: &AppHandle, layout: serde_json::Value) -> Result<serde_json::Value, String> {
+pub async fn update_manager_glass(
+  app: &AppHandle, layout: serde_json::Value, events: Option<Channel<serde_json::Value>>,
+) -> Result<serde_json::Value, String> {
   let bridge = app.state::<IosSessionBridge<tauri::Wry>>();
-  bridge.0.run_mobile_plugin_async("updateManagerGlass", layout).await.map_err(|error| error.to_string())
+  bridge.0.run_mobile_plugin_async("updateManagerGlass", serde_json::json!({ "layout": layout, "events": events })).await.map_err(|error| error.to_string())
 }

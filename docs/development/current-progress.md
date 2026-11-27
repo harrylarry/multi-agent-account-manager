@@ -1,5 +1,9 @@
 # 当前开发进度
 
+## iPhone 原生玻璃导航
+
+管理页的 Swift 原生顶栏、搜索、底栏和新建对话按钮位于 WKWebView 上方。滚动区通过原生安全区留出首尾空间。控件按压和选中态交由 UIKit，服务切换和已约定的方向过渡移动原生控件。只在真实控件区域截获触摸，空白区继续交给网页。复用相同的账号和会话操作以及仅本地管理页可用的授权。两个移动 WebKit 视口用模拟桥验证导航事件、内容在栏下滚动以及退回原页面。[真机复测](../acceptance/iphone-acceptance.md#iphone-原生玻璃导航)
+
 ## iPhone 重构验收修正
 
 修正包 Spike 0.1.26 基于 `027e24b8ae29c7d0af4148fbcf988a978c1bac65`。解压后的 IPA SHA-256 为 `23f16cb0f1b4b47492cb3282daa073ecb0d29d5ad4b85d56b718baee0c932baa`。已下载并核对包标识、版本和最低 iOS 26.0。CI 与 Xcode 均通过，真机待验。[下载 IPA](https://github.com/harrylarry/multi-agent-account-manager/actions/runs/45918293892/artifacts/15163541954) · [Quick checks](https://github.com/harrylarry/multi-agent-account-manager/actions/runs/45918270002) · [iOS 构建](https://github.com/harrylarry/multi-agent-account-manager/actions/runs/45918293892)

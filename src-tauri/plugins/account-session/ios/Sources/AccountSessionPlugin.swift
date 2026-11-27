@@ -198,22 +198,9 @@ private struct QuarantineProxyArgs: Decodable {
   let reason: String?
 }
 
-private struct ManagerGlassArgs: Decodable {
-  struct Rect: Decodable {
-    let x: Double
-    let y: Double
-    let width: Double
-    let height: Double
-  }
-  let generation: Int
-  let viewportWidth: Double
-  let surfaces: [Rect]
-}
-
 class AccountSessionPlugin: Plugin {
   private weak var managerWebView: WKWebView?
-  private var managerGlass: [UIVisualEffectView] = []
-  private var managerGlassGeneration = -1
+  private weak var managerNavigation: UIView?
 
   override func load(webview: WKWebView) {
     managerWebView = webview
@@ -223,38 +210,32 @@ class AccountSessionPlugin: Plugin {
     let args = try invoke.parseArgs(ManagerGlassArgs.self)
     DispatchQueue.main.async {
       guard #available(iOS 26.0, *), let web = self.managerWebView,
-            let parent = web.superview, args.viewportWidth.isFinite, args.viewportWidth > 0 else {
+            let parent = web.superview else {
         invoke.resolve(["ready": false])
         return
       }
-      guard args.generation >= self.managerGlassGeneration else {
-        invoke.resolve(["ready": true])
-        return
+      let navigation: ManagerGlassNavigation
+      if let existing = self.managerNavigation as? ManagerGlassNavigation, existing.superview === parent {
+        navigation = existing
+      } else {
+        guard args.events != nil else {
+          invoke.resolve(["ready": false])
+          return
+        }
+        self.managerNavigation?.removeFromSuperview()
+        navigation = ManagerGlassNavigation()
+        navigation.translatesAutoresizingMaskIntoConstraints = false
+        parent.insertSubview(navigation, aboveSubview: web)
+        NSLayoutConstraint.activate([
+          navigation.leadingAnchor.constraint(equalTo: web.leadingAnchor),
+          navigation.trailingAnchor.constraint(equalTo: web.trailingAnchor),
+          navigation.topAnchor.constraint(equalTo: web.topAnchor),
+          navigation.bottomAnchor.constraint(equalTo: web.bottomAnchor),
+        ])
+        self.managerNavigation = navigation
       }
-      self.managerGlassGeneration = args.generation
-      self.managerGlass.forEach { $0.removeFromSuperview() }
-      self.managerGlass.removeAll(keepingCapacity: true)
-      web.isOpaque = false
-      web.backgroundColor = .clear
-      web.scrollView.backgroundColor = .clear
-      parent.backgroundColor = .systemGroupedBackground
-      let scale = web.bounds.width / CGFloat(args.viewportWidth)
-      for bounds in args.surfaces.prefix(8) {
-        guard [bounds.x, bounds.y, bounds.width, bounds.height].allSatisfy({ $0.isFinite }),
-              bounds.width > 0, bounds.height > 0 else { continue }
-        let local = CGRect(x: CGFloat(bounds.x) * scale, y: CGFloat(bounds.y) * scale,
-                           width: CGFloat(bounds.width) * scale, height: CGFloat(bounds.height) * scale)
-        guard web.bounds.insetBy(dx: -1, dy: -1).contains(local) else { continue }
-        let glass = UIGlassEffect(style: .regular)
-        let view = UIVisualEffectView(effect: glass)
-        view.isUserInteractionEnabled = false
-        view.accessibilityElementsHidden = true
-        view.frame = web.convert(local, to: parent)
-        view.layer.cornerRadius = min(24, view.bounds.height / 2)
-        view.layer.cornerCurve = .continuous
-        parent.insertSubview(view, belowSubview: web)
-        self.managerGlass.append(view)
-      }
+      parent.layoutIfNeeded()
+      navigation.apply(args.layout, events: args.events)
       invoke.resolve(["ready": true])
     }
   }

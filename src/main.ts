@@ -1,4 +1,4 @@
-import { invoke } from "@tauri-apps/api/core";
+import { Channel, invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 import "./styles.css";
 import "./iphone.css";
@@ -1097,35 +1097,108 @@ async function readIphoneArtifacts(providerId: ProviderId, uuid: string, threadI
   }
 }
 
-let iphoneGlassFrame = 0;
-let iphoneGlassGeneration = 0;
-let iphoneGlassLayout = "";
+type IphoneNavigationEvent = { action: string; value?: string; top?: string; bottom?: string; width?: string };
+let iphoneNavigationEvents: Channel<IphoneNavigationEvent> | undefined;
+let iphoneNavigationFrame = 0;
+let iphoneNavigationInFlight = false;
+let iphoneNavigationLayout = "";
+let iphoneNavigationRetry: number | undefined;
+let iphoneNavigationRetries = 0;
 
-function scheduleIphoneGlass(): void {
-  if (iphoneGlassFrame || snapshot?.platform !== "ios") return;
-  iphoneGlassFrame = requestAnimationFrame(() => {
-    iphoneGlassFrame = 0;
+function receiveIphoneNavigation(event: IphoneNavigationEvent): void {
+  if (snapshot?.platform !== "ios") return;
+  if (event.action === "insets") {
+    const values = [Number(event.top), Number(event.bottom), Number(event.width)];
+    if (values.some((value) => !Number.isFinite(value) || value < 0) || !values[2]) return;
+    const [top, bottom, width] = values;
+    const scale = document.documentElement.clientWidth / width;
+    document.documentElement.style.setProperty("--iphone-native-top", `${Math.ceil(top * scale)}px`);
+    document.documentElement.style.setProperty("--iphone-native-bottom", `${Math.ceil(bottom * scale)}px`);
+    return;
+  }
+  if (event.action === "back" && modal.kind !== "none") {
+    document.querySelector<HTMLButtonElement>("#modal-root #modal-cancel-btn.iphone-back")?.click();
+    return;
+  }
+  if (modal.kind !== "none") return;
+  if (event.action === "query" && iphonePage === "search") {
+    updateIphoneQuery(event.value ?? "");
+    return;
+  }
+  const selectors: Record<string, string> = {
+    accounts: '.iphone-nav [data-iphone-page="accounts"]',
+    sessions: '.iphone-nav [data-iphone-page="sessions"]',
+    manage: '[data-iphone-page="manage"]',
+    overview: "#iphone-overview",
+    search: '[data-iphone-page="search"]',
+    cancelSearch: "[data-iphone-cancel-search]",
+    back: "#iphone-back",
+    addAccount: "#add-account-btn",
+    compose: "#iphone-compose",
+  };
+  let selector = Object.hasOwn(selectors, event.action) ? selectors[event.action] : undefined;
+  if (event.action === "provider" && (event.value === "muse" || event.value === "hark")) {
+    selector = `.iphone-service-menu [data-provider="${event.value}"]`;
+  }
+  const button = selector ? document.querySelector<HTMLButtonElement>(selector) : null;
+  const page = document.querySelector<HTMLElement>(".iphone-shell")?.dataset.iphoneView;
+  const main = page === "accounts" || page === "sessions";
+  const allowed = main ? ["accounts", "sessions", "compose", "manage", "search", "addAccount", "provider"].includes(event.action)
+    || (page === "accounts" && event.action === "overview")
+    : page === "search" ? event.action === "cancelSearch" : event.action === "back";
+  if (allowed) button?.click();
+}
+
+function updateIphoneQuery(value: string): void {
+  if (!snapshot) return;
+  iphoneQuery = value;
+  iphoneSearchScroll = 0;
+  syncIphoneViews(snapshot, currentProvider(snapshot));
+}
+
+function scheduleIphoneNavigation(): void {
+  if (iphoneNavigationFrame || iphoneNavigationInFlight || snapshot?.platform !== "ios") return;
+  iphoneNavigationFrame = requestAnimationFrame(() => {
+    iphoneNavigationFrame = 0;
     const shell = document.querySelector<HTMLElement>(".iphone-shell");
-    if (!shell) return;
-    const surfaces = modal.kind === "none" ? [...shell.querySelectorAll<HTMLElement>("[data-iphone-glass]")]
-      .filter((node) => node.getClientRects().length)
-      .map((node) => {
-        const rect = node.getBoundingClientRect();
-        return { x: rect.x, y: rect.y, width: rect.width, height: rect.height };
-      }) : [];
-    const layout = { surfaces, viewportWidth: document.documentElement.clientWidth };
-    const key = JSON.stringify(layout);
-    if (key === iphoneGlassLayout) return;
-    iphoneGlassLayout = key;
-    const generation = ++iphoneGlassGeneration;
-    void invoke<{ ready: boolean }>("update_iphone_glass", { layout: { ...layout, generation } }).then(({ ready }) => {
-      if (generation === iphoneGlassGeneration) document.documentElement.classList.toggle("native-iphone-glass", ready);
+    if (!shell || !snapshot) return;
+    const modalBack = shell.querySelector<HTMLButtonElement>("#modal-root #modal-cancel-btn.iphone-back");
+    const page = modal.kind === "none" ? shell.dataset.iphoneView ?? "hidden" : modalBack ? "modal" : "hidden";
+    const state = {
+      page, provider: snapshot.selectedProviderId,
+      composeEnabled: Boolean(currentProvider(snapshot).enabled && snapshot.conflicts.length === 0),
+      backEnabled: modalBack ? !modalBack.disabled : true,
+    };
+    const key = JSON.stringify(state);
+    if (key === iphoneNavigationLayout) return;
+    const binding = !iphoneNavigationLayout;
+    if (binding) iphoneNavigationEvents = new Channel<IphoneNavigationEvent>(receiveIphoneNavigation);
+    iphoneNavigationInFlight = true;
+    void invoke<{ ready: boolean }>("update_iphone_glass", {
+      layout: { ...state, query: iphoneQuery }, events: binding ? iphoneNavigationEvents : null,
+    }).then(({ ready }) => {
+      document.documentElement.classList.toggle("native-iphone-navigation", ready);
+      if (ready) {
+        iphoneNavigationLayout = key;
+        iphoneNavigationRetries = 0;
+      } else {
+        iphoneNavigationLayout = "";
+        if (iphoneNavigationRetry === undefined && iphoneNavigationRetries++ < 4) {
+          iphoneNavigationRetry = window.setTimeout(() => {
+            iphoneNavigationRetry = undefined;
+            scheduleIphoneNavigation();
+          }, 500);
+        }
+      }
     }).catch(() => {
-      if (generation === iphoneGlassGeneration) iphoneGlassLayout = "";
+      document.documentElement.classList.remove("native-iphone-navigation");
+      iphoneNavigationLayout = "";
+    }).finally(() => {
+      iphoneNavigationInFlight = false;
+      if (iphoneNavigationLayout === key) scheduleIphoneNavigation();
     });
   });
 }
-window.addEventListener("resize", scheduleIphoneGlass);
 
 function animateIphoneEntrance(page: IphonePage, previous: IphonePage, exiting?: HTMLElement): void {
   if (matchMedia("(prefers-reduced-motion: reduce)").matches) return;
@@ -1152,7 +1225,7 @@ function syncIphoneViews(state: ManagerSnapshot, provider: ProviderInfo): void {
     item.providerId === iphoneArtifacts?.providerId && item.authState === "authenticated")) iphoneArtifacts = null;
   const pageMode = spikeWorkspaceOpen && provider.id === "muse" ? "diagnostics" : page;
   shell.dataset.iphoneView = pageMode;
-  scheduleIphoneGlass();
+  scheduleIphoneNavigation();
   const header = shell.querySelector(".iphone-global-tools");
   const menu = shell.querySelector(".iphone-service-menu");
   const search = shell.querySelector(".iphone-search-tools");
@@ -1327,7 +1400,7 @@ async function setModal(next: ModalMode): Promise<void> {
   const wasActive = modal.kind !== "none";
   const isActive = next.kind !== "none";
   modal = next;
-  scheduleIphoneGlass();
+  scheduleIphoneNavigation();
   if (wasActive !== isActive) {
     try {
       snapshot = await invoke<ManagerSnapshot>("set_modal_active", {
@@ -3962,27 +4035,27 @@ function renderMiddleContent(state: ManagerSnapshot, provider: ProviderInfo): st
     return `
       <header class="iphone-top iphone-toolbar">
         <div class="iphone-global-tools">
-          <button type="button" data-iphone-page="manage" class="iphone-icon-button" data-iphone-glass aria-label="管理">${iphoneIcon("manage")}</button>
+          <button type="button" data-iphone-page="manage" class="iphone-icon-button" aria-label="管理">${iphoneIcon("manage")}</button>
           <div class="iphone-service-picker">
-            <button type="button" id="iphone-service-menu" class="iphone-service-button" data-iphone-glass aria-expanded="false">${escapeHtml(provider.shortName)} <span aria-hidden="true">⌄</span></button>
+            <button type="button" id="iphone-service-menu" class="iphone-service-button" aria-expanded="false">${escapeHtml(provider.shortName)} <span aria-hidden="true">⌄</span></button>
             <div class="iphone-service-menu" hidden>
               ${state.providers.map((item) => `<button type="button" data-provider="${escapeHtml(item.id)}" aria-current="${item.id === provider.id}">${escapeHtml(item.shortName)}</button>`).join("")}
               <button type="button" id="add-account-btn">新增账号</button>
             </div>
           </div>
-          <button type="button" id="iphone-overview" data-iphone-page="overview" class="iphone-icon-button" data-iphone-glass aria-label="总览">${iphoneIcon("pulse")}</button>
-          <button type="button" data-iphone-page="search" class="iphone-icon-button" data-iphone-glass aria-label="全局搜索">${iphoneIcon("search")}</button>
+          <button type="button" id="iphone-overview" data-iphone-page="overview" class="iphone-icon-button" aria-label="总览">${iphoneIcon("pulse")}</button>
+          <button type="button" data-iphone-page="search" class="iphone-icon-button" aria-label="全局搜索">${iphoneIcon("search")}</button>
         </div>
-        <button type="button" id="iphone-back" class="iphone-icon-button iphone-back-button" data-iphone-glass aria-label="返回" hidden>‹</button>
+        <button type="button" id="iphone-back" class="iphone-icon-button iphone-back-button" aria-label="返回" hidden>‹</button>
         <div class="iphone-search-tools" hidden>
-          <input type="search" id="iphone-global-search" data-iphone-glass aria-label="全局搜索" placeholder="搜索账号或会话">
-          <button type="button" data-iphone-cancel-search data-iphone-glass>取消</button>
+          <input type="search" id="iphone-global-search" aria-label="全局搜索" placeholder="搜索账号或会话">
+          <button type="button" data-iphone-cancel-search>取消</button>
         </div>
       </header>
       <div id="spike-account-view" class="spike-account-view">
         <h1 class="iphone-sr-only">账号</h1>
-        ${noticeHtml}${conflictsHtml}${filtersHtml}
         <div class="account-list${inReorder ? " reorder-mode" : ""}">
+          ${noticeHtml}${conflictsHtml}${filtersHtml}
           <section class="iphone-attention" aria-label="需要处理" hidden></section>
           <div class="iphone-list-title"><h2>全部账号 <small>${providerAccounts.length}</small></h2>
             <div class="iphone-list-actions">
@@ -4009,9 +4082,9 @@ function renderMiddleContent(state: ManagerSnapshot, provider: ProviderInfo): st
       <section class="iphone-account-panel iphone-scroll"></section>
       ${museDiagnostics ? spikeDiagHtml : ""}
       <nav class="iphone-nav" aria-label="叠号导航">
-        <div class="iphone-nav-tabs" data-iphone-glass><button type="button" data-iphone-page="accounts">${iphoneIcon("account")}<span>账号</span></button>
+        <div class="iphone-nav-tabs"><button type="button" data-iphone-page="accounts">${iphoneIcon("account")}<span>账号</span></button>
         <button type="button" data-iphone-page="sessions">${iphoneIcon("chat")}<span>会话</span></button></div>
-        <button type="button" id="iphone-compose" class="iphone-add" data-iphone-glass aria-label="新建对话" ${provider.enabled ? "" : "disabled"}>${iphoneIcon("add")}</button>
+        <button type="button" id="iphone-compose" class="iphone-add" aria-label="新建对话" ${provider.enabled ? "" : "disabled"}>${iphoneIcon("add")}</button>
       </nav>
       <div id="modal-root"></div>`;
   }
@@ -4751,7 +4824,7 @@ function bindDelegatedEvents(): void {
       syncIphoneViews(snapshot, currentProvider(snapshot));
       if (iphonePage === "accounts" && !iphoneDetail) restoreScrollPosition();
       if ((next && overlays.includes(next)) || exiting) animateIphoneEntrance(iphonePage, previous, exiting);
-      if (next === "search") document.getElementById("iphone-global-search")?.focus();
+      if (next === "search" && !document.documentElement.classList.contains("native-iphone-navigation")) document.getElementById("iphone-global-search")?.focus();
       if (next === "sessions" || next === "search") void refreshIphoneSessionBatch();
       return;
     }
@@ -5602,9 +5675,7 @@ root.addEventListener("change", async (ev) => {
   root.addEventListener("input", (ev) => {
     const input = ev.target as HTMLInputElement;
     if (input.id === "iphone-global-search" && snapshot) {
-      iphoneQuery = input.value;
-      iphoneSearchScroll = 0;
-      syncIphoneViews(snapshot, currentProvider(snapshot));
+      updateIphoneQuery(input.value);
       return;
     }
     if (input.id === "iphone-first-message" && modal.kind === "compose" && modal.uuid && !modal.pending) {
