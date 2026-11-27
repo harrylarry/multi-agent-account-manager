@@ -1,5 +1,11 @@
 # 当前开发进度
 
+## PR #16 合入收尾
+
+收尾范围限验收缺陷和主线合入准备。真机验收以当前候选 App 为准，旧版覆盖安装退出本轮验收。点选底栏项时玻璃指示器须跟随滑动，账号／会话仍通过点选切换。真机回报 `4b0a87f` 的底栏跟随动画未达到预期（M-5 `FAIL`），Muse 头像视频仍会突现后消失（M-2 `FAIL`）。两个结果均来自真机，CI 通过不改变此状态。
+
+在最新版 App 聚焦验证双账号实际切换、会话归属与代理隔离，以及发送结果未知时的核对和备份恢复。合入前以整包代码与真机证据为准，保存合入基线和回滚点。新增功能和非验收改动移出 PR #16。合入 `main` 需用户明确授权。
+
 ## iPhone 启动与交互优化
 
 Spike 0.1.26 基于 `4b0a87fb08aff1b215d1e9d67f88913dab28bae2`，最低 iOS 26.0。`CI_PASSED`。同一提交的 Quick checks 和 Xcode 打包均通过，已校验归档、IPA、包标识和图标。解压后 IPA SHA-256 为 `de330814b97a740ca6c72ab8ba37e2ea4cdac16652855bcaa7b347fd930dcd8c`。[下载 IPA](https://github.com/harrylarry/multi-agent-account-manager/actions/runs/45988780841/artifacts/15192853240) · [Quick checks](https://github.com/harrylarry/multi-agent-account-manager/actions/runs/45988762223) · [iOS 构建](https://github.com/harrylarry/multi-agent-account-manager/actions/runs/45988780841)

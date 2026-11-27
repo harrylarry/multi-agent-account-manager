@@ -33,7 +33,10 @@ final class ManagerGlassNavigation: UIView, UITextFieldDelegate {
   private let accountTab = UIButton(type: .system)
   private let sessionTab = UIButton(type: .system)
   private let tabIndicator = UIVisualEffectView(effect: UIGlassEffect(style: .regular))
+  private let tabIndicatorCarrier = UIView()
   private var indicatorTab: UIButton?
+  private var indicatorTarget = CGRect.null
+  private var indicatorAnimator: UIViewPropertyAnimator?
   private let compose = UIButton(type: .system)
   private var primary: UIStackView!
   private var search: UIStackView!
@@ -96,8 +99,10 @@ final class ManagerGlassNavigation: UIView, UITextFieldDelegate {
     dock.cornerConfiguration = .corners(radius: 26)
     tabIndicator.cornerConfiguration = .corners(radius: 21)
     tabIndicator.isUserInteractionEnabled = false
-    tabIndicator.isAccessibilityElement = false
-    dock.contentView.addSubview(tabIndicator)
+    tabIndicatorCarrier.isUserInteractionEnabled = false
+    tabIndicatorCarrier.accessibilityElementsHidden = true
+    dock.contentView.addSubview(tabIndicatorCarrier)
+    embed(tabIndicator, in: tabIndicatorCarrier)
     configureTab(accountTab, title: "账号", action: "accounts")
     configureTab(sessionTab, title: "会话", action: "sessions")
     let tabs = row([accountTab, sessionTab])
@@ -123,6 +128,8 @@ final class ManagerGlassNavigation: UIView, UITextFieldDelegate {
     ])
     top.isHidden = true
     bottom.isHidden = true
+    NotificationCenter.default.addObserver(self, selector: #selector(reduceMotionChanged),
+      name: UIAccessibility.reduceMotionStatusDidChangeNotification, object: nil)
     NotificationCenter.default.addObserver(self, selector: #selector(keyboardFrameChanged(_:)),
       name: UIResponder.keyboardWillChangeFrameNotification, object: nil)
   }
@@ -212,19 +219,42 @@ final class ManagerGlassNavigation: UIView, UITextFieldDelegate {
     }
   }
 
-  private func layoutTabIndicator(animated: Bool) {
-    guard let tab = indicatorTab, let container = tabIndicator.superview else { return }
-    let target = tab.convert(tab.bounds, to: container)
-    guard !target.isEmpty, target != tabIndicator.frame else { return }
-    if animated && !tabIndicator.frame.isEmpty && !UIAccessibility.isReduceMotionEnabled {
-      UIView.animate(withDuration: 0.34, delay: 0, usingSpringWithDamping: 0.62, initialSpringVelocity: 0,
-                     options: [.beginFromCurrentState, .allowUserInteraction]) {
-        self.tabIndicator.frame = target
-      }
-    } else {
-      tabIndicator.layer.removeAllAnimations()
-      tabIndicator.frame = target
+  @objc private func reduceMotionChanged() {
+    if UIAccessibility.isReduceMotionEnabled {
+      indicatorAnimator?.stopAnimation(true)
+      indicatorAnimator = nil
+      if !indicatorTarget.isNull { tabIndicatorCarrier.frame = indicatorTarget }
     }
+  }
+
+  private func layoutTabIndicator(animated: Bool) {
+    guard let tab = indicatorTab, let container = tabIndicatorCarrier.superview else { return }
+    let target = tab.convert(tab.bounds, to: container)
+    guard !target.isEmpty, target != indicatorTarget else { return }
+
+    // Keep layout passes from resetting the animation. When retargeting,
+    // start at the layer's visible position rather than its model endpoint.
+    let visible = tabIndicatorCarrier.layer.presentation()?.frame ?? tabIndicatorCarrier.frame
+    indicatorAnimator?.stopAnimation(true)
+    indicatorAnimator = nil
+    indicatorTarget = target
+    guard animated, !visible.isEmpty,
+          !UIAccessibility.isReduceMotionEnabled else {
+      tabIndicatorCarrier.frame = target
+      return
+    }
+    tabIndicatorCarrier.frame = visible
+    let destination = CGPoint(x: target.midX, y: target.midY)
+    let animator = UIViewPropertyAnimator(duration: 0.36, dampingRatio: 0.62) { [weak self] in
+      guard let carrier = self?.tabIndicatorCarrier else { return }
+      carrier.center = destination
+      if carrier.bounds.size != target.size {
+        carrier.bounds.size = target.size
+        carrier.layoutIfNeeded()
+      }
+    }
+    indicatorAnimator = animator
+    animator.startAnimation()
   }
 
   func apply(_ state: ManagerGlassArgs.Layout, events: Channel?) {
