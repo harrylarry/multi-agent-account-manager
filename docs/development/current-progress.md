@@ -1,5 +1,13 @@
 # 当前开发进度
 
+## iPhone 启动与交互优化
+
+Spike 0.1.26 基于 `4b0a87fb08aff1b215d1e9d67f88913dab28bae2`，最低 iOS 26.0。`CI_PASSED`。同一提交的 Quick checks 和 Xcode 打包均通过，已校验归档、IPA、包标识和图标。解压后 IPA SHA-256 为 `de330814b97a740ca6c72ab8ba37e2ea4cdac16652855bcaa7b347fd930dcd8c`。[下载 IPA](https://github.com/harrylarry/multi-agent-account-manager/actions/runs/45988780841/artifacts/15192853240) · [Quick checks](https://github.com/harrylarry/multi-agent-account-manager/actions/runs/45988762223) · [iOS 构建](https://github.com/harrylarry/multi-agent-account-manager/actions/runs/45988780841)
+
+M-1、M-2、M-3、M-5 和 M-6 已实现。双尺寸 WebKit 回归覆盖 Muse 头像插入、换源、超时显现和消息视频隔离，会话无缓存补载及全失败重进，三个账号的草稿与焦点和发送结果未知时的防重发。原生冷启动、真机媒体合成、底栏玻璃动画和实际账号交互待[真机复测](../acceptance/iphone-acceptance.md#iphone-启动与交互优化)。
+
+M-4 后续先核对 Muse 和 Hark 会话列表是否提供可索引摘要；若字段不足，再评估按会话限量读近期内容。本地索引须兼容现有缓存并设置容量上限，标题优先、内容命中带片段。当前搜索继续使用本地会话标题，本批无全文索引、冷启动预取或缓存迁移。
+
 ## iPhone 十项真机反馈修正
 
 Spike 0.1.26 基于 `ef217f17944e9d4d6eb44fa2370649db2d4067fe`，最低 iOS 26.0。`CI_PASSED`。Quick checks 和 Xcode 打包均通过，下载后已核对归档、IPA、包标识和图标。解压后 IPA 的 SHA-256 为 `385999f2615eb111b3906ea3057053b0d2594c8f52bb692d7a3de91d193e62d6`。[下载 IPA](https://github.com/harrylarry/multi-agent-account-manager/actions/runs/45981448790/artifacts/15189609156) · [Quick checks](https://github.com/harrylarry/multi-agent-account-manager/actions/runs/45981433817) · [iOS 构建](https://github.com/harrylarry/multi-agent-account-manager/actions/runs/45981448790)
