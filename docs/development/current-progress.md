@@ -2,6 +2,10 @@
 
 ## PR #16 合入收尾
 
+最新验收包 Spike 0.1.26 基于 `7eeeb9b7c3866b3faacf7dfebd23fe1079fae64b`，最低 iOS 26.0。`CI_PASSED`，IPA 已下载校验。解压后 SHA-256 为 `8651211bbbf5e3c4f5ac45e01037c63140d0176c5294c2973849fa5cb29c1db1`。[下载 IPA](https://github.com/harrylarry/multi-agent-account-manager/actions/runs/46000516930/artifacts/15198646927) · [CI](https://github.com/harrylarry/multi-agent-account-manager/actions/runs/46000482948) · [Xcode 构建](https://github.com/harrylarry/multi-agent-account-manager/actions/runs/46000516930)
+
+按 UIKit 指南核查顶栏、服务菜单、搜索、底栏、新建对话和导航转场。底栏由单个标准 UISegmentedControl 接收触摸并渲染玻璃，移除额外玻璃底座和自绘指示器。顶栏和新建对话保留系统玻璃按钮，搜索保留单层玻璃背板和原生输入。Muse 只为自动播放的头像视频补齐内联属性，消息视频保留原行为。原生按压跟手、各页面实际材质及头像跳出仍须在此包[真机复测](../acceptance/iphone-acceptance.md#pr-16-收尾复测当前-app)。用户已授权达到合入条件后并入 `main`。
+
 底栏收尾候选 Spike 0.1.26，源码 `bbbb5857ca9037e33bab877406f9b402d61631ee`，最低 iOS 26.0。`CI_PASSED`，已校验 IPA 和包标识。解压后 IPA SHA-256 为 `9af2cdcaf0788834d1f22c656c26a7d8ee3d9003e99e246ec866b1869d11de49`。底栏指示器复测待回执，头像视频仍为 `FAIL`。[下载 IPA](https://github.com/harrylarry/multi-agent-account-manager/actions/runs/45996300058/artifacts/15196094369) · [CI](https://github.com/harrylarry/multi-agent-account-manager/actions/runs/45996285715) · [收尾复测](../acceptance/iphone-acceptance.md#pr-16-收尾复测当前-app)
 
 收尾范围限验收缺陷和主线合入准备。真机验收以当前候选 App 为准，旧版覆盖安装退出本轮验收。点选底栏项时玻璃指示器须跟随滑动，账号／会话仍通过点选切换。真机回报 `4b0a87f` 的底栏跟随动画未达到预期（M-5 `FAIL`），Muse 头像视频仍会突现后消失（M-2 `FAIL`）。两个结果均来自真机，CI 通过不改变此状态。
