@@ -1,5 +1,11 @@
 # 当前开发进度
 
+## iPhone 十项真机反馈修正
+
+Spike 0.1.26 基于 `ef217f17944e9d4d6eb44fa2370649db2d4067fe`，最低 iOS 26.0。`CI_PASSED`。Quick checks 和 Xcode 打包均通过，下载后已核对归档、IPA、包标识和图标。解压后 IPA 的 SHA-256 为 `385999f2615eb111b3906ea3057053b0d2594c8f52bb692d7a3de91d193e62d6`。[下载 IPA](https://github.com/harrylarry/multi-agent-account-manager/actions/runs/45981448790/artifacts/15189609156) · [Quick checks](https://github.com/harrylarry/multi-agent-account-manager/actions/runs/45981433817) · [iOS 构建](https://github.com/harrylarry/multi-agent-account-manager/actions/runs/45981448790)
+
+F-1 至 F-10 已逐项复核。14 项 JS/IPC、92 项 Rust 测试及两种屏宽的 WebKit 回归通过。原生玻璃观感和设备交互待用户按[真机步骤](../acceptance/iphone-acceptance.md#spike-ef217f1-真机验收)回执。未读拉取与红点机制沿用原逻辑，未读专项仍独立安排。代码保存在 [PR #16](https://github.com/harrylarry/multi-agent-account-manager/pull/16) 的开发分支。
+
 ## iPhone 真机回报修正
 
 Spike 0.1.26 基于 `74e3cf67392c716511eb28ffa1dc3fe8d7f04278`，最低 iOS 26.0。`CI_PASSED`。Swift 插件、Rust iOS 目标和 Xcode 打包通过。下载后核对归档、IPA、Bundle ID 和包内 120×120 主图标，像素与新图稿一致。IPA SHA-256 为 `fd20442dafaff2619fa7b2804402a05bb9051cb69463cc8e668b0be0623690e3`。[下载 IPA](https://github.com/harrylarry/multi-agent-account-manager/actions/runs/45969403734/artifacts/15184349912) · [Quick checks](https://github.com/harrylarry/multi-agent-account-manager/actions/runs/45969388240) · [iOS 构建](https://github.com/harrylarry/multi-agent-account-manager/actions/runs/45969403734)
