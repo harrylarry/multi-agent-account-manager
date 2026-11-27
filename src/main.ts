@@ -26,7 +26,7 @@ type ModalMode =
   | { kind: "harkDiagnostic"; account: AccountRecord }
   | { kind: "harkReplies"; account: AccountRecord; reading: boolean; result: HarkRecovery | null; error: string }
   | { kind: "backup"; busy: boolean; encrypted: string; fileName: string; preview: BackupPreview | null; message: string; mode: BackupMode; includeGroups: boolean; includeProxy: boolean; includeCredentials?: boolean; fromLan?: boolean; expiryDays: number; lanCode?: string; lanShare?: {code:string;png:string;seconds:number} }
-  | { kind: "proxyPool"; account: AccountRecord | null; data: ProxyPoolView | null; setting: SpikeProxySettingView | null; selected?: string; editId?: string; busy: boolean; message: string }
+  | { kind: "proxyPool"; account: AccountRecord | null; data: ProxyPoolView | null; setting: SpikeProxySettingView | null; selected?: string; editId?: string; detection?: { result: string; at: number }; busy: boolean; message: string }
   | { kind: "sessions"; account: AccountRecord; loading: boolean; items: MuseSession[] | null; error: string }
   | { kind: "cookies"; account: AccountRecord; busy: boolean; preview: CookiePreview | null; message: string; imported: boolean; stored: Pick<CookiePreview, "count" | "nextExpiry"> | null }
   | { kind: "approvals"; account: AccountRecord; loading: boolean; result: SpikeApprovalsResult | null; fetchedAt: number | null; decisionMessage: string }
@@ -1856,20 +1856,14 @@ function spikeDiagInnerHtml(accountUuid: string | undefined = pickWatchAccount()
   let proxyHtml = "";
   if (proxyAccount.view) {
     const v = proxyAccount.view;
-    proxyHtml += `<div class="hint">账号代理：${v.enabled ? "已启用" : "未启用"}　${escapeHtml(v.display)}</div>`;
-    const credential = v.hasCredentials ? (v.credentialAvailable ? "可读" : "不可用") : "无需认证";
-    proxyHtml += `<div class="hint">Keychain 凭据：${credential}</div>`;
     const wv = v.webview;
-    if (wv) {
-      const desc = wv.applied
-        ? wv.sessionOpen
-          ? "已写入（当前会话需重新打开才生效）"
-          : "已写入"
-        : `未生效：${wv.reason ?? "该设备不支持 WebView 代理"}`;
-      proxyHtml += `<div class="hint">账号 WebView：${escapeHtml(desc)}</div>`;
-    } else {
-      proxyHtml += `<div class="hint">账号 WebView：等待会话打开或保存时验证下发</div>`;
-    }
+    const delivery = wv?.applied ? (wv.sessionOpen ? "已下发，重新打开会话后生效" : "已下发")
+      : wv ? wv.reason ?? "未能下发" : "待验证";
+    proxyHtml += iphoneStatusList([
+      ["账号代理", v.enabled ? v.display : "未启用"],
+      ["认证凭据", v.hasCredentials ? (v.credentialAvailable ? "可用" : "不可用") : "无需认证"],
+      ["网页代理", v.enabled ? delivery : null],
+    ]);
   }
   if (proxyAccount.saveLines.length) {
     const cls =
@@ -1880,7 +1874,7 @@ function spikeDiagInnerHtml(accountUuid: string | undefined = pickWatchAccount()
   }
   if (proxyAccount.result) {
     const p = proxyAccount.result;
-    proxyHtml = `
+    proxyHtml += `
       <div class="spike-diag-result ${p.ok ? "ok" : "fail"}">
         <div>${p.ok ? "✓" : "■"} 代理探针：阶段 ${escapeHtml(p.phase)}　协议 ${escapeHtml(p.proxyScheme ?? "—")}　隧道 ${escapeHtml(p.tunnelVia ?? "—")}</div>
         ${p.phase === "connectivity"
@@ -3116,14 +3110,18 @@ function renderTasks(view: Extract<ModalMode, { kind: "tasks" }>): string {
         <p class="modal-desc">自动检查在前台运行，低电量模式下暂停。回到前台时会检查已保留的会话页面。</p>` : ""}
         ${note ? `<div class="modal-desc" role="status">${escapeHtml(note)}</div>` : ""}
         ${section === "models" ? `
+          <p class="modal-desc">检测会在隔离会话发送三条消息并消耗该账号额度。候选结果基于参考库。${account.providerId === "hark" ? "首次须验证同一账号的隔离发送和完整回复。" : ""}</p>
           <details class="hark-reply" ${fingerprintRunning ? "open" : ""}><summary>检测记录 ${records.length ? "· " + escapeHtml(records[0].model ?? "不可判定") : ""}</summary>
-            <div class="modal-desc">检测会在隔离会话发送三条消息并消耗该账号额度。结果是根据参考库推断的模型候选。${account.providerId === "hark" ? "首次须通过同一账号的隔离发送和完整回复验证。" : ""}</div>
             ${fingerprintRunning ? `<div role="status">检测中 · 已取得 ${spikeFingerprintProgress?.samples ?? 0}/3 条样本</div>` : ""}
-            ${records.map((record) => `<div class="modal-desc">${new Date(record.recordedAtMs).toLocaleString()} ·
-              ${escapeHtml(record.model ?? "不可判定")} · ${record.validSamples}/3 条
-              ${record.probabilityPpm != null ? ` · ${(record.probabilityPpm / 10000).toFixed(1)}%` : ""}
-              ${record.referenceBuiltAt ? `<div>参考库 ${escapeHtml(record.referenceBuiltAt)}${record.referenceSha256 ? ` · ${escapeHtml(record.referenceSha256.slice(0, 12))}` : ""}</div>` : ""}
-            </div>`).join("")}
+            ${records.length ? records.map((record) => `<details class="iphone-disclosure">
+              <summary>${escapeHtml(record.model ?? "不可判定")} · ${new Date(record.recordedAtMs).toLocaleString()}</summary>
+              ${iphoneStatusList([
+                ["有效样本", `${record.validSamples}/3 条`],
+                ["校准置信度", record.probabilityPpm != null ? `${(record.probabilityPpm / 10000).toFixed(1)}%` : null],
+                ["参考库时间", record.referenceBuiltAt],
+                ["参考库 SHA-256", record.referenceSha256?.slice(0, 12)],
+              ])}
+            </details>`).join("") : '<p class="modal-desc">本机暂无检测记录。</p>'}
           </details>
           ${fingerprintRunning ? '<button id="account-fingerprint-stop" class="btn" type="button">停止检测</button>' :
             `<button id="account-fingerprint-start" class="btn primary" type="button" ${spikeFingerprintRunning ? "disabled" : ""}>检测模型</button>`}
@@ -3259,10 +3257,10 @@ function renderAccountBackup(view: Extract<ModalMode, { kind: "backup" }>): stri
             <option value="custom" ${mode === "custom" ? "selected" : ""}>自定义</option>
           </select>
           ${mode === "custom" ? `<div class="proxy-pool-actions">
-            <label><input id="backup-include-groups" type="checkbox" ${includeGroups ? "checked" : ""} ${disabled} />分组</label>
-            <label><input id="backup-include-proxy" type="checkbox" ${includeProxy ? "checked" : ""} ${disabled} />账号代理端点</label>
+            <label class="iphone-check iphone-switch"><input id="backup-include-groups" type="checkbox" role="switch" ${includeGroups ? "checked" : ""} ${disabled} />分组</label>
+            <label class="iphone-check iphone-switch"><input id="backup-include-proxy" type="checkbox" role="switch" ${includeProxy ? "checked" : ""} ${disabled} />账号代理端点</label>
           </div>` : ""}
-          <label><input id="backup-include-credentials" type="checkbox" ${view.includeCredentials ? "checked" : ""} ${disabled}> 包含登录 Cookie 和代理密码</label>
+          <label class="iphone-check iphone-switch"><input id="backup-include-credentials" type="checkbox" role="switch" ${view.includeCredentials ? "checked" : ""} ${disabled}> 包含登录 Cookie 和代理密码</label>
           <label for="backup-expiry">导出有效期</label>
           <select id="backup-expiry" class="modal-input" ${disabled}>
             ${[[0, "长期保留"], [1, "1 天"], [7, "7 天"], [30, "30 天"]].map(([days, title]) =>
@@ -3402,17 +3400,20 @@ function renderProxyPool(view: Extract<ModalMode, { kind: "proxyPool" }>): strin
   const editing = data?.entries.find((entry) => entry.id === view.editId);
   const disabled = busy ? "disabled" : "";
   const action = (label: string, name: string, id = "") =>
-    `<button type="button" class="mini-btn" data-proxy-pool-action="${name}" data-pool-id="${escapeHtml(id)}" ${disabled}>${label}</button>`;
+    `<button type="button" class="${label === '检测代理' ? 'btn primary' : 'mini-btn'}" data-proxy-pool-action="${name}" data-pool-id="${escapeHtml(id)}" ${disabled}>${label}</button>`;
   return `
     <div class="inline-modal" role="dialog" aria-modal="true" aria-labelledby="proxy-pool-title">
       <div class="modal-card proxy-pool-modal">
         <div class="modal-title" id="proxy-pool-title">${account ? "账号代理" : "代理池"}</div>
         ${account ? iphoneStatusList([
           ["当前生效", setting?.enabled ? setting.display : busy ? "正在读取…" : "未启用"],
-          ["认证凭据", setting?.enabled ? setting.credentialAvailable === false ? "不可用" : setting.credentialAvailable === true ? "可用" : null : null],
+          ["协议", setting?.enabled ? setting.display.split(":", 1)[0].toUpperCase() : null],
+          ["认证凭据", setting?.enabled ? setting.hasCredentials ? setting.credentialAvailable === false ? "不可用" : "可用" : "无需认证" : null],
+          ["所选代理检测", view.detection?.result],
+          ["检测时间", view.detection ? new Date(view.detection.at).toLocaleString() : null],
         ]) : ""}
         ${!account && snapshot?.platform === "ios" && iosNetworkPrefs ? `<details class="iphone-disclosure"><summary>会话保留与额度刷新</summary><div class="proxy-pool-actions">
-          <label><input id="ios-proxy-retention" type="checkbox" ${iosNetworkPrefs.isolate ? "checked" : ""} ${disabled}> 同一服务和代理出口仅保留最近使用的会话页面</label>
+          <label class="iphone-check iphone-switch"><input id="ios-proxy-retention" type="checkbox" role="switch" ${iosNetworkPrefs.isolate ? "checked" : ""} ${disabled}> 同一服务和代理出口仅保留最近使用的会话页面</label>
           <label for="ios-quota-interval">自动刷新额度（仅前台）</label>
           <select id="ios-quota-interval" class="modal-input" ${disabled}>${[[0,"回到前台或切换账号时"],[5,"每 5 分钟"],[15,"每 15 分钟"],[30,"每 30 分钟"]].map(([minutes,label]) =>
             `<option value="${minutes}" ${iosNetworkPrefs?.quotaMinutes === minutes ? "selected" : ""}>${label}</option>`).join("")}</select>
@@ -3540,6 +3541,7 @@ async function proxyPoolAction(view: Extract<ModalMode, { kind: "proxyPool" }>, 
     } else if (action === "clear" && target) {
       await invoke("muse_native_clear_account_proxy", target);
       view.setting = null;
+      view.detection = undefined;
       if (target.providerId === "muse") spikeProxyAccounts.delete(target.uuid);
       iphoneProxyFaults.delete(iphoneAccountKey(target));
       view.message = "已停用账号代理，将使用系统网络。";
@@ -3549,7 +3551,8 @@ async function proxyPoolAction(view: Extract<ModalMode, { kind: "proxyPool" }>, 
         action === "measure-entry" ? { providerId: target.providerId, entryId } : target,
       );
       if (action === "measure") iphoneProxyFaults.delete(iphoneAccountKey(target));
-      view.message = `代理 HTTPS 可达 · HTTP ${result.status} · ${result.milliseconds} ms`;
+      view.detection = { result: `HTTPS ${result.status} · ${result.milliseconds} ms`, at: Date.now() };
+      view.message = "";
     } else {
       const poolAction = action === "remove-source" ? "remove" : action === "save-edit" ? "edit" : action;
       view.data = await invoke<ProxyPoolView>("manage_proxy_pool", {
@@ -3570,6 +3573,7 @@ async function proxyPoolAction(view: Extract<ModalMode, { kind: "proxyPool" }>, 
     }
   } catch (error) {
     if (action === "measure" && target) iphoneProxyFaults.set(iphoneAccountKey(target), "unreachable");
+    if (action === "measure" || action === "measure-entry") view.detection = { result: "连接失败", at: Date.now() };
     view.message = String(error);
   } finally {
     view.busy = false;
@@ -3621,8 +3625,11 @@ function renderCookieModal(view: Extract<ModalMode, { kind: "cookies" }>): strin
       <div class="modal-card">
         <div class="modal-title" id="cookie-title">登录恢复</div>
         <div class="modal-desc">导入前先预览。导入后打开会话核对登录状态。</div>
-        <div class="modal-desc">上次登录检查 · ${account.authState === "authenticated" ? "已登录" : account.authState === "logged_out" ? "需要重新登录" : "未验证"}</div>
-        <div class="modal-desc" id="account-cookie-stored">${stored?.count ? `本机会话有 ${stored.count} 条 Cookie · 最早已知到期 ${stored.nextExpiry ? new Date(stored.nextExpiry * 1000).toLocaleString() : "未提供"}` : stored ? "暂未读到本机 Cookie。可打开此账号确认登录后再查看。" : "本机 Cookie 状态暂不可用。"}</div>
+        <div id="account-cookie-stored">${iphoneStatusList([
+          ["登录状态", account.authState === "authenticated" ? "已登录" : account.authState === "logged_out" ? "需要重新登录" : "未验证"],
+          ["本机 Cookie", stored == null ? "暂不可用" : `${stored.count} 条`],
+          ["最早已知到期", stored ? stored.nextExpiry ? new Date(stored.nextExpiry * 1000).toLocaleString() : "未提供" : null],
+        ])}</div>
         <label for="account-cookie-input">Cookie</label>
         <textarea id="account-cookie-input" class="modal-input account-cookie-input" placeholder="粘贴 Cookie 或带来源的会话 Token JSON" spellcheck="false" autocomplete="off" autocapitalize="off" ${busy ? "readonly" : ""}></textarea>
         <details class="iphone-disclosure"><summary>会话 Token 格式</summary><div class="modal-desc">填写真实导出信息。JSON 需要 type 为 session-cookie-token、provider 为 muse 或 hark，以及 cookieName、domain、token。可填写 Unix 秒 expirationDate。</div></details>
@@ -5718,6 +5725,7 @@ root.addEventListener("change", async (ev) => {
     const field = ev.target;
     if (modal.kind === "proxyPool" && field instanceof HTMLSelectElement && field.id === "proxy-pool-selection") {
       modal.selected = field.value;
+      modal.detection = undefined;
       modal.message = "";
       await setModal(modal);
       return;
