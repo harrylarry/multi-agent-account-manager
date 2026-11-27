@@ -5,6 +5,8 @@
 
 ## iPhone 原生玻璃导航
 
+Spike 0.1.26 基于 `baa6394b2760472302b0441762995cf8957e23bf`，最低 iOS 26.0。解压后的 IPA SHA-256 为 `60efe7e91413898de2c94b6e04b5e0f8407ad8923a12731a36fb480e0c78d067`。Quick checks 与 Xcode 打包通过，下载后已核对包体。玻璃折射、触摸反馈与设备过渡效果待真机验收。[下载 IPA](https://github.com/harrylarry/multi-agent-account-manager/actions/runs/45921741203/artifacts/15164753667) · [Quick checks](https://github.com/harrylarry/multi-agent-account-manager/actions/runs/45921726634) · [iOS 构建](https://github.com/harrylarry/multi-agent-account-manager/actions/runs/45921741203)
+
 1. 用 iPhone 覆盖安装。打开账号或会话列表，从两个玻璃栏之间上下滚动，观察头像、列表文字经过栏下时的折射和对比度是否连续。列表收尾处仍应能看见和点到最后一行。确认滚动过程中没有跳动、重影或网页导航重复出现。
 2. 轻按管理、总览、搜索、返回和底栏新建按钮，观察玻璃是否随实际控件一起响应。切换 Muse 和 Hark，确认菜单标题、列表与会话归属同步，切回时核对滚动位置。管理从左进入，总览和搜索从右进入，返回沿相反方向。开启「减少动态效果」后再试一次。
 3. 全局搜索输入中文和英文，试用清除与取消，再打开跨服务结果并返回核对查询和列表位置。点击右下新建对话，检查账号归属、键盘、草稿和返回，验玻璃时可以在发送前返回。需要验证发送时只用测试账号，发一条唯一短句。
