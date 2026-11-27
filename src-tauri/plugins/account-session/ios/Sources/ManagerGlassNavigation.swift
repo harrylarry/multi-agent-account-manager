@@ -191,18 +191,23 @@ final class ManagerGlassNavigation: UIView, UITextFieldDelegate {
   }
 
   private func configureTab(_ button: UIButton, title: String, action: String) {
-    var config = UIButton.Configuration.plain()
-    config.title = title
-    config.cornerStyle = .capsule
-    button.configuration = config
+    var plain = UIButton.Configuration.plain()
+    plain.title = title
+    plain.baseForegroundColor = .label
+    plain.automaticallyUpdateForSelection = false
+
+    var glass = UIButton.Configuration.glass()
+    glass.title = title
+    // The 42pt tab is inset by 5pt in the 52pt dock: 21pt and 26pt are concentric.
+    glass.cornerStyle = .capsule
+    glass.baseForegroundColor = .systemBlue
+    glass.automaticallyUpdateForSelection = false
+
+    button.configuration = plain
     button.accessibilityIdentifier = "manager-" + action
     button.addAction(UIAction { [weak self] _ in self?.send(action) }, for: .touchUpInside)
     button.configurationUpdateHandler = { tab in
-      var configuration = tab.configuration
-      configuration?.baseForegroundColor = tab.isSelected ? .systemBlue : .label
-      configuration?.background.backgroundColor = tab.isSelected
-        ? UIColor.systemBlue.withAlphaComponent(0.18) : .clear
-      tab.configuration = configuration
+      tab.configuration = tab.isSelected ? glass : plain
     }
   }
 

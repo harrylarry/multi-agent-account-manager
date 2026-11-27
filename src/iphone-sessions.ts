@@ -52,17 +52,15 @@ export function reconcileIphoneSessions(accounts: AccountRecord[]): void {
 
 export function iphoneSessionsFor(account: AccountRecord) {
   const key = sessionAccountKey(account);
-  return { items: records.get(key)?.items ?? [], pending: requests.has(key), failed: failures.has(key) };
+  return { items: records.get(key)?.items ?? [], cached: records.has(key), pending: requests.has(key), failed: failures.has(key) };
 }
 
-export function updateIphoneSessions(account: AccountRecord, force: boolean, notify: () => void): Promise<void> | undefined {
+export function updateIphoneSessions(account: AccountRecord, notify: () => void): Promise<void> | undefined {
   const uuid = account.uuid;
   const key = sessionAccountKey(account);
   if (!eligible.has(key)) return;
   const pending = requests.get(key);
   if (pending) return pending;
-  const cached = records.get(key);
-  if (!force && cached && !failures.has(key) && Date.now() - cached.fetchedAt < 30_000) return;
   const work = invoke<IphoneSession[]>(account.providerId === "muse" ? "list_muse_sessions" : "list_hark_sessions", { uuid }).then((items) => {
     if (requests.get(key) !== work || !eligible.has(key)) return;
     records.set(key, { items: [...new Map(items.map((item) => [item.id, item])).values()], fetchedAt: Date.now() });

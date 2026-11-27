@@ -327,7 +327,7 @@
   background: linear-gradient(160deg, var(--dh-mist), var(--dh-page) 53%);
 }
 .iphone-shell .iphone-subpage .modal-card > * { flex-shrink: 0; }
-.iphone-shell .iphone-subpage .modal-title {
+.iphone-shell :is(.iphone-subpage .modal-title, .iphone-task-title) {
   font-size: 20px;
   font-weight: 600;
   line-height: 1.25;
@@ -445,14 +445,12 @@
   font-size: 13px;
   color: var(--dh-secondary);
 }
-.iphone-shell #iphone-unread-refresh { margin-block: 0 8px; }
 @media (prefers-reduced-motion: reduce) {
   .iphone-shell .account-list > :not(.iphone-pull-indicator) { transition: none; }
 }
 .iphone-shell .iphone-group-filter { padding-bottom: 8px; }
 .iphone-shell #iphone-account-groups { font-size: inherit; font-weight: inherit; text-align: left; padding-inline: 0; }
 .iphone-shell .iphone-accessible-action:focus-visible { position: static; width: auto; height: auto; clip-path: none; }
-.iphone-shell .iphone-task-title { font-size: 20px; font-weight: 600; letter-spacing: normal; }
 .iphone-shell .iphone-form-group { display: grid; gap: 8px; padding: 12px; background: var(--dh-surface); border-radius: var(--dh-card-radius); }
 .iphone-shell .iphone-form-group label { margin-top: 4px; }
 .iphone-shell .iphone-form-group #add-cookie-input { min-height: 72px; }
@@ -489,3 +487,6 @@
 .iphone-shell .iphone-proxy-entry { display: grid; gap: 10px; min-width: 0; padding: 12px; border: 1px solid var(--dh-line); border-radius: var(--dh-card-radius); background: var(--dh-surface); }
 .iphone-shell .iphone-proxy-entry strong { overflow-wrap: anywhere; }
 .iphone-shell .iphone-proxy-entry .iphone-status-list { padding-inline: 0; }
+
+.iphone-shell .proxy-pool-body { max-height: none; overflow-y: visible; }
+.iphone-shell .iphone-proxy-entry .iphone-form-group { padding: 0; }

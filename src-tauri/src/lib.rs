@@ -1777,6 +1777,7 @@ pub struct ProxySettingView {
   pub pool_entry_id: Option<uuid::Uuid>,
   pub enabled: bool,
   pub display: String,
+  pub scheme: Option<&'static str>,
   pub has_credentials: bool,
   pub credential_available: Option<bool>,
   /// iOS：账号 WebView（WKWebView）侧的代理应用结果；其它平台为 `None`（不适用，
@@ -2130,6 +2131,7 @@ async fn save_account_proxy(
     pool_entry_id,
     enabled: setting.enabled,
     display: setting.display_safe(),
+    scheme: muse_native_client::proxy::ProxyConfig::parse_endpoint(&setting.uri).ok().map(|uri| uri.scheme),
     has_credentials: setting.credential_ref.is_some(),
     credential_available: proxy_credential_available(&setting, &secrets),
     webview,
@@ -2156,6 +2158,7 @@ async fn muse_native_get_account_proxy(
     pool_entry_id: s.pool_entry_id,
     enabled: s.enabled,
     display: s.display_safe(),
+    scheme: muse_native_client::proxy::ProxyConfig::parse_endpoint(&s.uri).ok().map(|uri| uri.scheme),
     has_credentials: s.credential_ref.is_some(),
     credential_available: proxy_credential_available(&s, &secrets),
     webview: None,

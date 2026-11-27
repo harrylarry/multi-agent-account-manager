@@ -71,12 +71,11 @@ pub struct ApplyEntry {
 }
 
 #[derive(Deserialize, Zeroize, ZeroizeOnDrop)]
-#[serde(rename_all = "camelCase")]
+#[serde(deny_unknown_fields)]
 struct ManualEdit {
   endpoint: String,
   username: String,
   password: String,
-  remove_auth: bool,
 }
 
 #[cfg(not(target_os = "android"))]
@@ -217,23 +216,20 @@ impl ProxyPool {
     let candidates = Zeroizing::new(parse_lines(&edit.endpoint)?);
     let [endpoint] = candidates.as_slice() else { return Err("请输入一条代理地址".into()); };
     if endpoint.contains('@') { return Err("账号和密码请填写在认证栏".into()); }
-    let entry = self.selected(id)?;
-    if edit.remove_auth { return self.edit_manual(id, endpoint); }
-    if endpoint != &entry.endpoint && entry.password.is_some()
-      && (edit.username.is_empty() || edit.password.is_empty()) {
-      return Err("代理地址已变更，请重新填写认证信息或明确移除认证".into());
+    let entry = self.entries.iter().find(|entry| entry.id == id && entry.source.is_none())
+      .ok_or("只能编辑手动添加的代理")?;
+    let previous = ProxyConfig::parse(&entry.uri).map_err(|_| "代理条目已损坏")?;
+    match (edit.username.is_empty(), edit.password.is_empty()) {
+      (true, true) if endpoint == &previous.display_safe() => return Ok(()),
+      (true, true) => return Err("代理地址已变更，请重新填写用户名和密码".into()),
+      (true, false) | (false, true) => return Err("代理用户名和密码需要同时提供".into()),
+      (false, false) => {}
     }
-    let saved_username = entry.username.map(Zeroizing::new);
-    let saved_password = entry.password.map(Zeroizing::new);
-    let username = if edit.username.is_empty() { saved_username.as_deref().map(String::as_str) } else { Some(edit.username.as_str()) };
-    let password = if edit.password.is_empty() { saved_password.as_deref().map(String::as_str) } else { Some(edit.password.as_str()) };
-    if username.is_none() && password.is_none() { return self.edit_manual(id, endpoint); }
-    let (Some(username), Some(password)) = (username, password) else { return Err("代理用户名和密码需要同时提供".into()); };
     let (scheme, authority) = endpoint.split_once("://").ok_or("代理地址无效")?;
     let encode = |text: &str| url::form_urlencoded::byte_serialize(text.as_bytes())
       .collect::<String>().replace('+', "%20");
-    let encoded_user = Zeroizing::new(encode(username));
-    let encoded_password = Zeroizing::new(encode(password));
+    let encoded_user = Zeroizing::new(encode(&edit.username));
+    let encoded_password = Zeroizing::new(encode(&edit.password));
     let uri = Zeroizing::new(format!("{scheme}://{encoded_user}:{encoded_password}@{authority}",
       encoded_user = encoded_user.as_str(), encoded_password = encoded_password.as_str()));
     self.edit_manual(id, &uri)
@@ -362,20 +358,20 @@ mod tests {
     let mut pool = ProxyPool::default();
     pool.import("socks5://user:old@proxy.example:1080").unwrap();
     let id = pool.entries[0].id;
-    let edit = |endpoint, username, password, remove_auth| serde_json::json!({
-      "endpoint": endpoint, "username": username, "password": password, "removeAuth": remove_auth,
+    let edit = |endpoint, username, password| serde_json::json!({
+      "endpoint": endpoint, "username": username, "password": password,
     }).to_string();
     let old_route = "socks5://proxy.example:1080";
     let new_route = "socks5://other.example:1080";
-    pool.edit_details(id, &edit(old_route, "", "", false)).unwrap();
+    pool.edit_details(id, &edit(old_route, "", "")).unwrap();
     assert_eq!(pool.selected(id).unwrap().password.as_deref(), Some("old"));
-    assert!(pool.edit_details(id, &edit(new_route, "", "", false)).is_err());
+    assert!(pool.edit_details(id, &edit(old_route, "user", "")).is_err());
+    assert!(pool.edit_details(id, &edit(old_route, "", "new")).is_err());
+    assert!(pool.edit_details(id, &edit(new_route, "", "")).is_err());
     assert_eq!(pool.selected(id).unwrap().endpoint, old_route);
-    pool.edit_details(id, &edit(new_route, "user name", "p%@;", false)).unwrap();
+    pool.edit_details(id, &edit(new_route, "user name", "p%@;")).unwrap();
     assert_eq!(pool.selected(id).unwrap().username.as_deref(), Some("user name"));
     assert_eq!(pool.selected(id).unwrap().password.as_deref(), Some("p%@;"));
-    pool.edit_details(id, &edit(new_route, "", "", true)).unwrap();
-    assert!(pool.selected(id).unwrap().password.is_none());
   }
 
   #[cfg(not(target_os = "android"))]
