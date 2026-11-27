@@ -10,7 +10,7 @@
 
 本仓库是 [ldjx7/multi-agent-account-manager](https://github.com/ldjx7/multi-agent-account-manager) 的 iOS 移植 fork：基于 Tauri 2 + WKWebView，在上游 v0.1.5 基础上新增 iOS 支持。
 
-- **当前版本**：0.1.22。
+- **当前版本**：0.1.26（PR #16 已于 2026-11-27 合入 main）。
 - **IPA 构建**：由 GitHub Actions（`.github/workflows/ios.yml`）在 `macos-15-intel` runner 上构建，产物为未签名 IPA（`account-manager-ios-unsigned.ipa`），无需 Apple 开发者账号。
 - **安装方式**：未签名 IPA（iOS 26.0+），需自行签名后侧载安装，详见「iOS 安装注意事项」。
 - **上游更新**：按 iOS 需求逐项评估和适配上游变更，排期见[执行计划 v2.2](docs/development/development-plan-v2.2.md)。
