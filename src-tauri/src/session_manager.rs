@@ -4965,6 +4965,12 @@ impl SessionManager {
       }
     }
 
+    // WebView metadata lacks the native quota window and reset time. Keep
+    // quota fields from the same source, including while a native sample is stale.
+    if target.has_native_quota() {
+      return (changed, alias_updated);
+    }
+
     if let Some(detail) = quota_detail_opt {
       if target.quota_detail.as_ref() != Some(&detail) {
         target.quota_detail = Some(detail);
@@ -5121,7 +5127,7 @@ impl SessionManager {
         &mut locked, &key, (!result.identity.is_empty()).then(|| result.identity.clone()),
         result.avatar_url.clone(), quota_text.map(str::to_string), result.quota_percent, detail,
       );
-      if has_quota && result.observation == "loaded" {
+      if has_quota && result.observation == "loaded" && !locked.store.accounts[index].has_native_quota() {
         let target = &mut locked.store.accounts[index];
         target.quota_observation = Some(crate::storage::QuotaObservation {
           source: "page".into(),
@@ -5135,7 +5141,9 @@ impl SessionManager {
       }
       any_changed |= changed;
       let after = &locked.store.accounts[index];
-      let status = if !has_quota {
+      let status = if has_quota && after.has_native_quota() {
+        "native_retained"
+      } else if !has_quota {
         "not_updated"
       } else if before.quota_text != after.quota_text || before.quota_percent != after.quota_percent
         || before.quota_detail != after.quota_detail {
@@ -5195,5 +5203,44 @@ mod proxy_tests {
     assert!(manager.set_account_proxy(ProviderId::Muse, &account_uuid, None).await.is_err());
     assert_eq!(manager.proxy_setting(ProviderId::Muse, &account_uuid).await, Some(before));
     std::fs::remove_dir_all(dir).unwrap();
+  }
+}
+
+#[cfg(test)]
+mod quota_source_tests {
+  use super::*;
+
+  #[tokio::test]
+  async fn page_metadata_keeps_native_quota_and_still_updates_identity() {
+    let dir = std::env::temp_dir().join(format!("quota-source-{}", Uuid::new_v4()));
+    let manager = SessionManager::new(dir);
+    let key = AccountKey { provider_id: ProviderId::Muse, uuid: Uuid::new_v4().to_string() };
+    let mut account: AccountRecord = serde_json::from_value(serde_json::json!({
+      "providerId": "muse", "uuid": key.uuid, "alias": "pending", "autoAlias": true,
+      "createdAtMs": 1, "quotaText": "已用 23%", "quotaPercent": 77,
+      "quotaObservation": {
+        "source": "native", "window": "monthly", "percentUsed": 23,
+        "resetsAtMs": 1234, "checkedAtMs": 42, "stale": true
+      }
+    })).unwrap();
+    let native = account.quota_observation.clone();
+    let mut state = manager.inner.lock().await;
+    state.store.accounts.push(account.clone());
+
+    let (changed, alias) = SessionManager::update_account_metadata_locked(
+      &mut state, &key, Some("verified identity".into()), None, Some("已用 80%".into()), Some(20), None,
+    );
+    assert!(changed);
+    assert_eq!(alias.as_deref(), Some("verified identity"));
+    assert_eq!(state.store.accounts[0].quota_observation, native);
+    assert_eq!(state.store.accounts[0].quota_text.as_deref(), Some("已用 23%"));
+    assert_eq!(state.store.accounts[0].quota_percent, Some(77));
+
+    account.quota_observation = None;
+    state.store.accounts[0] = account;
+    SessionManager::update_account_metadata_locked(
+      &mut state, &key, None, None, Some("已用 80%".into()), Some(20), None,
+    );
+    assert_eq!(state.store.accounts[0].quota_percent, Some(20));
   }
 }

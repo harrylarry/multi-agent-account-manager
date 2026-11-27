@@ -1,11 +1,13 @@
 # iPhone 真机验收
 
-当前 Spike 验收包是 **0.1.26**，Bundle ID 为 `com.ldjx.accountmanager.spike`，最低 iOS 17.0。开发状态与待验收范围见[当前进度](../development/current-progress.md)。
+当前 Spike 验收包是 **0.1.26**，Bundle ID 为 `com.ldjx.accountmanager.spike`，最低 iOS 26.0。开发状态与待验收范围见[当前进度](../development/current-progress.md)。
 
 
 ## iPhone 最终方案 · 重构真机验收
 
 Spike 0.1.26 的源码提交为 `22d0fc0123ad33adf460f41946207f11961b8e5c`。包标识 `com.ldjx.accountmanager.spike`，最低系统 iOS 26.0。解压后的 IPA SHA-256 为 `866815c047482120a374a008c1d2fd84f5d5eb95b453b89b1025e6b9a06d6e73`。[下载](https://github.com/harrylarry/multi-agent-account-manager/actions/runs/45915130323/artifacts/15161784175) · [Quick checks](https://github.com/harrylarry/multi-agent-account-manager/actions/runs/45915114122) · [iOS 构建](https://github.com/harrylarry/multi-agent-account-manager/actions/runs/45915130323)
+
+22d0fc0 的产物记录保留用于追溯。该包遗漏 11 个 Tauri 权限，涉及新建对话、浏览与产物、删除分组、原生玻璃、代理检测和批量额度等入口，真机验收失败。请按后续修正包复测。
 
 使用 iOS 26 上的 Spike 候选覆盖安装。开始前在原版本保留一份加密文件备份。使用两个已登录的 Muse 测试账号及一个 Hark 测试账号。代理故障使用专用测试条目。
 

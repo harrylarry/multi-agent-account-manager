@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-update-iphone-glass"
+description = "Enables the update_iphone_glass command without any pre-configured scope."
+commands.allow = ["update_iphone_glass"]
+
+[[permission]]
+identifier = "deny-update-iphone-glass"
+description = "Denies the update_iphone_glass command without any pre-configured scope."
+commands.deny = ["update_iphone_glass"]

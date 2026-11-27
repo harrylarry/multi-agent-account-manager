@@ -52,6 +52,8 @@ jobs:
       # 打出一个「能装但钩子从未运行」的包（见 2d39149 的 Scripts.swift）。
       - name: Verify embedded JavaScript
         run: npm run check:embedded-js
+      - name: Verify local manager IPC grants
+        run: node --test tests/tauri-ipc.test.mjs
       # init must go through `npm run tauri` (never raw xcodebuild / xcodegen);
       # --skip-targets-install because the target is installed above.
       - run: npm run tauri -- ios init --ci --skip-targets-install

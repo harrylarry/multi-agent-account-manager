@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-send-new-hark-conversation"
+description = "Enables the send_new_hark_conversation command without any pre-configured scope."
+commands.allow = ["send_new_hark_conversation"]
+
+[[permission]]
+identifier = "deny-send-new-hark-conversation"
+description = "Denies the send_new_hark_conversation command without any pre-configured scope."
+commands.deny = ["send_new_hark_conversation"]

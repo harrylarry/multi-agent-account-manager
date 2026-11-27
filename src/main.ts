@@ -1882,6 +1882,7 @@ function backgroundQuotaLines(): string[] {
   };
   const quota: Record<string, string> = {
     updated: "已更新并保存", unchanged: "已取得，数据未变", not_updated: "未取得可更新的额度",
+    native_retained: "保留原生额度记录",
     signed_out: "登录已失效", account_changed: "账号状态已变化，本次跳过", save_failed: "保存失败",
   };
   return backgroundQuotaRows.map((row) => {
@@ -5094,7 +5095,8 @@ function bindDelegatedEvents(): void {
           try {
             const rows = await invoke<{ quota: string }[]>("refresh_iphone_quotas", { providerId: provider.id });
             const updated = rows.filter((row) => row.quota === "updated" || row.quota === "unchanged").length;
-            refresh.message = `额度已同步 ${updated} · 未取得 ${rows.length - updated} · 跳过 ${Math.max(0, eligible - rows.length)}`;
+            const retained = rows.filter((row) => row.quota === "native_retained").length;
+            refresh.message = `额度已同步 ${updated} · 保留原生记录 ${retained} · 未取得 ${rows.length - updated - retained} · 跳过 ${Math.max(0, eligible - rows.length)}`;
           } catch (error) {
             refresh.message = String(error);
           } finally {

@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-list-muse-thread-artifacts"
+description = "Enables the list_muse_thread_artifacts command without any pre-configured scope."
+commands.allow = ["list_muse_thread_artifacts"]
+
+[[permission]]
+identifier = "deny-list-muse-thread-artifacts"
+description = "Denies the list_muse_thread_artifacts command without any pre-configured scope."
+commands.deny = ["list_muse_thread_artifacts"]

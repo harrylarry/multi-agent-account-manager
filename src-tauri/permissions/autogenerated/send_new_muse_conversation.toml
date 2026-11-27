@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-send-new-muse-conversation"
+description = "Enables the send_new_muse_conversation command without any pre-configured scope."
+commands.allow = ["send_new_muse_conversation"]
+
+[[permission]]
+identifier = "deny-send-new-muse-conversation"
+description = "Denies the send_new_muse_conversation command without any pre-configured scope."
+commands.deny = ["send_new_muse_conversation"]

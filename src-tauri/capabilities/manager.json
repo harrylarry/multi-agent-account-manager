@@ -67,6 +67,17 @@
     "allow-muse-native-liveness-start",
     "allow-muse-native-liveness-status",
     "allow-muse-native-lease-probe",
+    "allow-update-iphone-glass",
+    "allow-delete-account-group",
+    "allow-refresh-iphone-quotas",
+    "allow-list-muse-thread-artifacts",
+    "allow-open-hark-thread",
+    "allow-list-hark-sessions",
+    "allow-list-hark-thread-artifacts",
+    "allow-send-new-muse-conversation",
+    "allow-send-new-hark-conversation",
+    "allow-check-new-muse-conversation",
+    "allow-measure-proxy-pool-entry",
     "allow-is-spike-build"
   ]
 }

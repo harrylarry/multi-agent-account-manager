@@ -59,6 +59,17 @@ const APP_COMMANDS: &[&str] = &[
   "muse_native_liveness_start",
   "muse_native_liveness_status",
   "muse_native_lease_probe",
+  "update_iphone_glass",
+  "delete_account_group",
+  "refresh_iphone_quotas",
+  "list_muse_thread_artifacts",
+  "open_hark_thread",
+  "list_hark_sessions",
+  "list_hark_thread_artifacts",
+  "send_new_muse_conversation",
+  "send_new_hark_conversation",
+  "check_new_muse_conversation",
+  "measure_proxy_pool_entry",
   "is_spike_build",
 ];
 

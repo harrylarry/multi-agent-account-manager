@@ -258,6 +258,12 @@ pub struct AccountRecord {
   pub proxy: Option<ProxySetting>,
 }
 
+impl AccountRecord {
+  pub(crate) fn has_native_quota(&self) -> bool {
+    self.quota_observation.as_ref().is_some_and(|quota| quota.source == "native")
+  }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct FingerprintRecord {
