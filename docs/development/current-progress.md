@@ -1,5 +1,11 @@
 # 当前开发进度
 
+## PR #16 已合入 main
+
+2026-11-27 20:59（CST），用户将 PR #16（181 个提交，167 个文件，+27838/−449）合入 `main`，合并提交 `d0a19ecc`（基线 `d5cd5aa6` → `d0a19ecc`）。合入后 `main` CI 全绿：Quick checks（run 46003223545）与 IPA 构建（run 46003223632）均 success。日常版 IPA（`com.ldjx.accountmanager`，0.1.26，最低 iOS 26.0）SHA-256 `40fe5b53aefc7322955da067b552a523bcf71225efdddc7e33e2345bcb69e11e`，5,750,990 字节。
+
+注意：7eeeb9b7 的真机复测（底栏原生分段控件拖动跟手、头像 playsInline 修复）在合入前未回报，M-5/M-2 的最终状态待在日常版上复测，见[收尾复测](../acceptance/iphone-acceptance.md#pr-16-收尾复测当前-app)。回滚点：合入基线 `d5cd5aa6`。
+
 ## PR #16 合入收尾
 
 最新验收包 Spike 0.1.26 基于 `7eeeb9b7c3866b3faacf7dfebd23fe1079fae64b`，最低 iOS 26.0。`CI_PASSED`，IPA 已下载校验。解压后 SHA-256 为 `8651211bbbf5e3c4f5ac45e01037c63140d0176c5294c2973849fa5cb29c1db1`。[下载 IPA](https://github.com/harrylarry/multi-agent-account-manager/actions/runs/46000516930/artifacts/15198646927) · [CI](https://github.com/harrylarry/multi-agent-account-manager/actions/runs/46000482948) · [Xcode 构建](https://github.com/harrylarry/multi-agent-account-manager/actions/runs/46000516930)
