@@ -2,9 +2,17 @@
 
 本 fork 基于上游 v0.1.5 + iOS 移植与优化。版本号 0.1.6–0.1.22 是 fork 自有版本，不包含上游 v0.1.6 的功能（每账号无认证 HTTP CONNECT 代理、一键复制 Cookie，仅 macOS/Windows/Android）。
 
-未签名 IPA（iOS 17.0+），需自行签名后侧载安装（LC sign / AltStore / Sideloadly 等）。
+未签名 IPA（iOS 26.0+），需自行签名后侧载安装（LC sign / AltStore / Sideloadly 等）。
 
 ---
+
+## 0.1.26（2026-11-27，PR #16 合入 main）
+
+- PR #16（181 个提交）合入 main：iPhone 多账号原生能力整批进主线——chat.subscribe 订阅读流与任务收件箱、原生审批、额度探针与后台同步、Muse/Hark 隔离发送（未知结果不重发）、三协议原生代理与代理池、lmfpd 指纹探针、Muse/Hark 会话列表、加密备份与局域网传输。
+- 底栏改回原生 UISegmentedControl：玻璃拇指按住可横向拖动跟手，松开归位；选中同步只在页面变化且未拖动时回推。
+- Muse 头像视频补齐 playsInline，内联播放；消息视频保留原行为。
+- 冷启动不再自动进账号网页；会话首次加载按账号过滤；新建会话选账号原地更新，不闪烁。
+- 7eeeb9b7 的真机复测（底栏拖动、头像）在合入前未回报，待在日常版上补验。
 
 ## 0.1.26 Spike（iPhone 导航与文案优化）
 
