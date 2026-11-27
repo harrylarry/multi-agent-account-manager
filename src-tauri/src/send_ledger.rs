@@ -343,11 +343,11 @@ impl SendLedger {
   }
 
   #[cfg(target_os = "ios")]
-  pub fn pending_muse_conversation(&self, account_uuid: &str, text: &str) -> Option<SendAttempt> {
+  pub fn pending_conversation(&self, account_uuid: &str, text: &str, kind: SendKind) -> Option<SendAttempt> {
     let digest = Self::new_muse_conversation_digest(text);
     let state = self.state.lock().unwrap_or_else(|error| error.into_inner());
     state.attempts.iter().rev().find(|attempt| {
-      attempt.kind == SendKind::NewMuseConversation && attempt.account_uuid == account_uuid
+      attempt.kind == kind && attempt.account_uuid == account_uuid
         && attempt.status == SendStatus::Unknown && attempt.digest == digest
     }).cloned()
   }
@@ -445,7 +445,7 @@ impl SendLedger {
       send_id: send_id.clone(),
       account_uuid: account_uuid.to_string(),
       conversation_id: conversation_id.to_string(),
-      digest: if kind == SendKind::NewMuseConversation { text.to_owned() } else { digest_of(text) },
+      digest: if matches!(kind, SendKind::NewMuseConversation | SendKind::HarkMessage) { text.to_owned() } else { digest_of(text) },
       started_at_ms: now_ms(),
       status: SendStatus::Prepared,
       error: None,
@@ -674,6 +674,11 @@ impl<'a> MissionGuard<'a> {
     let kind = if diagnostic { SendKind::HarkVerifiedProbe } else { SendKind::HarkFingerprintProbe };
     self.ledger.begin_mission_attempt(&self.mission_id, &self.account_uuid, conversation_id, digest, kind)
   }
+  #[cfg(any(target_os = "ios", test))]
+  pub fn begin_hark_message(&self, conversation_id: &str, digest: &str) -> Result<String, SendError> {
+    self.ledger.begin_mission_attempt(&self.mission_id, &self.account_uuid, conversation_id, digest, SendKind::HarkMessage)
+  }
+
   #[allow(dead_code)] // 调用方目前只用 begin_probe，保留 id 读取供诊断
   pub fn mission_id(&self) -> &str {
     &self.mission_id

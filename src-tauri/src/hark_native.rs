@@ -589,6 +589,26 @@ pub(crate) fn bound_reply(payload: &serde_json::Value, conversation: &str, reply
   (seen, text)
 }
 
+#[cfg(target_os = "ios")]
+pub(crate) fn project_artifact_names(payload: &serde_json::Value, conversation: &str) -> Result<Vec<String>, String> {
+  let frames = payload["frames"].as_array().ok_or("Hark 项目未返回可核验的会话记录")?;
+  let mut tracker = SyncTracker { conversation: conversation.to_owned(), collect_replies: true, polling: true, ..Default::default() };
+  for frame in frames.iter().filter_map(serde_json::Value::as_str) {
+    tracker.apply_frame(frame);
+  }
+  if !tracker.saw_snapshot || tracker.summary.malformed_frames != 0 {
+    return Err("Hark 项目会话记录不完整".into());
+  }
+  let mut names = Vec::new();
+  for id in tracker.reply_order.iter().rev() {
+    for item in tracker.replies.get(id).into_iter().flat_map(|reply| &reply.artifacts) {
+      if !names.contains(&item.name) { names.push(item.name.clone()); }
+      if names.len() == 100 { return Ok(names); }
+    }
+  }
+  Ok(names)
+}
+
 #[cfg(any(target_os = "ios", test))]
 async fn read_sse(
   mut response: reqwest::Response,

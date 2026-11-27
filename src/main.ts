@@ -1025,17 +1025,14 @@ function renderIphonePanel(state: ManagerSnapshot, provider: ProviderInfo, page:
     .sort((a, b) => (b.item.updatedAtMs ?? 0) - (a.item.updatedAtMs ?? 0));
   const rows = sessions.map(({ account, item }) => {
     const title = `<strong>${escapeHtml(item.title)}</strong><small>${page === "search" ? (account.providerId === "muse" ? "Muse · " : "Hark · ") : ""}${escapeHtml(account.alias)}</small>`;
-    if (account.providerId !== "muse") {
-      return `<div class="iphone-item">${iphoneIcon("chat")}<span>${title}</span><small>网页定位待验证</small></div>`;
-    }
-    const attributes = `data-iphone-thread="${escapeHtml(item.id)}" data-owner-uuid="${escapeHtml(account.uuid)}"`;
+    const attributes = `data-iphone-thread="${escapeHtml(item.id)}" data-owner-uuid="${escapeHtml(account.uuid)}" data-owner="${account.providerId}"`;
     const link = iphoneMenuItem("chat", title, attributes);
     if (page !== "sessions") return link;
-    const artifacts = iphoneArtifacts?.uuid === account.uuid && iphoneArtifacts.threadId === item.id ? iphoneArtifacts : null;
+    const artifacts = iphoneArtifacts?.uuid === account.uuid && iphoneArtifacts.providerId === account.providerId && iphoneArtifacts.threadId === item.id ? iphoneArtifacts : null;
     return `<div class="iphone-session-entry">
       <div class="iphone-session-row">${link}
         <button type="button" class="iphone-back" aria-expanded="${Boolean(artifacts)}"
-          data-iphone-artifacts="${escapeHtml(item.id)}" data-artifact-owner="${escapeHtml(account.uuid)}">${artifacts?.failed ? "重试产物" : "产物"}</button>
+          data-iphone-artifacts="${escapeHtml(item.id)}" data-artifact-owner="${escapeHtml(account.uuid)}" data-artifact-provider="${account.providerId}">${artifacts?.failed ? "重试产物" : "产物"}</button>
       </div>
       ${artifacts ? `<div class="iphone-artifact-list" role="status">
         ${artifacts.pending ? "正在读取产物…" : artifacts.failed ? "未能读取产物。" : artifacts.names.length
@@ -1054,7 +1051,7 @@ function renderIphonePanel(state: ManagerSnapshot, provider: ProviderInfo, page:
     <section class="iphone-section"><div class="iphone-list-title"><h2>${page === "search" ? "会话" : "最近会话"}</h2>
       ${page === "sessions" && !pending && !failures.length && synced.length ? '<button type="button" id="iphone-refresh-sessions">刷新</button>' : ""}</div>
       ${rows ? `<div class="iphone-group">${rows}</div>` : `<p class="iphone-caption">${pending || failures.length ? "可用数据中暂无会话。" : page === "search" ? "没有匹配的会话。" : "暂无可显示的会话。"}</p>`}</section>
-    ${accounts.some((account) => account.providerId === "hark") ? '<p class="iphone-caption">Hark 会话可参与搜索，指定会话的网页定位待验证。</p>' : ""}`;
+`;
 }
 
 async function refreshIphoneSessionBatch(force = false, failedOnly = false): Promise<void> {
@@ -1072,22 +1069,22 @@ async function refreshIphoneSessionBatch(force = false, failedOnly = false): Pro
   }
 }
 
-let iphoneArtifacts: { uuid: string; threadId: string; pending: boolean; names: string[]; unscoped: number; failed: boolean } | null = null;
+let iphoneArtifacts: { providerId: ProviderId; uuid: string; threadId: string; pending: boolean; names: string[]; unscoped: number; failed: boolean } | null = null;
 
-async function readIphoneArtifacts(uuid: string, threadId: string): Promise<void> {
-  const account = snapshot?.accounts.find((item) => item.providerId === "muse" && item.authState === "authenticated" && item.uuid === uuid);
+async function readIphoneArtifacts(providerId: ProviderId, uuid: string, threadId: string): Promise<void> {
+  const account = snapshot?.accounts.find((item) => item.providerId === providerId && item.authState === "authenticated" && item.uuid === uuid);
   if (!snapshot || snapshot.conflicts.length || !account || !iphoneSessionsFor(account).items.some((session) => session.id === threadId)) return;
   const current = iphoneArtifacts;
-  if (current?.uuid === uuid && current.threadId === threadId && !current.failed) {
+  if (current?.uuid === uuid && current.providerId === providerId && current.threadId === threadId && !current.failed) {
     iphoneArtifacts = null;
     syncIphoneViews(snapshot, currentProvider(snapshot));
     return;
   }
-  const view = { uuid, threadId, pending: true, names: [] as string[], unscoped: 0, failed: false };
+  const view = { providerId, uuid, threadId, pending: true, names: [] as string[], unscoped: 0, failed: false };
   iphoneArtifacts = view;
   syncIphoneViews(snapshot, currentProvider(snapshot));
   try {
-    const rows = await invoke<{ names: string[]; unscoped: number }>("list_muse_thread_artifacts", { uuid, threadId });
+    const rows = await invoke<{ names: string[]; unscoped: number }>(providerId === "muse" ? "list_muse_thread_artifacts" : "list_hark_thread_artifacts", { uuid, threadId });
     view.names = rows.names;
     view.unscoped = rows.unscoped;
   } catch {
@@ -1150,7 +1147,7 @@ function syncIphoneViews(state: ManagerSnapshot, provider: ProviderInfo): void {
   const page = detailAccount ? "detail" : iphonePage;
   reconcileIphoneSessions(state.accounts);
   if (iphoneArtifacts && !state.accounts.some((item) => item.uuid === iphoneArtifacts?.uuid &&
-    item.providerId === "muse" && item.authState === "authenticated")) iphoneArtifacts = null;
+    item.providerId === iphoneArtifacts?.providerId && item.authState === "authenticated")) iphoneArtifacts = null;
   const pageMode = spikeWorkspaceOpen && provider.id === "muse" ? "diagnostics" : page;
   shell.dataset.iphoneView = pageMode;
   scheduleIphoneGlass();
@@ -3573,7 +3570,7 @@ async function submitNewAccount(view: Extract<ModalMode, { kind: "add" }>): Prom
 }
 
 async function submitIphoneConversation(view: Extract<ModalMode, { kind: "compose" }>, verify = false): Promise<void> {
-  if (modal !== view || view.pending || view.providerId !== "muse" || !snapshot) return;
+  if (modal !== view || view.pending || !snapshot) return;
   const { uuid, providerId } = view;
   const draft = iphoneConversationDraft.get(uuid);
   if (!draft?.text.trim() || (draft.status === "UNKNOWN") !== verify || !snapshot.accounts.some((item) =>
@@ -3582,13 +3579,16 @@ async function submitIphoneConversation(view: Extract<ModalMode, { kind: "compos
   await setModal(view);
   try {
     if (!draft.threadId) {
-      const result = await invoke<{ status: string; sessionId: string | null }>(verify ? "check_new_muse_conversation" : "send_new_muse_conversation", { uuid, text: draft.text });
+      const command = providerId === "hark" ? "send_new_hark_conversation" :
+        verify ? "check_new_muse_conversation" : "send_new_muse_conversation";
+      const result = await invoke<{ status: string; sessionId: string | null }>(command, { uuid, text: draft.text, ...(providerId === "hark" ? { verify } : {}) });
       draft.status = result.status;
       if (result.status === "CONFIRMED" && result.sessionId) draft.threadId = result.sessionId;
       else if (!["DEFINITIVELY_FAILED", "BUSY"].includes(result.status)) draft.status = "UNKNOWN";
     }
     if (draft.threadId) {
-      snapshot = await invoke<ManagerSnapshot>("open_muse_thread", { uuid, threadId: draft.threadId });
+      const command = providerId === "hark" ? "open_hark_thread" : "open_muse_thread";
+      snapshot = await invoke<ManagerSnapshot>(command, { uuid, threadId: draft.threadId });
       const destination = snapshot.switchingAccount ?? snapshot.activeAccount;
       if (destination?.uuid === uuid && destination.providerId === providerId) {
         iphoneConversationDraft.delete(uuid);
@@ -3609,8 +3609,7 @@ function renderIphoneConversation(view: Extract<ModalMode, { kind: "compose" }>)
   const unknown = draft?.status === "UNKNOWN";
   const confirmed = Boolean(draft?.threadId);
   const waiting = view.pending;
-  const supported = view.providerId === "muse";
-  const status = waiting ? (unknown ? "正在核对网页历史…" : "正在发送…") : !supported ? "Hark 的新会话网页定位仍待验证。" : unknown
+  const status = waiting ? (unknown ? "正在核对网页历史…" : "正在发送…") : unknown
     ? "发送结果待核对。请在该账号的网页查看会话。"
     : confirmed ? "消息已确认，重新打开会话。" : draft?.status === "DEFINITIVELY_FAILED"
       ? "消息未发出。检查该账号的登录与代理后可重试。"
@@ -3619,7 +3618,7 @@ function renderIphoneConversation(view: Extract<ModalMode, { kind: "compose" }>)
     <div class="modal-card">
       <button id="modal-cancel-btn" class="iphone-back" type="button" ${waiting ? "disabled" : ""}>‹ 返回</button>
       <h1 id="iphone-compose-title">新建对话</h1>
-      <fieldset ${waiting || !supported ? "disabled" : ""}><legend>选择发送账号</legend>
+      <fieldset ${waiting ? "disabled" : ""}><legend>选择发送账号</legend>
         ${accounts.map((account) => `<label class="iphone-compose-account">
           <input type="radio" name="iphone-compose-account" value="${escapeHtml(account.uuid)}" ${account.uuid === view.uuid ? "checked" : ""} ${account.authState !== "authenticated" ? "disabled" : ""}>
           <span>${escapeHtml(account.alias)}${account.authState === "authenticated" ? "" : " · 需要登录"}</span>
@@ -3631,7 +3630,7 @@ function renderIphoneConversation(view: Extract<ModalMode, { kind: "compose" }>)
       <div class="modal-footer">
         ${unknown ? `<button type="button" class="btn" id="iphone-compose-verify" ${waiting ? "disabled" : ""}>检查发送结果</button>
           <button type="button" class="btn" id="iphone-compose-check" ${waiting ? "disabled" : ""}>打开账号核对</button>` : ""}
-        <button type="button" class="btn primary" id="iphone-compose-send" ${!supported || waiting || unknown || !draft?.text.trim() ? "disabled" : ""}>${confirmed ? "打开会话" : "发送并打开"}</button>
+        <button type="button" class="btn primary" id="iphone-compose-send" ${waiting || unknown || !draft?.text.trim() ? "disabled" : ""}>${confirmed ? "打开会话" : "发送并打开"}</button>
       </div>
     </div>
   </div>`;
@@ -4743,18 +4742,22 @@ function bindDelegatedEvents(): void {
     }
     const artifactButton = target.closest<HTMLElement>("[data-iphone-artifacts]");
     if (artifactButton && modal.kind === "none" && iphonePage === "sessions") {
-      await readIphoneArtifacts(artifactButton.dataset.artifactOwner ?? "", artifactButton.dataset.iphoneArtifacts ?? "");
+      const provider = artifactButton.dataset.artifactProvider;
+      if (provider === "muse" || provider === "hark") {
+        await readIphoneArtifacts(provider, artifactButton.dataset.artifactOwner ?? "", artifactButton.dataset.iphoneArtifacts ?? "");
+      }
       return;
     }
     const openResult = target.closest<HTMLElement>("[data-iphone-open-account], [data-iphone-thread]");
     if (openResult && modal.kind === "none" && snapshot.conflicts.length === 0) {
       const threadId = openResult.dataset.iphoneThread;
       const uuid = threadId ? openResult.dataset.ownerUuid : openResult.dataset.iphoneOpenAccount;
-      const owner = threadId ? "muse" : openResult.dataset.owner;
+      const owner = openResult.dataset.owner;
       const account = snapshot.accounts.find((item) => item.uuid === uuid && item.providerId === owner);
       if (!account || (threadId && !iphoneSessionsFor(account).items.some((item) => item.id === threadId))) return;
       const key = { uuid: account.uuid, providerId: account.providerId };
-      await callCommand(threadId ? "open_muse_thread" : "switch_account", threadId ? { uuid: key.uuid, threadId } : key, key);
+      const openThread = account.providerId === "muse" ? "open_muse_thread" : "open_hark_thread";
+      await callCommand(threadId ? openThread : "switch_account", threadId ? { uuid: key.uuid, threadId } : key, key);
       return;
     }
     const iphoneAction = target.closest<HTMLElement>("[data-iphone-account]");

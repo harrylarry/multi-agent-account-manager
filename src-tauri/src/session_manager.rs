@@ -2535,8 +2535,19 @@ impl SessionManager {
     thread: Uuid,
   ) -> Result<ManagerSnapshot, String> {
     let key = AccountKey { provider_id: ProviderId::Muse, uuid };
-    self.switch_account_internal(app, key, false, Some(thread)).await
+    self.switch_account_internal(app, key, false, Some(format!("https://muse.ai/thread/{thread}"))).await
   }
+
+  #[cfg(target_os = "ios")]
+  pub async fn open_hark_project(
+    self: &Arc<Self>, app: &AppHandle, uuid: String, project: &str, main: bool,
+  ) -> Result<ManagerSnapshot, String> {
+    if !crate::hark_send::valid_project_id(project) { return Err("Hark 项目标识无效".into()); }
+    let key = AccountKey { provider_id: ProviderId::Hark, uuid };
+    let url = if main { "https://hark.com/chat".to_owned() } else { format!("https://hark.com/project/{project}") };
+    self.switch_account_internal(app, key, false, Some(url)).await
+  }
+
 
   pub async fn switch_account_by_index(
     self: &Arc<Self>,
@@ -2768,7 +2779,7 @@ impl SessionManager {
     app: &AppHandle,
     key: AccountKey,
     is_cold_start: bool,
-    #[cfg_attr(not(target_os = "ios"), allow(unused_variables))] muse_thread: Option<Uuid>,
+    #[cfg_attr(not(target_os = "ios"), allow(unused_variables))] conversation_url: Option<String>,
   ) -> Result<ManagerSnapshot, String> {
     {
       let locked = self.inner.lock().await;
@@ -3013,7 +3024,7 @@ impl SessionManager {
       };
 
       self
-        .open_ios_session(app, account_record, next_seq, view_instance_id, is_cold_start, muse_thread)
+        .open_ios_session(app, account_record, next_seq, view_instance_id, is_cold_start, conversation_url)
         .await
     }
   }
@@ -3881,7 +3892,7 @@ impl SessionManager {
     expected_seq: u64,
     view_instance_id: u64,
     is_cold_start: bool,
-    muse_thread: Option<Uuid>,
+    conversation_url: Option<String>,
   ) -> Result<ManagerSnapshot, String> {
     let caps = match crate::platform::ios::check_capabilities(app).await {
       Ok(c) => c,
@@ -3954,8 +3965,7 @@ impl SessionManager {
       timezone: account.timezone.clone(),
       language: account.language.clone(),
       auto_alias: account.auto_alias,
-      entry_url: muse_thread.map(|thread| format!("https://muse.ai/thread/{thread}"))
-        .unwrap_or_else(|| spec.info.entry_url.to_string()),
+      entry_url: conversation_url.unwrap_or_else(|| spec.info.entry_url.to_string()),
       allowed_hosts: spec.allowed_hosts.iter().map(|s| (*s).to_string()).collect(),
       switch_seq: expected_seq,
       view_instance_id,

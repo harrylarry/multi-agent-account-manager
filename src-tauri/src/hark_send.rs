@@ -42,11 +42,14 @@ impl Transport<'_> {
   }
 }
 
+pub(crate) fn valid_project_id(id: &str) -> bool {
+  !id.is_empty() && id.len() <= 128 && id.bytes().all(|byte| byte.is_ascii_alphanumeric() || b"_-".contains(&byte))
+}
+
 fn project_id(value: &Value) -> Option<&str> {
   value["conversationId"].as_str().or_else(|| value["conversation_id"].as_str())
     .or_else(|| value["conversation"]["id"].as_str()).or_else(|| value["id"].as_str())
-    .filter(|id| !id.is_empty() && id.len() <= 128
-      && id.bytes().all(|b| b.is_ascii_alphanumeric() || b"_-".contains(&b)))
+    .filter(|id| valid_project_id(id))
 }
 
 fn projects(list: &Value) -> Result<&[Value], String> {
@@ -72,6 +75,19 @@ pub(crate) async fn list_projects(transport: &Transport<'_>) -> Result<Vec<HarkS
   Ok(result)
 }
 
+pub(crate) async fn project_is_main(transport: &Transport<'_>, id: &str) -> Result<bool, String> {
+  if !valid_project_id(id) { return Err("Hark 项目标识无效".into()); }
+  let main = transport.read(transport.request(Method::GET, "/conversations/main", &[("timezone", transport.timezone)])?).await?;
+  let main_id = project_id(&main).or_else(|| main["main"]["id"].as_str()).ok_or("Hark 主会话不可核验")?;
+  if main_id == id { return Ok(true); }
+  let list = transport.projects().await?;
+  if projects(&list)?.iter().any(|row| project_id(row) == Some(id)) { Ok(false) }
+  else { Err("该会话不在所选账号的项目列表中".into()) }
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Purpose { IsolationProbe, Fingerprint, Product }
+
 fn response_id(send_id: &str) -> Result<String, String> {
   Uuid::parse_str(send_id).map(|uuid| Uuid::from_u128(uuid.as_u128() ^ 1).to_string())
     .map_err(|_| "发送标识无效".into())
@@ -86,16 +102,34 @@ fn receipt(payload: &Value, conversation: &str, key: &str, reply: &str) -> bool 
   exact || (scope == Some(conversation) && payload["userMessageId"].as_str().is_some_and(|id| !id.is_empty()))
 }
 
+#[cfg(target_os = "ios")]
+pub(crate) async fn read_project_snapshot(transport: &Transport<'_>, conversation: &str) -> Result<Value, String> {
+  if !valid_project_id(conversation) { return Err("Hark 项目标识无效".into()); }
+  let manager = Uuid::new_v4().to_string();
+  let request = transport.request(Method::GET, "/sync/poll", &[
+    ("conversationId", conversation), ("manager", &manager), ("v", "2"), ("mode", "in_tab"), ("dial", "initial"), ("first", "1"),
+  ])?;
+  transport.read(request).await
+}
+
+#[cfg(target_os = "ios")]
+pub(crate) async fn verify_product_reply(transport: &Transport<'_>, conversation: &str, send_id: &str) -> bool {
+  let Ok(reply_id) = response_id(send_id) else { return false; };
+  let Ok(value) = read_project_snapshot(transport, conversation).await else { return false; };
+  crate::hark_native::bound_reply(&value, conversation, &reply_id).0
+}
+
 pub(crate) async fn send_isolated(
   transport: &Transport<'_>, ledger: &SendLedger, mission: &MissionGuard<'_>, text: &str, token: &mut CancelToken,
-  collect_limit: std::time::Duration, diagnostic: bool,
+  collect_limit: std::time::Duration, purpose: Purpose,
 ) -> Result<SendReport, String> {
   let setup = async {
     let old = transport.projects().await?;
     let main = transport.read(transport.request(Method::GET, "/conversations/main", &[("timezone", transport.timezone)])?).await?;
     let main_id = project_id(&main).or_else(|| main["main"]["id"].as_str()).ok_or("Hark 主会话不可核验")?;
     let prior = projects(&old)?;
-    let title = format!("叠号隔离验证 {}", &Uuid::new_v4().simple().to_string()[..8]);
+    let title = if purpose == Purpose::Product { "新对话" } else { "叠号隔离验证" };
+    let title = format!("{title} {}", &Uuid::new_v4().simple().to_string()[..8]);
     let created = transport.read(transport.request(Method::POST, "/conversations", &[])?
       .header(CONTENT_TYPE,"application/json").body(json!({"title":title,"timezone":transport.timezone,"autoTitle":false}).to_string())).await?;
     let id = project_id(&created).filter(|id| *id != main_id
@@ -116,8 +150,12 @@ pub(crate) async fn send_isolated(
   };
   let digest: String = ring::digest::digest(&ring::digest::SHA256, text.as_bytes()).as_ref()
     .iter().map(|byte| format!("{byte:02x}")).collect();
-  let send_id = mission.begin_hark_send(&conversation, &digest, diagnostic)
-    .map_err(|_| "无法写入发送台账")?;
+  let prepared = if purpose == Purpose::Product {
+    mission.begin_hark_message(&conversation, &digest)
+  } else {
+    mission.begin_hark_send(&conversation, &digest, purpose == Purpose::IsolationProbe)
+  };
+  let send_id = prepared.map_err(|_| "无法写入发送台账")?;
   let reply_id = response_id(&send_id)?;
   if token.is_cancelled() {
     ledger.fail(&send_id, "尚未发送".into());
@@ -139,9 +177,13 @@ pub(crate) async fn send_isolated(
   };
   let mut report = SendReport { conversation_id:conversation.clone(), send_id:send_id.clone(), confirmed:false,
     response_seen:false, http_status:result.as_ref().map(|r|r.0), completed_text:None };
-  if !diagnostic && result.and_then(|r| r.1).is_some_and(|payload| receipt(&payload, &conversation, &send_id, &reply_id)) {
+  if purpose != Purpose::IsolationProbe && result.and_then(|r| r.1).is_some_and(|payload| receipt(&payload, &conversation, &send_id, &reply_id)) {
     ledger.confirm(&send_id);
     report.confirmed = true;
+  }
+  if purpose == Purpose::Product && report.confirmed {
+    if ledger.is_poisoned() { return Err("Hark 回执已收到，发送台账待核对".into()); }
+    return Ok(report);
   }
   let _ = tokio::time::timeout(collect_limit, async {
     while !token.is_cancelled() {
@@ -157,11 +199,11 @@ pub(crate) async fn send_isolated(
       if let Some(data) = snapshot {
         let (seen, completed_text) = crate::hark_native::bound_reply(&data, &conversation, &reply_id);
         report.response_seen |= seen;
-        if !report.confirmed && seen && (!diagnostic || completed_text.is_some()) {
+        if !report.confirmed && seen && (purpose != Purpose::IsolationProbe || completed_text.is_some()) {
           ledger.confirm(&send_id);
           report.confirmed = true;
         }
-        if completed_text.is_some() { report.completed_text = completed_text; break; }
+        if completed_text.is_some() || (purpose == Purpose::Product && report.confirmed) { report.completed_text = completed_text; break; }
       }
       tokio::time::sleep(std::time::Duration::from_secs(2)).await;
     }
@@ -178,11 +220,16 @@ mod tests {
 
   #[tokio::test]
   async fn sends_once_to_new_project_and_marks_an_unbound_ack_unknown() {
-    for (created, completed) in [("new",false), ("main",false), ("new",true)] {
+    for (created, completed, purpose) in [
+      ("new", false, Purpose::IsolationProbe),
+      ("main", false, Purpose::IsolationProbe),
+      ("new", true, Purpose::IsolationProbe),
+      ("new", false, Purpose::Product),
+    ] {
       let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
       let origin = format!("http://{}", listener.local_addr().unwrap());
       let server = tokio::spawn(async move {
-        let rounds = if created == "new" { 6 } else { 3 };
+        let rounds = if purpose == Purpose::Product { 5 } else if created == "new" { 6 } else { 3 };
         let mut title = String::new();
         let mut reply_id = String::new();
         for index in 0..rounds {
@@ -219,7 +266,7 @@ mod tests {
               assert_eq!(payload["conversationId"], "new");
               assert_ne!(payload["idempotencyKey"], payload["responseMessageId"]);
               reply_id = payload["responseMessageId"].as_str().unwrap().into();
-              json!({"conversationId":"main","responseMessageId":payload["responseMessageId"]})
+              json!({"conversationId":if purpose == Purpose::Product { "new" } else { "main" }, "responseMessageId":payload["responseMessageId"]})
             }
             5 => {
               assert!(line.starts_with("GET /api/sync/poll?conversationId=new"));
@@ -241,15 +288,19 @@ mod tests {
       let mission = ledger.mission("account").unwrap();
       let transport = Transport { client:Client::builder().no_proxy().timeout(std::time::Duration::from_secs(2)).build().unwrap(),
         cookie:HeaderValue::from_static("mock=1"), timezone:"UTC", origin:&origin };
-      let result = send_isolated(&transport, &ledger, &mission, "Test", &mut token, std::time::Duration::from_millis(500), true).await;
+      let result = send_isolated(&transport, &ledger, &mission, "Test", &mut token, std::time::Duration::from_millis(500), purpose).await;
       if created == "new" {
         let report = result.unwrap();
-        assert_eq!(report.confirmed, completed);
+        assert_eq!(report.confirmed, completed || purpose == Purpose::Product);
         assert_eq!(crate::hark_isolation_proved(&ledger, "account"), completed);
         assert_eq!(ledger.attempts().len(), 1);
         assert_eq!(report.completed_text.as_deref(), if completed { Some("OK") } else { None });
         assert_eq!(ledger.attempts()[0].status,
-          if completed { crate::send_ledger::SendStatus::Confirmed } else { crate::send_ledger::SendStatus::Unknown });
+          if completed || purpose == Purpose::Product { crate::send_ledger::SendStatus::Confirmed } else { crate::send_ledger::SendStatus::Unknown });
+        if purpose == Purpose::Product {
+          assert_eq!(ledger.attempts()[0].kind, crate::send_ledger::SendKind::HarkMessage);
+          assert_eq!(ledger.attempts()[0].digest.len(), 64);
+        }
       } else {
         assert!(result.is_err());
         assert!(ledger.attempts().is_empty());

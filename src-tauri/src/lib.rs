@@ -749,6 +749,79 @@ async fn list_hark_sessions(
 
 #[tauri::command]
 #[cfg_attr(not(target_os = "ios"), allow(unused_variables))]
+async fn list_hark_thread_artifacts(
+  app: AppHandle, mgr: State<'_, Arc<SessionManager>>, cancel: State<'_, Arc<probe_cancel::ProbeCancel>>,
+  uuid: String, thread_id: String,
+) -> Result<serde_json::Value, String> {
+  #[cfg(target_os = "ios")]
+  {
+    let uuid = storage::normalize_uuid(&uuid).ok_or("账号标识无效")?;
+    let proxy_guard = mgr.proxy_write_lock.lock().await;
+    let (mut token, _guard) = cancel.register(&uuid, "hark_artifacts");
+    let snapshot = mgr.get_snapshot().await;
+    drop(proxy_guard);
+    let account = authenticated_hark_account(&snapshot, &uuid)?;
+    let timezone = account.timezone.as_deref().unwrap_or("UTC");
+    tokio::select! {
+      biased;
+      _ = token.cancelled() => Err("账号设置有变化，已停止读取项目产物".into()),
+      response = tokio::time::timeout(std::time::Duration::from_secs(30), async {
+        let (client, cookie) = hark_native::account_http(&app, &uuid, account.proxy.as_ref()).await?;
+        let transport = hark_send::Transport { client, cookie, timezone, origin: "https://app.hark.com" };
+        hark_send::project_is_main(&transport, &thread_id).await?;
+        let response = hark_send::read_project_snapshot(&transport, &thread_id).await?;
+        let names = hark_native::project_artifact_names(&response, &thread_id)?;
+        Ok(serde_json::json!({ "names": names, "unscoped": 0 }))
+      }) => response.map_err(|_| "读取 Hark 项目产物超时")?,
+    }
+  }
+  #[cfg(not(target_os = "ios"))]
+  Err("此操作仅支持 iOS".into())
+}
+
+#[tauri::command]
+#[cfg_attr(not(target_os = "ios"), allow(unused_variables))]
+async fn open_hark_thread(
+  app: AppHandle, mgr: State<'_, Arc<SessionManager>>, cancel: State<'_, Arc<probe_cancel::ProbeCancel>>,
+  uuid: String, thread_id: String,
+) -> Result<ManagerSnapshot, String> {
+  #[cfg(target_os = "ios")]
+  {
+    let uuid = storage::normalize_uuid(&uuid).ok_or("账号标识无效")?;
+    if !hark_send::valid_project_id(&thread_id) { return Err("Hark 项目标识无效".into()); }
+    let proxy_guard = mgr.proxy_write_lock.lock().await;
+    let (mut token, _guard) = cancel.register(&uuid, "hark_open_thread");
+    let snapshot = mgr.get_snapshot().await;
+    drop(proxy_guard);
+    let account = authenticated_hark_account(&snapshot, &uuid)?;
+    let timezone = account.timezone.as_deref().unwrap_or("UTC");
+    let main = tokio::select! {
+      biased;
+      _ = token.cancelled() => return Err("账号设置有变化，已停止打开会话".into()),
+      response = tokio::time::timeout(std::time::Duration::from_secs(25), async {
+        let (client, cookie) = hark_native::account_http(&app, &uuid, account.proxy.as_ref()).await?;
+        let transport = hark_send::Transport { client, cookie, timezone, origin: "https://app.hark.com" };
+        hark_send::project_is_main(&transport, &thread_id).await
+      }) => response.map_err(|_| "Hark 项目归属核对超时")??,
+    };
+    mgr.open_hark_project(&app, uuid, &thread_id, main).await
+  }
+  #[cfg(not(target_os = "ios"))]
+  Err("此操作仅支持 iOS".into())
+}
+
+#[cfg(target_os = "ios")]
+fn authenticated_hark_account<'a>(snapshot: &'a ManagerSnapshot, uuid: &str) -> Result<&'a storage::AccountRecord, String> {
+  if snapshot.conflicts.iter().any(|item| item.uuid == uuid) || snapshot.pending_cleanup.iter().any(|item| item.uuid == uuid) {
+    return Err("账号暂不可用".into());
+  }
+  snapshot.accounts.iter().find(|account| account.uuid == uuid
+    && account.provider_id == providers::ProviderId::Hark && account.auth_state == storage::AuthState::Authenticated)
+    .ok_or_else(|| "请先登录此 Hark 账号".into())
+}
+
+#[tauri::command]
+#[cfg_attr(not(target_os = "ios"), allow(unused_variables))]
 async fn open_muse_thread(
   app: AppHandle,
   mgr: State<'_, Arc<SessionManager>>,
@@ -1142,7 +1215,7 @@ async fn check_new_muse_conversation(
   {
     let unknown = || NewConversationResult { status: "UNKNOWN".into(), session_id: None };
     let uuid = storage::normalize_uuid(&uuid).ok_or("账号标识无效")?;
-    let Some(attempt) = ledger.pending_muse_conversation(&uuid, text.trim()) else { return Ok(unknown()); };
+    let Some(attempt) = ledger.pending_conversation(&uuid, text.trim(), send_ledger::SendKind::NewMuseConversation) else { return Ok(unknown()); };
     let Ok(session) = uuid::Uuid::parse_str(&attempt.conversation_id) else { return Ok(unknown()); };
     let proxy_guard = mgr.proxy_write_lock.lock().await;
     let (mut token, _guard) = cancel.register(&uuid, "verify_new_conversation");
@@ -1169,6 +1242,61 @@ async fn check_new_muse_conversation(
     if !verified { return Ok(unknown()); }
     ledger.confirm(&attempt.send_id);
     Ok(NewConversationResult { status: "CONFIRMED".into(), session_id: Some(session.to_string()) })
+  }
+  #[cfg(not(target_os = "ios"))]
+  Err("此操作仅支持 iOS".into())
+}
+
+#[tauri::command]
+#[cfg_attr(not(target_os = "ios"), allow(unused_variables))]
+async fn send_new_hark_conversation(
+  app: AppHandle, uuid: String, text: String, verify: bool,
+  ledger: State<'_, Arc<send_ledger::SendLedger>>, mgr: State<'_, Arc<SessionManager>>,
+  cancel: State<'_, Arc<probe_cancel::ProbeCancel>>,
+) -> Result<NewConversationResult, String> {
+  #[cfg(target_os = "ios")]
+  {
+    use send_ledger::SendKind;
+    let no_session = |status: &str| NewConversationResult { status: status.to_owned(), session_id: None };
+    let uuid = storage::normalize_uuid(&uuid).ok_or("账号标识无效")?;
+    let text = text.trim();
+    if text.is_empty() || text.chars().count() > 16000 { return Ok(no_session("DEFINITIVELY_FAILED")); }
+    let proxy_guard = mgr.proxy_write_lock.lock().await;
+    let task = uuid::Uuid::new_v4();
+    let (mut token, _guard) = cancel.register_task(&uuid, "new_hark_conversation", task);
+    let snapshot = mgr.get_snapshot().await;
+    drop(proxy_guard);
+    let account = authenticated_hark_account(&snapshot, &uuid)?;
+    let timezone = account.timezone.as_deref().unwrap_or("UTC");
+    let mission = match ledger.mission(&uuid) {
+      Ok(mission) => mission,
+      Err(send_ledger::SendError::Busy(_)) => return Ok(no_session("BUSY")),
+      Err(_) => return Ok(no_session("UNKNOWN")),
+    };
+    let pending = ledger.pending_conversation(&uuid, text, SendKind::HarkMessage);
+    if verify != pending.is_some() { return Ok(no_session("UNKNOWN")); }
+    let (client, cookie) = match hark_native::account_http(&app, &uuid, account.proxy.as_ref()).await {
+      Ok(connected) => connected,
+      Err(_) => return Ok(no_session(if verify { "UNKNOWN" } else { "DEFINITIVELY_FAILED" })),
+    };
+    let transport = hark_send::Transport { client, cookie, timezone, origin: "https://app.hark.com" };
+    if let Some(attempt) = pending {
+      let checked = tokio::select! {
+        biased;
+        _ = token.cancelled() => false,
+        response = tokio::time::timeout(std::time::Duration::from_secs(25), hark_send::verify_product_reply(&transport, &attempt.conversation_id, &attempt.send_id)) => response.unwrap_or(false),
+      };
+      if !checked { return Ok(no_session("UNKNOWN")); }
+      ledger.confirm(&attempt.send_id);
+      return Ok(NewConversationResult { status: "CONFIRMED".into(), session_id: Some(attempt.conversation_id) });
+    }
+    match Box::pin(hark_send::send_isolated(&transport, &ledger, &mission, text, &mut token,
+      std::time::Duration::from_secs(24), hark_send::Purpose::Product)).await {
+      Ok(report) if report.confirmed => Ok(NewConversationResult { status: "CONFIRMED".into(), session_id: Some(report.conversation_id) }),
+      Ok(_) => Ok(no_session("UNKNOWN")),
+      Err(_) if ledger.is_poisoned() || ledger.busy_account(&uuid).is_some() => Ok(no_session("UNKNOWN")),
+      Err(_) => Ok(no_session("DEFINITIVELY_FAILED")),
+    }
   }
   #[cfg(not(target_os = "ios"))]
   Err("此操作仅支持 iOS".into())
@@ -1408,7 +1536,7 @@ async fn hark_isolated_send_probe(
     if token.is_cancelled() { return Err("已取消，未发送".into()); }
     let mission = ledger.mission(&uuid).map_err(|_| "该账号有其他发送任务或台账不可用")?;
     let report = Box::pin(hark_send::send_isolated(&transport, &ledger, &mission, "这是叠号的隔离测试。请只回复 OK。", &mut token,
-      std::time::Duration::from_secs(55), true)).await?;
+      std::time::Duration::from_secs(55), hark_send::Purpose::IsolationProbe)).await?;
     serde_json::to_value(report).map_err(|_| "无法呈现诊断结果".into())
   }
   #[cfg(not(target_os = "ios"))]
@@ -1472,7 +1600,7 @@ async fn hark_fingerprint_probe(
     for probe in probes {
       if token.is_cancelled() { stop_reason = Some("指纹已停止".to_string()); break; }
       match Box::pin(hark_send::send_isolated(&transport, &ledger, &mission, &probe.prompt, &mut token,
-        Duration::from_secs(90), false)).await {
+        Duration::from_secs(90), hark_send::Purpose::Fingerprint)).await {
         Ok(report) if report.confirmed => {
           if let Some(text) = report.completed_text.filter(|text| fingerprint::check_sample(text, probe.expected_count).accepted) {
             samples.push(Sample { text, expected_count:probe.expected_count });
@@ -2177,7 +2305,9 @@ pub fn run() {
       list_muse_sessions,
       list_muse_thread_artifacts,
       open_muse_thread,
+      open_hark_thread,
       list_hark_sessions,
+      list_hark_thread_artifacts,
       spike_ios_quota_sync_probe,
       reorder_accounts,
       check_for_updates,
@@ -2199,6 +2329,7 @@ pub fn run() {
       muse_native_quota_probe,
       muse_native_send_probe,
       send_new_muse_conversation,
+      send_new_hark_conversation,
       check_new_muse_conversation,
       muse_native_fingerprint_probe,
       set_muse_fingerprint_settings,
