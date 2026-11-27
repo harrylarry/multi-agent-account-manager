@@ -56,7 +56,7 @@ final class ManagerGlassNavigation: UIView, UITextFieldDelegate {
     primary = row([manage, service, spacer, overview, searchButton])
 
     let searchGlass = makeGlass()
-    searchGlass.cornerConfiguration = .fixed(14)
+    searchGlass.cornerConfiguration = .corners(radius: 14)
     let searchIcon = UIImageView(image: UIImage(systemName: "magnifyingglass"))
     searchIcon.tintColor = .secondaryLabel
     searchIcon.contentMode = .center
@@ -90,7 +90,7 @@ final class ManagerGlassNavigation: UIView, UITextFieldDelegate {
     ])
 
     let dock = makeGlass()
-    dock.cornerConfiguration = .fixed(26)
+    dock.cornerConfiguration = .corners(radius: 26)
     tabs.accessibilityLabel = "账号和会话"
     tabs.accessibilityIdentifier = "manager-navigation-tabs"
     tabs.selectedSegmentIndex = 0
