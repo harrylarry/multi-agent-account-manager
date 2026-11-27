@@ -2,6 +2,8 @@
 
 ## PR #16 合入收尾
 
+底栏收尾候选 Spike 0.1.26，源码 `bbbb5857ca9037e33bab877406f9b402d61631ee`，最低 iOS 26.0。`CI_PASSED`，已校验 IPA 和包标识。解压后 IPA SHA-256 为 `9af2cdcaf0788834d1f22c656c26a7d8ee3d9003e99e246ec866b1869d11de49`。底栏指示器复测待回执，头像视频仍为 `FAIL`。[下载 IPA](https://github.com/harrylarry/multi-agent-account-manager/actions/runs/45996300058/artifacts/15196094369) · [CI](https://github.com/harrylarry/multi-agent-account-manager/actions/runs/45996285715) · [收尾复测](../acceptance/iphone-acceptance.md#pr-16-收尾复测当前-app)
+
 收尾范围限验收缺陷和主线合入准备。真机验收以当前候选 App 为准，旧版覆盖安装退出本轮验收。点选底栏项时玻璃指示器须跟随滑动，账号／会话仍通过点选切换。真机回报 `4b0a87f` 的底栏跟随动画未达到预期（M-5 `FAIL`），Muse 头像视频仍会突现后消失（M-2 `FAIL`）。两个结果均来自真机，CI 通过不改变此状态。
 
 在最新版 App 聚焦验证双账号实际切换、会话归属与代理隔离，以及发送结果未知时的核对和备份恢复。合入前以整包代码与真机证据为准，保存合入基线和回滚点。新增功能和非验收改动移出 PR #16。合入 `main` 需用户明确授权。
