@@ -2,7 +2,11 @@
 
 ## iPhone 统一页面
 
-用户确认以实际 App 页面验收 UIKit Liquid Glass、键盘和排版。账号页下拉仅同步当前服务已登录账号的额度、未读和任务状态。总览显示待办、未读和进行中，搜索可跨服务并直接打开原会话。代理池修改需确认保存，已分配账号随后在账号代理页确认应用。指纹历史仅在设备记录。Muse 空间、Hark 看板继续暂缓。下一步核对本批 SHA 的 Quick checks 和 iOS 候选，并在真机复测。
+Spike 0.1.26 基于 `a9e7c7175ddba37d0674dcb29ec7776b6565baff`，最低 iOS 26.0，Bundle ID `com.ldjx.accountmanager.spike`。`CI_PASSED`。Swift 插件、Rust iOS 目标与 Xcode 打包均通过，下载后已核对归档和内部 IPA。IPA SHA-256 为 `d86b69eb9e2671af2be447ea0d5edea7df4db1672930b5f606342566e29e7715`。[下载 IPA](https://github.com/harrylarry/multi-agent-account-manager/actions/runs/45962267476/artifacts/15182705128) · [Quick checks](https://github.com/harrylarry/multi-agent-account-manager/actions/runs/45962255225) · [iOS 构建](https://github.com/harrylarry/multi-agent-account-manager/actions/runs/45962267476)
+
+本地前端构建、14 项 JS/IPC、90 项主 crate 和 110 项 Muse 原生测试通过。320×568 深色及 390×844 浅色 WebKit 测试以模拟 IPC 验证刷新范围、导航、发送及核对、代理保存与应用确认。首轮 iOS 检查因 Swift 圆角 API 名称失败，已按正式 SDK 修正。UIKit 玻璃材质、实际键盘及两个服务的在线读取仍为 `UNVERIFIED`。[真机复测](../acceptance/iphone-acceptance.md#iphone-统一页面)
+
+用户确认以实际 App 页面验收 UIKit Liquid Glass、键盘和排版。账号页下拉仅同步当前服务已登录账号的额度、未读和任务状态。总览显示待办、未读和进行中，搜索可跨服务并直接打开原会话。代理池修改需确认保存，已分配账号随后在账号代理页确认应用。指纹历史仅在设备记录。Muse 空间、Hark 看板继续暂缓。下一步按真机步骤核对显示、出站、账号归属与返回路径。
 
 ## iPhone 原生玻璃导航
 
