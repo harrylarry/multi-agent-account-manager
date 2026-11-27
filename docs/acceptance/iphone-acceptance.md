@@ -5,6 +5,8 @@
 
 ## iPhone 最终方案 · 重构真机验收
 
+Spike 0.1.26 的源码提交为 `22d0fc0123ad33adf460f41946207f11961b8e5c`。包标识 `com.ldjx.accountmanager.spike`，最低系统 iOS 26.0。解压后的 IPA SHA-256 为 `866815c047482120a374a008c1d2fd84f5d5eb95b453b89b1025e6b9a06d6e73`。[下载](https://github.com/harrylarry/multi-agent-account-manager/actions/runs/45915130323/artifacts/15161784175) · [Quick checks](https://github.com/harrylarry/multi-agent-account-manager/actions/runs/45915114122) · [iOS 构建](https://github.com/harrylarry/multi-agent-account-manager/actions/runs/45915130323)
+
 使用 iOS 26 上的 Spike 候选覆盖安装。开始前在原版本保留一份加密文件备份。使用两个已登录的 Muse 测试账号及一个 Hark 测试账号。代理故障使用专用测试条目。
 
 1. **导航与切号**。在账号首页交替点两个 Muse 账号主体，各自核对网页身份，再返回列表。点账号右侧信息按钮，核对只出现该账号设置。切换 Hark，打开管理、搜索和返回，核对管理页隐藏服务与底栏。总览只显示当前服务，且待办、未读、进行中各自独立。用深浅色、降低动态和降低透明度走一遍顶栏与底栏。

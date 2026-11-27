@@ -12,7 +12,7 @@
 
 - **当前版本**：0.1.22。
 - **IPA 构建**：由 GitHub Actions（`.github/workflows/ios.yml`）在 `macos-15-intel` runner 上构建，产物为未签名 IPA（`account-manager-ios-unsigned.ipa`），无需 Apple 开发者账号。
-- **安装方式**：未签名 IPA（iOS 17.0+），需自行签名后侧载安装，详见「iOS 安装注意事项」。
+- **安装方式**：未签名 IPA（iOS 26.0+），需自行签名后侧载安装，详见「iOS 安装注意事项」。
 - **上游更新**：按 iOS 需求逐项评估和适配上游变更，排期见[执行计划 v2.2](docs/development/development-plan-v2.2.md)。
 
 ---
@@ -66,7 +66,7 @@
 | macOS | `account-manager-macos-universal.dmg` | Apple Silicon & Intel（macOS 14.0+） | 上游 |
 | Windows | `account-manager-windows-x64-setup.exe` | x64（Windows 10 / 11） | 上游 |
 | Android | `account-manager-android-universal-release.apk` | 通用 ABI（Android 7.0+） | 上游 |
-| iOS | `account-manager-ios-unsigned.ipa` | 未签名 IPA（iOS 17.0+，需自行签名侧载） | 本 fork |
+| iOS | `account-manager-ios-unsigned.ipa` | 未签名 IPA（iOS 26.0+，需自行签名侧载） | 本 fork |
 
 本 fork 的 iOS 安装包见 [GitHub Releases](https://github.com/harrylarry/multi-agent-account-manager/releases)。
 
@@ -136,7 +136,7 @@
 
 ## 本地开发
 
-环境要求：Node.js 22+、Rust 1.85+，Android 构建需额外配置 Android SDK 与 NDK 26+，iOS 构建需 macOS + Xcode（见 [.github/workflows/ios.yml](.github/workflows/ios.yml)）。
+环境要求：Node.js 22+、Rust 1.85+，Android 构建需额外配置 Android SDK 与 NDK 26+，iOS 构建需 macOS + Xcode 26（见 [.github/workflows/ios.yml](.github/workflows/ios.yml)）。
 
 ```bash
 npm ci

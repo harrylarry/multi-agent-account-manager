@@ -43,7 +43,7 @@
 | iOS IPA | `Actions → Build unsigned iOS IPA`（手动 dispatch），产物 `ios-unsigned-ipa` |
 | 快速检查 | push 到开发分支自动触发 `Quick checks`（前端 / actionlint / Rust） |
 
-Rust 的 `cargo check` 需要在 macOS + Xcode 环境；若在 CI 中执行，注意 `IPHONEOS_DEPLOYMENT_TARGET=17.0`（Swift 插件最低版本）。
+当前 iPhone 构建使用 Xcode 26，并设置 `IPHONEOS_DEPLOYMENT_TARGET=26.0`。Rust 的 iOS target 检查在 macOS 上执行。
 
 ## 五、测试、安全和权限
 

@@ -2,13 +2,17 @@
 
 ## iPhone 导航与账号流程重构
 
+Spike 0.1.26 的源码提交为 `22d0fc0123ad33adf460f41946207f11961b8e5c`。包标识 `com.ldjx.accountmanager.spike`，最低系统 iOS 26.0。解压后的 IPA SHA-256 为 `866815c047482120a374a008c1d2fd84f5d5eb95b453b89b1025e6b9a06d6e73`。[下载](https://github.com/harrylarry/multi-agent-account-manager/actions/runs/45915130323/artifacts/15161784175) · [Quick checks](https://github.com/harrylarry/multi-agent-account-manager/actions/runs/45915114122) · [iOS 构建](https://github.com/harrylarry/multi-agent-account-manager/actions/runs/45915130323)
+
+`CI_PASSED`。对最终代码已通过前端构建、13 项嵌入脚本测试、87 项本地主 crate 测试，以及 320×568 深色和 390×844 浅色移动 WebKit 回归。iOS 构建通过，下载后已核对 IPA 哈希、版本、包标识和最低系统。WebKit 回归使用 IPC 测试数据。真实账号、网络、凭据、玻璃效果和精确网页落点处于 `UNVERIFIED`，按[真机步骤](../acceptance/iphone-acceptance.md#iphone-最终方案--重构真机验收)回填。
+
 2026-11-27 用户确认[最终方案](iphone-ui-final-plan.md)。继续使用 [PR #16](https://github.com/harrylarry/multi-agent-account-manager/pull/16) 和 spike/native-methods。首批代码从 5dcb013 推进至 6b6f715，后续提交补充代理只读检测、Hark 会话索引、按账号审批回写、文件凭据备份、同服务额度刷新和防重复发送回归。6b6f715 的 Quick checks 在 Rust iOS 交叉编译暴露 sha2 目标依赖差异，后续改用现有跨目标的 ring。8da7420 的两条 iOS 流水线暴露文件备份新字段在 iOS 专用构造分支的遗漏，已补齐后重新验证。
 
 - 原生玻璃、账号切换与返回路径、新增账号、按服务会话缓存、搜索及 Muse 发送待真机验证。应用最低 iOS 26。
 - Hark 会话列表、搜索直达与隔离发送已接入。公开登录页脚本列出的路由与用户在已登录网页观察一致。主对话为 https://hark.com/chat，项目为 https://hark.com/project/<id>。打开前核对账号的项目列表及主会话标识。主会话回复补同步保留现有卡片，并读取已知附件字段中的文件名和类型。已登录真机的路由落点、回执和项目产物仍待验证。
 - 加密文件备份可选择包含账号 Cookie 和账号代理密码。恢复前列出账号及凭据类型，写入新增账号前登记清理记录，保留已有账号凭据。设备上的错误密码、过期 Cookie、重复 UUID、恢复中断和回滚待验收。
 - Muse 会话行可试读服务产物列表，仅展示有明确会话归属的记录。Hark 读取当前项目的同步快照。两边均复用原会话跳转。关联字段的覆盖率和网页落点需真实样本。Muse 空间、Hark 看板继续暂缓。
-- 通过 CI 和 iOS 打包前，旧 IPA 不作为本轮交付。完整的候选版本、SHA-256 和真机步骤记入[真机验收指南](../acceptance/iphone-acceptance.md)。
+- 本轮候选已取代此前用于旧界面验收的 IPA。下一步按步骤验证真实账号与会话归属，记录失败分类、触发路径与回前台观察结果。
 
 ## 当前优先级 · 多账号稳定性
 
