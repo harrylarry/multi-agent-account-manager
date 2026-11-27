@@ -26,7 +26,7 @@ type ModalMode =
   | { kind: "harkDiagnostic"; account: AccountRecord }
   | { kind: "harkReplies"; account: AccountRecord; reading: boolean; result: HarkRecovery | null; error: string }
   | { kind: "backup"; busy: boolean; encrypted: string; fileName: string; preview: BackupPreview | null; message: string; mode: BackupMode; includeGroups: boolean; includeProxy: boolean; includeCredentials?: boolean; fromLan?: boolean; expiryDays: number; lanCode?: string; lanShare?: {code:string;png:string;seconds:number} }
-  | { kind: "proxyPool"; account: AccountRecord | null; data: ProxyPoolView | null; setting: SpikeProxySettingView | null; selected?: string; busy: boolean; message: string }
+  | { kind: "proxyPool"; account: AccountRecord | null; data: ProxyPoolView | null; setting: SpikeProxySettingView | null; selected?: string; editId?: string; busy: boolean; message: string }
   | { kind: "sessions"; account: AccountRecord; loading: boolean; items: MuseSession[] | null; error: string }
   | { kind: "cookies"; account: AccountRecord; busy: boolean; preview: CookiePreview | null; message: string; imported: boolean; stored: Pick<CookiePreview, "count" | "nextExpiry"> | null }
   | { kind: "approvals"; account: AccountRecord; loading: boolean; result: SpikeApprovalsResult | null; fetchedAt: number | null; decisionMessage: string }
@@ -141,17 +141,17 @@ type IphonePage = "accounts" | "sessions" | "manage" | "overview" | "search";
 let iphonePage: IphonePage = "accounts";
 let iphoneReturn: IphonePage = "accounts";
 let iphoneQuery = "";
+let iphoneSearchScope: "all" | "sessions" | "accounts" = "all";
 let iphoneMenuOpen = false;
 let iphonePanelRequest = 0;
 let iphoneSearchOrigin: ProviderId | null = null;
 let iphoneDetail: AccountKey | null = null;
 let iphoneDiagnosticAccount: AccountKey | null = null;
-let iphoneSearchOpen = false;
 let renderedModal: ModalMode | null = null;
 const iphoneSessionScroll: Record<ProviderId, number> = { muse: 0, hark: 0 };
 let iphoneSearchScroll = 0;
 const iphoneConversationDraft = new Map<string, { text: string; status: string; threadId?: string }>();
-const iphoneQuotaRefresh: Record<ProviderId, { running: boolean; message: string }> = {
+const iphoneQuotaRefresh: Record<ProviderId, { running: boolean; message: string; checkedAt?: number }> = {
   muse: { running: false, message: "" }, hark: { running: false, message: "" },
 };
 const iphoneProxyFaults = new Map<string, "blocked" | "unreachable">();
@@ -964,7 +964,7 @@ function iphoneQuota(account: AccountRecord): string {
 }
 
 function iphoneMenuItem(icon: Parameters<typeof iphoneIcon>[0], label: string, target: string, extra = ""): string {
-  return `<button type="button" class="iphone-item" ${target}>${iphoneIcon(icon)}<span>${label}</span>${extra}<span class="iphone-chevron" aria-hidden="true">›</span></button>`;
+  return `<button type="button" class="iphone-item" ${target}>${iphoneIcon(icon)}<span class="iphone-row-copy">${label}${extra}</span><span class="iphone-chevron" aria-hidden="true">›</span></button>`;
 }
 
 function iphoneAccountDetail(account: AccountRecord, provider: ProviderInfo): string {
@@ -1007,17 +1007,28 @@ function iphoneAttention(accounts: AccountRecord[]): string {
 
 function renderIphonePanel(state: ManagerSnapshot, provider: ProviderInfo, page: "sessions" | "overview" | "search"): string {
   const accounts = state.accounts.filter((account) => page === "search" || account.providerId === provider.id);
+  const ownerName = (account: AccountRecord) => escapeHtml(`${account.providerId === "muse" ? "Muse" : "Hark"} · ${account.alias}`);
   const accountLink = (account: AccountRecord, icon: Parameters<typeof iphoneIcon>[0]) =>
-    iphoneMenuItem(icon, escapeHtml(account.alias), `data-iphone-open-account="${escapeHtml(account.uuid)}" data-owner="${account.providerId}"`,
-      page === "search" ? `<small>${account.providerId === "muse" ? "Muse" : "Hark"}</small>` : "");
+    iphoneMenuItem(icon, page === "search" ? ownerName(account) : escapeHtml(account.alias),
+      `data-iphone-open-account="${escapeHtml(account.uuid)}" data-owner="${account.providerId}"`);
   if (page === "overview") {
+    const needsAttention = iphoneAttention(accounts);
     const unread = accounts.filter((account) => account.hasUnreadReply);
     const working = accounts.filter((account) => latestTaskObservations.get(iphoneAccountKey(account))?.activity === "working");
-    return `<h1>总览</h1>${iphoneAttention(accounts) || '<section class="iphone-section"><h2>需要处理</h2><p>暂无待处理事项。</p></section>'}
-      <section class="iphone-section"><h2>未读回复</h2>${unread.length ? `<div class="iphone-group">${unread.map((account) => accountLink(account, "chat")).join("")}</div>` : "<p>暂无未读回复。</p>"}</section>
-      <section class="iphone-section"><h2>进行中的任务</h2>${working.length ? `<div class="iphone-group">${working.map((account) => iphoneMenuItem("task", escapeHtml(account.alias), `data-iphone-account="${escapeHtml(account.uuid)}" data-account-action="tasks"`)).join("")}</div>` : "<p>暂无已确认的进行中任务。</p>"}</section>`;
+    return `<h1>总览</h1>
+      ${needsAttention ? `<section class="iphone-section">${needsAttention}</section>` : ""}
+      ${unread.length ? `<section class="iphone-section"><h2>未读回复</h2><div class="iphone-group">${unread.map((account) => accountLink(account, "chat")).join("")}</div></section>` : ""}
+      ${working.length ? `<section class="iphone-section"><h2>进行中的任务</h2><div class="iphone-group">${working.map((account) => iphoneMenuItem("task", escapeHtml(account.alias), `data-iphone-account="${escapeHtml(account.uuid)}" data-account-action="tasks"`)).join("")}</div></section>` : ""}
+      ${!needsAttention && !unread.length && !working.length ? '<div class="iphone-empty-state"><strong>当前没有需要跟进的事项</strong><p>待办、未读回复和已确认正在运行的任务会显示在这里。</p></div>' : ""}`;
   }
-  const query = page === "search" ? iphoneQuery.trim().toLocaleLowerCase() : "";
+  const search = page === "search";
+  const query = search ? iphoneQuery.trim().toLocaleLowerCase() : "";
+  const showAccounts = search && iphoneSearchScope !== "sessions";
+  const showSessions = !search || iphoneSearchScope !== "accounts";
+  const searchControls = search ? `<div class="iphone-search-chips" role="group" aria-label="结果类型">
+    ${([["all", "全部"], ["sessions", "会话"], ["accounts", "账号"]] as const).map(([key, label]) =>
+      `<button type="button" data-search-scope="${key}" aria-pressed="${iphoneSearchScope === key}">${label}</button>`).join("")}
+    </div>${!query ? `<section class="iphone-section"><h2>快捷操作</h2><div class="iphone-group">${iphoneMenuItem("add", "新建对话", "data-search-compose")}</div></section>` : ""}` : "";
   const matches = (value: string) => value.toLocaleLowerCase().includes(query);
   const synced = accounts.filter((account) => account.authState === "authenticated")
     .map((account) => ({ account, ...iphoneSessionsFor(account) }));
@@ -1026,15 +1037,18 @@ function renderIphonePanel(state: ManagerSnapshot, provider: ProviderInfo, page:
   const sessions = synced.flatMap(({ account, items }) => items.filter((item) => matches(`${item.title} ${account.alias} ${account.providerId}`)).map((item) => ({ account, item })))
     .sort((a, b) => (b.item.updatedAtMs ?? 0) - (a.item.updatedAtMs ?? 0));
   const rows = sessions.map(({ account, item }) => {
-    const title = `<strong>${escapeHtml(item.title)}</strong><small>${page === "search" ? (account.providerId === "muse" ? "Muse · " : "Hark · ") : ""}${escapeHtml(account.alias)}</small>`;
+    const timestamp = item.updatedAtMs && Number.isFinite(item.updatedAtMs)
+      ? `<span class="iphone-row-time">${escapeHtml(new Date(item.updatedAtMs).toLocaleDateString())}</span>` : "";
+    const title = `<strong>${escapeHtml(item.title)}</strong><small>${search ? ownerName(account) : escapeHtml(account.alias)}${timestamp}</small>`;
     const attributes = `data-iphone-thread="${escapeHtml(item.id)}" data-owner-uuid="${escapeHtml(account.uuid)}" data-owner="${account.providerId}"`;
-    const link = iphoneMenuItem("chat", title, attributes);
-    if (page !== "sessions") return link;
+    if (page !== "sessions") return iphoneMenuItem("chat", title, attributes);
     const artifacts = iphoneArtifacts?.uuid === account.uuid && iphoneArtifacts.providerId === account.providerId && iphoneArtifacts.threadId === item.id ? iphoneArtifacts : null;
     return `<div class="iphone-session-entry">
-      <div class="iphone-session-row">${link}
+      <div class="iphone-session-row">
+        <button type="button" class="iphone-item iphone-session-link" ${attributes}>${iphoneIcon("chat")}<span class="iphone-row-copy">${title}</span></button>
         <button type="button" class="iphone-back" aria-expanded="${Boolean(artifacts)}"
           data-iphone-artifacts="${escapeHtml(item.id)}" data-artifact-owner="${escapeHtml(account.uuid)}" data-artifact-provider="${account.providerId}">${artifacts?.failed ? "重试产物" : "产物"}</button>
+        <button class="iphone-session-arrow" type="button" ${attributes} tabindex="-1" aria-hidden="true">›</button>
       </div>
       ${artifacts ? `<div class="iphone-artifact-list" role="status">
         ${artifacts.pending ? "正在读取产物…" : artifacts.failed ? "未能读取产物。" : artifacts.names.length
@@ -1045,14 +1059,17 @@ function renderIphonePanel(state: ManagerSnapshot, provider: ProviderInfo, page:
       </div>` : ""}
     </div>`;
   }).join("");
-  const matching = page === "search" ? accounts.filter((account) => matches(`${account.alias} ${account.group ?? ""} ${account.providerId}`)) : [];
-  return `<h1 class="iphone-sr-only">${page === "search" ? "全局搜索" : "会话"}</h1>
-    ${pending ? '<p class="iphone-caption" role="status">正在同步会话，已有结果仍可打开。</p>' : ""}
-    ${failures.length ? `<p class="iphone-caption" role="status">未能读取 ${failures.join("、")} 的会话。</p><button type="button" class="iphone-back" id="iphone-refresh-sessions">重试失败账号</button>` : ""}
+  const matching = showAccounts ? accounts.filter((account) => matches(`${account.alias} ${account.group ?? ""} ${account.providerId}`)) : [];
+  return `<h1 class="iphone-sr-only">${search ? "全局搜索" : "会话"}</h1>
+    ${searchControls}
+    ${showSessions && pending ? '<p class="iphone-caption" role="status">正在同步会话，已有结果仍可打开。</p>' : ""}
+    ${showSessions && failures.length ? `<div class="iphone-empty-state" role="status">未能读取 ${failures.join("、")} 的会话。<button type="button" class="btn" id="iphone-refresh-sessions">重试失败账号</button></div>` : ""}
     ${matching.length ? `<section class="iphone-section"><h2>账号</h2><div class="iphone-group">${matching.map((account) => accountLink(account,"account")).join("")}</div></section>` : ""}
-    <section class="iphone-section"><div class="iphone-list-title"><h2>${page === "search" ? "会话" : "最近会话"}</h2>
-      ${page === "sessions" && !pending && !failures.length && synced.length ? '<button type="button" id="iphone-refresh-sessions">刷新</button>' : ""}</div>
-      ${rows ? `<div class="iphone-group">${rows}</div>` : `<p class="iphone-caption">${pending || failures.length ? "可用数据中暂无会话。" : page === "search" ? "没有匹配的会话。" : "暂无可显示的会话。"}</p>`}</section>
+    ${showSessions && (!search || rows) ? `<section class="iphone-section"><div class="iphone-list-title"><h2>${search ? "会话" : "最近会话"}</h2>
+      ${!search && !pending && !failures.length && synced.length ? '<button type="button" id="iphone-refresh-sessions">刷新</button>' : ""}</div>
+      ${rows ? `<div class="iphone-group">${rows}</div>` : '<div class="iphone-empty-state">暂无可显示的会话。</div>'}</section>` : ""}
+    ${search && !matching.length && (!showSessions || !rows) && (!showSessions || !pending) ? '<div class="iphone-empty-state">没有匹配的结果。</div>' : ""}
+
 `;
 }
 
@@ -1117,7 +1134,7 @@ function receiveIphoneNavigation(event: IphoneNavigationEvent): void {
     return;
   }
   if (event.action === "back" && modal.kind !== "none") {
-    document.querySelector<HTMLButtonElement>("#modal-root #modal-cancel-btn.iphone-back")?.click();
+    document.querySelector<HTMLButtonElement>("#modal-root :is(#modal-cancel-btn.iphone-back, #iphone-add-back)")?.click();
     return;
   }
   if (modal.kind !== "none") return;
@@ -1162,7 +1179,7 @@ function scheduleIphoneNavigation(): void {
     iphoneNavigationFrame = 0;
     const shell = document.querySelector<HTMLElement>(".iphone-shell");
     if (!shell || !snapshot) return;
-    const modalBack = shell.querySelector<HTMLButtonElement>("#modal-root #modal-cancel-btn.iphone-back");
+    const modalBack = shell.querySelector<HTMLButtonElement>("#modal-root :is(#modal-cancel-btn.iphone-back, #iphone-add-back)");
     const page = modal.kind === "none" ? shell.dataset.iphoneView ?? "hidden" : modalBack ? "modal" : "hidden";
     const state = {
       page, provider: snapshot.selectedProviderId,
@@ -1199,6 +1216,14 @@ function scheduleIphoneNavigation(): void {
     });
   });
 }
+
+function updateIphoneKeyboardClearance(): void {
+  const viewport = window.visualViewport;
+  const height = viewport ? Math.max(0, window.innerHeight - viewport.height - viewport.offsetTop) : 0;
+  document.documentElement.style.setProperty("--iphone-web-keyboard", `${height}px`);
+}
+window.visualViewport?.addEventListener("resize", updateIphoneKeyboardClearance);
+window.visualViewport?.addEventListener("scroll", updateIphoneKeyboardClearance);
 
 function animateIphoneEntrance(page: IphonePage, previous: IphonePage, exiting?: HTMLElement): void {
   if (matchMedia("(prefers-reduced-motion: reduce)").matches) return;
@@ -1254,14 +1279,15 @@ function syncIphoneViews(state: ManagerSnapshot, provider: ProviderInfo): void {
     if (button.dataset.iphonePage === (page === "detail" ? "accounts" : page)) button.setAttribute("aria-current", "page");
     else button.removeAttribute("aria-current");
   }
-  const quotaRefresh = iphoneQuotaRefresh[provider.id];
-  const quotaButton = shell.querySelector<HTMLButtonElement>("#sync-all-btn");
-  if (quotaButton) {
-    quotaButton.disabled = quotaRefresh.running;
-    quotaButton.textContent = quotaRefresh.running ? "正在刷新额度" : "刷新额度";
-  }
+  const refresh = iphoneQuotaRefresh[provider.id];
   const quotaMessage = shell.querySelector("#iphone-quota-message");
-  if (quotaMessage) quotaMessage.textContent = quotaRefresh.message;
+  const previousSync = Math.max(0, ...state.accounts.filter((account) => account.providerId === provider.id)
+    .map((account) => account.quotaObservation?.checkedAtMs ?? 0));
+  if (quotaMessage) {
+    const timestamp = refresh.checkedAt ?? previousSync;
+    quotaMessage.textContent = refresh.running ? "正在刷新额度、未读和任务…"
+      : refresh.message || (timestamp ? `最近同步 ${new Date(timestamp).toLocaleTimeString()}` : "尚未同步 · 下拉刷新");
+  }
   const detail = shell.querySelector<HTMLElement>(".iphone-account-detail");
   const detailHtml = detailAccount ? iphoneAccountDetail(detailAccount, provider) : "";
   if (detail && detail.dataset.content !== detailHtml) {
@@ -1288,9 +1314,6 @@ function syncIphoneViews(state: ManagerSnapshot, provider: ProviderInfo): void {
       }
     }
   }
-  const filters = shell.querySelector<HTMLElement>(".account-filters");
-  if (filters) filters.hidden = !(iphoneSearchOpen || accountFilters[provider.id].query || accountFilters[provider.id].group !== null);
-  shell.querySelector("#iphone-search-btn")?.setAttribute("aria-expanded", String(Boolean(filters && !filters.hidden)));
 }
 
 function rerenderPreservingScroll(): void {
@@ -1546,6 +1569,67 @@ function applyTaskObservation(key: string, result: TaskObservation): void {
     pendingTaskActivity.delete(key);
   }
   latestTaskObservations.set(key, result);
+}
+
+async function refreshIphoneAccounts(providerId: ProviderId): Promise<void> {
+  const refresh = iphoneQuotaRefresh[providerId];
+  if (snapshot?.platform !== "ios" || refresh.running || busy || reorderMode) return;
+  const accounts = snapshot.accounts.filter((account) => account.providerId === providerId);
+  if (!accounts.length) return;
+  const update = () => { if (snapshot) syncIphoneViews(snapshot, currentProvider(snapshot)); };
+  if (!navigator.onLine) {
+    refresh.message = "当前离线，保留上次同步结果。";
+    update();
+    return;
+  }
+  const targets = accounts.filter((account) => account.authState === "authenticated" &&
+    !snapshot?.conflicts.some((item) => item.uuid === account.uuid) &&
+    !snapshot?.pendingCleanup.some((item) => item.uuid === account.uuid));
+  refresh.running = true;
+  refresh.message = "";
+  update();
+  const totals = { quota: 0, unread: 0, tasks: 0 };
+  const timezone = Intl.DateTimeFormat().resolvedOptions().timeZone || "UTC";
+  try {
+    if (providerId === "hark" && targets.length) {
+      const rows = await invoke<{ quota: string }[]>("refresh_iphone_quotas", { providerId }).catch(() => []);
+      totals.quota = rows.filter((row) => ["updated", "unchanged"].includes(row.quota)).length;
+    }
+    for (let offset = 0; offset < targets.length; offset += 2) {
+      await Promise.all(targets.slice(offset, offset + 2).map(async (account) => {
+        const args = { providerId, uuid: account.uuid };
+        const [observation, quota] = await Promise.allSettled([
+          invoke<TaskObservation & { unreadObserved?: boolean }>("observe_account_tasks",
+            { ...args, timezone, tier: "idle", includeUnread: true }),
+          providerId === "muse" ? invoke<{ ok: boolean }>("muse_native_quota_probe", args) : Promise.resolve(null),
+        ]);
+        if (quota.status === "fulfilled" && quota.value?.ok) totals.quota++;
+        if (observation.status === "fulfilled") {
+          const latest = observation.value;
+          if (latest.unreadObserved) totals.unread++;
+          const stillEligible = snapshot?.accounts.some((item) => isSameKey(item, account) && item.authState === "authenticated");
+          if (latest.observedAtMs && latest.activity !== "unknown" && stillEligible) {
+            const key = iphoneAccountKey(account);
+            if ((latestTaskObservations.get(key)?.observedAtMs ?? 0) <= latest.observedAtMs) {
+              pendingTaskActivity.delete(key);
+              latestTaskObservations.set(key, latest);
+            }
+            totals.tasks++;
+          }
+        }
+      }));
+    }
+  } finally {
+    refresh.running = false;
+    refresh.checkedAt = Date.now();
+    const skipped = accounts.length - targets.length;
+    const time = new Date(refresh.checkedAt).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" });
+    const count = targets.length;
+    refresh.message = count
+      ? `${time} · 额度 ${totals.quota}/${count} · 未读 ${totals.unread}/${count} · 任务 ${totals.tasks}/${count}${skipped ? ` · 跳过 ${skipped}` : ""}`
+      : `${time} · ${skipped} 个账号待登录或暂不可用`;
+    update();
+  }
 }
 
 async function refreshForegroundTask(): Promise<void> {
@@ -2991,6 +3075,11 @@ function formatAccountClock(ms: number, timezone?: string): string {
   }
 }
 
+function iphoneStatusList(rows: [string, string | null | undefined][]): string {
+  return `<dl class="iphone-status-list">${rows.filter(([, value]) => value != null).map(([label, value]) =>
+    `<div><dt>${escapeHtml(label)}</dt><dd>${escapeHtml(value ?? "")}</dd></div>`).join("")}</dl>`;
+}
+
 function renderTasks(view: Extract<ModalMode, { kind: "tasks" }>): string {
   const { account, checking, note, section = "tasks" } = view;
   const current = snapshot?.accounts.find((entry) => entry.uuid === account.uuid && entry.providerId === account.providerId);
@@ -3000,7 +3089,7 @@ function renderTasks(view: Extract<ModalMode, { kind: "tasks" }>): string {
   };
   const recent = current?.lastTaskReplyAtMs;
   const fingerprintRunning = spikeFingerprintTask?.accountUuid === account.uuid;
-  const records = current?.fingerprintHistory ?? [];
+  const records = [...(current?.fingerprintHistory ?? [])].sort((a, b) => b.recordedAtMs - a.recordedAtMs);
   const unreadStatus: Record<string, string> = {
     unread: "Muse 返回未读", zero: "服务已返回未读计数，本次为零",
     unavailable: "本次未收到未读计数", network_or_protocol: "未读查询失败", timeout: "未读查询超时",
@@ -3013,14 +3102,17 @@ function renderTasks(view: Extract<ModalMode, { kind: "tasks" }>): string {
     <div class="inline-modal" role="dialog" aria-modal="true" aria-labelledby="account-task-title">
       <div class="modal-card">
         <div class="modal-title" id="account-task-title">${{tasks:"任务与通知", quota:"账号额度", models:"模型指纹"}[section]}</div>
-        ${section === "tasks" ? `<div role="status">${checking ? "正在检查任务…" : escapeHtml(status[observation?.activity ?? "unknown"])}</div>
-        ${observation?.observedAtMs ? `<div class="modal-desc">最近一次成功检测 ${new Date(observation.observedAtMs).toLocaleString()} · ${observation.source === "native" ? "原生" : "停驻页面"}</div>` : ""}
-        ${observation?.tier ? `<div class="modal-desc">监听档位 · ${{live:"持续观察",watch:"短时监听",idle:"空闲抽查"}[observation.tier]}</div>` : ""}
-        ${current?.pendingApprovalCount != null ? `<div class="modal-desc">待审批 ${current.pendingApprovalCount} 项</div>` : ""}
-        ${recent ? `<div class="modal-desc">最近发现回复 ${new Date(recent).toLocaleString()}</div>` : ""}
-        ${current?.museUnreadStatus ? `<div class="modal-desc">回前台补查 · ${unreadStatus[current.museUnreadStatus] ?? "暂不可判定"}</div>` : ""}
-        ${account.providerId === "muse" && isSpikeBuild ? `<div class="modal-desc" id="badge-timing-line" style="user-select:text;-webkit-user-select:text">${escapeHtml(badgeTimingLine(account.uuid))}</div>` : ""}
-        <label class="iphone-check"><input id="account-task-notifications" type="checkbox" ${current?.taskNotifications ? "checked" : ""}/> 启用任务监测和通知</label>
+        ${section === "tasks" ? `<div role="status">${iphoneStatusList([
+          ["任务状态", checking ? "正在检查…" : status[observation?.activity ?? "unknown"]],
+          ["最近检查", observation?.observedAtMs ? new Date(observation.observedAtMs).toLocaleString() : null],
+          ["数据来源", observation?.source ? observation.source === "native" ? "原生接口" : "停驻页面" : null],
+          ["监听方式", observation?.tier ? {live:"持续观察",watch:"短时监听",idle:"空闲抽查"}[observation.tier] : null],
+          ["待审批", current?.pendingApprovalCount != null ? `${current.pendingApprovalCount} 项` : null],
+          ["最新回复", recent ? new Date(recent).toLocaleString() : null],
+          ["回前台检查", current?.museUnreadStatus ? unreadStatus[current.museUnreadStatus] ?? "暂不可判定" : null],
+        ])}</div>
+        ${account.providerId === "muse" && isSpikeBuild ? `<details class="iphone-disclosure"><summary>通知计时诊断</summary><div class="modal-desc" id="badge-timing-line" style="user-select:text;-webkit-user-select:text">${escapeHtml(badgeTimingLine(account.uuid))}</div></details>` : ""}
+        <label class="iphone-check iphone-switch"><input id="account-task-notifications" type="checkbox" role="switch" ${current?.taskNotifications ? "checked" : ""}/> 启用任务监测和通知</label>
         <p class="modal-desc">自动检查在前台运行，低电量模式下暂停。回到前台时会检查已保留的会话页面。</p>` : ""}
         ${note ? `<div class="modal-desc" role="status">${escapeHtml(note)}</div>` : ""}
         ${section === "models" ? `
@@ -3034,7 +3126,7 @@ function renderTasks(view: Extract<ModalMode, { kind: "tasks" }>): string {
             </div>`).join("")}
           </details>
           ${fingerprintRunning ? '<button id="account-fingerprint-stop" class="btn" type="button">停止检测</button>' :
-            `<button id="account-fingerprint-start" class="btn" type="button" ${spikeFingerprintRunning ? "disabled" : ""}>检测模型</button>`}
+            `<button id="account-fingerprint-start" class="btn primary" type="button" ${spikeFingerprintRunning ? "disabled" : ""}>检测模型</button>`}
         ` : ""}
         ${section === "quota" && current?.quotaDetail ? (() => {
           const quota = resolveQuotaState(current);
@@ -3044,14 +3136,19 @@ function renderTasks(view: Extract<ModalMode, { kind: "tasks" }>): string {
           const quota = current.quotaObservation;
           const stale = quota.stale || Date.now() - quota.checkedAtMs > 10 * 60_000
             || (quota.resetsAtMs !== null && Date.now() >= quota.resetsAtMs);
-          return `<div class="modal-desc">${stale ? "上次记录，待刷新" : "已同步"} · ${quota.source === "native" ? "原生接口" : "网页"} · ${formatAccountClock(quota.checkedAtMs, current.timezone)}
-            <div>已用 ${quota.percentUsed != null ? `${quota.percentUsed}%` : "未观测"} · 窗口 ${escapeHtml(quota.window ?? "未观测")}</div>
-            <div>额度重置 ${quota.resetsAtMs ? formatAccountClock(quota.resetsAtMs, current.timezone) : "未观测"}</div></div>`;
+          return iphoneStatusList([
+            ["同步状态", stale ? "上次记录，待刷新" : "已同步"],
+            ["来源", quota.source === "native" ? "原生接口" : "网页"],
+            ["最近更新", formatAccountClock(quota.checkedAtMs, current.timezone)],
+            ["已用", quota.percentUsed != null ? `${quota.percentUsed}%` : "未观测"],
+            ["窗口", quota.window ?? "未观测"],
+            ["重置时间", quota.resetsAtMs ? formatAccountClock(quota.resetsAtMs, current.timezone) : "未观测"],
+          ]);
         })() : current?.quotaDetail ? "" : '<p class="modal-desc">尚无额度记录。</p>' : ""}
         ${section === "models" && account.providerId === "hark" && isSpikeBuild ? '<details><summary>Hark 检测前置验证</summary><button id="hark-isolated-send" class="btn" type="button">验证隔离发送与回复</button></details>' : ""}
         <div class="modal-footer">
           <button id="modal-cancel-btn" class="btn" type="button">关闭</button>
-          ${section === "quota" && account.providerId === "muse" ? `<button id="account-quota-refresh" class="btn" type="button" ${view.quotaChecking ? "disabled" : ""}>刷新额度</button>` : ""}
+          ${section === "quota" && account.providerId === "muse" ? `<button id="account-quota-refresh" class="btn primary" type="button" ${view.quotaChecking ? "disabled" : ""}>刷新额度</button>` : ""}
           ${section === "tasks" && account.providerId === "hark" ? `<button id="account-task-open" class="btn" type="button">打开会话查看审批</button>` : ""}
           ${section === "tasks" ? `<button id="account-task-refresh" class="btn primary" type="button" ${checking ? "disabled" : ""}>检查任务</button>` : ""}
         </div>
@@ -3302,6 +3399,7 @@ async function accountBackupAction(view: Extract<ModalMode, { kind: "backup" }>,
 
 function renderProxyPool(view: Extract<ModalMode, { kind: "proxyPool" }>): string {
   const { account, data, setting, message, busy } = view;
+  const editing = data?.entries.find((entry) => entry.id === view.editId);
   const disabled = busy ? "disabled" : "";
   const action = (label: string, name: string, id = "") =>
     `<button type="button" class="mini-btn" data-proxy-pool-action="${name}" data-pool-id="${escapeHtml(id)}" ${disabled}>${label}</button>`;
@@ -3309,7 +3407,10 @@ function renderProxyPool(view: Extract<ModalMode, { kind: "proxyPool" }>): strin
     <div class="inline-modal" role="dialog" aria-modal="true" aria-labelledby="proxy-pool-title">
       <div class="modal-card proxy-pool-modal">
         <div class="modal-title" id="proxy-pool-title">${account ? "账号代理" : "代理池"}</div>
-        <div class="modal-desc">${setting?.enabled ? `当前 ${escapeHtml(setting.display)}` : account ? busy ? "正在读取账号代理…" : message ? "请核对操作结果。" : "当前账号未启用代理" : "从账号详情选择该账号要使用的代理。"}</div>
+        ${account ? iphoneStatusList([
+          ["当前生效", setting?.enabled ? setting.display : busy ? "正在读取…" : "未启用"],
+          ["认证凭据", setting?.enabled ? setting.credentialAvailable === false ? "不可用" : setting.credentialAvailable === true ? "可用" : null : null],
+        ]) : ""}
         ${!account && snapshot?.platform === "ios" && iosNetworkPrefs ? `<details class="iphone-disclosure"><summary>会话保留与额度刷新</summary><div class="proxy-pool-actions">
           <label><input id="ios-proxy-retention" type="checkbox" ${iosNetworkPrefs.isolate ? "checked" : ""} ${disabled}> 同一服务和代理出口仅保留最近使用的会话页面</label>
           <label for="ios-quota-interval">自动刷新额度（仅前台）</label>
@@ -3320,6 +3421,13 @@ function renderProxyPool(view: Extract<ModalMode, { kind: "proxyPool" }>): strin
           ? "当前设置绑定代理池条目。"
           : "原池条目已删除或订阅内容已变化。当前保留此前账号配置，可手动选择新条目。"}</div>` : ""}
         <div class="proxy-pool-body">
+          ${editing ? `<section class="iphone-form-group" aria-labelledby="proxy-edit-title">
+            <h2 id="proxy-edit-title">编辑代理</h2>
+            <p class="modal-desc">当前地址 ${escapeHtml(editing.endpoint)}。填写新的完整代理地址，认证信息需随地址填写。</p>
+            <label for="proxy-pool-edit-input">新代理地址</label>
+            <input id="proxy-pool-edit-input" class="modal-input" type="password" spellcheck="false" autocomplete="off" autocapitalize="off" ${disabled}>
+            <div class="proxy-pool-actions">${action("取消编辑", "cancel-edit")}${action("保存到代理池", "save-edit", editing.id)}</div>
+          </section>` : ""}
           ${!account ? `<label for="proxy-pool-input">代理地址或 HTTPS 订阅链接</label>
           <div class="modal-desc">支持 HTTP、HTTPS 和 SOCKS5，代理地址可用换行或分号分隔。订阅链接须直接返回同样格式的纯文本。</div>
           <textarea id="proxy-pool-input" class="modal-input account-cookie-input" spellcheck="false" autocomplete="off" autocapitalize="off" ${disabled}></textarea>
@@ -3342,7 +3450,7 @@ function renderProxyPool(view: Extract<ModalMode, { kind: "proxyPool" }>): strin
           </div>`).join("") ?? "" : ""}
           ${!account ? data?.entries.map((entry) => `<div class="proxy-pool-row">
             <div>${escapeHtml(entry.endpoint)}${entry.missingCredentials ? "<small>待补认证</small>" : entry.requiresAuth ? "<small>需要认证</small>" : ""}</div>
-            <div>${!account || entry.missingCredentials ? "" : action("应用", "apply", entry.id)}${account || entry.sourceId ? "" : action("移除", "remove", entry.id)}</div>
+            <div>${!account || entry.missingCredentials ? "" : action("应用", "apply", entry.id)}${account || entry.sourceId ? "" : `${entry.missingCredentials ? "" : action("编辑", "edit", entry.id)}${action("移除", "remove", entry.id)}`}</div>
           </div>`).join("") ?? "" : ""}
         </div>
         ${message ? `<div role="status">${escapeHtml(message)}</div>` : ""}
@@ -3363,15 +3471,34 @@ async function openProxyPool(account: AccountRecord | null): Promise<void> {
 
 async function proxyPoolAction(view: Extract<ModalMode, { kind: "proxyPool" }>, action: string, entryId: string | null): Promise<void> {
   if (modal !== view || view.busy) return;
-  const input = document.querySelector<HTMLTextAreaElement>("#proxy-pool-input");
+  if (action === "edit" || action === "cancel-edit") {
+    if (view.account) return;
+    view.editId = action === "edit" ? entryId ?? undefined : undefined;
+    view.message = "";
+    render();
+    document.querySelector<HTMLInputElement>("#proxy-pool-edit-input")?.focus();
+    return;
+  }
+  const input = action === "save-edit"
+    ? document.querySelector<HTMLInputElement>("#proxy-pool-edit-input")
+    : document.querySelector<HTMLTextAreaElement>("#proxy-pool-input");
   const secret = input?.value.trim() ?? "";
+  if (action === "save-edit" && (!secret || view.editId !== entryId)) {
+    view.message = "请输入新的完整代理地址。";
+    render();
+    return;
+  }
   if (input) input.value = "";
   const account = view.account;
   if (account ? !["list", "apply", "clear", "measure", "measure-entry"].includes(action)
     : ["apply", "clear", "measure", "measure-entry"].includes(action)) return;
   const target = account ? { providerId: account.providerId, uuid: account.uuid } : null;
-  if (action === "apply" || action === "remove-source" || action === "clear") {
-    const confirm = action === "apply" ? {
+  if (action === "apply" || action === "remove-source" || action === "clear" || action === "save-edit") {
+    const confirm = action === "save-edit" ? {
+      title: "保存代理修改",
+      desc: "新地址与认证信息将保存到代理池。要更换正在使用的代理，请到账号详情重新选择并确认应用。",
+      confirmLabel: "确认保存",
+    } : action === "apply" ? {
       title: "更换账号代理",
       desc: `将所选代理用于「${account?.alias}」，已打开的会话需要重新打开。`,
       confirmLabel: "确认应用",
@@ -3424,9 +3551,9 @@ async function proxyPoolAction(view: Extract<ModalMode, { kind: "proxyPool" }>, 
       if (action === "measure") iphoneProxyFaults.delete(iphoneAccountKey(target));
       view.message = `代理 HTTPS 可达 · HTTP ${result.status} · ${result.milliseconds} ms`;
     } else {
-      const poolAction = action === "remove-source" ? "remove" : action;
+      const poolAction = action === "remove-source" ? "remove" : action === "save-edit" ? "edit" : action;
       view.data = await invoke<ProxyPoolView>("manage_proxy_pool", {
-        action: poolAction, entryId, input: poolAction === "import" || poolAction === "subscribe" ? secret : null,
+        action: poolAction, entryId, input: ["import", "subscribe", "edit"].includes(poolAction) ? secret : null,
       });
       if (action === "list") {
         if (target) {
@@ -3438,7 +3565,8 @@ async function proxyPoolAction(view: Extract<ModalMode, { kind: "proxyPool" }>, 
         }
         if (!target && snapshot?.platform === "ios") await updateIosNetworkPreferences(null, null);
       }
-      view.message = "";
+      if (action === "save-edit") view.editId = undefined;
+      view.message = action === "save-edit" ? "已保存。到账号代理确认应用后生效。" : "";
     }
   } catch (error) {
     if (action === "measure" && target) iphoneProxyFaults.set(iphoneAccountKey(target), "unreachable");
@@ -3497,7 +3625,7 @@ function renderCookieModal(view: Extract<ModalMode, { kind: "cookies" }>): strin
         <div class="modal-desc" id="account-cookie-stored">${stored?.count ? `本机会话有 ${stored.count} 条 Cookie · 最早已知到期 ${stored.nextExpiry ? new Date(stored.nextExpiry * 1000).toLocaleString() : "未提供"}` : stored ? "暂未读到本机 Cookie。可打开此账号确认登录后再查看。" : "本机 Cookie 状态暂不可用。"}</div>
         <label for="account-cookie-input">Cookie</label>
         <textarea id="account-cookie-input" class="modal-input account-cookie-input" placeholder="粘贴 Cookie 或带来源的会话 Token JSON" spellcheck="false" autocomplete="off" autocapitalize="off" ${busy ? "readonly" : ""}></textarea>
-        <details><summary>会话 Token 格式</summary><div class="modal-desc">填写真实导出信息。JSON 需要 type 为 session-cookie-token、provider 为 muse 或 hark，以及 cookieName、domain、token。可填写 Unix 秒 expirationDate。</div></details>
+        <details class="iphone-disclosure"><summary>会话 Token 格式</summary><div class="modal-desc">填写真实导出信息。JSON 需要 type 为 session-cookie-token、provider 为 muse 或 hark，以及 cookieName、domain、token。可填写 Unix 秒 expirationDate。</div></details>
         <div id="account-cookie-preview" role="status">${preview ? `
           共 ${preview.count} 条 · ${escapeHtml(preview.domains.join("、"))}
           <div>最早已知到期 ${preview.nextExpiry ? new Date(preview.nextExpiry * 1000).toLocaleString() : "未提供"}</div>
@@ -3693,26 +3821,37 @@ function renderIphoneConversation(view: Extract<ModalMode, { kind: "compose" }>)
     : confirmed ? "消息已确认，重新打开会话。" : draft?.status === "DEFINITIVELY_FAILED"
       ? "消息未发出。检查该账号的登录与代理后可重试。"
       : draft?.status === "BUSY" ? "账号已有操作正在发送。等该操作结束后重试。" : "";
-  return `<div class="inline-modal iphone-screen-modal" role="dialog" aria-modal="true" aria-labelledby="iphone-compose-title">
+  const sendLabel = confirmed ? "打开会话" : "发送并打开";
+  return `<div class="inline-modal iphone-screen-modal iphone-compose-screen" role="dialog" aria-modal="true" aria-labelledby="iphone-compose-title">
     <div class="modal-card">
-      <button id="modal-cancel-btn" class="iphone-back" type="button" ${waiting ? "disabled" : ""}>‹ 返回</button>
-      <h1 id="iphone-compose-title">新建对话</h1>
-      <fieldset ${waiting ? "disabled" : ""}><legend>选择发送账号</legend>
-        ${accounts.map((account) => `<label class="iphone-compose-account">
-          <input type="radio" name="iphone-compose-account" value="${escapeHtml(account.uuid)}" ${account.uuid === view.uuid ? "checked" : ""} ${account.authState !== "authenticated" ? "disabled" : ""}>
-          <span>${escapeHtml(account.alias)}${account.authState === "authenticated" ? "" : " · 需要登录"}</span>
-        </label>`).join("") || "<p>还没有账号。请先新增并登录。</p>"}
-      </fieldset>
-      <label for="iphone-first-message">首条消息</label>
-      <textarea class="modal-input" id="iphone-first-message" maxlength="16000" rows="5" ${waiting || unknown || confirmed || !view.uuid ? "readonly" : ""}>${escapeHtml(draft?.text ?? "")}</textarea>
-      <p role="status" class="iphone-caption">${escapeHtml(status)}</p>
-      <div class="modal-footer">
-        ${unknown ? `<button type="button" class="btn" id="iphone-compose-verify" ${waiting ? "disabled" : ""}>检查发送结果</button>
-          <button type="button" class="btn" id="iphone-compose-check" ${waiting ? "disabled" : ""}>打开账号核对</button>` : ""}
-        <button type="button" class="btn primary" id="iphone-compose-send" ${waiting || unknown || !draft?.text.trim() ? "disabled" : ""}>${confirmed ? "打开会话" : "发送并打开"}</button>
+      <button id="modal-cancel-btn" class="iphone-back" type="button" aria-label="返回" ${waiting ? "disabled" : ""}>‹</button>
+      <div class="iphone-compose-content">
+        <h1 id="iphone-compose-title" class="iphone-task-title">新建对话</h1>
+        <p class="iphone-compose-prompt">今天想聊些什么？</p>
+        <fieldset class="iphone-choice-group" ${waiting ? "disabled" : ""}><legend>选择发送账号</legend>
+          <div class="iphone-group">
+          ${accounts.map((account) => `<label class="iphone-compose-account">
+            <input class="iphone-sr-only" type="radio" name="iphone-compose-account" value="${escapeHtml(account.uuid)}" ${account.uuid === view.uuid ? "checked" : ""} ${account.authState !== "authenticated" ? "disabled" : ""}>
+            <span class="iphone-symbol">${iphoneIcon("account")}</span>
+            <span class="iphone-row-copy"><strong>${escapeHtml(account.alias)}</strong><small>${account.authState === "authenticated" ? "已登录" : "需要登录"}</small></span>
+            <span class="iphone-choice-mark" aria-hidden="true">✓</span>
+          </label>`).join("") || '<div class="iphone-empty-state">还没有可用账号。</div>'}
+          </div>
+        </fieldset>
+      </div>
+      <div class="iphone-composer">
+        <p role="status" class="iphone-caption">${escapeHtml(status)}</p>
+        ${unknown ? `<div class="modal-footer"><button type="button" class="btn" id="iphone-compose-check" ${waiting ? "disabled" : ""}>打开账号核对</button>
+          <button type="button" class="btn primary" id="iphone-compose-verify" ${waiting ? "disabled" : ""}>检查发送结果</button></div>` : ""}
+        <div class="iphone-composer-input">
+          <label for="iphone-first-message" class="iphone-sr-only">首条消息</label>
+          <textarea class="modal-input" id="iphone-first-message" maxlength="16000" rows="2" placeholder="${view.uuid ? "输入首条消息" : "先选择发送账号"}" ${waiting || unknown || confirmed || !view.uuid ? "readonly" : ""}>${escapeHtml(draft?.text ?? "")}</textarea>
+          <button type="button" class="btn primary" id="iphone-compose-send" aria-label="${sendLabel}" ${waiting || unknown || !draft?.text.trim() ? "disabled" : ""}>${confirmed ? "打开" : "↑"}</button>
+        </div>
       </div>
     </div>
   </div>`;
+
 }
 
 function renderModal(provider: ProviderInfo): string {
@@ -3734,7 +3873,9 @@ function renderModal(provider: ProviderInfo): string {
       const view = modal;
       return `<div class="inline-modal iphone-screen-modal" role="dialog" aria-modal="true" aria-labelledby="iphone-add-title">
         <div class="modal-card">
-          <h1 id="iphone-add-title" tabindex="-1">新增账号</h1>
+          <button id="iphone-add-back" class="iphone-back" type="button" aria-label="返回">‹</button>
+          <h1 id="iphone-add-title" class="iphone-task-title" tabindex="-1">新增账号</h1>
+          <section class="iphone-form-group" aria-label="基本信息">
           <label for="add-provider">服务</label>
           <select id="add-provider" class="modal-input">
             ${snapshot.providers.filter((item) => item.enabled).map((item) => `<option value="${escapeHtml(item.id)}" ${item.id === view.providerId ? "selected" : ""}>${escapeHtml(item.shortName)}</option>`).join("")}
@@ -3751,13 +3892,16 @@ function renderModal(provider: ProviderInfo): string {
           <select id="add-language" class="modal-input">
             ${iphoneLanguages.map(([value, label]) => `<option value="${value}">${label}</option>`).join("")}
           </select>
+          </section>
+          <section class="iphone-form-group" aria-label="连接">
           <label for="add-proxy">代理</label>
           <select id="add-proxy" class="modal-input">
             <option value="">不启用代理</option>
 
           </select>
           <label for="add-cookie-input">Cookie <small>可选</small></label>
-          <textarea id="add-cookie-input" class="modal-input account-cookie-input" placeholder="留空时使用网页登录" autocomplete="off" autocapitalize="off" spellcheck="false"></textarea>
+          <textarea id="add-cookie-input" rows="3" class="modal-input account-cookie-input" placeholder="留空时使用网页登录" autocomplete="off" autocapitalize="off" spellcheck="false"></textarea>
+          </section>
           <div id="add-account-result" role="status"></div>
           <div class="modal-footer"><button id="modal-cancel-btn" class="btn" type="button">取消</button><button id="modal-confirm-btn" class="btn primary" type="button">创建并打开</button></div>
         </div>
@@ -3915,7 +4059,7 @@ function renderMiddleContent(state: ManagerSnapshot, provider: ProviderInfo): st
   const groupOptions = ["", ...groups].map((group) =>
     `<option value="group:${escapeHtml(group)}" ${filter.group === group ? "selected" : ""}>${escapeHtml(group || "未分组")}</option>`
   ).join("");
-  const filtersHtml = provider.enabled && providerAccounts.length && !inReorder ? `
+  const filtersHtml = !iphone && provider.enabled && providerAccounts.length && !inReorder ? `
     <div class="account-filters">
       <input id="account-search" class="modal-input" type="search" aria-label="搜索账号" placeholder="搜索备注或分组" value="${escapeHtml(filter.query)}" />
       <select id="account-group-select" class="modal-input" aria-label="按分组筛选">
@@ -4009,9 +4153,9 @@ function renderMiddleContent(state: ManagerSnapshot, provider: ProviderInfo): st
     <section id="spike-workspace" class="spike-workspace" aria-labelledby="spike-workspace-title" ${spikeWorkspaceOpen ? "" : "hidden"}>
       <header class="spike-toolbar">
         <div class="spike-toolbar-title">
-          <button id="spike-back-btn" class="mini-btn" type="button">返回</button>
+          ${iphone ? "" : '<button id="spike-back-btn" class="mini-btn" type="button">返回</button>'}
           <div>
-            <h2 id="spike-workspace-title" tabindex="-1">原生诊断（Spike）</h2>
+            <h1 id="spike-workspace-title" tabindex="-1">原生诊断（Spike）</h1>
             <div id="spike-workspace-account">${escapeHtml(diagAccount?.alias ?? "未登录 Muse 账号")}</div>
           </div>
         </div>
@@ -4057,14 +4201,16 @@ function renderMiddleContent(state: ManagerSnapshot, provider: ProviderInfo): st
         <div class="account-list${inReorder ? " reorder-mode" : ""}">
           ${noticeHtml}${conflictsHtml}${filtersHtml}
           <section class="iphone-attention" aria-label="需要处理" hidden></section>
-          <div class="iphone-list-title"><h2>全部账号 <small>${providerAccounts.length}</small></h2>
-            <div class="iphone-list-actions">
-              ${inReorder ? '<button type="button" id="reorder-done-btn">完成</button>' : providerAccounts.length ? '<button type="button" id="iphone-search-btn" aria-expanded="false">筛选</button>' : ""}
-              ${!inReorder && providerAccounts.length && provider.id === "muse" ? '<button type="button" id="sync-all-btn">刷新额度</button>' : ""}
-              ${!inReorder && providerAccounts.length > 1 ? '<button type="button" id="iphone-reorder-btn">排序</button>' : ""}
-            </div>
+          <div class="iphone-list-title">
+            <h2>${inReorder ? "账号排序" : `<button type="button" id="iphone-account-groups" aria-label="账号分组" aria-expanded="false">${escapeHtml(filter.group === null ? "全部账号" : filter.group || "未分组")} <small>${providerAccounts.filter((account) => filter.group === null || (account.group ?? "") === filter.group).length}</small> ⌄</button>`}</h2>
+            ${inReorder ? '<button type="button" id="reorder-done-btn">完成</button>' : ""}
           </div>
+          ${!inReorder ? `<div class="iphone-group-filter" hidden>
+            <select id="account-group-select" class="modal-input" aria-label="按分组筛选">
+              <option value="all" ${filter.group === null ? "selected" : ""}>全部账号</option>${groupOptions}
+            </select></div>` : ""}
           <p id="iphone-quota-message" class="iphone-caption" role="status"></p>
+          ${!inReorder ? '<button type="button" id="iphone-refresh-accessible" class="iphone-sr-only iphone-accessible-action">刷新账号状态</button>' : ""}
           ${listBody}<div id="account-filter-empty" class="empty-list" hidden>没有匹配的账号</div>
         </div>
       </div>
@@ -4761,6 +4907,28 @@ function bindDelegatedEvents(): void {
   const root = document.querySelector<HTMLElement>("#app");
   if (!root) return;
 
+  let pull: { id: number; x: number; y: number; providerId: ProviderId } | null = null;
+  root.addEventListener("touchstart", (event) => {
+    pull = null;
+    const target = event.target;
+    if (!(target instanceof Element) || snapshot?.platform !== "ios" || iphonePage !== "accounts" || iphoneDetail
+      || modal.kind !== "none" || reorderMode || event.touches.length !== 1
+      || !target.closest("#spike-account-view .account-list") || (root.querySelector(".account-list")?.scrollTop ?? 0) > 1) return;
+    const touch = event.touches[0];
+    pull = { id: touch.identifier, x: touch.clientX, y: touch.clientY, providerId: snapshot.selectedProviderId };
+  }, { passive: true });
+  root.addEventListener("touchend", (event) => {
+    const start = pull;
+    pull = null;
+    if (!start || snapshot?.selectedProviderId !== start.providerId || modal.kind !== "none" || reorderMode) return;
+    const touch = Array.from(event.changedTouches).find((item) => item.identifier === start.id);
+    if (touch && touch.clientY - start.y >= 72 && Math.abs(touch.clientX - start.x) < 44) {
+      cancelLongPress();
+      void refreshIphoneAccounts(start.providerId);
+    }
+  }, { passive: true });
+  root.addEventListener("touchcancel", () => { pull = null; }, { passive: true });
+
   root.addEventListener("scroll", (event) => {
     const panel = event.target;
     if (!(panel instanceof HTMLElement) || !panel.matches(".iphone-account-panel") || panel.hidden ||
@@ -4815,7 +4983,7 @@ function bindDelegatedEvents(): void {
         if (next === "search" || next === "overview" || next === "manage") iphoneReturn = previous;
         iphonePage = next ?? iphoneReturn;
       }
-      if (next === "search") { iphoneSearchOrigin = provider.id; iphoneQuery = ""; iphoneSearchScroll = 0; }
+      if (next === "search") { iphoneSearchOrigin = provider.id; iphoneQuery = ""; iphoneSearchScope = "all"; iphoneSearchScroll = 0; }
       if (!next && previous === "search") {
         iphoneSearchOrigin = null;
         if (origin && origin !== snapshot.selectedProviderId) await callCommand("select_provider", { providerId: origin });
@@ -4827,6 +4995,19 @@ function bindDelegatedEvents(): void {
       if (next === "search" && !document.documentElement.classList.contains("native-iphone-navigation")) document.getElementById("iphone-global-search")?.focus();
       if (next === "sessions" || next === "search") void refreshIphoneSessionBatch();
       return;
+    }
+    const searchScope = target.closest<HTMLElement>("[data-search-scope]")?.dataset.searchScope;
+    if (iphonePage === "search" && modal.kind === "none") {
+      if (searchScope === "all" || searchScope === "accounts" || searchScope === "sessions") {
+        iphoneSearchScope = searchScope;
+        iphoneSearchScroll = 0;
+        syncIphoneViews(snapshot, provider);
+        return;
+      }
+      if (target.closest("[data-search-compose]") && !busy && !snapshot.conflicts.length) {
+        await setModal({ kind: "compose", providerId: iphoneSearchOrigin ?? provider.id, uuid: "", pending: false });
+        return;
+      }
     }
     const artifactButton = target.closest<HTMLElement>("[data-iphone-artifacts]");
     if (artifactButton && modal.kind === "none" && iphonePage === "sessions") {
@@ -5157,27 +5338,18 @@ function bindDelegatedEvents(): void {
       case "stage-open-site-btn":
         await callCommand("open_official_site", { providerId: provider.id });
         break;
+      case "iphone-refresh-accessible":
+        await refreshIphoneAccounts(provider.id);
+        break;
+      case "iphone-account-groups": {
+        const picker = root.querySelector<HTMLElement>(".iphone-group-filter");
+        if (!picker) break;
+        picker.hidden = !picker.hidden;
+        target.closest("button")?.setAttribute("aria-expanded", String(!picker.hidden));
+        if (!picker.hidden) picker.querySelector("select")?.focus();
+        break;
+      }
       case "sync-all-btn": {
-        if (snapshot.platform === "ios") {
-          const refresh = iphoneQuotaRefresh[provider.id];
-          if (refresh.running || busy) break;
-          const eligible = snapshot.accounts.filter((account) => account.providerId === provider.id).length;
-          refresh.running = true;
-          refresh.message = "";
-          syncIphoneViews(snapshot, provider);
-          try {
-            const rows = await invoke<{ quota: string }[]>("refresh_iphone_quotas", { providerId: provider.id });
-            const updated = rows.filter((row) => row.quota === "updated" || row.quota === "unchanged").length;
-            const retained = rows.filter((row) => row.quota === "native_retained").length;
-            refresh.message = `额度已同步 ${updated} · 保留原生记录 ${retained} · 未取得 ${rows.length - updated - retained} · 跳过 ${Math.max(0, eligible - rows.length)}`;
-          } catch (error) {
-            refresh.message = String(error);
-          } finally {
-            refresh.running = false;
-            if (snapshot) syncIphoneViews(snapshot, currentProvider(snapshot));
-          }
-          break;
-        }
         const btn = document.querySelector("#sync-all-btn");
         btn?.classList.add("spinning");
         try {
@@ -5227,18 +5399,6 @@ function bindDelegatedEvents(): void {
         }
         break;
       }
-      case "iphone-search-btn": {
-        const filters = root.querySelector<HTMLElement>(".account-filters");
-        iphoneSearchOpen = Boolean(filters?.hidden);
-        syncIphoneViews(snapshot, provider);
-        if (iphoneSearchOpen) root.querySelector<HTMLInputElement>("#account-search")?.focus();
-        break;
-      }
-      case "iphone-reorder-btn":
-        reorderMode = true;
-        reorderProviderId = provider.id;
-        rerenderPreservingScroll();
-        break;
       case "iphone-proxy-pool-btn":
         if (modal.kind === "none") await openProxyPool(null);
         break;
@@ -5427,6 +5587,7 @@ function bindDelegatedEvents(): void {
           await callCommand("switch_account", { providerId, uuid }, { providerId, uuid });
         }
         break;
+      case "iphone-add-back":
       case "modal-cancel-btn":
         if (modal.kind === "update" && updateState.installing) break;
         if ((modal.kind === "add" || modal.kind === "compose") && modal.pending) break;
@@ -5497,6 +5658,7 @@ function bindDelegatedEvents(): void {
     const row = (ev.target as HTMLElement).closest<HTMLElement>(
       "[data-switch-uuid]"
     );
+    if (snapshot?.platform === "ios" && accountFilters[snapshot.selectedProviderId].group !== null) return;
     if (!row) return;
     if ((ev.target as HTMLElement).closest("button:not(.iphone-open-account)")) return;
     if (reorderMode) {
@@ -5670,6 +5832,17 @@ root.addEventListener("change", async (ev) => {
     const provider = currentProvider(snapshot);
     accountFilters[provider.id].group = select.value === "all" ? null : select.value.slice(6);
     applyAccountFilter(snapshot, provider);
+    if (snapshot.platform === "ios") {
+      const button = root.querySelector<HTMLButtonElement>("#iphone-account-groups");
+      if (button) {
+        const name = accountFilters[provider.id].group;
+        const count = snapshot.accounts.filter((item) => item.providerId === provider.id && (name === null || (item.group ?? "") === name)).length;
+        button.innerHTML = `${escapeHtml(name === null ? "全部账号" : name || "未分组")} <small>${count}</small> ⌄`;
+        button.setAttribute("aria-expanded", "false");
+      }
+      select.closest(".iphone-group-filter")?.setAttribute("hidden", "");
+    }
+
   });
 
   root.addEventListener("input", (ev) => {

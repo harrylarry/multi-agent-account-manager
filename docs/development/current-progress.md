@@ -1,5 +1,9 @@
 # 当前开发进度
 
+## iPhone 统一页面
+
+用户确认以实际 App 页面验收 UIKit Liquid Glass、键盘和排版。账号页下拉仅同步当前服务已登录账号的额度、未读和任务状态。总览显示待办、未读和进行中，搜索可跨服务并直接打开原会话。代理池修改需确认保存，已分配账号随后在账号代理页确认应用。指纹历史仅在设备记录。Muse 空间、Hark 看板继续暂缓。下一步核对本批 SHA 的 Quick checks 和 iOS 候选，并在真机复测。
+
 ## iPhone 原生玻璃导航
 
 Spike 0.1.26 基于 `baa6394b2760472302b0441762995cf8957e23bf`，最低 iOS 26.0。解压后的 IPA SHA-256 为 `60efe7e91413898de2c94b6e04b5e0f8407ad8923a12731a36fb480e0c78d067`。Quick checks 与 Xcode 打包通过，下载后已核对包体。玻璃折射、触摸反馈与设备过渡效果待真机验收。[下载 IPA](https://github.com/harrylarry/multi-agent-account-manager/actions/runs/45921741203/artifacts/15164753667) · [Quick checks](https://github.com/harrylarry/multi-agent-account-manager/actions/runs/45921726634) · [iOS 构建](https://github.com/harrylarry/multi-agent-account-manager/actions/runs/45921741203)

@@ -6,6 +6,12 @@
   --dh-blue-ink: #fff;
   --dh-mist: #e8effc;
   --dh-surface: #fff;
+  --dh-content-inset: 16px;
+  --dh-section-gap: 24px;
+  --dh-card-radius: 16px;
+  --dh-field-radius: 14px;
+  --dh-control-radius: 12px;
+  --dh-row-height: 56px;
   --dh-line: #dce5f1;
   --dh-page: #f7faff;
   --dh-wash: #e5eefc;
@@ -83,7 +89,7 @@
 .iphone-shell[data-iphone-view="search"] .iphone-account-panel,
 .iphone-shell[data-iphone-view="diagnostics"] .spike-workspace { display: flex; }
 .iphone-shell:not([data-iphone-view="accounts"]):not([data-iphone-view="sessions"]) .iphone-nav { display: none; }
-.iphone-shell #spike-account-view { padding: 0 18px; }
+.iphone-shell #spike-account-view { padding: 0 var(--dh-content-inset); }
 .iphone-sr-only { position: absolute; width: 1px; height: 1px; overflow: hidden; clip-path: inset(50%); white-space: nowrap; }
 .iphone-shell .iphone-toolbar { display: block; flex: none; min-height: 57px; padding: 4px 16px 8px; position: relative; z-index: 10; }
 .iphone-global-tools, .iphone-search-tools, .iphone-list-actions { display: flex; align-items: center; gap: 8px; }
@@ -156,14 +162,14 @@
 }
 .iphone-attention { margin: 7px 0 9px; }
 .iphone-attention h2, .iphone-section h2 { margin-bottom: 8px; }
-.iphone-group { background: var(--dh-surface); border-radius: 15px; }
+.iphone-group { background: var(--dh-surface); border-radius: var(--dh-card-radius); }
 .iphone-alert, .iphone-item {
   display: grid;
   align-items: center;
   grid-template-columns: auto minmax(0, 1fr) auto;
   gap: 10px;
   width: 100%;
-  min-height: 49px;
+  min-height: var(--dh-row-height);
   padding: 9px 11px;
   border: 0;
   border-bottom: 1px solid var(--dh-line);
@@ -249,7 +255,7 @@
   flex-direction: column;
   min-height: 0;
   overflow-y: auto;
-  padding: 5px 18px 20px;
+  padding: 5px var(--dh-content-inset) 20px;
 }
 .iphone-scroll > * { flex-shrink: 0; }
 .iphone-back { align-self: flex-start; text-align: left; }
@@ -381,7 +387,7 @@
   --iphone-bottom-clearance: var(--iphone-native-bottom, calc(env(safe-area-inset-bottom, 0px) + 66px));
   padding-block: 0;
 }
-.native-iphone-navigation .iphone-shell :is(.iphone-toolbar, .iphone-nav, .modal-card > #modal-cancel-btn.iphone-back) {
+.native-iphone-navigation .iphone-shell :is(.iphone-toolbar, .iphone-nav, .modal-card > #modal-cancel-btn.iphone-back, #iphone-add-back) {
   display: none;
 }
 .native-iphone-navigation .iphone-shell :is(.account-list, .iphone-scroll) {
@@ -402,8 +408,57 @@
 }
 .iphone-session-entry { border-bottom: 1px solid var(--dh-line); }
 .iphone-session-entry:last-child { border-bottom: 0; }
-.iphone-session-row { display: grid; grid-template-columns: minmax(0, 1fr) auto; align-items: center; }
-.iphone-session-row .iphone-item { border-bottom: 0; }
+.iphone-session-row { display: grid; grid-template-columns: minmax(0, 1fr) auto auto; align-items: center; }
+.iphone-session-row .iphone-item { border-bottom: 0; grid-template-columns: auto minmax(0, 1fr); }
 .iphone-session-row > button:last-child { margin-inline: 4px; white-space: nowrap; }
 .iphone-artifact-list { margin: 0 12px 8px; padding: 6px 8px; overflow-wrap: anywhere; color: var(--dh-secondary); font-size: 13px; }
 .iphone-artifact-list ul { padding-inline-start: 20px; }
+
+
+/* The same content components serve native navigation and the WebView. */
+.iphone-shell .iphone-section { margin-block-end: var(--dh-section-gap); }
+.iphone-shell .iphone-item .iphone-row-copy { min-width: 0; overflow-wrap: anywhere; }
+.iphone-shell .iphone-item .iphone-chevron { grid-column: 3; grid-row: 1; justify-self: end; }
+.iphone-shell .iphone-row-copy small { display: block; }
+.iphone-shell .iphone-row-time { margin-inline-start: 8px; white-space: nowrap; }
+.iphone-shell .iphone-session-arrow { border: 0; background: transparent; min-height: 44px; min-width: 44px; font-size: 24px; color: var(--dh-secondary); }
+.iphone-shell .iphone-empty-state { padding: 16px; margin: 8px 0; border-radius: var(--dh-card-radius); background: var(--dh-surface); color: var(--dh-secondary); }
+.iphone-shell .iphone-empty-state p:last-child { margin-bottom: 0; }
+.iphone-shell .iphone-search-chips { display: flex; gap: 8px; flex-wrap: wrap; margin-bottom: 16px; }
+.iphone-shell .iphone-search-chips button { font: inherit; font-size: 14px; min-height: 44px; padding: 0 14px; border: 1px solid var(--dh-line); border-radius: var(--dh-field-radius); background: var(--dh-surface); color: var(--dh-ink); }
+.iphone-shell .iphone-search-chips [aria-pressed="true"] { background: var(--dh-mist); color: var(--dh-blue); font-weight: 600; }
+.iphone-shell .account-list { overscroll-behavior-y: contain; }
+.iphone-shell .iphone-group-filter { padding-bottom: 8px; }
+.iphone-shell #iphone-account-groups { font-size: inherit; font-weight: inherit; text-align: left; padding-inline: 0; }
+.iphone-shell .iphone-accessible-action:focus-visible { position: static; width: auto; height: auto; clip-path: none; }
+.iphone-shell .iphone-task-title { font-size: 20px; font-weight: 600; letter-spacing: normal; }
+.iphone-shell .iphone-form-group { display: grid; gap: 8px; padding: 12px; background: var(--dh-surface); border-radius: var(--dh-card-radius); }
+.iphone-shell .iphone-form-group label { margin-top: 4px; }
+.iphone-shell .iphone-form-group #add-cookie-input { min-height: 72px; }
+.iphone-shell #spike-workspace-title { margin: 0; }
+.iphone-shell .spike-toolbar { padding-inline: var(--dh-content-inset); }
+.iphone-shell .iphone-compose-screen .modal-card { overflow: hidden; padding-bottom: calc(max(var(--iphone-bottom-clearance, 0px), var(--iphone-web-keyboard, 0px)) + 10px); }
+.iphone-shell .iphone-compose-content { flex: 1; min-height: 0; overflow-y: auto; overscroll-behavior: contain; }
+.iphone-shell .iphone-compose-content h1, .iphone-shell .iphone-compose-prompt { text-align: center; }
+.iphone-shell .iphone-compose-prompt { font-size: 24px; font-weight: 600; margin: 8px 0 22px; }
+.iphone-shell .iphone-choice-group { padding: 0; margin: 0; border: 0; min-inline-size: 0; }
+.iphone-shell .iphone-choice-group legend { margin-bottom: 8px; font-size: 17px; font-weight: 600; }
+.iphone-shell .iphone-compose-account { display: grid; grid-template-columns: auto minmax(0, 1fr) auto; padding: 8px 12px; margin: 0; min-height: var(--dh-row-height); border-bottom: 1px solid var(--dh-line); }
+.iphone-shell .iphone-compose-account:last-child { border-bottom: 0; }
+.iphone-shell .iphone-compose-account:has(input:checked) { background: var(--dh-mist); border-radius: var(--dh-control-radius); }
+.iphone-shell .iphone-compose-account:has(input:disabled) { color: var(--dh-secondary); }
+.iphone-shell .iphone-compose-account:has(input:focus-visible) { outline: 2px solid var(--dh-blue); outline-offset: -2px; }
+.iphone-shell .iphone-choice-mark { visibility: hidden; color: var(--dh-blue); }
+.iphone-shell .iphone-compose-account:has(input:checked) .iphone-choice-mark { visibility: visible; }
+.iphone-shell .iphone-composer { flex-shrink: 0; }
+.iphone-shell .iphone-composer-input { position: relative; }
+.iphone-shell .iphone-composer-input textarea { padding: 11px 82px 11px 12px; min-height: 56px; max-height: 132px; resize: none; }
+.iphone-shell .iphone-composer-input button { position: absolute; bottom: 8px; right: 8px; min-width: 44px; border-radius: var(--dh-control-radius); }
+.iphone-shell .iphone-status-list { margin: 0; padding: 0 12px; background: var(--dh-surface); border-radius: var(--dh-card-radius); }
+.iphone-shell .iphone-status-list > div { display: grid; grid-template-columns: minmax(0, 1fr) minmax(0, 1.35fr); gap: 8px; align-items: center; min-height: 46px; padding-block: 8px; border-bottom: 1px solid var(--dh-line); }
+.iphone-shell .iphone-status-list > div:last-child { border: 0; }
+.iphone-shell .iphone-status-list dd { margin: 0; text-align: right; overflow-wrap: anywhere; color: var(--dh-secondary); }
+.iphone-shell .iphone-switch input { appearance: none; position: relative; width: 46px; height: 28px; margin: 0; flex: none; border: 1px solid var(--dh-line); background: var(--dh-line); border-radius: 999px; }
+.iphone-shell .iphone-switch input::before { content: ""; position: absolute; left: 2px; top: 2px; width: 22px; height: 22px; border-radius: 50%; background: white; }
+.iphone-shell .iphone-switch input:checked { background: var(--dh-blue); }
+.iphone-shell .iphone-switch input:checked::before { translate: 18px 0; }

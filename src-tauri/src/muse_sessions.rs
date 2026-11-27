@@ -65,6 +65,26 @@ async fn request(gateway: &mut crate::egress::AccountGateway, path: &str) -> Res
   Ok(body)
 }
 
+#[cfg(any(target_os = "ios", test))]
+pub(crate) fn parse_unread_total(raw: &Value) -> Option<u64> {
+  if raw["ok"] == false || !raw["error"].is_null() { return None; }
+  let body = raw.get("result").unwrap_or(raw);
+  ["count", "unread_count", "unreadCount"].iter().find_map(|key| body[*key].as_u64())
+}
+
+#[cfg(target_os = "ios")]
+pub(crate) async fn fetch_unread_total(
+  app: &tauri::AppHandle, uuid: &str, setting: Option<&crate::storage::ProxySetting>,
+) -> Result<Option<u64>, String> {
+  let header = zeroize::Zeroizing::new(crate::muse_native::cookie_header_for(app, uuid).await?);
+  if header.is_empty() { return Ok(None); }
+  let egress = crate::egress::resolve_for_app(app, setting)?;
+  let cookies = muse_native_client::cookie::SessionCookies::from_header(&header);
+  let mut gateway = Box::pin(egress.connect(&cookies)).await.map_err(|_| "无法连接 Muse 网关")?;
+  let body = Box::pin(request(&mut gateway, "/chat/unread-count")).await?;
+  Ok(serde_json::from_slice::<Value>(&body).ok().as_ref().and_then(parse_unread_total))
+}
+
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct MuseThreadArtifacts {
@@ -303,6 +323,14 @@ pub fn parse_list(raw: &[u8]) -> Result<Vec<MuseSession>, String> {
 #[cfg(test)]
 mod tests {
   use super::*;
+
+  #[test]
+  fn unread_totals_require_explicit_counts() {
+    assert_eq!(parse_unread_total(&serde_json::json!({"count": 0})), Some(0));
+    assert_eq!(parse_unread_total(&serde_json::json!({"ok": true, "result": {"unread_count": 7}})), Some(7));
+    assert_eq!(parse_unread_total(&serde_json::json!({"ok": false, "count": 0})), None);
+    assert_eq!(parse_unread_total(&serde_json::json!({"sessions": []})), None);
+  }
 
   #[test]
   fn artifacts_require_explicit_thread_ownership_and_hide_download_urls() {

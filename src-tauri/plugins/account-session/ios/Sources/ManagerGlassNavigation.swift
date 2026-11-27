@@ -37,6 +37,7 @@ final class ManagerGlassNavigation: UIView, UITextFieldDelegate {
   private var current: Page?
   private var selectedProvider = ""
   private var lastInsets: [Int] = []
+  private var keyboardBottom: CGFloat = 0
   private var event: (([String: String]) -> Void)?
 
   init() {
@@ -55,6 +56,7 @@ final class ManagerGlassNavigation: UIView, UITextFieldDelegate {
     primary = row([manage, service, spacer, overview, searchButton])
 
     let searchGlass = makeGlass()
+    searchGlass.cornerConfiguration = .fixed(14)
     let searchIcon = UIImageView(image: UIImage(systemName: "magnifyingglass"))
     searchIcon.tintColor = .secondaryLabel
     searchIcon.contentMode = .center
@@ -88,6 +90,7 @@ final class ManagerGlassNavigation: UIView, UITextFieldDelegate {
     ])
 
     let dock = makeGlass()
+    dock.cornerConfiguration = .fixed(26)
     tabs.accessibilityLabel = "账号和会话"
     tabs.accessibilityIdentifier = "manager-navigation-tabs"
     tabs.selectedSegmentIndex = 0
@@ -100,7 +103,7 @@ final class ManagerGlassNavigation: UIView, UITextFieldDelegate {
     bottom.addArrangedSubview(dock)
     bottom.addArrangedSubview(compose)
     let dockGroup = UIGlassContainerEffect()
-    dockGroup.spacing = 12
+    dockGroup.spacing = 6
     let dockContainer = UIVisualEffectView(effect: dockGroup)
     add(dockContainer, to: self)
     embed(bottom, in: dockContainer.contentView)
@@ -112,9 +115,19 @@ final class ManagerGlassNavigation: UIView, UITextFieldDelegate {
     ])
     top.isHidden = true
     bottom.isHidden = true
+    NotificationCenter.default.addObserver(self, selector: #selector(keyboardFrameChanged(_:)),
+      name: UIResponder.keyboardWillChangeFrameNotification, object: nil)
   }
 
   required init?(coder: NSCoder) { return nil }
+
+  @objc private func keyboardFrameChanged(_ notification: Notification) {
+    guard let window, let frame = notification.userInfo?[UIResponder.keyboardFrameEndUserInfoKey] as? CGRect else { return }
+    let visible = convert(window.convert(frame, from: window.screen.coordinateSpace), from: window)
+    keyboardBottom = max(0, bounds.intersection(visible).height)
+    if !keyboardBottom.isFinite { keyboardBottom = 0 }
+    publishInsets()
+  }
 
   private func row(_ views: [UIView]) -> UIStackView {
     let stack = UIStackView(arrangedSubviews: views)
@@ -277,7 +290,8 @@ final class ManagerGlassNavigation: UIView, UITextFieldDelegate {
   private func publishInsets() {
     guard bounds.height > 0 else { return }
     let above = safeAreaInsets.top + (current == .hidden || current == nil ? 0 : 62)
-    let below = safeAreaInsets.bottom + (current == .accounts || current == .sessions ? 66 : 0)
+    let chromeBottom = safeAreaInsets.bottom + (current == .accounts || current == .sessions ? 66 : 0)
+    let below = current == .search ? max(chromeBottom, keyboardBottom) : chromeBottom
     let insets = [Int(ceil(above)), Int(ceil(below)), Int(bounds.width.rounded())]
     guard insets != lastInsets else { return }
     lastInsets = insets

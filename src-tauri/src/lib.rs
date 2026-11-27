@@ -277,6 +277,7 @@ async fn observe_account_tasks(
   timezone: String,
   automatic: Option<bool>,
   tier: Option<String>,
+  include_unread: Option<bool>,
 ) -> Result<serde_json::Value, String> {
   #[cfg(target_os = "ios")]
   {
@@ -348,28 +349,41 @@ async fn observe_account_tasks(
       if token.is_cancelled() {
         return Err("账号出站配置已变化，已停止检测".into());
       }
-      let ((native, completed), approvals) = tokio::select! {
+      let unread_request = Box::pin(async {
+        if include_unread != Some(true) { return None; }
+        let request = Box::pin(async {
+          match provider {
+            providers::ProviderId::Muse => Box::pin(muse_sessions::fetch_unread_total(&app, &uuid, proxy.as_ref())).await,
+            providers::ProviderId::Hark => Box::pin(hark_send::fetch_unread_total(&app, &uuid, proxy.as_ref(), &timezone)).await,
+          }
+        });
+        tokio::time::timeout(std::time::Duration::from_secs(20), request).await.ok().and_then(Result::ok).flatten()
+      });
+      let ((native, completed), approvals, unread) = tokio::select! {
         biased;
         _ = token.cancelled() => return Err("账号出站配置已变化，已停止检测".into()),
         status = tokio::time::timeout(std::time::Duration::from_secs(32), Box::pin(async {
-          tokio::join!(native, approval_poll)
+          tokio::join!(native, approval_poll, unread_request)
         })) => status.unwrap_or_default(),
       };
       if automatic && !platform::ios::automatic_task_polling_available(&app).await? {
         return Err("系统已暂停自动任务监听".into());
       }
       mgr.record_task_observations(&app, provider, &uuid, &completed, approvals.as_deref()).await?;
+      if let Some(count) = unread {
+        mgr.apply_manual_unread(&app, provider, &uuid, proxy.as_ref(), count).await?;
+      }
       if let Some(activity) = native {
-        return Ok(serde_json::json!({ "activity": activity, "source": "native", "observedAtMs": storage::now_ms(), "tier":mode }));
+        return Ok(serde_json::json!({ "activity": activity, "source": "native", "observedAtMs": storage::now_ms(), "tier":mode, "unreadObserved":unread.is_some() }));
       }
       if provider == providers::ProviderId::Muse && !token.is_cancelled() {
         let fallback = tokio::time::timeout(std::time::Duration::from_secs(3), platform::ios::read_parked_task_state(&app, &uuid))
           .await.ok().and_then(Result::ok).flatten();
         if let Some(activity) = fallback {
-          return Ok(serde_json::json!({ "activity": activity, "source": "page", "observedAtMs": storage::now_ms(), "tier":mode }));
+          return Ok(serde_json::json!({ "activity": activity, "source": "page", "observedAtMs": storage::now_ms(), "tier":mode, "unreadObserved":unread.is_some() }));
         }
       }
-      Ok(serde_json::json!({ "activity": "unknown", "source": null, "observedAtMs": null, "tier":mode }))
+      Ok(serde_json::json!({ "activity": "unknown", "source": null, "observedAtMs": null, "tier":mode, "unreadObserved":unread.is_some() }))
     });
     observation.await.map_err(|_| "任务检测未能完成".to_string())?
   }
@@ -1790,6 +1804,10 @@ async fn manage_proxy_pool(
     "list" => {}
     "import" => {
       pool.import(input.as_deref().ok_or("请输入代理")?)?;
+      pool.save(&secrets)?;
+    }
+    "edit" => {
+      pool.edit_manual(entry_id.ok_or("缺少代理标识")?, input.as_deref().ok_or("请输入代理")?)?;
       pool.save(&secrets)?;
     }
     "subscribe" => {

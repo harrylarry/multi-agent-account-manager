@@ -160,6 +160,20 @@ impl ProxyPool {
     self.replace_entries(None, parse_lines(raw)?)
   }
 
+  pub fn edit_manual(&mut self, id: Uuid, raw: &str) -> Result<(), String> {
+    let entries = Zeroizing::new(parse_lines(raw)?);
+    let [uri] = entries.as_slice() else { return Err("编辑时只接受一条代理".into()); };
+    let index = self.entries.iter().position(|entry| entry.id == id && entry.source.is_none())
+      .ok_or("只能编辑手动添加的代理")?;
+    if self.entries.iter().any(|other| other.id != id && other.uri == *uri) {
+      return Err("代理池里已有相同配置".into());
+    }
+    let mut new_uri = uri.clone();
+    std::mem::swap(&mut self.entries[index].uri, &mut new_uri);
+    new_uri.zeroize();
+    Ok(())
+  }
+
   fn replace_entries(&mut self, source: Option<Uuid>, incoming: Vec<String>) -> Result<(), String> {
     let keep = self.entries.iter().filter(|entry| source.is_none() || entry.source != source).count();
     let to_add = incoming.iter().filter(|uri| {
@@ -272,6 +286,19 @@ pub fn restored_entry_id(entry: &ProxyPoolProfile) -> Uuid {
 #[cfg(test)]
 mod tests {
   use super::*;
+
+  #[test]
+  fn manual_edit_preserves_binding_id_and_rejects_duplicate_or_invalid_input() {
+    let mut pool = ProxyPool::default();
+    pool.import("socks5://u:old@proxy.example:1080; http://other.example:8080").unwrap();
+    let id = pool.entries[0].id;
+    assert!(pool.edit_manual(id, "http://other.example:8080").is_err());
+    assert!(pool.edit_manual(id, "https://invalid.example:443/path").is_err());
+    assert_eq!(pool.selected(id).unwrap().password.as_deref(), Some("old"));
+    pool.edit_manual(id, "socks5://u:new@proxy.example:1080").unwrap();
+    assert_eq!(pool.selected(id).unwrap().password.as_deref(), Some("new"));
+    assert_eq!(pool.view().unwrap().entries[0].endpoint, "socks5://proxy.example:1080");
+  }
 
   #[test]
   fn batch_import_understands_semicolons_and_preserves_userinfo() {

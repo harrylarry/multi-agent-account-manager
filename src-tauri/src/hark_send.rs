@@ -75,6 +75,16 @@ pub(crate) async fn list_projects(transport: &Transport<'_>) -> Result<Vec<HarkS
   Ok(result)
 }
 
+#[cfg(target_os = "ios")]
+pub(crate) async fn fetch_unread_total(
+  app: &tauri::AppHandle, uuid: &str, setting: Option<&crate::storage::ProxySetting>, timezone: &str,
+) -> Result<Option<u64>, String> {
+  let (client, cookie) = crate::hark_native::account_http(app, uuid, setting).await?;
+  let transport = Transport { client, cookie, timezone, origin: "https://app.hark.com" };
+  let raw = transport.read(transport.request(Method::GET, "/conversations/unread-count", &[])?).await?;
+  Ok(crate::muse_sessions::parse_unread_total(&raw))
+}
+
 pub(crate) async fn project_is_main(transport: &Transport<'_>, id: &str) -> Result<bool, String> {
   if !valid_project_id(id) { return Err("Hark 项目标识无效".into()); }
   let main = transport.read(transport.request(Method::GET, "/conversations/main", &[("timezone", transport.timezone)])?).await?;

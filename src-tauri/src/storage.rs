@@ -520,7 +520,7 @@ fn migrate_from_value(root: Value) -> Result<(AccountsStoreFile, bool), String> 
         created_at_ms,
         fingerprint_history: item_obj.get("fingerprintHistory")
           .and_then(|value| serde_json::from_value::<Vec<FingerprintRecord>>(value.clone()).ok())
-          .unwrap_or_default().into_iter().take(12).collect(),
+          .unwrap_or_default(),
         fingerprint_settings: item_obj.get("fingerprintSettings")
           .and_then(|value| serde_json::from_value(value.clone()).ok()).unwrap_or_default(),
         auto_alias,
