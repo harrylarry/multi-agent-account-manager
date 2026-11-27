@@ -51,6 +51,12 @@ final class AccountWebViewController: UIViewController, WKNavigationDelegate, WK
   private var committedAuthority: String?
   private var mainLoadFailed = false
   private var popupWebView: WKWebView?
+  /// #11/#16（补 W）：非 nil 时该会话已被阻断（代理由启用变为不可用、代理变更、
+  /// 本地配置损坏等），所有主框架导航一律取消，不放行任何直连请求。
+  private var egressBlockedReason: String?
+  /// 阻断时是否已经销毁过 WebView，避免在导航回调里重复销毁。
+  private var egressTornDown = false
+  private var egressBlockLabel: UILabel?
   // 0.1.11 (generalized in 0.1.18): set when the popup navigates to a
   // non-allowlisted host — the popup is doing external auth. The popup
   // auto-closes (and the session reloads) once it lands back on an
@@ -374,6 +380,79 @@ final class AccountWebViewController: UIViewController, WKNavigationDelegate, WK
 
   // MARK: - Session binding
 
+  /// 代理不可用/变更后，当前 WebView 必须**立即停止出站**。
+  ///
+  /// 只弹提示不算阻断；只 `stopLoading` + 隐藏也不够：已建立的 XHR /
+  /// WebSocket / EventSource 会继续跑，JS 定时器还会接着发请求。这里按
+  /// 「能撤的撤、撤不掉的重建」处理：
+  /// 1. 停加载、销毁 OAuth 弹窗；
+  /// 2. 注入 `window.stop()` 并尽力关闭页内可枚举的连接；
+  /// 3. **销毁 WebView 本身**：从视图层级移除、断开代理引用，交给 WebKit
+  ///    回收内容进程（回收时机由系统决定，须真机验证，不能仅凭推理断言
+  ///    连接已全部断开）；
+  /// 4. 不依赖回收的兜底：调用方先行 `AccountProxyQuarantine.engage(uuid:)`
+  ///    把该 store 的出口换成不可达代理并关掉 failover，此后**新**连接
+  ///    （包括残留进程发起的）无法离开设备。
+  ///
+  /// 想继续用，只能关掉会话重新打开（那时按新配置重建 WebView）。
+  func blockEgress(reason: String) {
+    egressBlockedReason = reason
+    mainLoadFailed = true
+    mainInputEnabled = false
+    loadingIndicator.stopAnimating()
+    destroyPopupWebView()
+
+    if !egressTornDown {
+      egressTornDown = true
+      progressObservation?.invalidate()
+      progressObservation = nil
+      stopIdentityProbeLoop()
+      if let view = mainWebView {
+        // 尽力让页面自己停下（同步执行，不等待回调）。
+        view.evaluateJavaScript(
+          "try{window.stop()}catch(e){};" +
+            "try{for(const k of Object.keys(window)){const v=window[k];" +
+            "if(v&&v.constructor&&/WebSocket|EventSource/.test(v.constructor.name)){" +
+            "try{v.close()}catch(e){}}}}catch(e){}",
+          completionHandler: nil)
+        view.stopLoading()
+        view.navigationDelegate = nil
+        view.uiDelegate = nil
+        // 去掉注入脚本，避免重建前的残留页面继续跑我们的钩子。
+        view.configuration.userContentController.removeAllUserScripts()
+        view.removeFromSuperview()
+      }
+      // 释放引用 = 销毁：WKWebView 的内容进程随最后一个引用消失而终止。
+      mainWebView = nil
+    }
+
+    headerTitleLabel.text = reason
+    let label = egressBlockLabel ?? {
+      let l = UILabel()
+      l.numberOfLines = 0
+      l.textAlignment = .center
+      l.font = .systemFont(ofSize: 15, weight: .medium)
+      l.translatesAutoresizingMaskIntoConstraints = false
+      mainWebContainer.addSubview(l)
+      NSLayoutConstraint.activate([
+        l.leadingAnchor.constraint(equalTo: mainWebContainer.leadingAnchor, constant: 24),
+        l.trailingAnchor.constraint(equalTo: mainWebContainer.trailingAnchor, constant: -24),
+        l.centerYAnchor.constraint(equalTo: mainWebContainer.centerYAnchor),
+      ])
+      egressBlockLabel = l
+      return l
+    }()
+    label.text = "\(reason)\n\n请返回账号列表，重新打开该账号。"
+    label.isHidden = false
+  }
+
+  /// 新会话/新页面建立时清除阻断态（WebView 会重新创建）。
+  private func clearEgressBlock() {
+    egressBlockedReason = nil
+    egressTornDown = false
+    egressBlockLabel?.isHidden = true
+  }
+
   func bindSessionSpec(_ spec: IosAccountSessionSpec) {
     // The plugin binds a fresh controller before presenting it; force the
     // view to load so the outlets below are initialized.
@@ -383,11 +462,23 @@ final class AccountWebViewController: UIViewController, WKNavigationDelegate, WK
     currentSpec = spec
     mainInputEnabled = false
     mainLoadFailed = false
+    clearEgressBlock()
     headerTitleLabel.text = "正在核验会话…"
     loadingIndicator.startAnimating()
 
     // No MULTI_PROFILE capability check on iOS: WKWebsiteDataStore identifiers
     // are available on every supported device (iOS 17+).
+    //
+    // #11/#16（补 W）：出口必须由统一解析器给出。
+    // 配置损坏、或还没收到该账号的条目（下发失败 / 两端未同步）都算未知，
+    // 一律阻断；**不能**因为「没读到配置」就按直连放行。
+    if let reason = AccountProxyResolver.resolve(uuid: spec.uuid).blockReason {
+      blockEgress(reason: reason)
+      return
+    }
+    // 缓存页可以直接复用：任何出口变更（set / quarantine）都会先
+    // discardProfile 把这个账号的缓存页销毁，所以能拿到缓存就说明
+    // 它的代理配置与当前解析结果一致。
     let cached = RecentAccountPages.take(spec: spec)
     let webView: WKWebView
     if let cached {
@@ -403,14 +494,38 @@ final class AccountWebViewController: UIViewController, WKNavigationDelegate, WK
         loadingIndicator.stopAnimating()
         return
       }
-      config.websiteDataStore = WKWebsiteDataStore(forIdentifier: identifier)
+      let store = WKWebsiteDataStore(forIdentifier: identifier)
+      config.websiteDataStore = store
       DataStoreRegistry.markCreated(spec.uuid)
+      // #11/#16：每账号独立代理。应用失败（不支持 / 缺口令 / 配置损坏）一律
+      // fail-closed：整个会话阻断，绝不回退直连。同一入口也负责清除残留隔离。
+      if let reason = AccountProxyResolver.apply(uuid: spec.uuid, to: store) {
+        blockEgress(reason: reason)
+        return
+      }
       config.defaultWebpagePreferences.allowsContentJavaScript = true
       config.preferences.javaScriptCanOpenWindowsAutomatically = false
       // Batch-1: on iPhone WKWebView plays every <video> fullscreen by
       // default, which breaks avatar videos (muted autoplay) and leaves
       // no working close control. Inline playback keeps video in-page.
       config.allowsInlineMediaPlayback = true
+      AccountTimeZone.install(spec.timezone, into: config)
+      if let language = spec.language,
+         let data = try? JSONEncoder().encode(language),
+         let locale = String(data: data, encoding: .utf8) {
+        let script = """
+        (() => {
+          const language = \(locale);
+          const languages = Object.freeze([language, language.split("-")[0]]);
+          Object.defineProperties(Navigator.prototype, {
+            language: { configurable: true, get: () => language },
+            languages: { configurable: true, get: () => languages }
+          });
+        })();
+        """
+        config.userContentController.addUserScript(WKUserScript(
+          source: script, injectionTime: .atDocumentStart, forMainFrameOnly: true))
+      }
       config.userContentController.addUserScript(
         WKUserScript(
           source: Scripts.quotaHookInitScript,
@@ -418,6 +533,14 @@ final class AccountWebViewController: UIViewController, WKNavigationDelegate, WK
           forMainFrameOnly: true
         )
       )
+      if spec.providerId == "muse" {
+        config.userContentController.addUserScript(WKUserScript(
+          source: MuseAvatarVideo.paintScript,
+          injectionTime: .atDocumentStart,
+          forMainFrameOnly: true,
+          in: .defaultClient
+        ))
+      }
       webView = WKWebView(frame: .zero, configuration: config)
     }
 
@@ -469,7 +592,9 @@ final class AccountWebViewController: UIViewController, WKNavigationDelegate, WK
         closeAndFinishFromManager()
         return
       }
-      webView.load(URLRequest(url: entryURL))
+      var request = URLRequest(url: entryURL)
+      if let language = spec.language { request.setValue(language, forHTTPHeaderField: "Accept-Language") }
+      webView.load(request)
     }
   }
 
@@ -506,6 +631,13 @@ final class AccountWebViewController: UIViewController, WKNavigationDelegate, WK
       navigationAction.targetFrame?.isMainFrame == true
     else {
       decisionHandler(.allow)
+      return
+    }
+    // 出站已被阻断：任何主框架导航（含 OAuth 回调）都不放行，
+    // 否则会绕过代理直接用系统网络发请求。
+    if egressBlockedReason != nil {
+      // 已经在 blockEgress 里销毁过视图；这里只拦下导航，不再重入销毁逻辑。
+      decisionHandler(.cancel)
       return
     }
     let url = navigationAction.request.url

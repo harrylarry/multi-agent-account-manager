@@ -1,6 +1,6 @@
 [package]
 name = "multi-agent-account-manager"
-version = "0.1.22"
+version = "0.1.26"
 edition = "2021"
 rust-version = "1.85"
 
@@ -17,21 +17,32 @@ tauri-plugin-account-session = { path = "plugins/account-session" }
 muse-native-client = { package = "muse-native", path = "muse-native" }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
-tokio = { version = "1", features = ["sync", "rt", "macros", "time"] }
+tokio = { version = "1", features = ["sync", "rt", "macros", "time", "net", "io-util"] }
 url = "2"
 uuid = { version = "1", features = ["v4"] }
 zeroize = { version = "1", features = ["derive"] }
+regex = "1"
+ring = "0.17"
+base64 = "0.22"
 
 [target.'cfg(not(any(target_os = "android", target_os = "ios")))'.dependencies]
 tauri = { version = "=2.12.6", features = ["unstable"] }
 open = "5"
-reqwest = { version = "0.13", default-features = false, features = ["native-tls", "http2", "system-proxy"] }
+# socks feature：控制面 HTTP 走 socks5:// 代理需要（WSS 侧的 SOCKS5 在
+# muse-native/proxy.rs 自行实现握手，与此无关）。
+reqwest = { version = "0.13", default-features = false, features = ["native-tls", "http2", "system-proxy", "socks"] }
 sha2 = "0.10"
 
 # Spike 0.1.22 (#3 认证链)：iOS 上控制面也需要 reqwest；用平台 native-tls
 #（Security framework），与桌面端同一 TLS 栈，不引入新的 C 编译依赖。
 [target.'cfg(target_os = "ios")'.dependencies]
-reqwest = { version = "0.13", default-features = false, features = ["native-tls", "http2"] }
+reqwest = { version = "0.13", default-features = false, features = ["native-tls", "http2", "socks"] }
+
+[target.'cfg(any(target_os = "ios", target_os = "macos"))'.dependencies]
+# #11/#16：代理口令写入系统 Keychain（Security.framework 的 generic password），
+# `accounts.json` 只保留 credential_ref，不放明文密码。passwords 模块同时支持
+# iOS 与 macOS。
+security-framework = "3"
 
 [target.'cfg(target_os = "macos")'.dependencies]
 objc2 = "0.6"

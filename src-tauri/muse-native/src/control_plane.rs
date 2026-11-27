@@ -35,6 +35,10 @@ pub struct ControlPlaneError {
 }
 
 impl ControlPlaneError {
+  fn is_invalid_vm_type(&self) -> bool {
+    self.status == Some(400) && self.message.ends_with(": HTTP 400 Invalid vmType")
+  }
+
   fn new(message: impl Into<String>, status: Option<u16>, code: Option<ControlPlaneCode>) -> Self {
     Self {
       message: message.into(),
@@ -58,6 +62,8 @@ impl std::error::Error for ControlPlaneError {}
 /// （async fn in trait：有意为之——调用方总是 .await，不做 dyn；见 gateway。）
 #[allow(async_fn_in_trait)]
 pub trait ControlPlaneFetch: Send + Sync {
+  async fn get(&self, url: &str, headers: &[(&str, &str)]) -> Result<(u16, Vec<u8>), String>;
+
   async fn post(
     &self,
     url: &str,
@@ -81,6 +87,10 @@ pub struct VmLease {
   pub vm_id: String,
   pub vm_name: String,
   pub gateway_url: String,
+  /// 上游若返回租约到期时间（毫秒归一后），保留用于 #8 观测。
+  pub expires_at_ms: Option<i64>,
+  /// 上游若返回剩余租期（秒）。
+  pub ttl_seconds: Option<i64>,
 }
 
 pub struct MuseControlPlane<F: ControlPlaneFetch> {
@@ -88,6 +98,30 @@ pub struct MuseControlPlane<F: ControlPlaneFetch> {
   cookies: SessionCookies,
   lease: Option<VmLease>,
   wake_retry: u32,
+  /// 每次 `lease-vm` 尝试的轨迹（vmType + 结果），只读诊断用。
+  pub lease_calls: Vec<String>,
+}
+
+/// 从任意数字/字符串字段读时间戳并归一到毫秒（>1e12 视为已是毫秒）。
+fn read_ts(v: Option<&serde_json::Value>) -> Option<i64> {
+  let raw = v?;
+  let n = raw
+    .as_i64()
+    .or_else(|| raw.as_f64().map(|f| f as i64))
+    .or_else(|| raw.as_str().and_then(|s| s.trim().parse::<i64>().ok()))?;
+  if n <= 0 {
+    return None;
+  }
+  Some(if n < 1_000_000_000_000 { n * 1000 } else { n })
+}
+
+fn read_secs(v: Option<&serde_json::Value>) -> Option<i64> {
+  let raw = v?;
+  raw
+    .as_i64()
+    .or_else(|| raw.as_f64().map(|f| f as i64))
+    .or_else(|| raw.as_str().and_then(|s| s.trim().parse::<i64>().ok()))
+    .filter(|n| *n > 0)
 }
 
 impl<F: ControlPlaneFetch> MuseControlPlane<F> {
@@ -97,6 +131,7 @@ impl<F: ControlPlaneFetch> MuseControlPlane<F> {
       cookies,
       lease: None,
       wake_retry: 0,
+      lease_calls: Vec::new(),
     }
   }
 
@@ -222,6 +257,47 @@ impl<F: ControlPlaneFetch> MuseControlPlane<F> {
       .await;
   }
 
+  async fn existing_vm(&mut self, wake_if_needed: bool) -> Result<VmLease, ControlPlaneError> {
+    const PATH: &str = "/api/session?vm_state=live";
+    let cookie = self.cookies.cookie_header();
+    let (status, body) = self.fetch.get(&format!("{ORIGIN}{PATH}"), &self.headers(&cookie))
+      .await.map_err(|error| ControlPlaneError::new(format!("{PATH}: {error}"), None, Some(ControlPlaneCode::Http)))?;
+    self.lease_calls.push(format!("session(vm_state=live) → HTTP {status}"));
+    if !(200..300).contains(&status) {
+      let code = if matches!(status, 401 | 403) { ControlPlaneCode::SignedOut } else { ControlPlaneCode::Http };
+      return Err(ControlPlaneError::new(format!("{PATH}: HTTP {status}"), Some(status), Some(code)));
+    }
+    let unavailable = || ControlPlaneError::new(
+      format!("{PATH}: no usable assigned VM"), Some(status), Some(ControlPlaneCode::VmUnavailable),
+    );
+    let value: Value = serde_json::from_slice(&body).map_err(|_| unavailable())?;
+    let vm_id = value["vm_id"].as_str().filter(|id| {
+      !id.is_empty() && id.len() <= 128 && id.bytes().all(|c| c.is_ascii_alphanumeric() || c == b'-' || c == b'_')
+    }).ok_or_else(unavailable)?;
+    let gateway_url = value["endpoint_url"].as_str().filter(|endpoint| {
+      endpoint.parse::<http::Uri>().is_ok_and(|uri| {
+        matches!(uri.scheme_str(), Some("https" | "wss"))
+          && uri.authority().is_some_and(|a| !a.as_str().contains('@'))
+          && uri.port_u16().is_none_or(|port| port == 443)
+          && uri.query().is_none()
+          && uri.host().is_some_and(|host| {
+            host.strip_suffix(".metaaivm.com").is_some_and(|label| {
+              !label.is_empty() && label.bytes().all(|c| c.is_ascii_alphanumeric() || c == b'-')
+            })
+          })
+      })
+    }).ok_or_else(unavailable)?;
+    let lease = VmLease {
+      vm_id: vm_id.to_string(), vm_name: vm_id.to_string(), gateway_url: gateway_url.to_string(),
+      expires_at_ms: None, ttl_seconds: None,
+    };
+    self.lease = Some(lease.clone());
+    if wake_if_needed && !value["vm_state"].as_str().is_some_and(|state| state.eq_ignore_ascii_case("running")) {
+      self.wake().await;
+    }
+    Ok(lease)
+  }
+
   pub async fn lease_vm(&mut self) -> Result<VmLease, ControlPlaneError> {
     let mut last: Option<ControlPlaneError> = None;
     for vm_type in ["standard", "hatch_vm"] {
@@ -233,6 +309,10 @@ impl<F: ControlPlaneFetch> MuseControlPlane<F> {
         .await
       {
         Ok(d) => {
+          self.lease_calls.push(format!(
+            "lease-vm({vm_type}) → {}",
+            d.get("status").and_then(|v| v.as_str()).unwrap_or("unknown")
+          ));
           let gateway_url = d
             .get("gatewayUrl")
             .and_then(|v| v.as_str())
@@ -270,6 +350,18 @@ impl<F: ControlPlaneFetch> MuseControlPlane<F> {
               vm_id,
               vm_name,
               gateway_url,
+              expires_at_ms: read_ts(
+                d.get("expiresAt")
+                  .or_else(|| d.get("leaseExpiresAt"))
+                  .or_else(|| d.get("expires_at"))
+                  .or_else(|| d.get("lease_expires_at")),
+              ),
+              ttl_seconds: read_secs(
+                d.get("ttl")
+                  .or_else(|| d.get("ttlSeconds"))
+                  .or_else(|| d.get("ttl_seconds"))
+                  .or_else(|| d.get("leaseTtlSeconds")),
+              ),
             };
             self.lease = Some(lease.clone());
             return Ok(lease);
@@ -286,6 +378,10 @@ impl<F: ControlPlaneFetch> MuseControlPlane<F> {
           ));
         }
         Err(e) => {
+          self.lease_calls.push(match e.status {
+            Some(status) => format!("lease-vm({vm_type}) → HTTP {status}"),
+            None => format!("lease-vm({vm_type}) → 失败"),
+          });
           if e.code == Some(ControlPlaneCode::SignedOut) {
             return Err(e);
           }
@@ -302,6 +398,19 @@ impl<F: ControlPlaneFetch> MuseControlPlane<F> {
     }))
   }
 
+  /// Observe the same assignment fallback as the gateway connection,
+  /// without waking the VM or requesting gateway credentials.
+  pub async fn observe_lease(&mut self) -> Result<(VmLease, bool), ControlPlaneError> {
+    match self.lease_vm().await {
+      Err(error) if error.is_invalid_vm_type() => self.existing_vm(false).await
+        .map(|lease| (lease, true))
+        .map_err(|fallback| ControlPlaneError::new(
+          format!("{error} · {fallback}"), fallback.status, fallback.code,
+        )),
+      result => result.map(|lease| (lease, false)),
+    }
+  }
+
   /// 取一次 Noise 连接所需的全部凭证（wake → lease → token → notary）。
   pub async fn credentials(
     &mut self,
@@ -310,7 +419,14 @@ impl<F: ControlPlaneFetch> MuseControlPlane<F> {
     self.wake().await;
     let lease = match (&self.lease, force_refresh) {
       (Some(l), false) => l.clone(),
-      _ => self.lease_vm().await?,
+      _ => match self.lease_vm().await {
+        Err(error) if error.is_invalid_vm_type() => {
+          self.existing_vm(true).await.map_err(|fallback| ControlPlaneError::new(
+            format!("{error} · {fallback}"), fallback.status, fallback.code,
+          ))?
+        }
+        result => result?,
+      },
     };
     let mut body = serde_json::json!({ "vmAddress": lease.gateway_url, "vmName": lease.vm_name });
     if force_refresh {
@@ -418,6 +534,11 @@ mod tests {
   }
 
   impl ControlPlaneFetch for MockFetch {
+    async fn get(&self, url: &str, headers: &[(&str, &str)]) -> Result<(u16, Vec<u8>), String> {
+      assert!(url.ends_with("/api/session?vm_state=live"));
+      self.post(url, headers, &[]).await
+    }
+
     async fn post(
       &self,
       url: &str,
@@ -502,6 +623,50 @@ mod tests {
   }
 
   #[tokio::test]
+  async fn invalid_vm_type_uses_only_a_valid_assigned_session_endpoint() {
+    for (endpoint, usable) in [("https://vm-123.metaaivm.com/", true), ("https://vm-123.metaaivm.com.example/", false)] {
+      let session = format!(r#"{{"vm_id":"vm-123","endpoint_url":"{endpoint}","vm_state":"RUNNING"}}"#);
+      let fetch = MockFetch::new(vec![
+        (200, "{}"),
+        (200, r#"{"status":"pending"}"#),
+        (400, r#"{"error":"Invalid vmType"}"#),
+        (200, &session),
+        (200, r#"{"token":"test-token","notary_token":"test-notary"}"#),
+      ]);
+      let mut cp = MuseControlPlane::new(fetch, cookies());
+      let result = cp.credentials(false).await;
+      if usable {
+        let creds = result.unwrap();
+        assert_eq!(creds.vm_id, "vm-123");
+        assert_eq!(creds.gateway_url, endpoint);
+        assert_eq!(cp.fetch.seen_cookie.lock().unwrap()[3].as_deref(), Some("hatch_sess=s3cr3t"));
+      } else {
+        assert_eq!(result.unwrap_err().code, Some(ControlPlaneCode::VmUnavailable));
+        assert_eq!(cp.fetch.seen_urls.lock().unwrap().len(), 4);
+      }
+    }
+  }
+
+  #[tokio::test]
+  async fn observing_an_assigned_stopped_vm_does_not_wake_it() {
+    let fetch = MockFetch::new(vec![
+      (400, r#"{"error":"Invalid vmType"}"#),
+      (400, r#"{"error":"Invalid vmType"}"#),
+      (200, r#"{"vm_id":"vm-123","endpoint_url":"https://vm-123.metaaivm.com/","vm_state":"STOPPED"}"#),
+    ]);
+    let mut cp = MuseControlPlane::new(fetch, cookies());
+    let (lease, from_assignment) = cp.observe_lease().await.unwrap();
+    assert!(from_assignment);
+    assert_eq!(lease.vm_id, "vm-123");
+    assert_eq!(lease.expires_at_ms, None);
+    let urls = cp.fetch.seen_urls.lock().unwrap();
+    assert_eq!(urls.len(), 3);
+    assert!(urls[0].ends_with("/api/hatch/lease-vm"));
+    assert!(urls[1].ends_with("/api/hatch/lease-vm"));
+    assert!(urls[2].ends_with("/api/session?vm_state=live"));
+  }
+
+  #[tokio::test]
   async fn credentials_full_flow_and_delegation_notary_dropped() {
     let fetch = MockFetch::new(vec![
       (200, "{}"), // wake
@@ -576,5 +741,21 @@ mod tests {
     );
     assert_eq!(vm_id_from_gateway("wss://abc.metaaivm.com.evil.com/"), None);
     assert_eq!(vm_id_from_gateway("wss://bad_host.metaaivm.com/"), None);
+  }
+
+  #[test]
+  fn lease_expiry_parsing() {
+    use serde_json::json;
+    // 秒 → 毫秒
+    assert_eq!(read_ts(Some(&json!(1762100300))), Some(1_762_100_300_000));
+    // 已是毫秒则保持
+    assert_eq!(read_ts(Some(&json!(1762100300000i64))), Some(1_762_100_300_000));
+    // 字符串数字
+    assert_eq!(read_ts(Some(&json!("1762100300"))), Some(1_762_100_300_000));
+    // 非法/缺失
+    assert_eq!(read_ts(None), None);
+    assert_eq!(read_ts(Some(&json!(0))), None);
+    assert_eq!(read_secs(Some(&json!(3600))), Some(3600));
+    assert_eq!(read_secs(Some(&json!(-5))), None);
   }
 }

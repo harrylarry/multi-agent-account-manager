@@ -106,6 +106,9 @@ enum RecentAccountPages {
     /// (0.1.15). May lag the live alias by one park cycle; refreshed
     /// whenever the account is re-parked.
     let alias: String
+    let timezone: String?
+    let language: String?
+    let parkedAtMs: Int64
   }
 
   // Park-ordered (oldest first = least recently active); eviction takes
@@ -115,6 +118,49 @@ enum RecentAccountPages {
   /// Retained: NotificationCenter does not retain block-observer tokens,
   /// and dropping the token would unregister the observation immediately.
   private static var memoryObserver: NSObjectProtocol?
+
+  private static let isolateEgressKey = "diehao.isolate-same-egress"
+  private static let quotaMinutesKey = "diehao.quota-sync-minutes"
+
+  static func networkPreferences(isolate: Bool?, quotaMinutes: Int?) -> [String: Any] {
+    let preferences = UserDefaults.standard
+    if let quotaMinutes, [0, 5, 15, 30].contains(quotaMinutes) { preferences.set(quotaMinutes, forKey: quotaMinutesKey) }
+    if let isolate {
+      preferences.set(isolate, forKey: isolateEgressKey)
+      if isolate {
+        // Retain the most recently used page of each known outbound group.
+        var retained = Set<EgressGroup>()
+        for candidate in pages.reversed() {
+          if let group = egress(candidate.key.providerId, candidate.key.uuid), retained.insert(group).inserted { continue }
+          release(candidate.key.providerId, candidate.key.uuid)
+        }
+      }
+    }
+    return ["isolate":preferences.bool(forKey: isolateEgressKey), "quotaMinutes":preferences.integer(forKey: quotaMinutesKey)]
+  }
+
+  private struct EgressGroup: Hashable { let provider: String; let host: String?; let port: UInt16? }
+
+  private static func egress(_ provider: String, _ uuid: String) -> EgressGroup? {
+    switch AccountProxyResolver.resolve(uuid: uuid) {
+    case .direct: return EgressGroup(provider: provider, host: nil, port: nil)
+    case .use(let config): return EgressGroup(provider: provider, host: config.host.lowercased(), port: config.port)
+    case .blocked: return nil
+    }
+  }
+
+  private static func release(_ provider: String, _ uuid: String) {
+    guard let index = pages.firstIndex(where: { $0.key.providerId == provider && $0.key.uuid == uuid }) else { return }
+    let view = pages.remove(at: index).entry.view
+    _ = AccountProxyQuarantine.engage(uuid: uuid)
+    destroy(view)
+  }
+
+  private static func releasePeers(of spec: IosAccountSessionSpec) {
+    guard UserDefaults.standard.bool(forKey: isolateEgressKey), let group = egress(spec.providerId, spec.uuid) else { return }
+    let peers = pages.filter { $0.key.uuid != spec.uuid && egress($0.key.providerId, $0.key.uuid) == group }
+    for peer in peers { release(peer.key.providerId, peer.key.uuid) }
+  }
 
   private static func ensureMemoryObserver() {
     guard !memoryObserverInstalled else { return }
@@ -132,20 +178,23 @@ enum RecentAccountPages {
 
   private static func isReusable(_ view: WKWebView, spec: IosAccountSessionSpec) -> Bool {
     guard let url = view.url,
-      let entryHost = URL(string: spec.entryUrl)?.host
+      let entryURL = URL(string: spec.entryUrl),
+      let entryHost = entryURL.host
     else { return false }
-    return AccountSessionCoordinator.hostMatchesAllowed(url, allowedHosts: [entryHost])
+    return (entryURL.path.isEmpty || entryURL.path == "/" || entryURL.path == url.path)
+      && AccountSessionCoordinator.hostMatchesAllowed(url, allowedHosts: [entryHost])
       && AccountSessionCoordinator.hostMatchesAllowed(url, allowedHosts: spec.allowedHosts)
   }
 
   static func take(spec: IosAccountSessionSpec) -> WKWebView? {
     ensureMemoryObserver()
+    releasePeers(of: spec)
     trim(maxAccountPages)
     guard let idx = pages.firstIndex(where: { $0.key.providerId == spec.providerId && $0.key.uuid == spec.uuid })
     else { return nil }
     let entry = pages.remove(at: idx).entry
     trim(maxAccountPages - 1)
-    if spec.isColdStart || !isReusable(entry.view, spec: spec) {
+    if spec.isColdStart || entry.timezone != spec.timezone || entry.language != spec.language || !isReusable(entry.view, spec: spec) {
       destroy(entry.view)
       return nil
     }
@@ -158,6 +207,7 @@ enum RecentAccountPages {
       destroy(view)
       return
     }
+    releasePeers(of: spec)
     let delegate = ParkedDelegate()
     view.navigationDelegate = delegate
     view.uiDelegate = nil
@@ -166,8 +216,15 @@ enum RecentAccountPages {
     if let idx = pages.firstIndex(where: { $0.key == key }) {
       destroy(pages.remove(at: idx).entry.view)
     }
-    pages.append((key: key, entry: Entry(view: view, delegate: delegate, alias: spec.alias)))
+    pages.append((key: key, entry: Entry(view: view, delegate: delegate, alias: spec.alias,
+      timezone: spec.timezone, language: spec.language, parkedAtMs: Int64(Date().timeIntervalSince1970 * 1000))))
     trim(maxAccountPages)
+    if spec.providerId == "muse" {
+      view.evaluateJavaScript(TaskWatcher.taskStateScript) { [weak view] result, _ in
+        guard let view, pages.contains(where: { $0.key == key && $0.entry.view === view }) else { return }
+        TaskWatcher.shared.noteSample(providerId: spec.providerId, uuid: spec.uuid, result: result)
+      }
+    }
   }
 
   /// Snapshot of parked accounts (provider, uuid, alias) for the task
@@ -188,6 +245,27 @@ enum RecentAccountPages {
       destroy(item.entry.view)
     }
     trim(maxAccountPages)
+  }
+
+  static func dataStore(providerId: String, uuid: String) -> WKWebsiteDataStore? {
+    pages.first { $0.key.providerId == providerId && $0.key.uuid == uuid }?.entry.view.configuration.websiteDataStore
+  }
+
+  static func museCatchUpTargets() -> [[String: Any]] {
+    pages.reversed().compactMap { item in
+      guard item.key.providerId == "muse" else { return nil }
+      var target: [String: Any] = ["uuid": item.key.uuid, "parkedAtMs": item.entry.parkedAtMs]
+      if let url = item.entry.view.url, url.scheme == "https",
+         ["muse.ai", "www.muse.ai"].contains(url.host ?? "") {
+        if url.path.isEmpty || url.path == "/" {
+          target["primary"] = true
+        } else if url.pathComponents.count == 3, url.pathComponents[1] == "thread",
+                  let thread = UUID(uuidString: url.pathComponents[2]) {
+          target["threadId"] = thread.uuidString.lowercased()
+        }
+      }
+      return target
+    }
   }
 
   /// Drops every parked page. Used when memory is tight or the active web

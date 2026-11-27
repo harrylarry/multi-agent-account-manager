@@ -42,23 +42,32 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
         with:
           targets: aarch64-apple-ios
+      - name: Select Xcode 26
+        run: sudo xcode-select --switch /Applications/Xcode_26.3.app/Contents/Developer
       - uses: Swatinem/rust-cache@v2
         with:
           workspaces: ./src-tauri -> target
       - run: npm ci
+      # 注入的 JS 不会经过 Xcode 的语法检查：先提取 + node --check，避免
+      # 打出一个「能装但钩子从未运行」的包（见 2d39149 的 Scripts.swift）。
+      - name: Verify embedded JavaScript
+        run: npm run check:embedded-js
+      - name: Verify local manager IPC grants
+        run: node --test tests/tauri-ipc.test.mjs
       # init must go through `npm run tauri` (never raw xcodebuild / xcodegen);
       # --skip-targets-install because the target is installed above.
       - run: npm run tauri -- ios init --ci --skip-targets-install
       # App icons are synced by tauri.ios.conf.json's beforeBuildCommand
       # (scripts/sync-ios-resources.mjs) before the Xcode build runs.
       # Spike 变体只覆盖 bundle id 与显示名，main 默认仍是日常版。
+      # 双分支写法避免未加引号的变量展开（SC2086）。
       - name: Build unsigned IPA
         run: |
-          args=""
           if [ "${{ inputs.spike }}" = "true" ]; then
-            args="--config src-tauri/tauri.spike.conf.json"
+            npm run tauri -- ios build --no-sign --ci --config src-tauri/tauri.spike.conf.json
+          else
+            npm run tauri -- ios build --no-sign --ci
           fi
-          npm run tauri -- ios build --no-sign --ci $args
       - name: Locate unsigned IPA
         run: |
           ipa=$(find src-tauri/gen/apple -name '*.ipa' -type f | head -n 1)

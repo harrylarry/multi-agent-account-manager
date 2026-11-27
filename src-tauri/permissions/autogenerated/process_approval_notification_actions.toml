@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-process-approval-notification-actions"
+description = "Enables the process_approval_notification_actions command without any pre-configured scope."
+commands.allow = ["process_approval_notification_actions"]
+
+[[permission]]
+identifier = "deny-process-approval-notification-actions"
+description = "Denies the process_approval_notification_actions command without any pre-configured scope."
+commands.deny = ["process_approval_notification_actions"]

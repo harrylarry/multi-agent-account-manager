@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-hark-recover-replies"
+description = "Enables the hark_recover_replies command without any pre-configured scope."
+commands.allow = ["hark_recover_replies"]
+
+[[permission]]
+identifier = "deny-hark-recover-replies"
+description = "Denies the hark_recover_replies command without any pre-configured scope."
+commands.deny = ["hark_recover_replies"]

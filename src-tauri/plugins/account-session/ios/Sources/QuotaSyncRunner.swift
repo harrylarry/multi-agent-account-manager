@@ -5,9 +5,10 @@
 // for each account NOT currently open, it either probes the account's
 // parked WKWebView (cheap — the page is already loaded) or spins up a
 // hidden WKWebView with the account's data store, loads the entry URL,
-// runs the identity probe once, and destroys it.
+// reads identity and quota, then destroys it. An explicit diagnostic
+// uses a new navigation and excludes previously cached quota.
 //
-// One account at a time, each capped at ~20s, so a sync never hammers the
+// One account at a time, with separate navigation and probe deadlines, so a sync never hammers the
 // device. Results go back to Rust in the invoke response; Rust applies
 // them (quota / identity / logged-out) and emits one snapshot.
 //
@@ -15,6 +16,7 @@
 // call resolves immediately with no results — the in-flight sync covers it.
 
 import Foundation
+import UIKit
 import WebKit
 
 enum QuotaSyncRunner {
@@ -23,6 +25,7 @@ enum QuotaSyncRunner {
     let providerId: String
     let uuid: String
     let entryUrl: String
+    let timezone: String?
   }
 
   struct SyncResult {
@@ -34,6 +37,8 @@ enum QuotaSyncRunner {
     let quotaPercent: Int?
     let quotaDetailJson: String?
     let loggedOut: Bool
+    let authenticated: Bool
+    let observation: String
 
     var json: [String: Any] {
       var obj: [String: Any] = [
@@ -41,6 +46,8 @@ enum QuotaSyncRunner {
         "uuid": uuid,
         "identity": identity,
         "loggedOut": loggedOut,
+        "authenticated": authenticated,
+        "observation": observation,
       ]
       if let avatarUrl, !avatarUrl.isEmpty { obj["avatarUrl"] = avatarUrl }
       if let quotaText, !quotaText.isEmpty { obj["quotaText"] = quotaText }
@@ -60,7 +67,7 @@ enum QuotaSyncRunner {
   // are weak, so nothing else would keep the loader alive).
   private static var currentLoader: SyncPageLoader?
 
-  static func run(targets: [Target], completion: @escaping ([SyncResult]) -> Void) {
+  static func run(targets: [Target], fresh: Bool, completion: @escaping ([SyncResult]) -> Void) {
     guard !running else {
       completion([])
       return
@@ -81,44 +88,46 @@ enum QuotaSyncRunner {
         return
       }
       let target = targets[index]
+      func completeTarget(_ observation: String, _ parsed: ProbeData?) {
+        results.append(SyncResult(
+          providerId: target.providerId, uuid: target.uuid,
+          identity: parsed?.email ?? "", avatarUrl: parsed?.avatar.nilIfEmpty,
+          quotaText: parsed?.quotaText.nilIfEmpty, quotaPercent: parsed?.quotaPct,
+          quotaDetailJson: parsed?.quotaDetailJson.nilIfEmpty,
+          loggedOut: parsed?.loggedOut ?? false, authenticated: parsed?.auth ?? false,
+          observation: observation
+        ))
+        step(index + 1)
+      }
+      // #11/#16（补 W）：出站策略必须先解析。配置损坏 / 该账号还没有可信
+      // 配置时直接跳过本次同步——宁可没有额度，也不能绕过代理拿一份
+      // 「看起来正常」的数据。
+      if AccountProxyResolver.resolve(uuid: target.uuid).blockReason != nil {
+        completeTarget("proxy_blocked", nil)
+        return
+      }
+      func loadHidden() {
+        let loader = SyncPageLoader(target: target, fresh: fresh) { observation, parsed in
+          currentLoader = nil
+          completeTarget(observation, parsed)
+        }
+        currentLoader = loader
+        loader.start()
+      }
+      if fresh {
+        loadHidden()
+        return
+      }
       // Cheap path first: a parked page already holds the live session.
       RecentAccountPages.probeParked(
         providerId: target.providerId, uuid: target.uuid,
         javascript: Scripts.identityProbeScript
       ) { raw in
         if let raw {
-          if let parsed = parseProbeOutput(raw) {
-            results.append(
-              SyncResult(
-                providerId: target.providerId, uuid: target.uuid,
-                identity: parsed.email, avatarUrl: parsed.avatar.nilIfEmpty,
-                quotaText: parsed.quotaText.nilIfEmpty,
-                quotaPercent: parsed.quotaPct,
-                quotaDetailJson: parsed.quotaDetailJson.nilIfEmpty,
-                loggedOut: parsed.loggedOut
-              ))
-          }
-          step(index + 1)
+          completeTarget("parked", parseProbeOutput(raw))
           return
         }
-        // No parked page: hidden load.
-        let loader = SyncPageLoader(target: target) { parsed in
-          currentLoader = nil
-          if let parsed {
-            results.append(
-              SyncResult(
-                providerId: target.providerId, uuid: target.uuid,
-                identity: parsed.email, avatarUrl: parsed.avatar.nilIfEmpty,
-                quotaText: parsed.quotaText.nilIfEmpty,
-                quotaPercent: parsed.quotaPct,
-                quotaDetailJson: parsed.quotaDetailJson.nilIfEmpty,
-                loggedOut: parsed.loggedOut
-              ))
-          }
-          step(index + 1)
-        }
-        currentLoader = loader
-        loader.start()
+        loadHidden()
       }
     }
 
@@ -158,13 +167,18 @@ enum QuotaSyncRunner {
 
   private final class SyncPageLoader: NSObject, WKNavigationDelegate {
     private let target: Target
-    private let completion: (ProbeData?) -> Void
+    private let fresh: Bool
+    private let completion: (String, ProbeData?) -> Void
     private var webView: WKWebView?
+    private var renderHost: UIView?
+    private var committed = false
     private var timeoutWork: DispatchWorkItem?
     private var finished = false
+    private var probeDeadline = Date.distantPast
 
-    init(target: Target, completion: @escaping (ProbeData?) -> Void) {
+    init(target: Target, fresh: Bool, completion: @escaping (String, ProbeData?) -> Void) {
       self.target = target
+      self.fresh = fresh
       self.completion = completion
     }
 
@@ -172,37 +186,80 @@ enum QuotaSyncRunner {
       guard let identifier = UUID(uuidString: target.uuid),
         let entryURL = URL(string: target.entryUrl)
       else {
-        finish(nil)
+        finish("setup_failed")
+        return
+      }
+      guard let window = UIApplication.shared.connectedScenes
+        .compactMap({ $0 as? UIWindowScene })
+        .filter({ $0.activationState == .foregroundActive })
+        .compactMap({ $0.keyWindow })
+        .first
+      else {
+        finish("no_foreground_window")
         return
       }
       let config = WKWebViewConfiguration()
-      config.websiteDataStore = WKWebsiteDataStore(forIdentifier: identifier)
+      let store = WKWebsiteDataStore(forIdentifier: identifier)
+      config.websiteDataStore = store
+      // #11/#16：后台额度同步也是账号出站流量——必须走与可见会话**同一个**
+      // 解析入口。损坏/缺失/缺口令/不支持都放弃本次探测，绝不回退直连。
+      if AccountProxyResolver.apply(uuid: target.uuid, to: store) != nil {
+        finish("proxy_blocked")
+        return
+      }
       config.defaultWebpagePreferences.allowsContentJavaScript = true
       config.preferences.javaScriptCanOpenWindowsAutomatically = false
+      AccountTimeZone.install(target.timezone, into: config)
       config.userContentController.addUserScript(
         WKUserScript(
-          source: Scripts.quotaHookInitScript,
+          source: "window.__maamRequireFreshQuota = true;\n" + Scripts.quotaHookInitScript,
           injectionTime: .atDocumentStart,
           forMainFrameOnly: true
         )
       )
-      let view = WKWebView(frame: .zero, configuration: config)
+      // Give WebKit an attached viewport so document rendering and quota
+      // bootstrap can run. Clip it to a non-interactive point under app content.
+      let host = UIView(frame: CGRect(x: 0, y: 0, width: 1, height: 1))
+      host.clipsToBounds = true
+      host.isUserInteractionEnabled = false
+      host.accessibilityElementsHidden = true
+      host.alpha = 0.02
+      let view = WKWebView(frame: CGRect(origin: .zero, size: window.bounds.size), configuration: config)
       view.navigationDelegate = self
+      host.addSubview(view)
+      window.insertSubview(host, at: 0)
       webView = view
+      renderHost = host
 
       let timeout = DispatchWorkItem { [weak self] in
-        // Load stuck: probe anyway — cached quota in localStorage may
-        // still be readable even when the page never finished.
-        self?.probeAndFinish()
+        self?.finish("navigation_commit_timeout")
       }
       timeoutWork = timeout
       DispatchQueue.main.asyncAfter(deadline: .now() + QuotaSyncRunner.loadTimeout, execute: timeout)
-      view.load(URLRequest(url: entryURL))
+      view.load(URLRequest(url: entryURL, cachePolicy: fresh ? .reloadIgnoringLocalCacheData : .useProtocolCachePolicy))
     }
 
-    func webView(_ webView: WKWebView, didFinish navigation: WKNavigation!) {
-      // Let the page's own API traffic run through the quota hooks for a
-      // moment before reading the captured values.
+    func webView(_ webView: WKWebView, decidePolicyFor navigationResponse: WKNavigationResponse,
+                 decisionHandler: @escaping (WKNavigationResponsePolicy) -> Void) {
+      if navigationResponse.isForMainFrame, let response = navigationResponse.response as? HTTPURLResponse,
+         !(200...299).contains(response.statusCode) {
+        decisionHandler(.cancel)
+        finish("http_error_\(response.statusCode)")
+      } else {
+        decisionHandler(.allow)
+      }
+    }
+
+    func webView(_ webView: WKWebView, didCommit navigation: WKNavigation!) {
+      guard !finished, !committed, webView.url?.scheme == "https" else { return }
+      committed = true
+      timeoutWork?.cancel()
+      probeDeadline = Date().addingTimeInterval(12)
+      let timeout = DispatchWorkItem { [weak self] in self?.finish("probe_timeout") }
+      timeoutWork = timeout
+      DispatchQueue.main.asyncAfter(deadline: .now() + 12, execute: timeout)
+      // Start after the document commits. Subresources and long-lived page
+      // requests need not finish before quota becomes available.
       DispatchQueue.main.asyncAfter(deadline: .now() + QuotaSyncRunner.settleDelay) { [weak self] in
         self?.probeAndFinish()
       }
@@ -213,7 +270,7 @@ enum QuotaSyncRunner {
       didFail navigation: WKNavigation!,
       withError error: Error
     ) {
-      probeAndFinish()
+      finish(navigationError(error, stage: "committed"))
     }
 
     func webView(
@@ -221,41 +278,49 @@ enum QuotaSyncRunner {
       didFailProvisionalNavigation navigation: WKNavigation!,
       withError error: Error
     ) {
-      probeAndFinish()
+      finish(navigationError(error, stage: "provisional"))
+    }
+
+    private func navigationError(_ error: Error, stage: String) -> String {
+      let cause = error as NSError
+      let code = cause.domain == NSURLErrorDomain ? "_url_\(cause.code)" : ""
+      return "navigation_\(stage)_failed\(code)"
     }
 
     func webViewWebContentProcessDidTerminate(_ webView: WKWebView) {
-      finish(nil)
+      finish("webview_terminated")
     }
 
     private func probeAndFinish() {
       guard !finished else { return }
       guard let view = webView else {
-        finish(nil)
+        finish("setup_failed")
         return
       }
-      // The probe callback is the normal path, but never let a stuck
-      // webview hang the whole sync: a 10s fallback finishes with nil.
-      timeoutWork?.cancel()
-      let fallback = DispatchWorkItem { [weak self] in
-        self?.finish(nil)
-      }
-      timeoutWork = fallback
-      DispatchQueue.main.asyncAfter(deadline: .now() + 10, execute: fallback)
-      view.evaluateJavaScript(Scripts.identityProbeScript) { [weak self] result, _ in
+      let script = "if (document.readyState !== 'loading') {\n" + Scripts.identityProbeScript + "\n}"
+      view.evaluateJavaScript(script) { [weak self] result, _ in
         guard let self, !self.finished else { return }
         let parsed = QuotaSyncRunner.parseProbeOutput(result)
-        self.finish(parsed)
+        if parsed?.loggedOut == true || parsed?.quotaPct != nil ||
+           parsed?.quotaDetailJson.isEmpty == false {
+          self.finish("loaded", parsed)
+          return
+        }
+        if Date().addingTimeInterval(1) >= self.probeDeadline {
+          self.finish("loaded", parsed)
+        } else {
+          DispatchQueue.main.asyncAfter(deadline: .now() + 0.75) { [weak self] in self?.probeAndFinish() }
+        }
       }
     }
 
-    private func finish(_ parsed: ProbeData?) {
+    private func finish(_ observation: String, _ parsed: ProbeData? = nil) {
       guard !finished else { return }
       finished = true
       timeoutWork?.cancel()
       timeoutWork = nil
       teardown()
-      completion(parsed)
+      completion(observation, parsed)
     }
 
     private func teardown() {
@@ -263,6 +328,8 @@ enum QuotaSyncRunner {
       webView?.navigationDelegate = nil
       webView?.removeFromSuperview()
       webView = nil
+      renderHost?.removeFromSuperview()
+      renderHost = nil
     }
   }
 }

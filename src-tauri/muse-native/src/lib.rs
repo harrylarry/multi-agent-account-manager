@@ -21,12 +21,28 @@
 // - gateway: WSS + Noise 握手 + 单次 unary RPC（BotArk gateway.ts 的 Spike 子集，
 //   无心跳、无自动重连——那是 Phase 1 的事）。
 // - cookie: 会话 cookie 的内存持有者（Swift WKWebsiteDataStore 桥接）。
+// - approvals: egress.approvals 只读解析（B2，Issue #13 #6）。
+// - watch: chat.subscribe 事件归一化与去重（B1，Issue #13 #5）。
 
+pub mod approvals;
+#[cfg(not(target_os = "android"))]
+pub mod chat_send;
+#[cfg(not(target_os = "android"))]
+pub mod collect;
 pub mod control_plane;
+// #18 模型指纹评分编排层（lmfpd 本地评分；不含联网发送）。
+pub mod fingerprint;
 pub mod cookie;
 #[cfg(not(target_os = "android"))]
 pub mod gateway;
+pub mod liveness;
 pub mod methods;
 pub mod noise;
 pub mod protobuf;
+// #11/#16 原生侧逐客户端代理（HTTP CONNECT / TLS CONNECT / SOCKS5，
+// 结构性 fail-closed）。
+pub mod proxy;
 pub mod transport;
+pub mod watch;
+#[cfg(not(target_os = "android"))]
+mod wire_trace;

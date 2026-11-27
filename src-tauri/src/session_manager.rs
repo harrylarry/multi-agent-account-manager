@@ -5,7 +5,7 @@ use crate::providers::{
 };
 use crate::storage::{
   detect_conflicts, load_or_migrate_store, normalize_uuid, now_ms, save_store_atomic, AccountKey,
-  AccountRecord, AccountsStoreFile, AuthState, ConflictItem, QuotaDetail,
+  AccountRecord, AccountsStoreFile, AuthState, ConflictItem, ProxySetting, QuotaDetail,
 };
 use serde::Serialize;
 use std::collections::HashMap;
@@ -889,9 +889,12 @@ const IDENTITY_PROBE_JS: &str = r#"(() => {
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ManagerSnapshot {
+  #[serde(skip_serializing_if = "Option::is_none")]
+  pub badge_sample_at_ms: Option<u64>,
   pub platform: &'static str,
   pub providers: Vec<ProviderInfo>,
   pub accounts: Vec<AccountRecord>,
+  pub account_groups: std::collections::BTreeMap<String, Vec<String>>,
   pub selected_provider_id: ProviderId,
   pub active_account: Option<AccountKey>,
   pub switching_account: Option<AccountKey>,
@@ -950,11 +953,25 @@ struct InnerState {
   modal_active: bool,
 }
 
+#[derive(serde::Serialize)]
+pub struct QuotaSyncDiagnostic {
+  account: String,
+  provider: String,
+  proxy: &'static str,
+  network: String,
+  quota: &'static str,
+}
+
 pub struct SessionManager {
   current_seq: Arc<AtomicU64>,
   active_view_id: Arc<AtomicU64>,
   view_counter: AtomicU64,
   last_sync_timestamp: AtomicU64,
+  pub(crate) proxy_write_lock: Mutex<()>,
+  #[cfg(target_os = "ios")]
+  quota_sync_lock: Mutex<()>,
+  #[cfg(target_os = "ios")]
+  unread_catch_up_lock: Mutex<()>,
   inner: Mutex<InnerState>,
 }
 
@@ -975,6 +992,11 @@ impl SessionManager {
       active_view_id: Arc::new(AtomicU64::new(0)),
       view_counter: AtomicU64::new(1),
       last_sync_timestamp: AtomicU64::new(0),
+      proxy_write_lock: Mutex::new(()),
+      #[cfg(target_os = "ios")]
+      quota_sync_lock: Mutex::new(()),
+      #[cfg(target_os = "ios")]
+      unread_catch_up_lock: Mutex::new(()),
       inner: Mutex::new(InnerState {
         store_path,
         app_data_dir,
@@ -991,6 +1013,582 @@ impl SessionManager {
         notice: loaded.startup_notice,
         modal_active: false,
       }),
+    }
+  }
+
+  /// #11/#16：读取某账号的代理设置（脱敏存储；口令在 Keychain）。
+  pub async fn proxy_setting(&self, provider: ProviderId, uuid: &str) -> Option<ProxySetting> {
+    let inner = self.inner.lock().await;
+    inner
+      .store
+      .accounts
+      .iter()
+      .find(|a| a.provider_id == provider && a.uuid == uuid)
+      .and_then(|a| a.proxy.clone())
+  }
+
+  /// #11/#16：写入/清除某账号的代理设置并落盘。`None` 表示清除。
+  pub async fn set_account_proxy(
+    &self,
+    provider: ProviderId,
+    uuid: &str,
+    proxy: Option<ProxySetting>,
+  ) -> Result<(), String> {
+    let mut inner = self.inner.lock().await;
+    let store_path = inner.store_path.clone();
+    let Some(index) = inner
+      .store
+      .accounts
+      .iter()
+      .position(|a| a.provider_id == provider && a.uuid == uuid)
+    else {
+      return Err("账号不存在".to_string());
+    };
+    let previous = std::mem::replace(&mut inner.store.accounts[index].proxy, proxy);
+    if let Err(error) = save_store_atomic(&store_path, &inner.store) {
+      inner.store.accounts[index].proxy = previous;
+      return Err(error);
+    }
+    Ok(())
+  }
+
+  #[cfg(target_os = "ios")]
+  pub async fn with_cookie_profile(
+    &self,
+    app: &AppHandle,
+    provider: ProviderId,
+    uuid: &str,
+    cookies: Option<&[crate::account_cookies::AccountCookie]>,
+    inspect: bool,
+    clipboard_seconds: u16,
+  ) -> Result<(crate::platform::ios::ProfileCookieSummary, usize), String> {
+    if !matches!(clipboard_seconds, 30 | 60 | 300) { return Err("不支持的剪贴板保留时间".into()); }
+    let _sync = self.quota_sync_lock.lock().await;
+    let locked = self.inner.lock().await;
+    let key = AccountKey { provider_id: provider, uuid: uuid.to_string() };
+    if !locked.store.accounts.iter().any(|account| account.provider_id == provider && account.uuid == uuid)
+      || locked.conflicts.iter().any(|conflict| conflict.uuid == uuid)
+      || locked.store.pending_cleanup.contains(&key)
+    {
+      return Err("账号不存在、正在清理或需要先解决归属冲突".to_string());
+    }
+    let mut response = crate::platform::ios::transfer_profile_cookies(app, provider.as_str(), uuid, cookies, inspect).await?;
+    if inspect || cookies.is_some() { return Ok((response, 0)); }
+    let raw = zeroize::Zeroizing::new(response.cookie_export_json.take().ok_or("无法读取 Cookie 导出数据")?);
+    let entries = serde_json::from_str(&raw).map_err(|_| "无法读取 Cookie 导出格式")?;
+    let (text, count, skipped) = crate::account_cookies::prepare_export(entries, provider.as_str(), now_ms() as f64 / 1000.0)?;
+    crate::platform::ios::copy_profile_cookies(app, provider.as_str(), uuid, &text, count, clipboard_seconds).await?;
+    response.count = count;
+    Ok((response, skipped))
+  }
+
+  #[cfg(target_os = "ios")]
+  pub async fn add_backup_credentials(
+    &self, app: &AppHandle, backup: &mut crate::account_backup::AccountBackup,
+  ) -> Result<(), String> {
+    use crate::account_backup::{BackupCredential, BackupProxySecret};
+    let _sync = self.quota_sync_lock.lock().await;
+    let _proxy_guard = self.proxy_write_lock.lock().await;
+    let locked = self.inner.lock().await;
+    if locked.active_slot.is_some() || !locked.conflicts.is_empty() || !locked.store.pending_cleanup.is_empty() {
+      return Err("请关闭会话并处理账号冲突后再备份登录态".into());
+    }
+    let secrets = crate::secrets::Secrets::new(&locked.app_data_dir);
+    let now = now_ms() as f64 / 1000.0;
+    for profile in &backup.accounts {
+      let account = locked.store.accounts.iter().find(|account| account.uuid == profile.uuid
+        && account.provider_id == profile.provider_id).ok_or("备份期间账号有变化，请重新导出")?;
+      let scope = profile.provider_id.as_str();
+      let mut cookies = Vec::new();
+      if account.auth_state != AuthState::LoggedOut {
+        let summary = crate::platform::ios::transfer_profile_cookies(
+          app, scope, &profile.uuid, None::<&[crate::account_cookies::AccountCookie]>, true,
+        ).await?;
+        if summary.count != 0 {
+          let mut export = crate::platform::ios::transfer_profile_cookies(
+            app, scope, &profile.uuid, None::<&[crate::account_cookies::AccountCookie]>, false,
+          ).await?;
+          let raw = zeroize::Zeroizing::new(export.cookie_export_json.take().ok_or("无法读取账号 Cookie")?);
+          let entries = serde_json::from_str(&raw).map_err(|_| "不能读取账号 Cookie 格式")?;
+          let (validated, _, _) = crate::account_cookies::prepare_export(entries, scope, now)?;
+          cookies = crate::account_cookies::parse(&validated, scope, now)?;
+        }
+      }
+      let proxy = if let Some(setting) = account.proxy.as_ref().filter(|_| profile.proxy_requires_auth) {
+        let reference = setting.credential_ref.as_deref().ok_or("缺少代理凭据")?;
+        let username = setting.effective_username().ok_or("缺少代理用户名")?;
+        let password = secrets.get(reference)?.ok_or("钥匙串无代理密码，请检查账号代理设置")?;
+        Some(BackupProxySecret { username, password })
+      } else { None };
+      if !cookies.is_empty() || proxy.is_some() {
+        backup.credentials.push(BackupCredential { uuid: profile.uuid.clone(), cookies, proxy });
+      }
+    }
+    Ok(())
+  }
+
+  pub async fn restore_account_backup(
+    &self,
+    app: &AppHandle,
+    backup: crate::account_backup::AccountBackup,
+    overwrite: bool,
+    preview_checksum: &str,
+  ) -> Result<ManagerSnapshot, String> {
+    #[cfg(target_os = "ios")]
+    let _sync = self.quota_sync_lock.lock().await;
+    #[cfg(not(target_os = "ios"))]
+    if !backup.credentials.is_empty() { return Err("登录态恢复需要 iOS".into()); }
+    let _proxy_guard = self.proxy_write_lock.lock().await;
+    let mut locked = self.inner.lock().await;
+    if locked.active_slot.is_some() || !locked.store.pending_cleanup.is_empty() || !locked.conflicts.is_empty() {
+      return Err("请关闭会话并完成账号清理或冲突处理后再恢复".into());
+    }
+    let preview = crate::account_backup::preview(&backup, &locked.store.accounts);
+    if preview.checksum != preview_checksum {
+      return Err("账号数据已变化，请重新预览".into());
+    }
+    let mut updated = locked.store.clone();
+    #[cfg(target_os = "ios")]
+    let mut staged = Vec::new();
+    for entry in backup.proxy_pool {
+      if updated.restored_proxy_pool.iter().any(|old| crate::proxy_pool::restored_entry_id(old) == crate::proxy_pool::restored_entry_id(&entry) && old != &entry) {
+        return Err("备份含已存在但资料不同的代理池标识".into());
+      }
+      if !updated.restored_proxy_pool.contains(&entry) {
+        updated.restored_proxy_pool.push(entry);
+      }
+    }
+    if updated.restored_proxy_pool.len() > 256 {
+      return Err("恢复后的代理池元数据超过容量，原资料保留".into());
+    }
+    for saved in backup.accounts {
+      if let Some(record) = updated.accounts.iter_mut().find(|record| record.uuid == saved.uuid) {
+        if record.provider_id != saved.provider_id {
+          return Err("备份含归属冲突，未修改任何账号".into());
+        }
+        if overwrite {
+          if backup.includes_proxy_endpoints && !backup.credentials.iter().any(|entry| entry.uuid == saved.uuid && entry.proxy.is_some()) {
+            record.proxy = saved.restored_proxy(record.proxy.as_ref());
+          }
+          record.alias = saved.alias;
+          record.auto_alias = false;
+          record.timezone = saved.timezone;
+          record.language = saved.language;
+          if saved.last_muse_thread.is_some() { record.last_muse_thread = saved.last_muse_thread; }
+          if backup.includes_groups { record.group = saved.group; }
+        }
+        continue;
+      }
+      #[allow(unused_mut)]
+      let mut proxy = saved.restored_proxy(None);
+      #[cfg(target_os = "ios")]
+      if let Some(data) = backup.credentials.iter().find(|data| data.uuid == saved.uuid) {
+        if let Some(secret) = &data.proxy {
+          let setting = proxy.as_mut().ok_or("缺少账号代理资料")?;
+          setting.username = Some(secret.username.clone());
+          setting.credential_ref = Some(format!("proxy-{}", saved.uuid));
+          setting.validate()?;
+        }
+        if !data.cookies.is_empty() || data.proxy.is_some() {
+          staged.push((AccountKey { provider_id: saved.provider_id, uuid: saved.uuid.clone() }, data));
+        }
+      }
+      updated.accounts.push(AccountRecord {
+        provider_id: saved.provider_id, uuid: saved.uuid, alias: saved.alias,
+        group: saved.group, timezone: saved.timezone, language: saved.language, last_muse_thread: saved.last_muse_thread,
+        created_at_ms: saved.created_at_ms, fingerprint_history: Vec::new(),
+        fingerprint_settings: Default::default(), auto_alias: false,
+        avatar_url: None, quota_text: None, quota_percent: None, quota_detail: None, quota_observation: None,
+        auth_state: AuthState::Unknown, has_unread_reply: false, last_task_reply_at_ms: None,
+        muse_unread_counts: Default::default(), muse_unread_status: None,
+        task_notifications: false, task_notice_keys: Vec::new(), pending_approval_count: None, proxy,
+      });
+    }
+    for account in &updated.accounts {
+      if let Some(group) = &account.group {
+        let names = updated.account_groups.entry(account.provider_id.as_str().to_owned()).or_default();
+        if !names.contains(group) { names.push(group.clone()); }
+      }
+    }
+    let mut seen_pool = std::collections::HashSet::new();
+    if updated.accounts.iter().filter_map(|account| account.proxy.as_ref().and_then(|proxy| proxy.pool_entry_id))
+      .any(|id| !seen_pool.insert(id)) {
+      return Err("备份会让两个账号使用同一代理池条目，已保留原资料".into());
+    }
+    #[cfg(target_os = "ios")]
+    if !staged.is_empty() {
+      let existing = crate::platform::ios::check_capabilities(app).await?.profile_names;
+      if staged.iter().any(|(key, _)| existing.contains(&key.uuid)) {
+        return Err("本机已有未关联的独立会话资料，已停止恢复以保留原资料".into());
+      }
+      let secrets = crate::secrets::Secrets::new(&locked.app_data_dir);
+      let keys: Vec<_> = staged.iter().map(|(key, _)| key.clone()).collect();
+      locked.store.pending_cleanup = keys.clone();
+      if let Err(error) = save_store_atomic(&locked.store_path, &locked.store) {
+        locked.store.pending_cleanup.clear();
+        return Err(error);
+      }
+      let result = async {
+        for (key, data) in &staged {
+          if let Some(secret) = &data.proxy {
+            secrets.set(&format!("proxy-{}", key.uuid), &secret.password)?;
+          }
+          if !data.cookies.is_empty() {
+            let result = crate::platform::ios::transfer_profile_cookies(
+              app, key.provider_id.as_str(), &key.uuid, Some(&data.cookies), false,
+            ).await?;
+            if result.count != data.cookies.len() { return Err("Cookie 写入未核对".into()); }
+          }
+        }
+        save_store_atomic(&locked.store_path, &updated)
+      }.await;
+      if let Err(error) = result {
+        for key in keys {
+          let deleted = crate::platform::ios::delete_profile(app, &key.uuid).await;
+          let cleared = secrets.delete(&format!("proxy-{}", key.uuid));
+          if deleted.is_ok() && cleared.is_ok() {
+            locked.store.pending_cleanup.retain(|entry| entry != &key);
+          }
+        }
+        let _ = save_store_atomic(&locked.store_path, &locked.store);
+        return Err(error);
+      }
+    } else {
+      save_store_atomic(&locked.store_path, &updated)?;
+    }
+    #[cfg(not(target_os = "ios"))]
+    save_store_atomic(&locked.store_path, &updated)?;
+    locked.store = updated;
+    let snapshot = Self::snapshot_from_locked(&locked);
+    drop(locked);
+    self.emit_snapshot(app, &snapshot);
+    Ok(snapshot)
+  }
+
+  pub async fn restored_proxy_metadata(&self) -> Vec<crate::account_backup::ProxyPoolProfile> {
+    self.inner.lock().await.store.restored_proxy_pool.clone()
+  }
+
+  pub async fn remove_restored_proxy_metadata(&self, id: Uuid) -> Result<(), String> {
+    let mut locked = self.inner.lock().await;
+    let mut updated = locked.store.clone();
+    updated.restored_proxy_pool.retain(|item| crate::proxy_pool::restored_entry_id(item) != id);
+    if updated.restored_proxy_pool == locked.store.restored_proxy_pool { return Ok(()); }
+    save_store_atomic(&locked.store_path, &updated)?;
+    locked.store = updated;
+    Ok(())
+  }
+
+  pub async fn record_approval_attempt(&self, key: &str, confirm: bool) -> Result<(), String> {
+    let mut locked = self.inner.lock().await;
+    let existing = locked.store.approval_attempts.get(key).copied();
+    if (!confirm && existing.is_some()) || (confirm && existing != Some(false)) {
+      return Err("本地已有该审批的提交记录，请打开会话核对".into());
+    }
+    if !confirm && locked.store.approval_attempts.len() >= 8192 {
+      return Err("审批台账已达容量，请在服务页面处理".into());
+    }
+    locked.store.approval_attempts.insert(key.to_string(), confirm);
+    if let Err(error) = save_store_atomic(&locked.store_path, &locked.store) {
+      match existing {
+        Some(value) => { locked.store.approval_attempts.insert(key.to_string(), value); }
+        None => { locked.store.approval_attempts.remove(key); }
+      }
+      return Err(error);
+    }
+    Ok(())
+  }
+
+  pub async fn record_native_quota(
+    &self,
+    app: &AppHandle,
+    uuid: &str,
+    result: Option<&crate::quota::QuotaSnapshot>,
+  ) -> Result<(), String> {
+    let mut locked = self.inner.lock().await;
+    let Some(index) = locked.store.accounts.iter().position(|account| {
+      account.provider_id == ProviderId::Muse && account.uuid == uuid && account.auth_state == AuthState::Authenticated
+    }) else { return Ok(()); };
+    let record = &mut locked.store.accounts[index];
+    let previous = record.clone();
+    if let Some(quota) = result {
+      record.quota_observation = Some(crate::storage::QuotaObservation {
+        source: "native".into(),
+        window: quota.window.clone(),
+        percent_used: quota.usage_observed.then_some(quota.percent_used as u8),
+        resets_at_ms: u64::try_from(quota.resets_at_ms).ok().filter(|value| *value > 0),
+        checked_at_ms: now_ms(),
+        stale: false,
+      });
+      if quota.usage_observed {
+        record.quota_text = Some(format!("已用 {}%", quota.percent_used));
+        record.quota_percent = u8::try_from(100 - quota.percent_used.clamp(0, 100)).ok();
+        if let Some(detail) = &mut record.quota_detail {
+          if !quota.tier.is_empty() { detail.plan_label.clone_from(&quota.tier); }
+          detail.plan_value = format!("已用 {}%", quota.percent_used);
+          detail.plan_used_percent = u8::try_from(quota.percent_used).ok();
+        }
+      }
+    } else if let Some(observation) = &mut record.quota_observation {
+      observation.stale = true;
+    }
+    if *record == previous { return Ok(()); }
+    if let Err(error) = save_store_atomic(&locked.store_path, &locked.store) {
+      locked.store.accounts[index] = previous;
+      return Err(error);
+    }
+    let snapshot = Self::snapshot_from_locked(&locked);
+    drop(locked);
+    self.emit_snapshot(app, &snapshot);
+    Ok(())
+  }
+
+  #[cfg(target_os = "ios")]
+  pub async fn set_task_notifications(
+    &self,
+    app: &AppHandle,
+    provider: ProviderId,
+    uuid: &str,
+    enabled: bool,
+  ) -> Result<ManagerSnapshot, String> {
+    let mut locked = self.inner.lock().await;
+    let index = locked.store.accounts.iter().position(|account| account.provider_id == provider && account.uuid == uuid)
+      .ok_or("账号已移除")?;
+    let previous = locked.store.accounts[index].task_notifications;
+    locked.store.accounts[index].task_notifications = enabled;
+    if let Err(error) = save_store_atomic(&locked.store_path, &locked.store) {
+      locked.store.accounts[index].task_notifications = previous;
+      return Err(error);
+    }
+    let snapshot = Self::snapshot_from_locked(&locked);
+    drop(locked);
+    self.emit_snapshot(app, &snapshot);
+    Ok(snapshot)
+  }
+
+  #[cfg(target_os = "ios")]
+  pub async fn update_muse_approval_count(&self, app: &AppHandle, uuid: &str, count: usize) -> Result<(), String> {
+    let mut locked = self.inner.lock().await;
+    let Some(index) = locked.store.accounts.iter().position(|account| account.provider_id == ProviderId::Muse
+      && account.uuid == uuid && account.auth_state == AuthState::Authenticated) else { return Ok(()); };
+    let previous = locked.store.accounts[index].pending_approval_count.replace(count);
+    if previous == Some(count) { return Ok(()); }
+    if let Err(error) = save_store_atomic(&locked.store_path, &locked.store) {
+      locked.store.accounts[index].pending_approval_count = previous;
+      return Err(error);
+    }
+    let state = Self::snapshot_from_locked(&locked);
+    drop(locked);
+    self.emit_snapshot(app, &state);
+    Ok(())
+  }
+
+  #[cfg(target_os = "ios")]
+  pub async fn record_task_observations(
+    &self,
+    app: &AppHandle,
+    provider: ProviderId,
+    uuid: &str,
+    completed: &[String],
+    pending: Option<&[muse_native_client::approvals::ApprovalItem]>,
+  ) -> Result<(), String> {
+    let mut locked = self.inner.lock().await;
+    let is_active = locked.active_slot.as_ref().is_some_and(|slot| slot.account_key.uuid == uuid);
+    let Some(index) = locked.store.accounts.iter().position(|account| account.provider_id == provider && account.uuid == uuid)
+    else { return Ok(()); };
+    let account = &mut locked.store.accounts[index];
+    let before = account.clone();
+    let mut notices = Vec::new();
+    for (kind, id) in completed.iter().map(|id| ("complete", id.as_str()))
+      .chain(pending.into_iter().flatten().map(|item| ("approval", item.id.as_str())))
+    {
+      let digest = ring::digest::digest(&ring::digest::SHA256, format!("{uuid}|{kind}|{id}").as_bytes());
+      let key: String = digest.as_ref().iter().map(|byte| format!("{byte:02x}")).collect();
+      if account.task_notice_keys.contains(&key) { continue; }
+      if account.task_notice_keys.len() >= 256 {
+        account.task_notice_keys.drain(..account.task_notice_keys.len() - 255);
+      }
+      account.task_notice_keys.push(key.clone());
+      if kind == "complete" && !is_active {
+        account.has_unread_reply = true;
+        account.last_task_reply_at_ms = Some(now_ms());
+      }
+      if account.task_notifications {
+        let action = pending.into_iter().flatten().find(|item| provider == ProviderId::Muse && kind == "approval"
+          && item.id == id && item.status == "pending" && item.expires_at_ms > now_ms() as i64
+          && !item.session_scope_id.is_empty()).and_then(|item| {
+          let allow = item.choices.iter().any(|choice| choice.decision == "allow_once" && choice.scope.is_none());
+          let deny = item.choices.iter().any(|choice| choice.decision == "deny" && choice.scope.is_none());
+          (allow || deny).then(|| serde_json::json!({"uuid":uuid, "approvalId":item.id,
+            "sessionScopeId":item.session_scope_id, "expiresAtMs":item.expires_at_ms, "allow":allow, "deny":deny}))
+        });
+        notices.push((kind, key, action));
+      }
+    }
+    if let Some(items) = pending { account.pending_approval_count = Some(items.len()); }
+    if *account == before { return Ok(()); }
+    if let Err(error) = save_store_atomic(&locked.store_path, &locked.store) {
+      locked.store.accounts[index] = before;
+      return Err(error);
+    }
+    let snapshot = Self::snapshot_from_locked(&locked);
+    let any_unread = snapshot.accounts.iter().any(|account| account.has_unread_reply);
+    drop(locked);
+    self.emit_snapshot(app, &snapshot);
+    let _ = crate::platform::ios::set_unread_badge(app, any_unread).await;
+    for (kind, key, action) in notices {
+      crate::platform::ios::post_task_notification(app, &key, kind, action).await;
+    }
+    Ok(())
+  }
+
+  #[cfg(target_os = "ios")]
+  pub(crate) async fn apply_manual_unread(
+    &self, app: &AppHandle, provider: ProviderId, uuid: &str, route: Option<&ProxySetting>, count: u64,
+  ) -> Result<bool, String> {
+    let mut locked = self.inner.lock().await;
+    if locked.active_slot.as_ref().is_some_and(|slot| slot.account_key.uuid == uuid)
+      || locked.conflicts.iter().any(|item| item.uuid == uuid)
+      || locked.store.pending_cleanup.iter().any(|item| item.uuid == uuid) { return Ok(false); }
+    let Some(index) = locked.store.accounts.iter().position(|account| {
+      account.provider_id == provider && account.uuid == uuid && account.auth_state == AuthState::Authenticated
+        && account.proxy.as_ref() == route
+    }) else { return Ok(false); };
+    let account = &mut locked.store.accounts[index];
+    let previous = account.clone();
+    let has_unread = count > 0;
+    account.has_unread_reply = has_unread;
+    if provider == ProviderId::Muse { account.muse_unread_status = Some(if has_unread { "unread" } else { "zero" }.into()); }
+    if *account == previous { return Ok(true); }
+    if let Err(error) = save_store_atomic(&locked.store_path, &locked.store) {
+      locked.store.accounts[index] = previous;
+      return Err(error);
+    }
+    let snapshot = Self::snapshot_from_locked(&locked);
+    let any_unread = snapshot.accounts.iter().any(|account| account.has_unread_reply);
+    drop(locked);
+    self.emit_snapshot(app, &snapshot);
+    let _ = crate::platform::ios::set_unread_badge(app, any_unread).await;
+    Ok(true)
+  }
+
+  #[cfg(target_os = "ios")]
+  async fn catch_up_muse_unread(&self, app: &AppHandle, targets: &[crate::platform::ios::ForegroundTaskTarget], resumed_at_ms: u64) {
+    let base = crate::muse_sessions::BadgeTiming { resumed_at_ms, handler_at_ms: now_ms(), ..Default::default() };
+    let emit = |uuid: Option<&str>, timing: &crate::muse_sessions::BadgeTiming| {
+      let _ = app.emit("muse-badge-timing", serde_json::json!({ "uuid": uuid, "timing": timing }));
+    };
+    if targets.is_empty() {
+      emit(None, &crate::muse_sessions::BadgeTiming { state: "no_parked_account", ..base });
+      return;
+    }
+    let Ok(_batch) = self.unread_catch_up_lock.try_lock() else {
+      emit(None, &crate::muse_sessions::BadgeTiming { state: "batch_busy", ..base });
+      return;
+    };
+    let cancel = app.state::<Arc<crate::probe_cancel::ProbeCancel>>();
+    for target in targets.iter().take(8) {
+      let Some(uuid) = normalize_uuid(&target.uuid) else { continue; };
+      let mut timing = base.clone();
+      let thread = target.thread_id.as_deref().and_then(|id| Uuid::parse_str(id).ok());
+      if !crate::platform::ios::automatic_task_polling_available(app).await.unwrap_or(false) {
+        timing.state = "polling_unavailable";
+        emit(Some(&uuid), &timing);
+        return;
+      }
+      let proxy_lock = self.proxy_write_lock.lock().await;
+      let (mut token, _guard) = cancel.register(&uuid, "muse_unread_catch_up");
+      let sequence = self.current_seq.load(Ordering::SeqCst);
+      let snapshot = self.get_snapshot().await;
+      drop(proxy_lock);
+      let Some(account) = snapshot.accounts.iter().find(|account| account.provider_id == ProviderId::Muse
+        && account.uuid == uuid && account.auth_state == AuthState::Authenticated
+      ) else {
+        timing.state = "account_unavailable";
+        emit(Some(&uuid), &timing);
+        continue;
+      };
+      if snapshot.active_account.is_some() || snapshot.switching_account.is_some()
+        || snapshot.conflicts.iter().any(|entry| entry.uuid == uuid)
+        || snapshot.pending_cleanup.iter().any(|key| key.uuid == uuid) {
+        timing.state = "account_ineligible";
+        emit(Some(&uuid), &timing);
+        continue;
+      }
+      timing.query_at_ms = Some(now_ms());
+      let query = Box::pin(async {
+        let header = zeroize::Zeroizing::new(crate::muse_native::cookie_header_for(app, &uuid).await?);
+        if header.is_empty() { return Err("缺少可用登录态".to_string()); }
+        let cookies = muse_native_client::cookie::SessionCookies::from_header(&header);
+        let egress = crate::egress::resolve_for_app(app, account.proxy.as_ref())?;
+        Box::pin(crate::muse_sessions::fetch_unread(&egress, &cookies, thread, target.primary, target.parked_at_ms, &mut timing)).await
+      });
+      let result = tokio::select! {
+        biased;
+        _ = token.cancelled() => None,
+        result = tokio::time::timeout(std::time::Duration::from_secs(18), query) => Some(result),
+      };
+      timing.result_at_ms = Some(now_ms());
+      let Some(result) = result else {
+        timing.state = "cancelled";
+        emit(Some(&uuid), &timing);
+        continue;
+      };
+      let mut locked = self.inner.lock().await;
+      if self.current_seq.load(Ordering::SeqCst) != sequence || token.is_cancelled() {
+        timing.state = "account_changed";
+        emit(Some(&uuid), &timing);
+        continue;
+      }
+      let Some(index) = locked.store.accounts.iter().position(|account| account.provider_id == ProviderId::Muse
+        && account.uuid == uuid && account.auth_state == AuthState::Authenticated
+      ) else { continue; };
+      let account = &mut locked.store.accounts[index];
+      let previous = account.clone();
+      let status = match result {
+        Ok(Ok((_, Some(id), status))) => {
+          let digest = ring::digest::digest(&ring::digest::SHA256, format!("{uuid}|complete|{id}").as_bytes());
+          let key: String = digest.as_ref().iter().map(|byte| format!("{byte:02x}")).collect();
+          if !account.task_notice_keys.contains(&key) {
+            if account.task_notice_keys.len() >= 256 {
+              account.task_notice_keys.drain(..account.task_notice_keys.len() - 255);
+            }
+            account.task_notice_keys.push(key);
+            account.has_unread_reply = true;
+            account.last_task_reply_at_ms = Some(now_ms());
+          }
+          status
+        }
+        Ok(Ok((Some(counts), _, status))) => {
+          let new_reply = crate::muse_sessions::update_unread_counts(&mut account.muse_unread_counts, &counts);
+          if new_reply { account.has_unread_reply = true; }
+          if counts.values().any(|count| *count > 0) { "unread" } else if thread.is_some() || target.primary { status } else { "zero" }
+        }
+        Ok(Ok((None, _, status))) => status,
+        Ok(Err(_)) => "network_or_protocol",
+        Err(_) => "timeout",
+      };
+      account.muse_unread_status = Some(status.into());
+      timing.state = status;
+      timing.expected_dot = Some(account.has_unread_reply);
+      if *account == previous {
+        emit(Some(&uuid), &timing);
+        continue;
+      }
+      if save_store_atomic(&locked.store_path, &locked.store).is_err() {
+        locked.store.accounts[index] = previous;
+        timing.state = "store_failed";
+        emit(Some(&uuid), &timing);
+        continue;
+      }
+      let mut snapshot = Self::snapshot_from_locked(&locked);
+      drop(locked);
+      timing.snapshot_at_ms = Some(now_ms());
+      snapshot.badge_sample_at_ms = timing.snapshot_at_ms;
+      self.emit_snapshot(app, &snapshot);
+      emit(Some(&uuid), &timing);
+      let any_unread = snapshot.accounts.iter().any(|account| account.has_unread_reply);
+      let _ = crate::platform::ios::set_unread_badge(app, any_unread).await;
     }
   }
 
@@ -1012,7 +1610,17 @@ impl SessionManager {
     #[cfg(not(desktop))]
     let warm_accounts = Vec::new();
 
+    let mut groups = locked.store.account_groups.clone();
+    for account in &locked.store.accounts {
+      if let Some(group) = &account.group {
+        let entries = groups.entry(account.provider_id.as_str().to_owned()).or_default();
+        if !entries.contains(group) { entries.push(group.clone()); }
+      }
+    }
+    for entries in groups.values_mut() { entries.sort(); }
     ManagerSnapshot {
+      account_groups: groups,
+      badge_sample_at_ms: None,
       platform: current_platform_name(),
       providers: all_provider_infos(),
       accounts: locked.store.accounts.clone(),
@@ -1119,7 +1727,9 @@ impl SessionManager {
         } else if !enabled {
           None
         } else {
-          locked.selected_provider_id = key.provider_id;
+          if !cfg!(target_os = "ios") || self.current_seq.load(Ordering::SeqCst) == 1 {
+            locked.selected_provider_id = key.provider_id;
+          }
           Some(key)
         }
       } else {
@@ -1127,8 +1737,9 @@ impl SessionManager {
       }
     };
 
-    if let Some(key) = candidate {
-      let _ = self.switch_account_internal(app, key, true).await;
+    // On iPhone the saved key selects the service, while opening a page requires a tap.
+    if let Some(key) = candidate.filter(|_| !cfg!(target_os = "ios")) {
+      let _ = self.switch_account_internal(app, key, true, None).await;
     } else {
       let snap = self.get_snapshot().await;
       self.emit_snapshot(app, &snap);
@@ -1155,6 +1766,8 @@ impl SessionManager {
       let deleted = self.delete_profile_for_key(app, &key.uuid).await;
       if deleted.is_ok() {
         let mut locked = self.inner.lock().await;
+        let secrets = crate::secrets::Secrets::new(&locked.app_data_dir);
+        if secrets.delete(&format!("proxy-{}", key.uuid)).is_err() { continue; }
         locked.store.pending_cleanup.retain(|k| k != &key);
         let _ = save_store_atomic(&locked.store_path, &locked.store);
       }
@@ -1420,7 +2033,7 @@ impl SessionManager {
 
     #[cfg(desktop)]
     if let Some(restore_key) = warm_restore {
-      return self.switch_account_internal(app, restore_key, false).await;
+      return self.switch_account_internal(app, restore_key, false, None).await;
     }
 
     #[cfg(not(desktop))]
@@ -1440,7 +2053,15 @@ impl SessionManager {
     app: &AppHandle,
     raw_provider: &str,
     raw_alias: &str,
+    cookies: Option<&[crate::account_cookies::AccountCookie]>,
+    timezone: Option<&str>,
+    language: Option<&str>,
+    pool: Option<(Uuid, crate::proxy_pool::ApplyEntry)>,
   ) -> Result<ManagerSnapshot, String> {
+    let timezone = crate::storage::normalize_account_timezone(timezone.unwrap_or_default())?;
+    let language = crate::storage::normalize_account_language(language.unwrap_or_default())?;
+    #[cfg(not(target_os = "ios"))]
+    if cookies.is_some() { return Err("新增时导入 Cookie 需要 iOS".into()); }
     let provider_id = ProviderId::parse(raw_provider).ok_or_else(|| "无效的服务标识".to_string())?;
     if !get_provider(provider_id).info.enabled {
       return Err(format!(
@@ -1455,7 +2076,10 @@ impl SessionManager {
       (trimmed.to_string(), false)
     };
 
+    #[cfg(target_os = "ios")]
+    let _cookie_guard = if cookies.is_some() { Some(self.quota_sync_lock.lock().await) } else { None };
     let created_key = {
+      let _proxy_guard = self.proxy_write_lock.lock().await;
       let mut locked = self.inner.lock().await;
       if !locked.conflicts.is_empty() {
         return Err("请先处理 UUID 归属冲突后再新增账号".to_string());
@@ -1470,25 +2094,105 @@ impl SessionManager {
         }
       };
 
+      let proxy = pool.map(|(entry_id, entry)| {
+        if locked.store.accounts.iter().any(|account| account.proxy.as_ref().is_some_and(|proxy| proxy.pool_entry_id == Some(entry_id))) {
+          return Err("该代理已分配给其他账号".to_string());
+        }
+        let password = entry.password.map(zeroize::Zeroizing::new);
+        let setting = crate::storage::ProxySetting {
+          pool_entry_id: Some(entry_id), uri: entry.endpoint, username: entry.username,
+          credential_ref: password.as_ref().map(|_| format!("proxy-{uuid}")), enabled: true,
+        };
+        setting.validate()?;
+        Ok((setting, password))
+      }).transpose()?;
+      let key = AccountKey { provider_id, uuid: uuid.clone() };
+      let needs_cleanup = cookies.is_some() || proxy.as_ref().is_some_and(|(_, password)| password.is_some());
+      if needs_cleanup {
+        locked.store.pending_cleanup.push(key.clone());
+        if let Err(error) = save_store_atomic(&locked.store_path, &locked.store) {
+          locked.store.pending_cleanup.pop();
+          return Err(error);
+        }
+      }
+      #[cfg(target_os = "ios")]
+      if let Some(cookies) = cookies {
+        let written = crate::platform::ios::transfer_profile_cookies(app, provider_id.as_str(), &uuid, Some(cookies), false).await;
+        if written.as_ref().map(|entry| entry.count).ok() != Some(cookies.len()) {
+          if crate::platform::ios::delete_profile(app, &uuid).await.is_ok() {
+            locked.store.pending_cleanup.retain(|entry| entry != &key);
+            if save_store_atomic(&locked.store_path, &locked.store).is_err() {
+              locked.store.pending_cleanup.push(key);
+            }
+          }
+          return Err(written.err().unwrap_or_else(|| "未能核对 Cookie 写入，账号未创建".into()));
+        }
+      }
+      let proxy_secrets = crate::secrets::Secrets::new(locked.store_path.parent().ok_or("无法定位凭据目录")?);
+      if let Some((setting, Some(password))) = &proxy {
+        let reference = setting.credential_ref.as_deref().ok_or("缺少代理凭据标识")?;
+        proxy_secrets.set(reference, password)?;
+      }
+      if needs_cleanup { locked.store.pending_cleanup.retain(|entry| entry != &key); }
       locked.store.accounts.push(AccountRecord {
         provider_id,
         uuid: uuid.clone(),
         alias,
+        group: None,
+        timezone,
+        language,
+        last_muse_thread: None,
         created_at_ms: now_ms(),
+        fingerprint_history: Vec::new(),
+        fingerprint_settings: Default::default(),
         auto_alias,
         avatar_url: None,
         quota_text: None,
         quota_percent: None,
         quota_detail: None,
-        auth_state: AuthState::LoggedOut,
+        quota_observation: None,
+        auth_state: if cookies.is_some() { AuthState::Unknown } else { AuthState::LoggedOut },
         has_unread_reply: false,
+        muse_unread_counts: Default::default(),
+        muse_unread_status: None,
+        last_task_reply_at_ms: None,
+        task_notifications: false,
+        task_notice_keys: Vec::new(),
+        pending_approval_count: None,
+        proxy: proxy.as_ref().map(|(setting, _)| setting.clone()),
       });
-      save_store_atomic(&locked.store_path, &locked.store)?;
+      if let Err(error) = save_store_atomic(&locked.store_path, &locked.store) {
+        locked.store.accounts.pop();
+        if let Some(reference) = proxy.as_ref().and_then(|(setting, _)| setting.credential_ref.as_deref()) {
+          let _ = proxy_secrets.delete(reference);
+        }
+        if needs_cleanup { locked.store.pending_cleanup.push(key); }
+        return Err(error);
+      }
       locked.selected_provider_id = provider_id;
-      AccountKey { provider_id, uuid }
+      key
     };
 
-    self.switch_account_internal(app, created_key, false).await
+    self.switch_account_internal(app, created_key, false, None).await
+  }
+
+
+  pub async fn delete_account_group(&self, app: &AppHandle, raw_provider: &str, raw_group: &str) -> Result<ManagerSnapshot, String> {
+    let provider = ProviderId::parse(raw_provider).ok_or("无效的服务标识")?;
+    let name = crate::storage::normalize_account_group(raw_group)?.ok_or("无分组不可删除")?;
+    let mut locked = self.inner.lock().await;
+    let count = locked.store.accounts.iter().filter(|account| account.provider_id == provider && account.group.as_deref() == Some(name.as_str())).count();
+    if count != 0 { return Err(format!("分组还有 {count} 个账号，请先移出后再删除。")); }
+    let before = locked.store.account_groups.clone();
+    if let Some(groups) = locked.store.account_groups.get_mut(provider.as_str()) { groups.retain(|group| group != &name); }
+    if let Err(error) = save_store_atomic(&locked.store_path, &locked.store) {
+      locked.store.account_groups = before;
+      return Err(error);
+    }
+    let state = Self::snapshot_from_locked(&locked);
+    drop(locked);
+    self.emit_snapshot(app, &state);
+    Ok(state)
   }
 
   pub async fn rename_account(
@@ -1497,6 +2201,9 @@ impl SessionManager {
     raw_provider: &str,
     raw_uuid: &str,
     raw_alias: &str,
+    raw_group: Option<&str>,
+    raw_timezone: Option<&str>,
+    raw_language: Option<&str>,
   ) -> Result<ManagerSnapshot, String> {
     let provider_id = ProviderId::parse(raw_provider).ok_or_else(|| "无效的服务标识".to_string())?;
     let uuid = normalize_uuid(raw_uuid).ok_or_else(|| "无效的账号 UUID".to_string())?;
@@ -1505,16 +2212,40 @@ impl SessionManager {
       return Err("账号别名不能为空".to_string());
     }
 
+    let group = raw_group.map(crate::storage::normalize_account_group).transpose()?;
+    let timezone = raw_timezone.map(crate::storage::normalize_account_timezone).transpose()?;
+    let language = raw_language.map(crate::storage::normalize_account_language).transpose()?;
     let mut locked = self.inner.lock().await;
-    let target = locked
+    let index = locked
       .store
       .accounts
-      .iter_mut()
-      .find(|a| a.provider_id == provider_id && a.uuid == uuid)
+      .iter()
+      .position(|a| a.provider_id == provider_id && a.uuid == uuid)
       .ok_or_else(|| "未找到匹配的账号记录，拒绝跨服务改名".to_string())?;
-    target.alias = alias.to_string();
-    target.auto_alias = false;
-    save_store_atomic(&locked.store_path, &locked.store)?;
+    let target = &mut locked.store.accounts[index];
+    let before = target.clone();
+    if target.alias != alias {
+      target.alias = alias.to_string();
+      target.auto_alias = false;
+    }
+    if let Some(group) = group {
+      target.group = group;
+    }
+    if let Some(timezone) = timezone {
+      target.timezone = timezone;
+    }
+    if let Some(language) = language { target.language = language; }
+    let new_group = target.group.clone();
+    let before_groups = locked.store.account_groups.clone();
+    let names = locked.store.account_groups.entry(provider_id.as_str().to_owned()).or_default();
+    for group in [before.group.as_ref(), new_group.as_ref()].into_iter().flatten() {
+      if !names.contains(group) { names.push(group.clone()); }
+    }
+    if let Err(error) = save_store_atomic(&locked.store_path, &locked.store) {
+      locked.store.accounts[index] = before;
+      locked.store.account_groups = before_groups;
+      return Err(error);
+    }
 
     if let Some(slot) = &locked.active_slot {
       if slot.committed && slot.account_key.provider_id == provider_id && slot.account_key.uuid == uuid {
@@ -1607,8 +2338,11 @@ impl SessionManager {
 
     if self.delete_profile_for_key(app, &uuid).await.is_ok() {
       let mut locked = self.inner.lock().await;
-      locked.store.pending_cleanup.retain(|k| k != &key);
-      let _ = save_store_atomic(&locked.store_path, &locked.store);
+      let secrets = crate::secrets::Secrets::new(&locked.app_data_dir);
+      if secrets.delete(&format!("proxy-{uuid}")).is_ok() {
+        locked.store.pending_cleanup.retain(|k| k != &key);
+        let _ = save_store_atomic(&locked.store_path, &locked.store);
+      }
     }
 
     #[cfg(target_os = "ios")]
@@ -1692,6 +2426,69 @@ impl SessionManager {
     Ok(Self::snapshot_from_locked(&locked))
   }
 
+  pub async fn archive_fingerprint(
+    &self, app: &AppHandle, provider: ProviderId, uuid: &str, entry: crate::storage::FingerprintRecord,
+  ) -> Result<(), String> {
+    let mut locked = self.inner.lock().await;
+    let index = locked.store.accounts.iter().position(|account| {
+      account.provider_id == provider && account.uuid == uuid
+    }).ok_or("原账号已经移除")?;
+    let history = &mut locked.store.accounts[index].fingerprint_history;
+    if history.iter().any(|record| record.task_id == entry.task_id) { return Ok(()); }
+    let previous = history.clone();
+    history.insert(0, entry);
+    if let Err(error) = save_store_atomic(&locked.store_path, &locked.store) {
+      locked.store.accounts[index].fingerprint_history = previous;
+      return Err(error);
+    }
+    let snapshot = Self::snapshot_from_locked(&locked);
+    drop(locked);
+    self.emit_snapshot(app, &snapshot);
+    Ok(())
+  }
+
+  pub async fn save_fingerprint_settings(
+    &self, app: &AppHandle, provider: ProviderId, uuid: &str, manual_model: Option<String>, interval_days: Option<u8>,
+  ) -> Result<ManagerSnapshot, String> {
+    let mut locked = self.inner.lock().await;
+    if locked.conflicts.iter().any(|item| item.uuid == uuid) { return Err("请先处理账号归属冲突".into()); }
+    let index = locked.store.accounts.iter().position(|account| {
+      account.provider_id == provider && account.uuid == uuid
+    }).ok_or("账号不存在")?;
+    let previous = locked.store.accounts[index].fingerprint_settings.clone();
+    let settings = &mut locked.store.accounts[index].fingerprint_settings;
+    settings.manual_model = manual_model;
+    settings.interval_days = interval_days;
+    if let Err(error) = save_store_atomic(&locked.store_path, &locked.store) {
+      locked.store.accounts[index].fingerprint_settings = previous;
+      return Err(error);
+    }
+    let snapshot = Self::snapshot_from_locked(&locked);
+    drop(locked);
+    self.emit_snapshot(app, &snapshot);
+    Ok(snapshot)
+  }
+
+  #[cfg(target_os = "ios")]
+  pub async fn claim_automatic_fingerprint(&self, provider: ProviderId, uuid: &str) -> Result<(), String> {
+    let mut locked = self.inner.lock().await;
+    let now = crate::storage::now_ms();
+    let index = locked.store.accounts.iter().position(|account| {
+      account.provider_id == provider && account.uuid == uuid
+        && account.auth_state == crate::storage::AuthState::Authenticated
+    }).ok_or("Muse 账号不可用")?;
+    let account = &mut locked.store.accounts[index];
+    if !account.fingerprint_settings.automatic_due(&account.fingerprint_history, now) {
+      return Err("自动重测未启用或未到期".into());
+    }
+    let previous = account.fingerprint_settings.last_automatic_attempt_ms.replace(now);
+    if let Err(error) = save_store_atomic(&locked.store_path, &locked.store) {
+      locked.store.accounts[index].fingerprint_settings.last_automatic_attempt_ms = previous;
+      return Err(error);
+    }
+    Ok(())
+  }
+
   pub async fn dismiss_notice(&self) -> ManagerSnapshot {
     let mut locked = self.inner.lock().await;
     locked.notice = None;
@@ -1756,8 +2553,30 @@ impl SessionManager {
     let provider_id = ProviderId::parse(raw_provider).ok_or_else(|| "无效的服务标识".to_string())?;
     let uuid = normalize_uuid(raw_uuid).ok_or_else(|| "无效的账号 UUID".to_string())?;
     let key = AccountKey { provider_id, uuid };
-    self.switch_account_internal(app, key, false).await
+    self.switch_account_internal(app, key, false, None).await
   }
+
+  #[cfg(target_os = "ios")]
+  pub async fn open_muse_thread(
+    self: &Arc<Self>,
+    app: &AppHandle,
+    uuid: String,
+    thread: Uuid,
+  ) -> Result<ManagerSnapshot, String> {
+    let key = AccountKey { provider_id: ProviderId::Muse, uuid };
+    self.switch_account_internal(app, key, false, Some(format!("https://muse.ai/thread/{thread}"))).await
+  }
+
+  #[cfg(target_os = "ios")]
+  pub async fn open_hark_project(
+    self: &Arc<Self>, app: &AppHandle, uuid: String, project: &str, main: bool,
+  ) -> Result<ManagerSnapshot, String> {
+    if !crate::hark_send::valid_project_id(project) { return Err("Hark 项目标识无效".into()); }
+    let key = AccountKey { provider_id: ProviderId::Hark, uuid };
+    let url = if main { "https://hark.com/chat".to_owned() } else { format!("https://hark.com/project/{project}") };
+    self.switch_account_internal(app, key, false, Some(url)).await
+  }
+
 
   pub async fn switch_account_by_index(
     self: &Arc<Self>,
@@ -1789,12 +2608,22 @@ impl SessionManager {
   pub async fn trigger_silent_sync(self: &Arc<Self>, app: &AppHandle, force: bool) {
     let now = now_ms();
     if !force {
+      #[cfg(target_os = "ios")]
+      let interval_ms = {
+        if !crate::platform::ios::automatic_task_polling_available(app).await.unwrap_or(false) { return; }
+        tauri_plugin_account_session::ios_network_preferences(app, None, None).await.ok()
+          .and_then(|settings| settings["quotaMinutes"].as_u64())
+          .filter(|minutes| matches!(*minutes, 5 | 15 | 30)).map_or(30_000, |minutes| minutes * 60_000)
+      };
+      #[cfg(not(target_os = "ios"))]
+      let interval_ms = 30_000;
       let last = self.last_sync_timestamp.load(Ordering::SeqCst);
-      if now > last && now - last < 30_000 {
+      if now.saturating_sub(last) < interval_ms || self.last_sync_timestamp.compare_exchange(last, now, Ordering::SeqCst, Ordering::SeqCst).is_err() {
         return;
       }
+    } else {
+      self.last_sync_timestamp.store(now, Ordering::SeqCst);
     }
-    self.last_sync_timestamp.store(now, Ordering::SeqCst);
 
     #[cfg(target_os = "ios")]
     {
@@ -1804,39 +2633,11 @@ impl SessionManager {
       // account is skipped — the foreground probe already covers it.
       // Runs in a spawned task: a sync can take a while (one hidden page
       // load per cold account) and must never block the caller.
-      let targets = {
-        let locked = self.inner.lock().await;
-        let active = locked.active_slot.as_ref().map(|s| s.account_key.clone());
-        locked
-          .store
-          .accounts
-          .iter()
-          .filter(|a| get_provider(a.provider_id).info.enabled)
-          .filter(|a| {
-            let k = AccountKey {
-              provider_id: a.provider_id,
-              uuid: a.uuid.clone(),
-            };
-            Some(&k) != active.as_ref() && !locked.store.pending_cleanup.contains(&k)
-          })
-          .map(|a| crate::platform::ios::SyncQuotaTarget {
-            provider_id: a.provider_id.as_str().to_string(),
-            uuid: a.uuid.clone(),
-            entry_url: get_provider(a.provider_id).info.entry_url.to_string(),
-          })
-          .collect::<Vec<_>>()
-      };
-      if !targets.is_empty() {
-        let mgr = Arc::clone(self);
-        let app_handle = app.clone();
-        tauri::async_runtime::spawn(async move {
-          if let Ok(results) =
-            crate::platform::ios::sync_account_quotas(&app_handle, targets).await
-          {
-            mgr.apply_synced_metadata(&app_handle, results).await;
-          }
-        });
-      }
+      let mgr = Arc::clone(self);
+      let app_handle = app.clone();
+      tauri::async_runtime::spawn(async move {
+        let _ = mgr.sync_ios_quotas(&app_handle, false, None).await;
+      });
     }
 
     #[cfg(target_os = "android")]
@@ -1917,11 +2718,97 @@ impl SessionManager {
     }
   }
 
+  #[cfg(target_os = "ios")]
+  pub async fn sync_ios_quotas(
+    &self,
+    app: &AppHandle,
+    fresh: bool,
+    provider_filter: Option<ProviderId>,
+  ) -> Result<Vec<QuotaSyncDiagnostic>, String> {
+    let _sync = self
+      .quota_sync_lock
+      .try_lock()
+      .map_err(|_| "后台额度同步正在运行，请稍后重试".to_string())?;
+    let targets = {
+      let locked = self.inner.lock().await;
+      locked.store.accounts.iter().filter_map(|account| {
+        let key = AccountKey { provider_id: account.provider_id, uuid: account.uuid.clone() };
+        let provider = get_provider(key.provider_id);
+        if provider_filter.is_some_and(|filter| filter != key.provider_id)
+          || !provider.info.enabled || locked.store.pending_cleanup.contains(&key)
+          || locked.conflicts.iter().any(|entry| entry.uuid == key.uuid)
+          || locked.active_slot.as_ref().is_some_and(|slot| slot.account_key == key)
+        {
+          return None;
+        }
+        Some((key, provider.info.entry_url.to_string()))
+      }).collect::<Vec<_>>()
+    };
+
+    let mut diagnostics = Vec::with_capacity(targets.len());
+    let mut eligible = Vec::with_capacity(targets.len());
+    let mut issued = HashMap::new();
+    for (key, entry_url) in targets {
+      let _proxy_guard = self.proxy_write_lock.lock().await;
+      let (setting, timezone) = {
+        let locked = self.inner.lock().await;
+        if locked.active_slot.as_ref().is_some_and(|slot| slot.account_key == key)
+          || locked.store.pending_cleanup.contains(&key) || locked.conflicts.iter().any(|entry| entry.uuid == key.uuid) {
+          continue;
+        }
+        let Some(account) = locked.store.accounts.iter().find(|entry| entry.uuid == key.uuid && entry.provider_id == key.provider_id)
+          else { continue; };
+        (account.proxy.clone(), account.timezone.clone())
+      };
+      let outcome = crate::webview_proxy::push(app, &key.uuid, setting.as_ref()).await;
+      let provider_id = key.provider_id.as_str().to_string();
+      let mut suffix = key.uuid.chars().rev().take(8).collect::<Vec<_>>();
+      suffix.reverse();
+      diagnostics.push((key.uuid.clone(), QuotaSyncDiagnostic {
+        account: suffix.into_iter().collect(),
+        provider: provider_id.clone(),
+        proxy: if !outcome.applied { "push_failed" } else if setting.as_ref().is_some_and(|p| p.enabled) {
+          "applied"
+        } else {
+          "disabled"
+        },
+        network: if outcome.applied { "runner_failed" } else { "not_attempted" }.into(),
+        quota: "not_updated",
+      }));
+      if outcome.applied {
+        issued.insert(key.clone(), (setting, timezone.clone()));
+        eligible.push(crate::platform::ios::SyncQuotaTarget { provider_id, uuid: key.uuid, entry_url, timezone });
+      }
+    }
+
+    if !eligible.is_empty() {
+      if let Ok(results) = crate::platform::ios::sync_account_quotas(app, eligible, fresh).await {
+        let statuses = self.apply_synced_metadata(app, &results, &issued).await;
+        for (result, status) in results.into_iter().zip(statuses) {
+          if let Some((_, row)) = diagnostics
+            .iter_mut()
+            .find(|(uuid, row)| uuid == &result.uuid && row.provider == result.provider_id)
+          {
+            if result.observation == "proxy_blocked" {
+              row.proxy = "blocked";
+              row.network = "not_attempted".into();
+            } else {
+              row.network = result.observation;
+            }
+            row.quota = status;
+          }
+        }
+      }
+    }
+    Ok(diagnostics.into_iter().map(|(_, row)| row).collect())
+  }
+
   async fn switch_account_internal(
     self: &Arc<Self>,
     app: &AppHandle,
     key: AccountKey,
     is_cold_start: bool,
+    #[cfg_attr(not(target_os = "ios"), allow(unused_variables))] conversation_url: Option<String>,
   ) -> Result<ManagerSnapshot, String> {
     {
       let locked = self.inner.lock().await;
@@ -2166,7 +3053,7 @@ impl SessionManager {
       };
 
       self
-        .open_ios_session(app, account_record, next_seq, view_instance_id, is_cold_start)
+        .open_ios_session(app, account_record, next_seq, view_instance_id, is_cold_start, conversation_url)
         .await
     }
   }
@@ -3034,6 +3921,7 @@ impl SessionManager {
     expected_seq: u64,
     view_instance_id: u64,
     is_cold_start: bool,
+    conversation_url: Option<String>,
   ) -> Result<ManagerSnapshot, String> {
     let caps = match crate::platform::ios::check_capabilities(app).await {
       Ok(c) => c,
@@ -3064,9 +3952,7 @@ impl SessionManager {
       uuid: account.uuid.clone(),
     };
 
-    // 0.1.16: if a flag was cleared, the aggregate dot on the "← 账号"
-    // button may need to go out — the block reports the new aggregate.
-    let badge_sync = {
+    {
       let mut locked = self.inner.lock().await;
       if self.current_seq.load(Ordering::SeqCst) != expected_seq {
         return Ok(Self::snapshot_from_locked(&locked));
@@ -3077,39 +3963,38 @@ impl SessionManager {
         switch_seq: expected_seq,
         committed: false,
       });
-      // 0.1.15: opening the account clears its unread-reply flag — the
-      // user is looking at the reply now.
-      let mut cleared_flag = false;
-      if let Some(acc) = locked
-        .store
-        .accounts
-        .iter_mut()
-        .find(|a| a.provider_id == key.provider_id && a.uuid == key.uuid)
-      {
-        if acc.has_unread_reply {
-          acc.has_unread_reply = false;
-          let _ = save_store_atomic(&locked.store_path, &locked.store);
-          cleared_flag = true;
-        }
-      }
-      if cleared_flag {
-        Some(locked.store.accounts.iter().any(|a| a.has_unread_reply))
-      } else {
-        None
-      }
-    };
-    if let Some(any_unread) = badge_sync {
-      let _ = crate::platform::ios::set_unread_badge(app, any_unread).await;
     }
 
     let spec = get_provider(account.provider_id);
+    // #11/#16（补 W）：打开会话前把账号代理重新下发一次。
+    // Rust 是权威源——App 重启、Swift 本地配置损坏/过期都在这里纠正；
+    // 下发失败就拒绝打开，绝不把可能直连的 WebView 放出去。
+    let pushed = {
+      let _proxy_guard = self.proxy_write_lock.lock().await;
+      if self.current_seq.load(Ordering::SeqCst) != expected_seq {
+        return Ok(self.get_snapshot().await);
+      }
+      let proxy_setting = self.proxy_setting(account.provider_id, &account.uuid).await;
+      crate::webview_proxy::push(app, &account.uuid, proxy_setting.as_ref()).await
+    };
+    if let Some(reason) = pushed.blocked() {
+      let mut locked = self.inner.lock().await;
+      if self.current_seq.load(Ordering::SeqCst) == expected_seq {
+        locked.active_slot = None;
+        locked.notice = Some(format!("账号代理不可用，已阻止打开会话：{reason}"));
+      }
+      return Ok(Self::snapshot_from_locked(&locked));
+    }
+
     let payload = crate::platform::ios::OpenIosAccountPayload {
       provider_id: account.provider_id.as_str().to_string(),
       provider_name: spec.info.short_name.to_string(),
       uuid: account.uuid.clone(),
       alias: account.alias.clone(),
+      timezone: account.timezone.clone(),
+      language: account.language.clone(),
       auto_alias: account.auto_alias,
-      entry_url: spec.info.entry_url.to_string(),
+      entry_url: conversation_url.unwrap_or_else(|| spec.info.entry_url.to_string()),
       allowed_hosts: spec.allowed_hosts.iter().map(|s| (*s).to_string()).collect(),
       switch_seq: expected_seq,
       view_instance_id,
@@ -3276,7 +4161,7 @@ impl SessionManager {
           locked.store.last_committed.clone()
         };
         if let Some(committed_key) = fallback {
-          let _ = self.switch_account_internal(app, committed_key, true).await;
+          let _ = self.switch_account_internal(app, committed_key, true, None).await;
         } else {
           let snap = self.get_snapshot().await;
           self.emit_snapshot(app, &snap);
@@ -3469,13 +4354,15 @@ impl SessionManager {
       IosSessionEvent::RecreateRequested { previous_switch_seq } => {
         let fallback = {
           let mut locked = self.inner.lock().await;
-          if self.current_seq.load(Ordering::SeqCst) == previous_switch_seq {
-            locked.active_slot = None;
-          }
-          locked.store.last_committed.clone()
+          if self.current_seq.load(Ordering::SeqCst) != previous_switch_seq { return; }
+          let key = locked.active_slot.as_ref()
+            .filter(|slot| slot.switch_seq == previous_switch_seq && slot.committed)
+            .map(|slot| slot.account_key.clone());
+          if key.is_some() { locked.active_slot = None; }
+          key
         };
-        if let Some(committed_key) = fallback {
-          let _ = self.switch_account_internal(app, committed_key, true).await;
+        if let Some(key) = fallback {
+          let _ = self.switch_account_internal(app, key, true, None).await;
         } else {
           let snap = self.get_snapshot().await;
           self.emit_snapshot(app, &snap);
@@ -3527,6 +4414,9 @@ impl SessionManager {
       // (0.1.16: the active account never reaches here — the Swift
       // coordinator skips it). Mark it unread in the manager list;
       // the flag clears when the account is opened (open_ios_session).
+      IosSessionEvent::ForegroundTaskCatchUp { targets, resumed_at_ms } => {
+        Box::pin(self.catch_up_muse_unread(app, &targets, resumed_at_ms)).await;
+      }
       IosSessionEvent::TaskReplyDetected {
         provider_id,
         uuid,
@@ -3539,19 +4429,19 @@ impl SessionManager {
         };
         let snap_opt = {
           let mut locked = self.inner.lock().await;
-          let Some(acc) = locked
+          let Some(index) = locked
             .store
             .accounts
-            .iter_mut()
-            .find(|a| a.provider_id == pid && a.uuid == norm_uuid)
+            .iter()
+            .position(|a| a.provider_id == pid && a.uuid == norm_uuid)
           else {
             return;
           };
-          if acc.has_unread_reply {
-            return;
-          }
-          acc.has_unread_reply = true;
+          let previous = locked.store.accounts[index].clone();
+          locked.store.accounts[index].has_unread_reply = true;
+          locked.store.accounts[index].last_task_reply_at_ms = Some(now_ms());
           if save_store_atomic(&locked.store_path, &locked.store).is_err() {
+            locked.store.accounts[index] = previous;
             return;
           }
           Some(Self::snapshot_from_locked(&locked))
@@ -3690,10 +4580,27 @@ impl SessionManager {
         return;
       }
 
+      let thread = if key.provider_id == ProviderId::Muse
+        && matches!(committed_url.host_str(), Some("muse.ai" | "www.muse.ai"))
+      {
+        committed_url.path().trim_end_matches('/').strip_prefix("/thread/")
+          .and_then(|id| Uuid::parse_str(id).ok())
+      } else { None };
+      let index = locked.store.accounts.iter().position(|account| {
+        account.provider_id == key.provider_id && account.uuid == key.uuid
+      }).expect("account checked with state locked");
+      let previous_thread = locked.store.accounts[index].last_muse_thread;
+      let was_unread = locked.store.accounts[index].has_unread_reply;
+      if let Some(thread) = thread {
+        locked.store.accounts[index].last_muse_thread = Some(thread);
+      }
+      locked.store.accounts[index].has_unread_reply = false;
       let prev_last = locked.store.last_committed.clone();
       locked.store.last_committed = Some(key.clone());
       if let Err(err) = save_store_atomic(&locked.store_path, &locked.store) {
         locked.store.last_committed = prev_last;
+        locked.store.accounts[index].last_muse_thread = previous_thread;
+        locked.store.accounts[index].has_unread_reply = was_unread;
         self.hide_foreground_slot(app, expected_seq, &mut locked).await;
         locked.notice = Some(format!("提交账号记录写盘失败，已回退管理页: {err}"));
         Some(Self::snapshot_from_locked(&locked))
@@ -3712,6 +4619,7 @@ impl SessionManager {
     };
 
     if let Some(snap) = snap_opt {
+      let _ = crate::platform::ios::set_unread_badge(app, snap.accounts.iter().any(|account| account.has_unread_reply)).await;
       self.emit_snapshot(app, &snap);
     }
   }
@@ -4023,6 +4931,7 @@ impl SessionManager {
       target.auth_state = AuthState::LoggedOut;
       target.quota_detail = None;
       target.quota_text = None;
+    target.quota_observation = None;
       target.quota_percent = None;
 
       if save_store_atomic(&locked.store_path, &locked.store).is_err() {
@@ -4085,6 +4994,12 @@ impl SessionManager {
         target.avatar_url = Some(av);
         changed = true;
       }
+    }
+
+    // WebView metadata lacks the native quota window and reset time. Keep
+    // quota fields from the same source, including while a native sample is stale.
+    if target.has_native_quota() {
+      return (changed, alias_updated);
     }
 
     if let Some(detail) = quota_detail_opt {
@@ -4185,88 +5100,102 @@ impl SessionManager {
     }
   }
 
-  /// Batch-1: applies background sync results (iOS). Unlike
-  /// apply_detected_metadata there is no live session to validate
-  /// against — the sync deliberately covers accounts that are NOT open —
-  /// so there is no view-instance check. Saves once and emits one
-  /// snapshot. A logged-out finding is applied directly: the probe ran
-  /// after a full page load, and opening the account re-verifies (a false
-  /// positive self-corrects on open via apply_detected_metadata).
   #[cfg(target_os = "ios")]
   async fn apply_synced_metadata(
     &self,
     app: &AppHandle,
-    results: Vec<crate::platform::ios::SyncQuotaResult>,
-  ) {
-    let changed_any = {
-      let mut locked = self.inner.lock().await;
-      let mut any = false;
-      for r in results {
-        let Some(pid) = ProviderId::parse(&r.provider_id) else {
-          continue;
-        };
-        let Some(norm_uuid) = normalize_uuid(&r.uuid) else {
-          continue;
-        };
-        let key = AccountKey {
-          provider_id: pid,
-          uuid: norm_uuid,
-        };
-        if r.logged_out {
-          let Some(target) = locked
-            .store
-            .accounts
-            .iter_mut()
-            .find(|a| a.provider_id == key.provider_id && a.uuid == key.uuid)
-          else {
-            continue;
-          };
-          if target.auth_state == AuthState::LoggedOut
-            && target.quota_detail.is_none()
-            && target.quota_text.is_none()
-            && target.quota_percent.is_none()
-          {
-            continue;
-          }
-          target.auth_state = AuthState::LoggedOut;
-          target.quota_detail = None;
-          target.quota_text = None;
-          target.quota_percent = None;
-          any = true;
-          continue;
-        }
-        let detail = r
-          .quota_detail_json
-          .as_deref()
-          .and_then(|s| serde_json::from_str::<QuotaDetail>(s).ok());
-        let (changed, _) = Self::update_account_metadata_locked(
-          &mut locked,
-          &key,
-          if r.identity.is_empty() {
-            None
-          } else {
-            Some(r.identity)
-          },
-          r.avatar_url,
-          r.quota_text,
-          r.quota_percent,
-          detail,
-        );
-        any = any || changed;
+    results: &[crate::platform::ios::SyncQuotaResult],
+    issued: &HashMap<AccountKey, (Option<ProxySetting>, Option<String>)>,
+  ) -> Vec<&'static str> {
+    let mut locked = self.inner.lock().await;
+    let previous = locked.store.clone();
+    let mut any_changed = false;
+    let mut statuses = Vec::with_capacity(results.len());
+    for result in results {
+      let (Some(provider_id), Some(uuid)) = (ProviderId::parse(&result.provider_id), normalize_uuid(&result.uuid)) else {
+        statuses.push(("not_updated", false));
+        continue;
+      };
+      let key = AccountKey { provider_id, uuid };
+      if locked.active_slot.as_ref().is_some_and(|slot| slot.account_key == key) {
+        statuses.push(("account_changed", false));
+        continue;
       }
-      if !any {
-        return;
+      let Some(index) = locked.store.accounts.iter().position(|a| a.provider_id == key.provider_id && a.uuid == key.uuid) else {
+        statuses.push(("account_changed", false));
+        continue;
+      };
+      let before = &previous.accounts[index];
+      if !issued.get(&key).is_some_and(|(proxy, timezone)| before.proxy == *proxy && before.timezone == *timezone)
+        || locked.store.pending_cleanup.contains(&key) || locked.conflicts.iter().any(|entry| entry.uuid == key.uuid) {
+        statuses.push(("account_changed", false));
+        continue;
       }
-      if save_store_atomic(&locked.store_path, &locked.store).is_err() {
-        return;
+      if result.logged_out {
+        let target = &mut locked.store.accounts[index];
+        let changed = target.auth_state != AuthState::LoggedOut || target.quota_detail.is_some()
+          || target.quota_text.is_some() || target.quota_percent.is_some() || target.quota_observation.is_some();
+        target.auth_state = AuthState::LoggedOut;
+        target.quota_detail = None;
+        target.quota_text = None;
+        target.quota_observation = None;
+        target.quota_percent = None;
+        any_changed |= changed;
+        statuses.push(("signed_out", changed));
+        continue;
       }
-      true
-    };
-    if changed_any {
-      let snap = self.get_snapshot().await;
-      self.emit_snapshot(app, &snap);
+      if !result.authenticated {
+        statuses.push(("not_updated", false));
+        continue;
+      }
+      let detail = result.quota_detail_json.as_deref()
+        .and_then(|json| serde_json::from_str::<QuotaDetail>(json).ok())
+        .filter(|detail| !detail.plan_label.is_empty());
+      let quota_text = result.quota_text.as_deref().map(str::trim)
+        .filter(|text| !text.is_empty() && text.len() <= 60 && !matches!(*text, "额度充足" | "正在同步额度…"));
+      let has_quota = detail.is_some() || quota_text.is_some();
+      let (mut changed, _) = Self::update_account_metadata_locked(
+        &mut locked, &key, (!result.identity.is_empty()).then(|| result.identity.clone()),
+        result.avatar_url.clone(), quota_text.map(str::to_string), result.quota_percent, detail,
+      );
+      if has_quota && result.observation == "loaded" && !locked.store.accounts[index].has_native_quota() {
+        let target = &mut locked.store.accounts[index];
+        target.quota_observation = Some(crate::storage::QuotaObservation {
+          source: "page".into(),
+          window: None,
+          percent_used: target.quota_detail.as_ref().and_then(|detail| detail.plan_used_percent),
+          resets_at_ms: None,
+          checked_at_ms: now_ms(),
+          stale: false,
+        });
+        changed = true;
+      }
+      any_changed |= changed;
+      let after = &locked.store.accounts[index];
+      let status = if has_quota && after.has_native_quota() {
+        "native_retained"
+      } else if !has_quota {
+        "not_updated"
+      } else if before.quota_text != after.quota_text || before.quota_percent != after.quota_percent
+        || before.quota_detail != after.quota_detail {
+        "updated"
+      } else {
+        "unchanged"
+      };
+      statuses.push((status, changed));
     }
+    let save_ok = !any_changed || save_store_atomic(&locked.store_path, &locked.store).is_ok();
+    if !save_ok {
+      locked.store = previous;
+    }
+    drop(locked);
+    if any_changed && save_ok {
+      let snapshot = self.get_snapshot().await;
+      self.emit_snapshot(app, &snapshot);
+    }
+    statuses.into_iter().map(|(status, changed)| if changed && !save_ok { "save_failed" } else { status }).collect()
   }
+
 }
 
 #[cfg(desktop)]
@@ -4280,4 +5209,69 @@ struct DesktopProbeResult {
   quota_pct: Option<u8>,
   quota_detail: Option<QuotaDetail>,
   pending_hotkey: Option<u8>,
+}
+
+#[cfg(test)]
+mod proxy_tests {
+  use super::*;
+
+  #[tokio::test]
+  async fn failed_proxy_store_write_preserves_the_previous_account_route() {
+    let dir = std::env::temp_dir().join(format!("proxy-write-{}", uuid::Uuid::new_v4()));
+    std::fs::create_dir_all(dir.join("blocked")).unwrap();
+    let account_uuid = uuid::Uuid::new_v4().to_string();
+    let before: ProxySetting = serde_json::from_value(serde_json::json!({
+      "uri": "socks5://proxy.example:1080", "enabled": true
+    })).unwrap();
+    let mut store = AccountsStoreFile::default();
+    store.accounts.push(serde_json::from_value(serde_json::json!({
+      "providerId": "muse", "uuid": account_uuid, "alias": "fixture",
+      "createdAtMs": 1, "proxy": before,
+    })).unwrap());
+    save_store_atomic(&dir.join("accounts.json"), &store).unwrap();
+    let manager = SessionManager::new(dir.clone());
+    manager.inner.lock().await.store_path = dir.join("blocked");
+    assert!(manager.set_account_proxy(ProviderId::Muse, &account_uuid, None).await.is_err());
+    assert_eq!(manager.proxy_setting(ProviderId::Muse, &account_uuid).await, Some(before));
+    std::fs::remove_dir_all(dir).unwrap();
+  }
+}
+
+#[cfg(test)]
+mod quota_source_tests {
+  use super::*;
+
+  #[tokio::test]
+  async fn page_metadata_keeps_native_quota_and_still_updates_identity() {
+    let dir = std::env::temp_dir().join(format!("quota-source-{}", Uuid::new_v4()));
+    let manager = SessionManager::new(dir);
+    let key = AccountKey { provider_id: ProviderId::Muse, uuid: Uuid::new_v4().to_string() };
+    let mut account: AccountRecord = serde_json::from_value(serde_json::json!({
+      "providerId": "muse", "uuid": key.uuid, "alias": "pending", "autoAlias": true,
+      "createdAtMs": 1, "quotaText": "已用 23%", "quotaPercent": 77,
+      "quotaObservation": {
+        "source": "native", "window": "monthly", "percentUsed": 23,
+        "resetsAtMs": 1234, "checkedAtMs": 42, "stale": true
+      }
+    })).unwrap();
+    let native = account.quota_observation.clone();
+    let mut state = manager.inner.lock().await;
+    state.store.accounts.push(account.clone());
+
+    let (changed, alias) = SessionManager::update_account_metadata_locked(
+      &mut state, &key, Some("verified identity".into()), None, Some("已用 80%".into()), Some(20), None,
+    );
+    assert!(changed);
+    assert_eq!(alias.as_deref(), Some("verified identity"));
+    assert_eq!(state.store.accounts[0].quota_observation, native);
+    assert_eq!(state.store.accounts[0].quota_text.as_deref(), Some("已用 23%"));
+    assert_eq!(state.store.accounts[0].quota_percent, Some(77));
+
+    account.quota_observation = None;
+    state.store.accounts[0] = account;
+    SessionManager::update_account_metadata_locked(
+      &mut state, &key, None, None, Some("已用 80%".into()), Some(20), None,
+    );
+    assert_eq!(state.store.accounts[0].quota_percent, Some(20));
+  }
 }

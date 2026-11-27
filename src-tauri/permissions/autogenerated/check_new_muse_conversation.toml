@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-check-new-muse-conversation"
+description = "Enables the check_new_muse_conversation command without any pre-configured scope."
+commands.allow = ["check_new_muse_conversation"]
+
+[[permission]]
+identifier = "deny-check-new-muse-conversation"
+description = "Denies the check_new_muse_conversation command without any pre-configured scope."
+commands.deny = ["check_new_muse_conversation"]

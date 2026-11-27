@@ -1,16 +1,20 @@
 // Scripts.swift — JavaScript injected into account web views.
 //
-// The two scripts below are byte-identical (modulo leading/trailing blank
-// lines, which are insignificant in JS) to the Kotlin constants
-// QUOTA_HOOK_INIT_SCRIPT and the probe part of IDENTITY_PROBE_SCRIPT in
-// AccountWebActivity.kt. They were extracted mechanically from the Kotlin
-// source; do not hand-edit them here — change the Kotlin originals and
-// re-extract, so Android and iOS never drift apart.
+// GENERATED FILE — do not edit by hand.
+//
+// Source of truth: AccountWebActivity.kt (QUOTA_HOOK_INIT_SCRIPT and
+// IDENTITY_PROBE_SCRIPT). The two platforms must inject byte-identical
+// JavaScript; hand-editing this file is what previously broke it (a
+// dropped `const origFetch = window.fetch` left an unbalanced brace, so
+// the whole script failed to parse and the hook never installed).
+//
+// Regenerate:  node scripts/sync-embedded-js.mjs --write
+// Verify:      node scripts/sync-embedded-js.mjs --check   (also in CI)
 
 enum Scripts {
-  /// fetch/XHR/WebSocket hooks that capture quota-related responses and
-  /// stash them on window.__maamQuota. Injected once per web view at
-  /// document start via WKUserScript.
+  /// fetch/WebSocket hooks that capture quota-related responses and stash
+  /// them on window.__maamQuota. Injected once per web view at document
+  /// start via WKUserScript.
   static let quotaHookInitScript = #"""
             (() => {
               try {
@@ -553,7 +557,7 @@ enum Scripts {
                 let qPct = -1;
                 let qDetailStr = '';
                 let dObj = window.__maamQuotaDetail || null;
-                if (!dObj) {
+                if (!dObj && !window.__maamRequireFreshQuota) {
                   try {
                     const cached = localStorage.getItem('__maam_cached_quota_detail_v2__');
                     if (cached) dObj = JSON.parse(cached);
@@ -629,7 +633,7 @@ enum Scripts {
                   qDetailStr = JSON.stringify(dObj);
                 } else {
                   let qObj = window.__maamQuota || null;
-                  if (!qObj) {
+                  if (!qObj && !window.__maamRequireFreshQuota) {
                     try {
                       const cachedQ = localStorage.getItem('__maam_cached_quota__');
                       if (cachedQ) qObj = JSON.parse(cachedQ);

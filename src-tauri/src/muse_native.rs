@@ -8,12 +8,15 @@
 //
 // 协议实现在 muse-native crate；这里只有平台接线，不含协议逻辑。
 
-use muse_native_client::control_plane::ControlPlaneFetch;
-use muse_native_client::cookie::{SessionCookie, SessionCookies};
-use muse_native_client::gateway::{GatewayError, MuseGateway};
+use muse_native_client::cookie::SessionCookies;
+use muse_native_client::approvals::{parse_pending, ApprovalItem};
+use muse_native_client::fingerprint::{self, FingerprintError, FingerprintResult, Sample};
+use muse_native_client::gateway::GatewayError;
+use muse_native_client::transport::{HttpRequest, Service};
+use muse_native_client::watch::{WatchSummary, WatchTracker};
 use serde::Serialize;
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use tauri::AppHandle;
 use zeroize::Zeroize;
 
@@ -58,40 +61,9 @@ impl SpikeDiagnose {
   }
 }
 
-#[cfg(not(target_os = "android"))]
-struct ReqwestFetch {
-  client: reqwest::Client,
-}
-
-#[cfg(not(target_os = "android"))]
-impl ReqwestFetch {
-  fn new() -> Result<Self, String> {
-    let client = reqwest::Client::builder()
-      .timeout(Duration::from_secs(20))
-      .build()
-      .map_err(|e| format!("创建 HTTP 客户端失败: {e}"))?;
-    Ok(Self { client })
-  }
-}
-
-#[cfg(not(target_os = "android"))]
-impl ControlPlaneFetch for ReqwestFetch {
-  async fn post(
-    &self,
-    url: &str,
-    headers: &[(&str, &str)],
-    body: &[u8],
-  ) -> Result<(u16, Vec<u8>), String> {
-    let mut req = self.client.post(url).body(body.to_vec());
-    for (k, v) in headers {
-      req = req.header(*k, *v);
-    }
-    let resp = req.send().await.map_err(|e| e.to_string())?;
-    let status = resp.status().as_u16();
-    let bytes = resp.bytes().await.map_err(|e| e.to_string())?;
-    Ok((status, bytes.to_vec()))
-  }
-}
+use crate::probe_cancel::ProbeCancel;
+use crate::secrets::Secrets;
+use crate::storage::ProxySetting;
 
 /// 是否 Spike 版：bundle id 不是日常版即为 Spike 版。
 /// 前端据此决定是否显示 Spike 专属 UI（顶栏徽章）。
@@ -115,12 +87,13 @@ pub async fn diagnose(
   app: &AppHandle,
   provider_id: &str,
   uuid: &str,
+  setting: Option<ProxySetting>,
 ) -> Result<SpikeDiagnose, String> {
   let app_owned = app.clone();
   let provider_owned = provider_id.to_string();
   let uuid_owned = uuid.to_string();
   let handle = tokio::spawn(async move {
-    diagnose_inner(&app_owned, &provider_owned, &uuid_owned).await
+    diagnose_inner(&app_owned, &provider_owned, &uuid_owned, setting.as_ref()).await
   });
   tokio::select! {
     res = handle => match res {
@@ -138,13 +111,14 @@ async fn diagnose_inner(
   app: &AppHandle,
   provider_id: &str,
   uuid: &str,
+  setting: Option<&ProxySetting>,
 ) -> Result<SpikeDiagnose, String> {
   if provider_id != ProviderId::Muse.as_str() {
     return Err("Spike 原生诊断只支持 Muse 账号".to_string());
   }
   #[cfg(target_os = "android")]
   {
-    let _ = (app, uuid);
+    let _ = (app, uuid, setting);
     return Err(
       "Spike 原生诊断在 Android 上不可用（Cookie 桥只接了 iOS WKWebsiteDataStore）".to_string(),
     );
@@ -179,13 +153,24 @@ async fn diagnose_inner(
       cookies.len(),
       cookies.names()
     );
-    let fetch = ReqwestFetch::new()?;
-    let gateway = MuseGateway::new(fetch);
-    let mut connected = match gateway.connect(&cookies).await {
-      Ok(c) => c,
+    let egress = match crate::egress::resolve_for_app(app, setting) {
+      Ok(e) => e,
       Err(e) => {
         cookies.zeroize();
+        return Ok(SpikeDiagnose::fail("egress", e));
+      }
+    };
+    let mut connected = match egress.connect(&cookies).await {
+      Ok(c) => c,
+      // GatewayError 里带语义（signed_out / cvm_required），不能压成一行字符串：
+      // 这两类失败才是用户真正需要看到的「去重新登录 / 去网页过验证」。
+      Err(crate::egress::EgressError::Gateway(e)) => {
+        cookies.zeroize();
         return Ok(report_connect_error(e));
+      }
+      Err(e) => {
+        cookies.zeroize();
+        return Ok(SpikeDiagnose::fail("connect", e.to_string()));
       }
     };
     // 控制面已跑完：cookie 不再需要，立即清零。
@@ -223,6 +208,1607 @@ async fn diagnose_inner(
   }
 }
 
+/// B4 发送结果（字段与前端契约一致）。
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SendOutcome {
+  pub ok: bool,
+  pub status: String,
+  pub send_id: String,
+  pub ack: Option<serde_json::Value>,
+  pub session_id: Option<String>,
+  pub error: Option<String>,
+}
+
+/// 发送一条消息：申请单发锁 → 建连 → 发一次 → 按结果记账。
+/// 超时/断线一律记 UNKNOWN，绝不自动重发。
+pub async fn send_probe(
+  app: &AppHandle,
+  ledger: &crate::send_ledger::SendLedger,
+  uuid: &str,
+  text: &str,
+  node_id: &str,
+  session_id: Option<&str>,
+  setting: Option<&ProxySetting>,
+  secrets: &Secrets,
+  cancel_token: crate::probe_cancel::CancelToken,
+) -> SendOutcome {
+  send_muse_message(
+    app, ledger, uuid, text, node_id, session_id, setting, secrets, cancel_token, false,
+  ).await
+}
+
+pub async fn send_muse_message(
+  app: &AppHandle,
+  ledger: &crate::send_ledger::SendLedger,
+  uuid: &str,
+  text: &str,
+  node_id: &str,
+  session_id: Option<&str>,
+  setting: Option<&ProxySetting>,
+  secrets: &Secrets,
+  mut cancel_token: crate::probe_cancel::CancelToken,
+  new_conversation: bool,
+) -> SendOutcome {
+  use crate::send_ledger::SendError;
+  let conversation = session_id.unwrap_or("new");
+  let prepared = if new_conversation {
+    ledger.begin_new_muse_conversation(uuid, text)
+  } else {
+    ledger.begin(uuid, conversation, text)
+  };
+  let send_id = match prepared {
+    Ok(id) => id,
+    Err(SendError::Busy(existing)) => {
+      return SendOutcome {
+        ok: false,
+        status: "BUSY".to_string(),
+        send_id: existing,
+        ack: None,
+        session_id: session_id.map(str::to_string),
+        error: Some("该账号已有一条发送在进行中（不排队）".to_string()),
+      }
+    }
+    Err(SendError::Unknown(e)) => {
+      return SendOutcome {
+        ok: false,
+        status: "ERROR".to_string(),
+        send_id: String::new(),
+        ack: None,
+        session_id: None,
+        error: Some(e),
+      }
+    }
+  };
+
+  #[cfg(target_os = "android")]
+  {
+    let _ = (app, node_id, text, setting, secrets, &mut cancel_token);
+    ledger.fail(&send_id, "Android 不可用".to_string());
+    return SendOutcome {
+      ok: false, status: "DEFINITIVELY_FAILED".to_string(), send_id,
+      ack: None, session_id: session_id.map(str::to_string),
+      error: Some("发送探针在 Android 上不可用".to_string()),
+    };
+  }
+
+  #[cfg(not(target_os = "android"))]
+  {
+    let app_owned = app.clone();
+    let uuid_owned = uuid.to_string();
+    let handle = tokio::spawn(async move { fetch_session_cookies(&app_owned, &uuid_owned).await });
+    let fetched = tokio::select! {
+      biased;
+      _ = cancel_token.cancelled() => {
+        ledger.fail(&send_id, "用户取消".to_string());
+        return SendOutcome {
+          ok: false, status: "DEFINITIVELY_FAILED".to_string(), send_id,
+          ack: None, session_id: session_id.map(str::to_string),
+          error: Some("用户取消（未发送）".to_string()),
+        };
+      }
+      result = tokio::time::timeout(COOKIE_TIMEOUT, handle) => result,
+    };
+    let mut cookies = match fetched {
+      Err(_) => {
+        ledger.fail(&send_id, "取 cookie 超时".to_string());
+        return SendOutcome {
+          ok: false, status: "DEFINITIVELY_FAILED".to_string(), send_id,
+          ack: None, session_id: session_id.map(str::to_string),
+          error: Some("取 muse.ai 会话 cookie 超时（15 秒）".to_string()),
+        };
+      }
+      Ok(Ok(Ok(c))) => c,
+      Ok(Ok(Err(e))) => {
+        ledger.fail(&send_id, e.clone());
+        return SendOutcome {
+          ok: false, status: "DEFINITIVELY_FAILED".to_string(), send_id,
+          ack: None, session_id: session_id.map(str::to_string), error: Some(e),
+        };
+      }
+      Ok(Err(e)) => {
+        ledger.fail(&send_id, e.to_string());
+        return SendOutcome {
+          ok: false, status: "DEFINITIVELY_FAILED".to_string(), send_id,
+          ack: None, session_id: session_id.map(str::to_string),
+          error: Some(format!("取 cookie 任务异常: {e}")),
+        };
+      }
+    };
+    if cookies.is_empty() {
+      ledger.fail(&send_id, "无登录态".to_string());
+      return SendOutcome {
+        ok: false, status: "DEFINITIVELY_FAILED".to_string(), send_id,
+        ack: None, session_id: session_id.map(str::to_string),
+        error: Some("该账号还没有 muse.ai 登录态".to_string()),
+      };
+    }
+
+    // 后端取消：用户停止后不再发出这条消息。
+    if cancel_token.check() {
+      cookies.zeroize();
+      ledger.fail(&send_id, "用户取消".to_string());
+      return SendOutcome {
+        ok: false, status: "DEFINITIVELY_FAILED".to_string(), send_id,
+        ack: None, session_id: session_id.map(str::to_string),
+        error: Some("用户取消（未发送）".to_string()),
+      };
+    }
+
+    // 账号级出站策略：启用代理时全程走代理，解析失败也不得退回直连。
+    let egress = match crate::egress::AccountEgress::resolve(setting, secrets) {
+      Ok(e) => e,
+      Err(e) => {
+        cookies.zeroize();
+        ledger.fail(&send_id, e.to_string());
+        return SendOutcome {
+          ok: false, status: "DEFINITIVELY_FAILED".to_string(), send_id,
+          ack: None, session_id: session_id.map(str::to_string),
+          error: Some(e.to_string()),
+        };
+      }
+    };
+    let setup = async {
+      let mut gateway = egress.connect(&cookies).await.map_err(|e| e.to_string())?;
+      let target = match session_id {
+        Some(id) if !id.trim().is_empty() => id.to_string(),
+        _ => allocate_isolated_session(&mut gateway).await?,
+      };
+      Ok::<_, String>((gateway, target))
+    };
+    let ready = tokio::select! {
+      res = tokio::time::timeout(Duration::from_secs(60), setup) => match res {
+        Ok(res) => res,
+        Err(_) => Err("建立发送连接或隔离会话超时".to_string()),
+      },
+      _ = cancel_token.cancelled() => Err("用户取消（尚未发送）".to_string()),
+    };
+    cookies.zeroize();
+    let (connected, target_session) = match ready {
+      Ok(ready) => ready,
+      Err(error) => {
+        ledger.fail(&send_id, error.clone());
+        return SendOutcome {
+          ok: false,
+          status: "DEFINITIVELY_FAILED".to_string(),
+          send_id,
+          ack: None,
+          session_id: session_id.map(str::to_string),
+          error: Some(error),
+        };
+      }
+    };
+    if ledger
+      .mark_in_flight_in(&send_id, Some(&target_session))
+      .is_err()
+    {
+      let detail = "发送台账无法持久化，尚未发送".to_string();
+      ledger.fail(&send_id, detail.clone());
+      return SendOutcome {
+        ok: false,
+        status: "DEFINITIVELY_FAILED".to_string(),
+        send_id,
+        ack: None,
+        session_id: Some(target_session),
+        error: Some(detail),
+      };
+    }
+
+    // 发送用一次性连接：mark_in_flight 之后所有权交给 send_message。
+    // 取消令牌直接传给发送侧：写入每一帧之间、等 ack 时都能中断，
+    // 并带回「已经写了几帧」，而不是在外面 select! 里丢掉这个信息。
+    let tracked = connected
+      .send_message_cancellable(
+        text,
+        node_id,
+        Some(&target_session),
+        Duration::from_secs(30),
+        Some(cancel_token.receiver()),
+      )
+      .await;
+    if matches!(tracked.outcome, Err(GatewayError::Cancelled)) {
+      // 取消发生在发送阶段：只要进入过网络写入就可能已发出，按 UNKNOWN 记账，绝不重发。
+      let detail = if tracked.on_wire {
+        format!(
+          "发送阶段被用户取消（已进入网络写入，完成 {} 帧；结果不明，未重发）",
+          tracked.wrote_frames
+        )
+      } else {
+        "发送阶段被用户取消（尚未进入网络写入，未重发）".to_string()
+      };
+      let status = if tracked.on_wire {
+        ledger.mark_unknown(&send_id, detail.clone());
+        "UNKNOWN"
+      } else {
+        ledger.fail(&send_id, detail.clone());
+        "DEFINITIVELY_FAILED"
+      };
+      return SendOutcome {
+        ok: false,
+        status: status.to_string(),
+        send_id,
+        ack: None,
+        session_id: session_id.map(str::to_string),
+        error: Some(detail),
+      };
+    }
+    match tracked.outcome {
+      Ok(ack) => {
+        let session_verified = ack.session_id.as_deref() == Some(target_session.as_str());
+        if new_conversation && !session_verified {
+          ledger.mark_unknown(&send_id, "ACK 未确认目标会话".into());
+        } else {
+          ledger.confirm(&send_id);
+        }
+        SendOutcome {
+          ok: session_verified,
+          status: if new_conversation && !session_verified { "UNKNOWN" } else { "CONFIRMED" }.to_string(),
+          send_id,
+          ack: Some(ack.raw),
+          session_id: ack.session_id,
+          error: (!session_verified).then(|| "发送已确认，但 ACK 未确认目标会话".to_string()),
+        }
+      }
+      Err(e) => {
+        // 只要进入过网络写入（哪怕一帧都没写完、写了一半就断），上游就可能
+        // 已经收到，只能 UNKNOWN。确认没进入写入阶段的失败才是明确失败。
+        let detail = if tracked.on_wire {
+          format!(
+            "请求已进入网络写入（完成 {} 帧）但未拿到 ack（结果不明，未重发）: {e}",
+            tracked.wrote_frames
+          )
+        } else {
+          format!("请求在进入网络写入前失败: {e}")
+        };
+        if tracked.on_wire {
+          ledger.mark_unknown(&send_id, detail.clone());
+          SendOutcome {
+            ok: false,
+            status: "UNKNOWN".to_string(),
+            send_id,
+            ack: None,
+            session_id: session_id.map(str::to_string),
+            error: Some(detail),
+          }
+        } else {
+          ledger.fail(&send_id, detail.clone());
+          SendOutcome {
+            ok: false,
+            status: "DEFINITIVELY_FAILED".to_string(),
+            send_id,
+            ack: None,
+            session_id: session_id.map(str::to_string),
+            error: Some(detail),
+          }
+        }
+      }
+    }
+  }
+}
+
+/// 单条探针的发送/采集状态，用于「整个检测任务」的汇总。
+///
+/// 与台账一一对应：`send_status` 直接取自该条探针自己的 SendAttempt，
+/// 不允许用任务级结果顶替；`text_done` 表示是否真的收到 `message_done`。
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct FingerprintSendRecord {
+  pub probe_id: String,
+  pub send_status: String,
+  pub text_done: bool,
+  pub sample_used: bool,
+  pub diagnostics: Option<FingerprintCollectionDiagnostics>,
+  pub error: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct FingerprintCollectionDiagnostics {
+  send_events: muse_native_client::collect::StreamEventCounts,
+  subscription_events: muse_native_client::collect::StreamEventCounts,
+  first_matched_delta_ms: Option<u64>,
+  first_delta_to_message_done_ms: Option<u64>,
+  ended_by: String,
+  lines: u64,
+  text_deltas: u64,
+  read_timeouts: u64,
+  parse_errors: u64,
+  unmatched_events: u64,
+  outside_turn_events: u64,
+  conflicting_events: u64,
+  session_conflicts: u64,
+  user_link_conflicts: u64,
+  turn_task_conflicts: u64,
+  parent_conflicts: u64,
+  missing_message_id_events: u64,
+  unlinked_events: u64,
+  saw_user: bool,
+  assistant_messages: usize,
+  saw_idle: bool,
+}
+
+/// #18 模型指纹探针结果。verdict/identification 的语义：
+/// - `scored`：三条有效样本 + 校准置信度，是**有效识别结果**；
+/// - `partial`：部分样本，只给候选排名，不算有效识别；
+/// - `indeterminate`：不可判定（样本不足 / 请求或参考库失败），无候选。
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct FingerprintProbe {
+  pub ok: bool,
+  pub phase: String,
+  pub verdict: String,
+  pub identification: bool,
+  pub result: Option<FingerprintResult>,
+  /// 进入网络写入的探针条数（可能还没有 ACK）。
+  pub probes_sent: usize,
+  /// 收到有效 ACK 并记入发送台账的条数。
+  pub probes_confirmed: usize,
+  /// 本次实际采到并送评分的样本数。
+  pub samples_collected: usize,
+  /// 任务汇总：每条探针的独立发送/采集状态。
+  pub sends: Vec<FingerprintSendRecord>,
+  pub wire_trace: Vec<String>,
+  /// 隔离会话 id（非敏感，便于人工核对探针落在测试会话里）。
+  pub session_id: Option<String>,
+  pub error: Option<String>,
+}
+
+impl FingerprintProbe {
+  fn fail(phase: &str, verdict: &str, error: impl Into<String>) -> Self {
+    Self {
+      ok: false,
+      phase: phase.to_string(),
+      verdict: verdict.to_string(),
+      identification: false,
+      result: None,
+      probes_sent: 0,
+      probes_confirmed: 0,
+      samples_collected: 0,
+      sends: Vec::new(),
+      wire_trace: Vec::new(),
+      session_id: None,
+      error: Some(error.into()),
+    }
+  }
+}
+
+/// #18: Allocate a side conversation, then send and collect one verified turn at a time.
+#[cfg_attr(target_os = "android", allow(unused_variables))]
+pub async fn fingerprint_probe(
+  app: &AppHandle,
+  ledger: &crate::send_ledger::SendLedger,
+  uuid: &str,
+  task_id: uuid::Uuid,
+  setting: Option<&ProxySetting>,
+  secrets: &Secrets,
+  mut cancel_token: crate::probe_cancel::CancelToken,
+) -> FingerprintProbe {
+  #[cfg(target_os = "android")]
+  {
+    FingerprintProbe::fail("android", "indeterminate", "指纹探针在 Android 上不可用")
+  }
+
+  #[cfg(not(target_os = "android"))]
+  {
+    use tauri::Emitter;
+    use zeroize::Zeroizing;
+
+    let progress = |phase: &str, probe: usize, confirmed: usize, samples: usize| {
+      let _ = app.emit_to(
+        "manager",
+        "muse-fingerprint-progress",
+        serde_json::json!({
+          "taskId": task_id.to_string(), "accountUuid": uuid, "phase": phase,
+          "probe": probe, "confirmed": confirmed, "samples": samples,
+        }),
+      );
+    };
+    let egress = match crate::egress::AccountEgress::resolve(setting, secrets) {
+      Ok(e) => e,
+      Err(_) => return FingerprintProbe::fail("egress", "indeterminate", "该账号的出站配置不可用"),
+    };
+    let mission = match ledger.mission(uuid) {
+      Ok(m) => m,
+      Err(e) => return FingerprintProbe::fail("ledger", "indeterminate", format!("{e:?}")),
+    };
+    progress("cookies", 0, 0, 0);
+    let cookies = tokio::select! {
+      res = tokio::time::timeout(COOKIE_TIMEOUT, fetch_session_cookies(app, uuid)) => match res {
+        Ok(Ok(c)) if !c.is_empty() => Zeroizing::new(c),
+        _ => return FingerprintProbe::fail("cookies", "indeterminate", "无法读取该测试账号的 Muse 登录态"),
+      },
+      _ = cancel_token.cancelled() => return FingerprintProbe::fail("cancelled", "indeterminate", "用户取消"),
+    };
+    let probes = match fingerprint::generate_probes() {
+      Ok(p) => p,
+      Err(_) => return FingerprintProbe::fail("generate", "indeterminate", "无法生成 lmfpd 探针"),
+    };
+    progress("reference_bank", 0, 0, 0);
+    let detector = tokio::select! {
+      result = tokio::task::spawn_blocking(fingerprint::FingerprintDetector::load) => match result {
+        Ok(Ok(d)) => d,
+        _ => return FingerprintProbe::fail("reference_bank", "indeterminate", "无法加载 lmfpd 参考库"),
+      },
+      _ = cancel_token.cancelled() => return FingerprintProbe::fail("cancelled", "indeterminate", "用户取消"),
+    };
+
+    progress("session", 0, 0, 0);
+    let setup = async {
+      let mut gateway = egress.connect(&cookies).await.map_err(|error| match error {
+        crate::egress::EgressError::Gateway(error) => safe_gateway_status(&error),
+        _ => "无法建立测试账号的出站连接".to_string(),
+      })?;
+      let session_id = allocate_isolated_session(&mut gateway).await?;
+      Ok::<_, String>((gateway, session_id))
+    };
+    let (gateway, session_id) = tokio::select! {
+      res = tokio::time::timeout(Duration::from_secs(60), setup) => match res {
+        Ok(Ok(s)) => s,
+        Ok(Err(e)) => return FingerprintProbe::fail("session", "indeterminate", e),
+        Err(_) => return FingerprintProbe::fail("session", "indeterminate", "建立或验证隔离会话超时"),
+      },
+      _ = cancel_token.cancelled() => return FingerprintProbe::fail("cancelled", "indeterminate", "用户取消"),
+    };
+    let route = muse_native_client::chat_send::IsolatedProbeRoute::new(session_id);
+    let session_id = route.session_id();
+    progress("register_route", 0, 0, 0);
+    let mut subscription = tokio::select! {
+      res = tokio::time::timeout(Duration::from_secs(25), gateway.subscribe_isolated_probe(&route)) => match res {
+        Ok(Ok(subscription)) => subscription,
+        Ok(Err(failure)) => {
+          let mut status = safe_gateway_status(&failure.error);
+          if let Some(rejection) = failure.rejection {
+            status.push_str(" · ");
+            status.push_str(&rejection);
+          }
+          return FingerprintProbe::fail(failure.phase, "indeterminate", status);
+        }
+        Err(_) => return FingerprintProbe::fail("register_route", "indeterminate", "注册推送能力或建立隔离订阅超时"),
+      },
+      _ = cancel_token.cancelled() => return FingerprintProbe::fail("cancelled", "indeterminate", "用户取消"),
+    };
+    subscription.enable_chat_wire_trace();
+    progress("subscribe", 0, 0, 0);
+    tokio::select! {
+      res = subscription.wait_ready(Duration::from_secs(25)) => {
+        if let Err(error) = res {
+          let mut failure = FingerprintProbe::fail("subscribe", "indeterminate", safe_gateway_status(&error));
+          failure.wire_trace = subscription.take_chat_wire_trace();
+          return failure;
+        }
+      }
+      _ = cancel_token.cancelled() => {
+        let mut failure = FingerprintProbe::fail("cancelled", "indeterminate", "用户取消");
+        failure.wire_trace = subscription.take_chat_wire_trace();
+        return failure;
+      }
+    }
+
+    let mut samples = Vec::new();
+    let mut seen_receipts = std::collections::HashSet::new();
+    let mut probes_sent = 0;
+    let mut probes_confirmed = 0;
+    let mut sends = Vec::new();
+    let mut wire_trace = Vec::new();
+    let mut first_error = None;
+    for (index, probe) in probes.iter().enumerate() {
+      if cancel_token.check() {
+        first_error = Some("用户取消".to_string());
+        break;
+      }
+      progress("sending", index + 1, probes_confirmed, samples.len());
+      let send_id = match mission.begin_probe(&session_id, &probe.prompt) {
+        Ok(id) => id,
+        Err(_) => {
+          first_error = Some("发送台账拒绝开始本轮".to_string());
+          break;
+        }
+      };
+      if let Err(e) = ledger.mark_in_flight(&send_id) {
+        ledger.fail(&send_id, "写入发送台账失败，尚未发送".to_string());
+        first_error = Some(format!("{e:?}"));
+        break;
+      }
+      let tracked = subscription
+        .send_on_subscription(
+          &probe.prompt,
+          &route,
+          Duration::from_secs(30),
+          cancel_token.receiver(),
+        )
+        .await;
+      probes_sent += usize::from(tracked.on_wire);
+      let mut record = FingerprintSendRecord {
+        probe_id: probe.id.clone(),
+        send_status: "DEFINITIVELY_FAILED".to_string(),
+        text_done: false,
+        sample_used: false,
+        diagnostics: None,
+        error: None,
+      };
+      match tracked.outcome {
+        Ok(ack) => {
+          ledger.confirm(&send_id);
+          record.send_status = "CONFIRMED".to_string();
+          probes_confirmed += 1;
+          if ack.session_id.as_deref() != Some(session_id)
+            || !seen_receipts.insert(ack.message_id.clone())
+          {
+            record.error =
+              Some("发送已确认，但 ACK 无法确认本轮属于新建隔离会话，后续发送已停止".to_string());
+          } else {
+            progress("collecting", index + 1, probes_confirmed, samples.len());
+            let on_first_delta = || progress("stream_delta", index + 1, probes_confirmed, samples.len());
+            let collected = tokio::select! {
+              c = subscription.collect(&ack, session_id, Duration::from_secs(90), Duration::from_secs(10), on_first_delta) => Some(c),
+              _ = cancel_token.cancelled() => None,
+            };
+            match collected {
+              Some(mut c) => {
+                if !c.done && c.ended_by == "timeout" {
+                  let recovery = read_fingerprint_history(&egress, &cookies, session_id, &ack.message_id);
+                  tokio::select! {
+                    result = tokio::time::timeout(Duration::from_secs(18), recovery) => {
+                      match result {
+                        Ok(Ok(Some(text))) => {
+                          c.text = text;
+                          c.done = true;
+                          c.ended_by = "history_completed".to_string();
+                        }
+                        Ok(Ok(None)) => c.ended_by = "history_unverified".to_string(),
+                        Ok(Err(reason)) => c.ended_by = reason,
+                        Err(_) => c.ended_by = "history_timeout".to_string(),
+                      }
+                    }
+                    _ = cancel_token.cancelled() => c.ended_by = "cancelled".to_string(),
+                  }
+                }
+                record.text_done = c.done;
+                record.diagnostics = Some(FingerprintCollectionDiagnostics {
+                  send_events: c.send_events,
+                  subscription_events: c.subscription_events,
+                  first_matched_delta_ms: c.first_matched_delta_ms,
+                  first_delta_to_message_done_ms: c.first_delta_to_message_done_ms,
+                  ended_by: c.ended_by.clone(),
+                  lines: c.lines,
+                  text_deltas: c.text_deltas,
+                  read_timeouts: c.read_timeouts,
+                  parse_errors: c.parse_errors,
+                  unmatched_events: c.unmatched_events,
+                  outside_turn_events: c.outside_turn_events,
+                  conflicting_events: c.conflicting_events,
+                  session_conflicts: c.session_conflicts,
+                  user_link_conflicts: c.user_link_conflicts,
+                  turn_task_conflicts: c.turn_task_conflicts,
+                  parent_conflicts: c.parent_conflicts,
+                  missing_message_id_events: c.missing_message_id_events,
+                  unlinked_events: c.unlinked_events,
+                  saw_user: c.saw_user,
+                  assistant_messages: c.assistant_messages,
+                  saw_idle: c.saw_idle,
+                });
+                if c.done && fingerprint::check_sample(&c.text, probe.expected_count).accepted {
+                  record.sample_used = true;
+                  samples.push(Sample {
+                    text: c.text,
+                    expected_count: probe.expected_count,
+                  });
+                } else if c.done {
+                  record.error = Some("回复已结束，但正文未达到 lmfpd 样本要求".to_string());
+                } else {
+                  record.error = Some(format!("回复采集未完成（{}），后续发送已停止", c.ended_by));
+                }
+              }
+              None => record.error = Some("发送已确认，用户取消采集".to_string()),
+            }
+          }
+        }
+        Err(e) => {
+          let reason = format!("发送阶段：{}", safe_gateway_status(&e));
+          if tracked.on_wire {
+            record.send_status = "UNKNOWN".to_string();
+            ledger.mark_unknown(&send_id, reason.clone());
+          } else {
+            ledger.fail(&send_id, reason.clone());
+          }
+          record.error = Some(reason);
+        }
+      }
+      wire_trace.extend(subscription.take_chat_wire_trace());
+      let proceed = record.sample_used;
+      first_error = record.error.clone();
+      sends.push(record);
+      if !proceed {
+        break;
+      }
+    }
+
+    wire_trace.extend(subscription.take_chat_wire_trace());
+    let samples_collected = samples.len();
+    progress("scoring", 0, probes_confirmed, samples_collected);
+    let result = if samples.is_empty() {
+      fingerprint::FingerprintResult::indeterminate(
+        first_error
+          .clone()
+          .unwrap_or_else(|| "没有完整有效的探针样本".to_string()),
+        detector.built_at().to_string(),
+      )
+    } else {
+      match detector.score(&samples) {
+        Ok(r) => r,
+        Err(FingerprintError::Scoring(e)) => fingerprint::FingerprintResult::indeterminate(
+          format!("评分失败: {e}"),
+          detector.built_at().to_string(),
+        ),
+        Err(e) => fingerprint::FingerprintResult::indeterminate(
+          e.to_string(),
+          detector.built_at().to_string(),
+        ),
+      }
+    };
+
+    FingerprintProbe {
+      ok: result.identification || result.verdict == fingerprint::Verdict::Partial,
+      phase: "done".to_string(),
+      verdict: result.verdict.as_str().to_string(),
+      identification: result.identification,
+      result: Some(result),
+      probes_sent,
+      probes_confirmed,
+      samples_collected,
+      sends,
+      wire_trace,
+      session_id: Some(session_id.to_string()),
+      error: first_error,
+    }
+  }
+}
+
+#[cfg(not(target_os = "android"))]
+pub(crate) async fn allocate_isolated_session(
+  gateway: &mut crate::egress::AccountGateway,
+) -> Result<String, String> {
+  use muse_native_client::chat_send::{
+    listed_session_ids, session_list_request, start_session_request, started_session_id,
+  };
+
+  let (status, body) = gateway
+    .request(session_list_request())
+    .await
+    .map_err(|e| safe_gateway_status(&e))?;
+  let previous = listed_session_ids(status, &body).map_err(|e| e.to_string())?;
+  let (status, body) = gateway
+    .request(start_session_request())
+    .await
+    .map_err(|e| safe_gateway_status(&e))?;
+  let created = started_session_id(status, &body).map_err(|e| e.to_string())?;
+  if previous.contains(&created) {
+    return Err("Muse 返回了已存在的会话，已停止".to_string());
+  }
+  let (status, body) = gateway
+    .request(session_list_request())
+    .await
+    .map_err(|e| safe_gateway_status(&e))?;
+  if !listed_session_ids(status, &body)
+    .map_err(|e| e.to_string())?
+    .contains(&created)
+  {
+    return Err("Muse 会话列表没有确认新会话，已停止".to_string());
+  }
+  Ok(created)
+}
+
+#[cfg(not(target_os = "android"))]
+pub(crate) async fn read_fingerprint_history(
+  egress: &crate::egress::AccountEgress,
+  cookies: &SessionCookies,
+  session_id: &str,
+  user_id: &str,
+) -> Result<Option<String>, String> {
+  let query = url::form_urlencoded::Serializer::new(String::new())
+    .append_pair("session_id", session_id)
+    .append_pair("limit", "50")
+    .finish();
+  let mut gateway = egress.connect(cookies).await.map_err(|_| "history_connect_error".to_string())?;
+  let (status, body) = gateway.request(HttpRequest {
+    service: Service::Daemon,
+    verb: "GET".to_string(),
+    path: format!("/chat/history?{query}"),
+    headers: vec![
+      ("x-app-id".to_string(), "hatch-web".to_string()),
+      ("x-request-id".to_string(), uuid::Uuid::new_v4().to_string()),
+      ("Accept-Language".to_string(), "en-US".to_string()),
+    ],
+    body: Vec::new(),
+  }).await.map_err(|error| format!("history_{}", safe_gateway_status(&error)))?;
+  if !(200..300).contains(&status) {
+    return Err(format!("history_http_{status}"));
+  }
+  Ok(muse_native_client::collect::completed_history_reply(&body, session_id, user_id))
+}
+
+#[cfg(not(target_os = "android"))]
+fn safe_gateway_status(error: &GatewayError) -> String {
+  match error {
+    GatewayError::Http(code) => format!("HTTP {code}"),
+    GatewayError::Closed(_) => "closed".to_string(),
+    GatewayError::Timeout(_) => "timeout".to_string(),
+    GatewayError::Reset(code, _) => format!("reset ({code})"),
+    GatewayError::Cancelled => "cancelled".to_string(),
+    GatewayError::Ws(_) => "websocket_error".to_string(),
+    _ => "protocol_error".to_string(),
+  }
+}
+
+/// #10 存活探针状态：记录一条长连接从建立到断开的时间线。
+pub use muse_native_client::liveness::Liveness;
+
+#[derive(Default)]
+pub struct LivenessState {
+  inner: std::sync::Mutex<Liveness>,
+}
+
+impl LivenessState {
+  pub fn snapshot(&self) -> Liveness {
+    self.inner.lock().unwrap().clone()
+  }
+  fn set<F: FnOnce(&mut Liveness)>(&self, f: F) {
+    f(&mut self.inner.lock().unwrap());
+  }
+}
+
+fn observation_now_ms() -> u64 {
+  std::time::SystemTime::now()
+    .duration_since(std::time::UNIX_EPOCH)
+    .map(|d| d.as_millis().min(u64::MAX as u128) as u64)
+    .unwrap_or(0)
+}
+
+/// 开一条长连接并持续读事件，直到超时或断开；结果写进共享状态。
+/// 用途是实测「App 退到后台后连接还能活多久」，不做保活、不重连。
+pub fn liveness_start(
+  app: &AppHandle,
+  state: &std::sync::Arc<LivenessState>,
+  uuid: &str,
+  seconds: u64,
+  manager: Arc<SessionManager>,
+  cancel: Arc<ProbeCancel>,
+  task: uuid::Uuid,
+) -> Result<(), String> {
+  let seconds = seconds.clamp(30, 3600);
+  // Check-and-set under one lock: concurrent starts must not create two probes.
+  {
+    let mut current = state.inner.lock().unwrap();
+    if current.running {
+      return Err("已有存活探针在运行".into());
+    }
+    *current = Liveness::started(observation_now_ms());
+  }
+
+  let app_owned = app.clone();
+  let uuid_owned = uuid.to_string();
+  let state_owned = state.clone();
+  // 用 Tauri 的运行时 spawn：即使命令在非 tokio 上下文被调用也不会 panic。
+  tauri::async_runtime::spawn(async move {
+    #[cfg(target_os = "android")]
+    {
+      let _ = (app_owned, uuid_owned, seconds, manager, cancel, task);
+      state_owned.set(|l| {
+        l.running = false;
+        l.ended_ms = Some(observation_now_ms());
+        l.error = Some("Android 不可用".to_string());
+      });
+      return;
+    }
+    #[cfg(not(target_os = "android"))]
+    {
+      let (mut token, _guard) = cancel.register_task(&uuid_owned, "liveness", task);
+      tokio::select! {
+        biased;
+        _ = token.cancelled() => {
+          state_owned.set(|l| l.finish(observation_now_ms(), "cancelled", None));
+        }
+        _ = async {
+          let setting = manager.proxy_setting(ProviderId::Muse, &uuid_owned).await;
+          let cookies = match tokio::time::timeout(
+            COOKIE_TIMEOUT,
+            fetch_session_cookies(&app_owned, &uuid_owned),
+          )
+          .await
+          {
+            Err(_) => {
+              state_owned.set(|l| {
+                l.running = false;
+                l.phase = "cookies-timeout".to_string();
+                l.ended_ms = Some(observation_now_ms());
+                l.error = Some("取 cookie 超时（15 秒）".to_string());
+              });
+              return;
+            }
+            Ok(Ok(c)) => c,
+            Ok(Err(e)) => {
+              state_owned.set(|l| {
+                l.running = false;
+                l.phase = "cookies-error".to_string();
+                l.ended_ms = Some(observation_now_ms());
+                l.error = Some(e);
+              });
+              return;
+            }
+          };
+          state_owned.set(|l| l.phase = "connect".to_string());
+          if cookies.is_empty() {
+            state_owned.set(|l| {
+              l.running = false;
+              l.phase = "no-cookies".to_string();
+              l.ended_ms = Some(observation_now_ms());
+              l.error = Some("无登录态".to_string());
+            });
+            return;
+          }
+          let egress = match crate::egress::resolve_for_app(&app_owned, setting.as_ref()) {
+            Ok(e) => e,
+            Err(e) => {
+              state_owned.set(|l| {
+                l.running = false;
+                l.phase = "egress".to_string();
+                l.ended_ms = Some(observation_now_ms());
+                l.error = Some(e);
+              });
+              return;
+            }
+          };
+          let mut cookies = cookies;
+          let connected = match tokio::time::timeout(Duration::from_secs(60), egress.connect(&cookies)).await {
+            Err(_) => {
+              cookies.zeroize();
+              state_owned.set(|l| {
+                l.running = false;
+                l.phase = "connect-timeout".to_string();
+                l.ended_ms = Some(observation_now_ms());
+                l.error = Some("建连超时（60 秒）".to_string());
+              });
+              return;
+            }
+            Ok(Ok(c)) => c,
+            Ok(Err(e)) => {
+              cookies.zeroize();
+              state_owned.set(|l| {
+                l.running = false;
+                l.phase = "connect-error".to_string();
+                l.ended_ms = Some(observation_now_ms());
+                l.error = Some(e.to_string());
+              });
+              return;
+            }
+          };
+          cookies.zeroize();
+          state_owned.set(|l| l.connected(observation_now_ms()));
+
+          let mut sub = match tokio::time::timeout(Duration::from_secs(15), connected.subscribe()).await {
+            Err(_) => {
+              state_owned.set(|l| l.finish(observation_now_ms(), "subscribe_timeout", Some("订阅发送超时（15 秒）".into())));
+              return;
+            }
+            Ok(Ok(s)) => s,
+            Ok(Err(e)) => {
+              state_owned.set(|l| {
+                l.running = false;
+                l.ended_ms = Some(observation_now_ms());
+                l.error = Some(e.to_string());
+              });
+              return;
+            }
+          };
+          if let Err(error) = sub.wait_ready(Duration::from_secs(15)).await {
+            state_owned.set(|l| l.finish(observation_now_ms(), "subscription_not_ready", Some(error.to_string())));
+            return;
+          }
+          state_owned.set(|l| l.reading(observation_now_ms(), seconds));
+          let mut end_reason = "window_elapsed";
+          let mut error = None;
+          loop {
+            let now = observation_now_ms();
+            state_owned.set(|l| l.observe(now));
+            let snapshot = state_owned.snapshot();
+            if snapshot.expired(now) {
+              break;
+            }
+            // Poll in short slices to record observation gaps. These are local task
+            // polls, not network heartbeats and not evidence of a live remote peer.
+            let left_ms = snapshot.deadline_ms.unwrap_or(now).saturating_sub(now);
+            let slice = Duration::from_millis(left_ms.min(5000));
+            let result = sub.next_line(slice).await;
+            let observed = observation_now_ms();
+            state_owned.set(|l| l.observe(observed));
+            match result {
+              Ok(Some(line)) => {
+                // A buffered row read on resume was received at an unknown time.
+                if state_owned.snapshot().expired(observed) {
+                  break;
+                }
+                let is_event = serde_json::from_str::<serde_json::Value>(&line)
+                  .ok()
+                  .and_then(|v| v.get("type").and_then(|t| t.as_str()).map(|t| t == "event"))
+                  .unwrap_or(false);
+                state_owned.set(|l| l.record_line(observed, is_event));
+              }
+              Ok(None) => {
+                end_reason = "stream_ended";
+                break;
+              }
+              Err(GatewayError::Timeout(_)) => continue,
+              Err(e) => {
+                end_reason = "read_error";
+                error = Some(e.to_string());
+                break;
+              }
+            }
+          }
+          state_owned.set(|l| l.finish(observation_now_ms(), end_reason, error));
+        } => {}
+      }
+    }
+  });
+  Ok(())
+}
+
+/// #8 VM 租约观测结果（不含任何凭据）。
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct LeaseProbe {
+  pub ok: bool,
+  pub phase: String,
+  pub assignment_only: bool,
+  pub same_vm_on_recheck: Option<bool>,
+  pub first_expires_at_ms: Option<i64>,
+  pub ttl_seconds: Option<i64>,
+  /// 上游是否真的返回了到期字段；缺失时一切都只能算「不可观测」。
+  pub expiry_field_present: bool,
+  /// `not_attempted` / `unobservable` / `unchanged` / `changed`。
+  /// 注意：`changed` 只代表**到期字段变化**，不等于自动续租。
+  pub renewal: String,
+  /// 是否已确认存在自动续租行为。只有长期观测到多次「到期时间随租期前移」
+  /// 才能置 true；单次探针永远无法确认，故当前恒为 false。
+  pub renewal_confirmed: bool,
+  pub second_expires_at_ms: Option<i64>,
+  /// 本次探针实际发出的控制面调用（vmType + 结果），用于评估副作用。
+  pub calls: Vec<String>,
+  /// 副作用说明：探针不调用 wake，但 lease-vm 本身是否会导致 VM 分配/唤醒属于未验证。
+  pub side_effects_note: String,
+  pub error: Option<String>,
+}
+
+/// 两次租约的到期字段对比结论。刻意不让「字段变化」等同于「自动续租」。
+pub fn renewal_verdict(first: Option<i64>, second: Option<i64>) -> &'static str {
+  match (first, second) {
+    // 两次都拿不到到期字段：无法判断，不能报「无变化」。
+    (None, None) => "unobservable",
+    // 一次有、一次没有：连字段稳定性都不成立，同样算不可观测。
+    (Some(_), None) | (None, Some(_)) => "unobservable",
+    (Some(a), Some(b)) => {
+      if a == b {
+        "unchanged"
+      } else {
+        // 仅「到期字段变化」；是否属于自动续租需长期观测，一次探针不能断言。
+        "changed"
+      }
+    }
+  }
+}
+
+/// #8：只读控制面执行 `lease-vm`，报告租期字段与「到期字段是否变化」。
+/// 明确不做的事：不调用 `wake()`、不建 Noise 连接、不发消息、不打印 token。
+/// 未验证的是：`lease-vm` 在服务端是否会造成 VM 分配或唤醒（见 side_effects_note）。
+pub async fn lease_probe(
+  app: &AppHandle,
+  uuid: &str,
+  twice: bool,
+  setting: Option<&ProxySetting>,
+) -> Result<LeaseProbe, String> {
+  let cookie = cookie_header_for(app, uuid).await?;
+  let cookies = muse_native_client::cookie::SessionCookies::from_header(&cookie);
+  // 控制面 HTTP 走账号级出站策略（启用代理时经代理，失败不直连）。
+  let egress = crate::egress::resolve_for_app(app, setting)?;
+  let fetch = egress.http().map_err(|e| e.to_string())?;
+  let mut cp = muse_native_client::control_plane::MuseControlPlane::new(fetch, cookies);
+  let note = concat!(
+    "探针不调用 wake()；每次 lease_vm 依次尝试 standard 与 hatch_vm",
+    "（最多 2 次 POST /api/hatch/lease-vm），类型被拒时查询已有分配。租约 POST 是否触发 VM",
+    "分配/唤醒未经证实，因此不要把本探针当作「无副作用」。"
+  )
+  .to_string();
+
+  let (lease, assignment_only) = match cp.observe_lease().await {
+    Ok(l) => l,
+    Err(e) => {
+      return Ok(LeaseProbe {
+        ok: false,
+        phase: "lease".to_string(),
+        assignment_only: false,
+        same_vm_on_recheck: None,
+        first_expires_at_ms: None,
+        ttl_seconds: None,
+        expiry_field_present: false,
+        renewal: "not_attempted".to_string(),
+        renewal_confirmed: false,
+        second_expires_at_ms: None,
+        calls: cp.lease_calls.clone(),
+        side_effects_note: note,
+        error: Some(e.to_string()),
+      })
+    }
+  };
+
+  let first = lease.expires_at_ms;
+  let ttl = lease.ttl_seconds;
+  let mut recheck_error = None;
+  let (renewal, second, same_vm) = if !twice {
+    ("not_attempted", None, None)
+  } else if assignment_only {
+    ("unobservable", None, None)
+  } else {
+    tokio::time::sleep(Duration::from_secs(2)).await;
+    match cp.observe_lease().await {
+      Ok((next, _)) => {
+        let same_vm = lease.vm_id == next.vm_id;
+        let result = if same_vm { renewal_verdict(first, next.expires_at_ms) } else { "vm_changed" };
+        (result, next.expires_at_ms, Some(same_vm))
+      }
+      Err(_) => {
+        recheck_error = Some("第二次观测失败，未确认到期变化".to_string());
+        ("recheck_failed", None, None)
+      }
+    }
+  };
+
+  Ok(LeaseProbe {
+    ok: true,
+    phase: if assignment_only { "assigned_vm" } else { "leased" }.to_string(),
+    assignment_only,
+    same_vm_on_recheck: same_vm,
+    first_expires_at_ms: first,
+    ttl_seconds: ttl,
+    expiry_field_present: first.is_some() || ttl.is_some(),
+    renewal: renewal.to_string(),
+    renewal_confirmed: false,
+    second_expires_at_ms: second,
+    calls: cp.lease_calls.clone(),
+    side_effects_note: note,
+    error: recheck_error,
+  })
+}
+
+/// 取一次会话 cookie 头（B3 额度用）。调用方用后立即丢弃，不落盘不打印。
+pub async fn cookie_header_for(app: &AppHandle, uuid: &str) -> Result<String, String> {
+  #[cfg(target_os = "android")]
+  {
+    let _ = (app, uuid);
+    return Err("该功能在 Android 上不可用".to_string());
+  }
+  #[cfg(not(target_os = "android"))]
+  {
+    let app_owned = app.clone();
+    let uuid_owned = uuid.to_string();
+    let handle = tokio::spawn(async move { fetch_session_cookies(&app_owned, &uuid_owned).await });
+    let mut cookies = tokio::select! {
+      res = handle => match res {
+        Ok(r) => r?,
+        Err(e) => return Err(format!("取 cookie 任务异常结束: {e}")),
+      },
+      _ = tokio::time::sleep(COOKIE_TIMEOUT) => {
+        return Err("取 muse.ai 会话 cookie 超时（15 秒）".to_string());
+      }
+    };
+    if cookies.is_empty() {
+      return Err("该账号还没有 muse.ai 登录态".to_string());
+    }
+    let header = cookies.cookie_header();
+    cookies.zeroize();
+    Ok(header)
+  }
+}
+
+/// B1 `chat.subscribe` 探针（Issue #13 #5）：订阅 N 秒，只统计事件数量与去重结果。
+/// 不返回任何事件文本、消息 id 或凭据，只给计数，便于真机核验。
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct WatchProbe {
+  pub ok: bool,
+  pub phase: String,
+  pub seconds: u64,
+  pub status: Option<u16>,
+  pub summary: WatchSummary,
+  pub lines: u64,
+  pub non_event: u64,
+  pub parse_errors: u64,
+  pub type_counts: std::collections::BTreeMap<String, u64>,
+  pub error: Option<String>,
+  #[serde(skip)]
+  pub completed_ids: Vec<String>,
+}
+
+pub async fn watch_probe(
+  app: &AppHandle,
+  provider_id: &str,
+  uuid: &str,
+  seconds: u64,
+  setting: Option<&ProxySetting>,
+) -> Result<WatchProbe, String> {
+  if provider_id != ProviderId::Muse.as_str() {
+    return Err("订阅探针只支持 Muse 账号".to_string());
+  }
+  #[cfg(target_os = "android")]
+  {
+    let _ = (app, uuid, seconds, setting);
+    return Err(
+      "订阅探针在 Android 上不可用（Cookie 桥只接了 iOS WKWebsiteDataStore）".to_string(),
+    );
+  }
+  #[cfg(not(target_os = "android"))]
+  {
+    let seconds = seconds.clamp(5, 60);
+    let app_owned = app.clone();
+    let uuid_owned = uuid.to_string();
+    let cookie_handle =
+      tokio::spawn(async move { fetch_session_cookies(&app_owned, &uuid_owned).await });
+    let mut cookies = tokio::select! {
+      res = cookie_handle => match res {
+        Ok(r) => r?,
+        Err(e) => return Err(format!("取 cookie 任务异常结束: {e}")),
+      },
+      _ = tokio::time::sleep(COOKIE_TIMEOUT) => {
+        return Err("取 muse.ai 会话 cookie 超时（15 秒）".to_string());
+      }
+    };
+    if cookies.is_empty() {
+      return Ok(WatchProbe {
+        ok: false,
+        phase: "no_cookies".to_string(),
+        seconds,
+        status: None,
+        summary: WatchSummary::default(),
+        lines: 0,
+        non_event: 0,
+        parse_errors: 0,
+        type_counts: Default::default(),
+        completed_ids: Vec::new(),
+        error: Some("该账号在 Spike App 里还没有 muse.ai 登录态".to_string()),
+      });
+    }
+    let egress = crate::egress::resolve_for_app(app, setting)?;
+    let connected = match egress.connect(&cookies).await {
+      Ok(c) => c,
+      Err(e) => {
+        cookies.zeroize();
+        return Ok(WatchProbe {
+          ok: false,
+          phase: "connect".to_string(),
+          seconds,
+          status: None,
+          summary: WatchSummary::default(),
+          lines: 0,
+          non_event: 0,
+          parse_errors: 0,
+          type_counts: Default::default(),
+        completed_ids: Vec::new(),
+          error: Some(e.to_string()),
+        });
+      }
+    };
+    cookies.zeroize();
+
+    // chat.subscribe 入参：网页端会广告这些能力，其中 delta_stream 决定是否推送文本增量。
+    let mut sub = match connected.subscribe().await {
+      Ok(s) => s,
+      Err(e) => {
+        return Ok(WatchProbe {
+          ok: false,
+          phase: "subscribe".to_string(),
+          seconds,
+          status: None,
+          summary: WatchSummary::default(),
+          lines: 0,
+          non_event: 0,
+          parse_errors: 0,
+          type_counts: Default::default(),
+        completed_ids: Vec::new(),
+          error: Some(e.to_string()),
+        });
+      }
+    };
+
+    let mut tracker = WatchTracker::new();
+    let deadline = Instant::now() + Duration::from_secs(seconds);
+    let mut error = None;
+    let mut lines: u64 = 0;
+    let mut non_event: u64 = 0;
+    let mut parse_errors: u64 = 0;
+    let mut type_counts: std::collections::BTreeMap<String, u64> = Default::default();
+    loop {
+      let left = deadline.saturating_duration_since(Instant::now());
+      if left.is_zero() {
+        break;
+      }
+      match sub.next_line(left).await {
+        Ok(Some(line)) => {
+          lines += 1;
+          match serde_json::from_str::<serde_json::Value>(&line) {
+            Ok(v) => {
+              let ty = v
+                .get("type")
+                .and_then(|x| x.as_str())
+                .unwrap_or("<none>")
+                .to_string();
+              *type_counts.entry(ty.clone()).or_insert(0) += 1;
+              if ty == "event" {
+                let _ = tracker.observe_line(&line);
+              } else {
+                non_event += 1;
+              }
+            }
+            Err(_) => parse_errors += 1,
+          }
+        }
+        Ok(None) => {
+          error = Some("订阅已结束".to_string());
+          break;
+        }
+        // 探针窗口到期：长连接空闲时本来就不会有下一行，属正常结束。
+        Err(GatewayError::Timeout(_)) => break,
+        Err(e) => {
+          error = Some(e.to_string());
+          break;
+        }
+      }
+    }
+    Ok(WatchProbe {
+      ok: error.is_none(),
+      phase: "subscribed".to_string(),
+      seconds,
+      status: sub.status(),
+      summary: tracker.summary().clone(),
+      lines,
+      non_event,
+      parse_errors,
+      type_counts,
+      completed_ids: tracker.live_completed().cloned().collect(),
+      error,
+    })
+  }
+}
+
+/// B2：只读拉取一次 `egress.approvals`，返回待审批列表的最小字段。
+/// 不做任何 approve/deny，也不返回审批正文。
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ApprovalsProbe {
+  pub ok: bool,
+  pub phase: String,
+  pub status: Option<u16>,
+  pub count: usize,
+  pub items: Vec<ApprovalItem>,
+  pub error: Option<String>,
+}
+
+pub async fn approvals_probe(
+  app: &AppHandle,
+  provider_id: &str,
+  uuid: &str,
+  setting: Option<&ProxySetting>,
+) -> Result<ApprovalsProbe, String> {
+  if provider_id != ProviderId::Muse.as_str() {
+    return Err("审批探针只支持 Muse 账号".to_string());
+  }
+  #[cfg(target_os = "android")]
+  {
+    let _ = (app, uuid, setting);
+    return Err("审批探针在 Android 上不可用".to_string());
+  }
+  #[cfg(not(target_os = "android"))]
+  {
+    let app_owned = app.clone();
+    let uuid_owned = uuid.to_string();
+    let cookie_handle =
+      tokio::spawn(async move { fetch_session_cookies(&app_owned, &uuid_owned).await });
+    let mut cookies = tokio::select! {
+      res = cookie_handle => match res {
+        Ok(r) => r?,
+        Err(e) => return Err(format!("取 cookie 任务异常结束: {e}")),
+      },
+      _ = tokio::time::sleep(COOKIE_TIMEOUT) => {
+        return Err("取 muse.ai 会话 cookie 超时（15 秒）".to_string());
+      }
+    };
+    if cookies.is_empty() {
+      return Ok(ApprovalsProbe {
+        ok: false, phase: "no_cookies".to_string(), status: None, count: 0,
+        items: Vec::new(), error: Some("该账号还没有 muse.ai 登录态".to_string()),
+      });
+    }
+    let egress = crate::egress::resolve_for_app(app, setting)?;
+    let mut connected = match egress.connect(&cookies).await {
+      Ok(c) => c,
+      Err(e) => {
+        cookies.zeroize();
+        return Ok(ApprovalsProbe {
+          ok: false, phase: "connect".to_string(), status: None, count: 0,
+          items: Vec::new(), error: Some(e.to_string()),
+        });
+      }
+    };
+    cookies.zeroize();
+
+    let req = HttpRequest {
+      service: Service::Sentinel,
+      verb: "GET".to_string(),
+      path: "/approvals".to_string(),
+      headers: vec![
+        ("x-request-id".to_string(), uuid::Uuid::new_v4().to_string()),
+        ("x-app-id".to_string(), "hatch-web".to_string()),
+        ("Accept-Language".to_string(), "en-US".to_string()),
+      ],
+      body: Vec::new(),
+    };
+    let (status, body) = match connected.request(req).await {
+      Ok(r) => r,
+      Err(e) => {
+        return Ok(ApprovalsProbe {
+          ok: false, phase: "request".to_string(), status: None, count: 0,
+          items: Vec::new(), error: Some(e.to_string()),
+        });
+      }
+    };
+    let _ = tokio::time::timeout(Duration::from_secs(2), connected.close()).await;
+    if !(200..300).contains(&status) {
+      return Ok(ApprovalsProbe {
+        ok: false, phase: "http".to_string(), status: Some(status), count: 0,
+        items: Vec::new(), error: Some(format!("egress.approvals HTTP {status}")),
+      });
+    }
+    let json: serde_json::Value = match serde_json::from_slice(&body) {
+      Ok(v) => v,
+      Err(e) => {
+        return Ok(ApprovalsProbe {
+          ok: false, phase: "parse".to_string(), status: Some(status), count: 0,
+          items: Vec::new(), error: Some(format!("响应不是 JSON: {e}")),
+        });
+      }
+    };
+    let Some(list) = parse_pending(&json) else {
+      return Ok(ApprovalsProbe {
+        ok: false, phase: "schema".to_string(), status: Some(status), count: 0,
+        items: Vec::new(), error: Some("无法确认审批列表格式".to_string()),
+      });
+    };
+    Ok(ApprovalsProbe {
+      ok: true,
+      phase: "ready".to_string(),
+      status: Some(status),
+      count: list.len(),
+      items: list,
+      error: None,
+    })
+  }
+}
+
+/// #11/#16 代理探针结果。只含阶段、状态码与脱敏代理串，不含 cookie /
+/// token / 代理口令。`failClosed` 恒为 true：代理失败只阻断，不直连。
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ProxyProbe {
+  pub ok: bool,
+  pub phase: String,
+  pub tunnel_via: Option<String>,
+  pub proxy_scheme: Option<String>,
+  pub handshake_completed: bool,
+  pub ping_status: Option<u16>,
+  pub connectivity_status: Option<u16>,
+  pub fail_closed: bool,
+  pub error: Option<String>,
+}
+
+impl ProxyProbe {
+  fn fail(phase: &str, tunnel_via: Option<String>, scheme: Option<String>, error: impl Into<String>) -> Self {
+    Self {
+      ok: false,
+      phase: phase.to_string(),
+      tunnel_via,
+      proxy_scheme: scheme,
+      handshake_completed: false,
+      ping_status: None,
+      connectivity_status: None,
+      fail_closed: true,
+      error: Some(error.into()),
+    }
+  }
+}
+
+/// #11/#16：用**该账号自己保存的代理**跑一次控制面 + WSS + Noise + ping。
+///
+/// 诊断必须与真实账号配置同源：代理 URI 与用户名取自 `ProxySetting`，
+/// 口令取自 Keychain（`credential_ref`），和发送/指纹走同一条
+/// [`crate::egress::AccountEgress::resolve`]。**不接受**前端传入的 URI，
+/// 否则会出现「诊断用 A 代理、实际发送用 B 代理」的误判，也会把口令带进 IPC。
+///
+/// 任何失败都 fail-closed（阻断并报错），不会改用直连。
+#[cfg(not(target_os = "android"))]
+pub async fn proxy_probe(
+  app: &AppHandle,
+  uuid: &str,
+  setting: Option<&ProxySetting>,
+  secrets: &Secrets,
+  mut cancel_token: crate::probe_cancel::CancelToken,
+  connectivity_only: bool,
+) -> ProxyProbe {
+  let egress = match crate::egress::AccountEgress::resolve(setting, secrets) {
+    Ok(e) => e,
+    Err(e) => return ProxyProbe::fail("egress", None, None, format!("账号代理不可用: {e}")),
+  };
+  if !egress.is_proxy() {
+    // 未启用代理就没有「代理探针」可测：明确说明，而不是悄悄测直连。
+    return ProxyProbe::fail(
+      "egress",
+      None,
+      None,
+      "该账号未启用代理：代理探针需要先保存并启用账号代理",
+    );
+  }
+  let tunnel_via = Some(egress.display.clone());
+  let scheme = match &egress.kind {
+    crate::egress::EgressKind::Proxy(cfg) => Some(cfg.scheme_name().to_string()),
+    crate::egress::EgressKind::Direct => None,
+  };
+
+  if connectivity_only {
+    // 固定目标、不带 Cookie、不跟随跳转，也不获取 VM 租约。
+    let result = match egress.http_client(Duration::from_secs(15), false) {
+      Ok(client) => tokio::select! {
+        r = client.head("https://muse.ai/").send() => {
+          r.map(|response| response.status().as_u16())
+            .map_err(|e| crate::egress::safe_http_error("代理 HTTPS", &e))
+        },
+        _ = cancel_token.cancelled() => Err("用户取消".to_string()),
+      },
+      Err(e) => Err(e.to_string()),
+    };
+    return match result {
+      Ok(status) => ProxyProbe {
+        ok: true,
+        phase: "connectivity".to_string(),
+        tunnel_via,
+        proxy_scheme: scheme,
+        handshake_completed: false,
+        ping_status: None,
+        connectivity_status: Some(status),
+        fail_closed: true,
+        error: None,
+      },
+      Err(e) => ProxyProbe::fail("connectivity", tunnel_via, scheme, e),
+    };
+  }
+
+  let app_owned = app.clone();
+  let uuid_owned = uuid.to_string();
+  let cookie_handle =
+    tokio::spawn(async move { fetch_session_cookies(&app_owned, &uuid_owned).await });
+  let mut cookies = tokio::select! {
+    res = cookie_handle => match res {
+      Ok(r) => match r {
+        Ok(c) => c,
+        Err(e) => return ProxyProbe::fail("cookies", tunnel_via.clone(), scheme.clone(), e),
+      },
+      Err(e) => return ProxyProbe::fail("cookies", tunnel_via.clone(), scheme.clone(), format!("取 cookie 任务异常: {e}")),
+    },
+    _ = tokio::time::sleep(COOKIE_TIMEOUT) => {
+      return ProxyProbe::fail("cookies", tunnel_via.clone(), scheme.clone(), "取会话 cookie 超时（15 秒）");
+    }
+    _ = cancel_token.cancelled() => {
+      return ProxyProbe::fail("cancelled", tunnel_via.clone(), scheme.clone(), "用户取消（取 cookie 阶段）");
+    }
+  };
+  if cookies.is_empty() {
+    return ProxyProbe::fail(
+      "cookies",
+      tunnel_via,
+      scheme,
+      "该账号未登录 muse.ai：请先在 Spike App 里登录 Muse 测试账号。",
+    );
+  }
+
+  // 控制面 HTTP 与 WSS 都经同一个 egress：与发送路径完全一致的出站。
+  if cancel_token.check() {
+    cookies.zeroize();
+    return ProxyProbe::fail("cancelled", tunnel_via, scheme, "用户取消（建立隧道前）");
+  }
+  let connected = tokio::select! {
+    r = tokio::time::timeout(Duration::from_secs(30), egress.connect(&cookies)) => Some(r),
+    _ = cancel_token.cancelled() => None,
+  };
+  let mut connected = match connected {
+    None => {
+      cookies.zeroize();
+      return ProxyProbe::fail("cancelled", tunnel_via, scheme, "用户取消（建立隧道阶段）")
+    }
+    Some(Err(_)) => {
+      cookies.zeroize();
+      return ProxyProbe::fail("connect_timeout", tunnel_via, scheme, "原生连接总超时（30 秒），未能确认失败子阶段");
+    }
+    Some(Ok(Ok(c))) => c,
+    Some(Ok(Err(e))) => {
+      cookies.zeroize();
+      use crate::egress::EgressError;
+      let phase = match &e {
+        EgressError::Http(_) => "http_client",
+        EgressError::Gateway(GatewayError::ControlPlane(_)) => "control_plane",
+        EgressError::Gateway(GatewayError::SignedOut) => "authentication",
+        EgressError::Gateway(GatewayError::Proxy(_)) => "tunnel",
+        EgressError::Gateway(GatewayError::Ws(_) | GatewayError::Timeout("websocket open (proxy)")) => "websocket",
+        EgressError::Gateway(_) => "handshake",
+        _ => "egress",
+      };
+      return ProxyProbe::fail(phase, tunnel_via, scheme, e.to_string());
+    }
+  };
+  cookies.zeroize();
+
+  let ping = tokio::select! {
+    r = connected.ping() => Some(r),
+    _ = cancel_token.cancelled() => None,
+    _ = tokio::time::sleep(Duration::from_secs(15)) => Some(Err(GatewayError::Closed(
+      "ping 超时（15 秒）".to_string(),
+    ))),
+  };
+  match ping {
+    None => {
+      connected.close().await;
+      ProxyProbe::fail("cancelled", tunnel_via, scheme, "用户取消（ping 阶段）")
+    }
+    Some(Ok(status)) => {
+      connected.close().await;
+      ProxyProbe {
+        ok: status < 400,
+        phase: "ready".to_string(),
+        tunnel_via,
+        proxy_scheme: scheme,
+        handshake_completed: true,
+        ping_status: Some(status),
+        connectivity_status: None,
+        fail_closed: true,
+        error: if status < 400 {
+          None
+        } else {
+          Some(format!("connection.ping HTTP {status}"))
+        },
+      }
+    }
+    Some(Err(e)) => {
+      connected.close().await;
+      ProxyProbe::fail("ping", tunnel_via, scheme, e.to_string())
+    }
+  }
+}
+
 #[cfg(not(target_os = "android"))]
 fn report_connect_error(e: GatewayError) -> SpikeDiagnose {
   match e {
@@ -248,7 +1834,8 @@ fn report_connect_error(e: GatewayError) -> SpikeDiagnose {
 }
 
 #[cfg(target_os = "ios")]
-async fn fetch_session_cookies(app: &AppHandle, uuid: &str) -> Result<SessionCookies, String> {
+pub(crate) async fn fetch_session_cookies(app: &AppHandle, uuid: &str) -> Result<SessionCookies, String> {
+  use muse_native_client::cookie::SessionCookie;
   let entries = crate::platform::ios::get_session_cookies(app, uuid).await?;
   Ok(SessionCookies {
     cookies: entries
@@ -268,6 +1855,7 @@ async fn fetch_session_cookies(_app: &AppHandle, _uuid: &str) -> Result<SessionC
 
 /// Spike 版启动自检：bundle id 不是日常版时，对第一个已登录的 Muse 账号
 /// 跑一次握手诊断，结果只打到诊断日志（不含密钥）。日常版直接返回。
+#[allow(dead_code)]
 pub async fn maybe_auto_diagnose(app: &AppHandle, mgr: &Arc<SessionManager>) {
   if app.config().identifier == DAILY_IDENTIFIER {
     return;
@@ -284,11 +1872,52 @@ pub async fn maybe_auto_diagnose(app: &AppHandle, mgr: &Arc<SessionManager>) {
     return;
   };
   let uuid = acc.uuid.clone();
-  match diagnose(app, ProviderId::Muse.as_str(), &uuid).await {
+  let setting = mgr.proxy_setting(ProviderId::Muse, &uuid).await;
+  match diagnose(app, ProviderId::Muse.as_str(), &uuid, setting).await {
     Ok(r) => eprintln!(
       "[muse-native] spike auto-diagnose: ok={} phase={} handshake={} ping={:?} cvm={} error={:?}",
       r.ok, r.phase, r.handshake_completed, r.ping_status, r.cvm_detected, r.error
     ),
     Err(e) => eprintln!("[muse-native] spike auto-diagnose failed: {e}"),
+  }
+
+}
+
+#[cfg(test)]
+mod tests {
+  use super::*;
+
+  #[test]
+  fn renewal_verdict_cases() {
+    // 都缺失 → 不可观测（关键回归：不能当成「无变化」）
+    assert_eq!(renewal_verdict(None, None), "unobservable");
+    // 相等 → 字段未变化
+    assert_eq!(
+      renewal_verdict(Some(1_762_100_300_000), Some(1_762_100_300_000)),
+      "unchanged"
+    );
+    // 不等 → 仅字段变化；UI 文案把「≠ 自动续租」讲清楚
+    assert_eq!(
+      renewal_verdict(Some(1_762_100_300_000), Some(1_762_100_400_000)),
+      "changed"
+    );
+    // 一有一缺 → 不可观测
+    assert_eq!(renewal_verdict(Some(1), None), "unobservable");
+    assert_eq!(renewal_verdict(None, Some(1)), "unobservable");
+    // 反向也要一致（对称性回归）
+    assert_eq!(
+      renewal_verdict(Some(1_762_100_400_000), Some(1_762_100_300_000)),
+      "changed"
+    );
+  }
+
+  #[test]
+  fn renewal_never_claims_confirmation() {
+    // 单次探针不可能确认自动续租：以上四种结论里没有「renewed」。
+    for (a, b) in [(None, None), (Some(1), None), (Some(1), Some(1)), (Some(1), Some(2))] {
+      let v = renewal_verdict(a, b);
+      assert_ne!(v, "renewed", "续租必须由长期观测确认，不能由一次探针得出");
+      assert_ne!(v, "extended");
+    }
   }
 }

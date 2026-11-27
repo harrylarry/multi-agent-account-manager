@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-hark-native-watch-probe"
+description = "Enables the hark_native_watch_probe command without any pre-configured scope."
+commands.allow = ["hark_native_watch_probe"]
+
+[[permission]]
+identifier = "deny-hark-native-watch-probe"
+description = "Denies the hark_native_watch_probe command without any pre-configured scope."
+commands.deny = ["hark_native_watch_probe"]

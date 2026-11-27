@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-muse-native-liveness-status"
+description = "Enables the muse_native_liveness_status command without any pre-configured scope."
+commands.allow = ["muse_native_liveness_status"]
+
+[[permission]]
+identifier = "deny-muse-native-liveness-status"
+description = "Denies the muse_native_liveness_status command without any pre-configured scope."
+commands.deny = ["muse_native_liveness_status"]

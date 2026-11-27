@@ -10,7 +10,7 @@ name: Quick checks
 # 本文件目前只在 spike 分支；合并进 main 后再按需加回。
 on:
   push:
-    branches: ["main", "spike/native-client"]
+    branches: ["main", "spike/**"]
 
 concurrency:
   group: quick-checks-${{ github.ref }}
@@ -55,7 +55,7 @@ jobs:
             all_checks "git diff 失败"
           fi
           echo "changed files:"; echo "$files"
-          if echo "$files" | grep -qE '^(src/|index\.html|package(-lock)?\.json|tsconfig\.json|vite\.config\.ts|scripts/)'; then
+          if echo "$files" | grep -qE '^(src/|index\.html|package(-lock)?\.json|tsconfig\.json|vite\.config\.ts|scripts/|tests/)'; then
             web=true
           else
             web=false
@@ -93,6 +93,26 @@ jobs:
       - run: npm ci
       - run: npm run build
 
+  # 内嵌 JavaScript：Xcode / Kotlin 编译通过，不代表注入的字符串能被解析。
+  # 2d39149 的 Scripts.swift 少了一行 `const origFetch = window.fetch`，括号
+  # 因此不平衡，整个 quota hook 从未安装，而所有构建都是绿的。
+  embedded-js:
+    name: Embedded JS (node --check + runtime)
+    needs: changes
+    if: needs.changes.outputs.rust == 'true' || needs.changes.outputs.web == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@v6
+        with:
+          node-version: 22
+      # 只依赖 Node 内置模块，不跑 npm ci。
+      - run: npm run check:embedded-js
+      - run: npm test
+
   actionlint:
     name: actionlint
     needs: changes
@@ -116,10 +136,7 @@ jobs:
     runs-on: macos-15-intel
     timeout-minutes: 30
     env:
-      # tauri-utils 用 swift-rs 编译插件里的 Swift 时读这个变量（缺省回落 13.0），
-      # 而本 App 最低 iOS 是 17.0（tauri.ios.conf.json）。不设会让 cargo check
-      # 在插件 Swift 的 iOS 15+ API 上报可用性错误——那是构建上下文问题，不是源码错误。
-      IPHONEOS_DEPLOYMENT_TARGET: "17.0"
+      IPHONEOS_DEPLOYMENT_TARGET: "26.0"
     steps:
       - uses: actions/checkout@v7
         with:
@@ -131,6 +148,8 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
         with:
           targets: aarch64-apple-ios
+      - name: Select Xcode 26
+        run: sudo xcode-select --switch /Applications/Xcode_26.3.app/Contents/Developer
       - uses: Swatinem/rust-cache@v2
         with:
           workspaces: ./src-tauri -> target
@@ -140,3 +159,41 @@ jobs:
       # muse-native 是 src-tauri 的 path 依赖、不是 workspace 成员，不能用 -p；
       # 对整个包 check 才能复用 src-tauri/Cargo.lock 与 target 目录。
       - run: cargo check --manifest-path src-tauri/Cargo.toml --target aarch64-apple-ios
+      # 纯逻辑测试（watch/transport/noise）跑宿主 target，不需要 Xcode。
+      # muse-native 的纯逻辑单测（含 liveness 观测语义）。
+      - name: cargo test (muse-native)
+        run: cargo test --manifest-path src-tauri/muse-native/Cargo.toml
+      # 主 crate 的单元测试（send_ledger / quota 解析）跑宿主 target：
+      # iOS target 只能编译不能执行，所以这里不带 --target。
+      - name: cargo test (main crate lib)
+        run: cargo test --manifest-path src-tauri/Cargo.toml --lib
+
+  # #18 最小实验：lmfpd 能否为 iOS 编译 + 能否用参考库对「已采集回答」离线评分。
+  # 独立 crate（src-tauri/lmfpd-probe），不进入 App 依赖图；这里只做可行性验证。
+  lmfpd-probe:
+    name: lmfpd experiment (iOS target + offline scoring)
+    needs: changes
+    if: needs.changes.outputs.rust == 'true'
+    runs-on: macos-15-intel
+    timeout-minutes: 30
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-apple-ios
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: ./src-tauri/lmfpd-probe -> target
+      - name: cargo check (iOS target)
+        run: cargo check --manifest-path src-tauri/lmfpd-probe/Cargo.toml --target aarch64-apple-ios
+      - name: build host binary
+        run: cargo build --manifest-path src-tauri/lmfpd-probe/Cargo.toml
+      - name: score real replies offline
+        run: |
+          cat > /tmp/outputs.json <<'JSON'
+          [{"text":"1, 2, 3, 4, 5, 6, 7, 8, 9, 10","expectedCount": 10}]
+          JSON
+          ./src-tauri/lmfpd-probe/target/debug/lmfpd-probe --default --outputs /tmp/outputs.json

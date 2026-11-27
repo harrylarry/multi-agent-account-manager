@@ -11,11 +11,21 @@ aes-gcm = { version = "0.10", features = ["aes"] }
 futures-util = "0.3"
 getrandom = "0.3"
 hmac = "0.12"
+# #18 模型指纹：lmfpd 0.2 参考库加载 + 本地评分（ureq 纯 Rust，已在
+# src-tauri/lmfpd-probe 验证可为 aarch64-apple-ios 编译）。评分只用本地
+# Detector::analyze，不调用它的联网 detect；探针采集走本项目隔离会话。
+lmfpd = "0.2"
 http = "1"
 # rustls 0.23 需要显式 crypto provider：tokio-tungstenite 的
 # rustls-tls-webpki-roots 只带 TLS 管道，不带 ring / aws-lc-rs 任一 provider，
 # 首次建 TLS 时 CryptoProvider 自动判定会 panic。ring 已由 rustls-webpki 引入。
 rustls = { version = "0.23", default-features = false, features = ["ring"] }
+# #11/#16 原生侧代理：https:// 代理需要到代理自身的 TLS（tokio-rustls 0.26，
+# 与主 crate 同一版本），webpki-roots 提供根证书；http:///socks5:// 不触发 TLS。
+# 必须 default-features=false + ring：默认 feature 带 aws_lc_rs，会引入 aws-lc-sys
+# 的 C/CMake 编译依赖，破坏 iOS 交叉编译；本项目 rustls 已统一用 ring。
+tokio-rustls = { version = "0.26", default-features = false, features = ["ring", "tls12"] }
+webpki-roots = "0.26"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 sha2 = "0.10"

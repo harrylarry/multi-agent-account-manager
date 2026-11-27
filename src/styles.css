@@ -223,6 +223,7 @@ body,
   display: flex;
   flex-direction: column;
   position: relative;
+  min-height: 0;
 }
 
 .mobile-shell {
@@ -1596,14 +1597,166 @@ body,
   border-radius: 8px;
   background: var(--stage-bg);
 }
-.spike-diag-header {
+.spike-account-view,
+.spike-workspace {
   display: flex;
-  justify-content: space-between;
-  align-items: center;
+  flex: 1;
+  flex-direction: column;
+  min-height: 0;
+  min-width: 0;
 }
-.spike-diag-title {
-  font-size: 13px;
+.spike-account-view[hidden],
+.spike-workspace[hidden] {
+  display: none;
+}
+.spike-workspace {
+  background: var(--stage-bg);
+}
+.spike-toolbar {
+  flex-shrink: 0;
+  display: grid;
+  gap: 10px;
+  padding: 10px 14px;
+  background: var(--list-bg);
+  border-bottom: 1px solid var(--border);
+}
+.spike-toolbar-title {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+}
+.spike-toolbar-title > div {
+  min-width: 0;
+}
+.spike-toolbar h2 {
+  font-size: 16px;
+  line-height: 1.4;
+}
+#spike-workspace-account {
+  color: var(--text-sub);
+  font-size: 12px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.spike-scroll {
+  flex: 1;
+  min-height: 0;
+  overflow-y: auto;
+  overscroll-behavior-y: contain;
+  -webkit-overflow-scrolling: touch;
+  padding: 12px 14px 24px;
+}
+.spike-workspace .spike-diag {
+  display: grid;
+  gap: 10px;
+  margin: 0;
+  padding: 0;
+  border: 0;
+  background: transparent;
+}
+.spike-panel {
+  min-width: 0;
+  padding: 12px;
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  background: var(--list-bg);
+}
+.spike-panel h3,
+.spike-panel > summary {
+  font-size: 14px;
   font-weight: 600;
+}
+.spike-panel summary {
+  cursor: pointer;
+}
+.spike-panel > summary {
+  line-height: 24px;
+}
+.spike-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+}
+.spike-toolbar .spike-actions {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+}
+#spike-wire-copy-btn:not(:disabled) {
+  color: var(--primary-hover);
+  background: var(--primary-soft);
+}
+.spike-panel .spike-actions {
+  margin-top: 10px;
+}
+.spike-workspace .mini-btn {
+  min-height: 44px;
+  padding: 0 12px;
+  border-radius: 8px;
+  white-space: normal;
+}
+.spike-workspace .spike-primary {
+  color: white;
+  background: var(--primary);
+  border-color: var(--primary);
+}
+.spike-workspace .spike-primary:not(:disabled):hover {
+  background: var(--primary-hover);
+  color: white;
+}
+.spike-proxy-fields {
+  display: grid;
+  gap: 5px;
+  margin-top: 10px;
+}
+.spike-proxy-fields label {
+  color: var(--text-sub);
+  font-size: 12px;
+}
+.spike-proxy-fields input {
+  width: 100%;
+  min-width: 0;
+  min-height: 44px;
+  padding: 8px 10px;
+  margin-bottom: 5px;
+  border: 1px solid var(--border-strong);
+  border-radius: 8px;
+  background: var(--list-bg);
+  color: var(--text-main);
+  font: inherit;
+  font-size: 16px;
+}
+.spike-wire-details {
+  margin: 8px 0;
+  color: var(--text-main);
+}
+.spike-metrics {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 6px;
+  margin: 8px 0;
+}
+.spike-metrics > div {
+  padding: 6px 8px;
+  border-radius: 6px;
+  background: var(--stage-bg);
+}
+.spike-metrics dt {
+  color: var(--text-sub);
+  font-size: 11px;
+}
+.spike-metrics dd {
+  font-weight: 600;
+  font-variant-numeric: tabular-nums;
+}
+#spike-wire-trace {
+  margin-top: 5px;
+  padding: 8px;
+  border-radius: 6px;
+  background: var(--stage-bg);
+  font: 11px/1.6 ui-monospace, monospace;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
 }
 .spike-diag-result {
   margin-top: 8px;
@@ -1616,6 +1769,53 @@ body,
 }
 .spike-diag-result.fail {
   color: var(--danger);
+}
+.spike-workspace .spike-diag-result {
+  color: var(--text-main);
+  font-size: 13px;
+}
+.spike-workspace .spike-diag-result.ok > div:first-child {
+  color: #08765b;
+  font-weight: 600;
+}
+.spike-workspace .spike-diag-result.fail {
+  color: #a61d2d;
+}
+
+/* Spike 前端阶段记录：真机复测时定位「点击 → 确认 → IPC → 返回」停在哪一步。 */
+.spike-trace {
+  margin-top: 8px;
+  font-size: 11px;
+  line-height: 1.65;
+  color: var(--text-muted);
+  word-break: break-word;
+}
+.spike-trace[hidden] {
+  display: none;
+}
+.spike-notice {
+  margin-top: 8px;
+  padding: 6px 8px;
+  border-radius: 6px;
+  background: var(--primary-soft);
+  color: var(--text-sub);
+  font-size: 12px;
+  line-height: 1.6;
+}
+
+/* Spike 诊断区允许选中与复制（全局 user-select: none 会挡住）。 */
+.spike-diag,
+.spike-diag * {
+  user-select: text;
+  -webkit-user-select: text;
+}
+.spike-workspace button,
+.spike-workspace summary {
+  user-select: none;
+  -webkit-user-select: none;
+}
+.mobile-shell #spike-open-btn {
+  min-height: 44px;
 }
 
 /* Spike 顶栏标识（0.1.22）：Spike 分支的 Muse 页标题旁显示。 */
@@ -1638,4 +1838,132 @@ body,
 .mobile-shell .spike-badge {
   font-size: 11px;
   padding: 3px 7px;
+}
+
+.account-filters {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) minmax(110px, 36%);
+  gap: 8px;
+  padding: 0 12px 8px;
+}
+
+.account-filters .modal-input {
+  min-width: 0;
+}
+
+.account-group-label {
+  flex: 0 1 auto;
+  min-width: 0;
+  max-width: 35%;
+  padding: 2px 6px;
+  overflow: hidden;
+  border-radius: 5px;
+  color: var(--text-muted);
+  background: var(--primary-soft);
+  font-size: 11px;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.account-row[hidden],
+#account-filter-empty[hidden] {
+  display: none;
+}
+
+.account-approval-btn {
+  width: auto;
+  padding-inline: 6px;
+  font-size: 11px;
+}
+
+.approval-items {
+  max-height: min(45vh, 320px);
+  overflow-y: auto;
+}
+
+.approval-item {
+  padding: 8px 0;
+  border-bottom: 1px solid var(--border-strong);
+  overflow-wrap: anywhere;
+}
+
+.approval-item summary {
+  cursor: pointer;
+}
+
+.approval-item div {
+  padding-top: 4px;
+  color: var(--text-muted);
+}
+
+.account-cookie-input {
+  min-height: 110px;
+  padding: 8px;
+  resize: vertical;
+}
+
+.account-cookie-actions {
+  flex-wrap: wrap;
+}
+
+.muse-thread-row {
+  display: grid;
+  gap: 4px;
+  width: 100%;
+  padding: 10px 6px;
+  border: 0;
+  border-bottom: 1px solid var(--border-strong);
+  background: transparent;
+  color: var(--text-main);
+  text-align: start;
+  overflow-wrap: anywhere;
+}
+
+.muse-thread-row small {
+  color: var(--text-muted);
+}
+
+.proxy-pool-body {
+  max-height: 48vh;
+  overflow-y: auto;
+}
+
+.proxy-pool-actions,
+.proxy-pool-row > div:last-child {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 5px;
+}
+
+.proxy-pool-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  padding: 8px 0;
+  border-bottom: 1px solid var(--border-strong);
+  overflow-wrap: anywhere;
+}
+
+.proxy-pool-row small {
+  display: block;
+  color: var(--text-muted);
+}
+.hark-reply {
+  padding: 0.55rem 0;
+}
+
+.hark-reply-text {
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+  padding-block: 0.45rem;
+}
+
+.lan-backup-qr {
+  width: min(13rem, 100%);
+  height: auto;
+  box-sizing: border-box;
+  margin-block: 0.5rem;
+  border: 0.75rem solid white;
+  image-rendering: pixelated;
 }

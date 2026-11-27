@@ -51,7 +51,7 @@ final class TaskWatcher: NSObject {
         if (host !== 'muse.ai' && !host.endsWith('.muse.ai')) {
           return JSON.stringify({ usable: false });
         }
-        if (document.readyState !== 'complete') {
+        if (document.readyState === 'loading') {
           return JSON.stringify({ usable: false });
         }
         const composerEls = Array.from(
@@ -77,6 +77,12 @@ final class TaskWatcher: NSObject {
           } catch (_) {}
         }
         const main = document.querySelector('main') || document.body;
+        const thread = /^\/thread\/([0-9a-f-]{36})\/?$/i.exec(location.pathname)?.[1] || '';
+        const replies = main.querySelectorAll(
+          '[data-message-author-role="assistant"], [data-message-role="assistant"], [data-role="assistant"]'
+        );
+        const lastReply = replies[replies.length - 1];
+        const reply = ((lastReply?.textContent || '').replace(/\s+/g, ' ')).trim().slice(-512);
         let txt = ((main.innerText || '').replace(/\s+/g, ' ')).trim();
         // The user's own draft in the composer is part of innerText;
         // strip it so typing never looks like a new reply.
@@ -105,6 +111,8 @@ final class TaskWatcher: NSObject {
         return JSON.stringify({
           usable: true, msgCount: best, tailHash: h,
           tailLen: txt.length, working: working,
+          thread, replyCount: replies.length,
+          replyHash: reply.split('').reduce((hash, ch) => ((hash * 31) + ch.charCodeAt(0)) | 0, 0),
         });
       } catch (_) {
         return JSON.stringify({ usable: false });
@@ -120,6 +128,10 @@ final class TaskWatcher: NSObject {
     var sawStopButton: Bool = false
     var stableCount: Int = 0
     var baselineSet: Bool = false
+    var thread = ""
+    var replyCount = 0
+    var replyHash = 0
+    var sawAssistantChange = false
     // 0.1.17: arrival time of the last accepted sample, for the
     // near-duplicate guard in noteSample.
     var lastSampleAt: Date?
@@ -130,6 +142,9 @@ final class TaskWatcher: NSObject {
     let tailHash: Int
     let tailLen: Int
     let working: Bool
+    let thread: String
+    let replyCount: Int
+    let replyHash: Int
   }
 
   private static let sweepInterval: TimeInterval = 20
@@ -138,6 +153,9 @@ final class TaskWatcher: NSObject {
   private var started = false
   private var sweepTimer: Timer?
   private var foregroundObserver: NSObjectProtocol?
+  private var backgroundObserver: NSObjectProtocol?
+  private var foregroundChecks: [DispatchWorkItem] = []
+  private var foregroundGeneration = 0
   private var states: [String: WatchState] = [:]
 
   private override init() {
@@ -166,10 +184,34 @@ final class TaskWatcher: NSObject {
     // while the app was suspended; the parked page's DOM shows the
     // finished state, so the transition is detected on return.
     foregroundObserver = NotificationCenter.default.addObserver(
-      forName: UIApplication.willEnterForegroundNotification,
+      forName: UIApplication.didBecomeActiveNotification,
       object: nil,
       queue: .main
-    ) { [weak self] _ in self?.sweepParkedPages() }
+    ) { [weak self] _ in self?.resumeForegroundChecks() }
+    backgroundObserver = NotificationCenter.default.addObserver(
+      forName: UIApplication.didEnterBackgroundNotification, object: nil, queue: .main
+    ) { [weak self] _ in self?.cancelForegroundChecks() }
+  }
+
+  private func cancelForegroundChecks() {
+    foregroundGeneration += 1
+    foregroundChecks.forEach { $0.cancel() }
+    foregroundChecks.removeAll()
+  }
+
+  private func resumeForegroundChecks() {
+    let resumedAtMs = Int64(Date().timeIntervalSince1970 * 1000)
+    cancelForegroundChecks()
+    sweepParkedPages()
+    AccountSessionCoordinator.shared.emitForegroundTaskCatchUp(targets: RecentAccountPages.museCatchUpTargets(),
+                                                               resumedAtMs: resumedAtMs)
+    // A parked document may need time to render new data after iOS resumes.
+    // Leave enough time between samples for the existing stability check.
+    for delay in [6.0, 12.0] {
+      let check = DispatchWorkItem { [weak self] in self?.sweepParkedPages() }
+      foregroundChecks.append(check)
+      DispatchQueue.main.asyncAfter(deadline: .now() + delay, execute: check)
+    }
   }
 
   /// Drops all state for an account (profile deleted).
@@ -188,12 +230,17 @@ final class TaskWatcher: NSObject {
     guard let sample = parseSample(result) else { return false }
     let key = "\(providerId)|\(uuid)"
     var state = states[key] ?? WatchState()
-    let signature = "\(sample.msgCount)|\(sample.tailHash)|\(sample.working)"
+    let signature = "\(sample.msgCount)|\(sample.tailHash)|\(sample.working)|\(sample.replyCount)|\(sample.replyHash)"
     let now = Date()
 
     // First sighting: record the baseline, never notify.
-    guard state.baselineSet else {
+    guard state.baselineSet, state.thread == sample.thread else {
+      state = WatchState()
       state.baselineSet = true
+      state.thread = sample.thread
+      state.replyCount = sample.replyCount
+      state.replyHash = sample.replyHash
+      state.sawStopButton = sample.working
       state.lastSignature = signature
       state.lastTailLen = sample.tailLen
       state.lastMsgCount = sample.msgCount
@@ -219,10 +266,11 @@ final class TaskWatcher: NSObject {
       state.stableCount += 1
       states[key] = state
       if !sample.working && state.stableCount >= Self.stableChecksToFire
-        && (state.sawStopButton || state.growthEvents >= 2)
+        && (state.sawStopButton || state.sawAssistantChange || state.growthEvents >= 2)
       {
         // Working → idle, with real growth behind it: task done.
         state.sawStopButton = false
+        state.sawAssistantChange = false
         state.growthEvents = 0
         state.stableCount = 0
         states[key] = state
@@ -242,6 +290,9 @@ final class TaskWatcher: NSObject {
       state.lastMsgCount = sample.msgCount
       state.growthEvents = 0
       state.sawStopButton = false
+      state.sawAssistantChange = false
+      state.replyCount = sample.replyCount
+      state.replyHash = sample.replyHash
       state.stableCount = 0
       states[key] = state
       return true
@@ -253,6 +304,12 @@ final class TaskWatcher: NSObject {
     if sample.working {
       state.sawStopButton = true
     }
+    if !sample.thread.isEmpty, sample.replyHash != 0,
+       sample.replyCount > state.replyCount || (sample.replyCount == state.replyCount && sample.replyHash != state.replyHash) {
+      state.sawAssistantChange = true
+    }
+    state.replyCount = sample.replyCount
+    state.replyHash = sample.replyHash
     state.stableCount = 0
     state.lastSignature = signature
     state.lastTailLen = sample.tailLen
@@ -266,7 +323,13 @@ final class TaskWatcher: NSObject {
   /// One sweep over all parked Muse pages. Called by the 20s timer,
   /// the foreground-return catch-up, and (0.1.17) the coordinator
   /// when the user returns to the account list. Main-thread only.
+  private var appIsActive: Bool {
+    MainActor.assumeIsolated { UIApplication.shared.applicationState == .active }
+  }
+
   func sweepParkedPages() {
+    guard appIsActive else { return }
+    let generation = foregroundGeneration
     for entry in RecentAccountPages.parkedKeys() {
       guard entry.providerId == "muse" else { continue }
       RecentAccountPages.probeParked(
@@ -276,7 +339,9 @@ final class TaskWatcher: NSObject {
         // probeParked returns nil when the page was evicted between
         // listing and probing; parseSample(nil) is nil, so this is
         // a harmless no-op.
-        self?.noteSample(
+        guard let self, self.foregroundGeneration == generation,
+              self.appIsActive else { return }
+        self.noteSample(
           providerId: entry.providerId, uuid: entry.uuid, result: result)
       }
     }
@@ -302,7 +367,10 @@ final class TaskWatcher: NSObject {
       msgCount: obj["msgCount"] as? Int ?? 0,
       tailHash: obj["tailHash"] as? Int ?? 0,
       tailLen: obj["tailLen"] as? Int ?? 0,
-      working: obj["working"] as? Bool ?? false
+      working: obj["working"] as? Bool ?? false,
+      thread: obj["thread"] as? String ?? "",
+      replyCount: obj["replyCount"] as? Int ?? 0,
+      replyHash: obj["replyHash"] as? Int ?? 0
     )
   }
 }

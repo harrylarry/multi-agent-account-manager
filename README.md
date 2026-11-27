@@ -12,8 +12,8 @@
 
 - **当前版本**：0.1.22。
 - **IPA 构建**：由 GitHub Actions（`.github/workflows/ios.yml`）在 `macos-15-intel` runner 上构建，产物为未签名 IPA（`account-manager-ios-unsigned.ipa`），无需 Apple 开发者账号。
-- **安装方式**：未签名 IPA（iOS 17.0+），需自行签名后侧载安装，详见「iOS 安装注意事项」。
-- **上游更新**：上游更新不再合入本 fork。
+- **安装方式**：未签名 IPA（iOS 26.0+），需自行签名后侧载安装，详见「iOS 安装注意事项」。
+- **上游更新**：按 iOS 需求逐项评估和适配上游变更，排期见[执行计划 v2.2](docs/development/development-plan-v2.2.md)。
 
 ---
 
@@ -66,7 +66,7 @@
 | macOS | `account-manager-macos-universal.dmg` | Apple Silicon & Intel（macOS 14.0+） | 上游 |
 | Windows | `account-manager-windows-x64-setup.exe` | x64（Windows 10 / 11） | 上游 |
 | Android | `account-manager-android-universal-release.apk` | 通用 ABI（Android 7.0+） | 上游 |
-| iOS | `account-manager-ios-unsigned.ipa` | 未签名 IPA（iOS 17.0+，需自行签名侧载） | 本 fork |
+| iOS | `account-manager-ios-unsigned.ipa` | 未签名 IPA（iOS 26.0+，需自行签名侧载） | 本 fork |
 
 本 fork 的 iOS 安装包见 [GitHub Releases](https://github.com/harrylarry/multi-agent-account-manager/releases)。
 
@@ -126,7 +126,7 @@
 
 ## 应用内更新与发版
 
-- **客户端检查更新**：桌面端点击左侧栏底部「更新」按钮，移动端（Android / iOS）点击右上角下载图标，可检查最新版本并一键下载校验安装；启动后也会静默检查一次并展示红点提醒（iOS 检查到新版后提示手动重新侧载）。
+- **客户端检查更新**：iPhone 在「管理 → 检查更新」查看新版并按提示侧载。Android 使用右上角下载图标，桌面使用左侧栏底部「更新」。启动后会静默检查，发现新版时显示更新标记。
 - **维护者发布新版本**：本 fork 只做 `ios-v*` 发版，不做 `v*` 三端发版（`v*` 标签会触发三端发版流程，不要用）。
   1. 同步更新 [package.json](package.json)、[src-tauri/Cargo.toml](src-tauri/Cargo.toml) 与 [src-tauri/tauri.conf.json](src-tauri/tauri.conf.json) 中的版本号。
   2. 合入 `main` 后由 GitHub Actions（`.github/workflows/ios.yml`）构建未签名 IPA。
@@ -136,7 +136,7 @@
 
 ## 本地开发
 
-环境要求：Node.js 22+、Rust 1.85+，Android 构建需额外配置 Android SDK 与 NDK 26+，iOS 构建需 macOS + Xcode（见 [.github/workflows/ios.yml](.github/workflows/ios.yml)）。
+环境要求：Node.js 22+、Rust 1.85+，Android 构建需额外配置 Android SDK 与 NDK 26+，iOS 构建需 macOS + Xcode 26（见 [.github/workflows/ios.yml](.github/workflows/ios.yml)）。
 
 ```bash
 npm ci
@@ -146,11 +146,13 @@ npm run tauri -- build
 
 ---
 
-## 开发约定与计划
+## 开发与验收
 
-- [AGENTS.md](AGENTS.md)：开发 Agent 的协作约定（单 Agent 连续开发、以 GitHub 作为项目事实来源、测试与安全门禁）。
-- [开发计划 v2.1](docs/叠号开发计划-严谨执行版-v2.1-2026-11-23.md)：Phase 0–5 的可执行任务、验收矩阵、风险登记与 Go/No-Go 门禁。
-- 任务进度、验收证据与阻断以 GitHub Issue / PR / Actions 为准；`.muse-graph/` 仅作辅助索引，不与 GitHub 记录冲突。
+- [AGENTS.md](AGENTS.md) · 开发协作、测试与安全门禁。
+- [产品设计 v4](<docs/叠号 iOS 借鉴 BotArk 优化设计规划 v4.md>) · 产品需求与设计决策。后续裁决见[开发决策记录](docs/开发决策记录.md)。
+- [开发计划 v2.1](docs/叠号开发计划-严谨执行版-v2.1-2026-11-23.md) · Phase 0–5 的任务、验收矩阵与 Go/No-Go 门禁。
+- [当前进度](docs/development/current-progress.md) · 阶段状态、候选提交、待验收事项与 GitHub 证据。
+- [iPhone 真机验收](docs/acceptance/iphone-acceptance.md) · Spike IPA、校验值、测试步骤与结果回填。
 
 ---
 

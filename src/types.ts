@@ -30,20 +30,36 @@ export interface QuotaDetail {
 }
 
 export interface AccountRecord {
+  fingerprintSettings?: { manualModel?: string | null; intervalDays?: number | null; lastAutomaticAttemptMs?: number | null };
+  fingerprintHistory?: {
+    taskId: string; recordedAtMs: number; verdict: string; model: string | null; family: string | null;
+    probabilityPpm: number | null; validSamples: number; referenceBuiltAt: string | null;
+    referenceSha256: string | null; method: string | null;
+  }[];
   providerId: ProviderId;
   uuid: string;
   alias: string;
+  group?: string;
+  timezone?: string;
+  language?: string;
+  lastMuseThread?: string;
   createdAtMs: number;
   autoAlias: boolean;
   avatarUrl: string | null;
   quotaText: string | null;
   quotaPercent: number | null;
   quotaDetail: QuotaDetail | null;
+  quotaObservation?: { source: string; window: string | null; percentUsed?: number | null; resetsAtMs: number | null; checkedAtMs: number; stale: boolean };
   authState: AuthState;
   // 0.1.15: the iOS task watcher saw a new reply for this account
   // while it was not active. Optional: the visual harness stubs and
   // pre-0.1.15 snapshots don't carry it.
   hasUnreadReply?: boolean;
+  lastTaskReplyAtMs?: number | null;
+  taskNotifications?: boolean;
+  pendingApprovalCount?: number | null;
+  museUnreadStatus?: string | null;
+  proxy?: { enabled: boolean; poolEntryId?: string | null } | null;
 }
 
 export interface ConflictItem {
@@ -52,9 +68,11 @@ export interface ConflictItem {
 }
 
 export interface ManagerSnapshot {
+  badgeSampleAtMs?: number;
   platform: string;
   providers: ProviderInfo[];
   accounts: AccountRecord[];
+  accountGroups?: Partial<Record<ProviderId, string[]>>;
   selectedProviderId: ProviderId;
   activeAccount: AccountKey | null;
   switchingAccount: AccountKey | null;

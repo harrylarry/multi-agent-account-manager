@@ -300,6 +300,8 @@ pub struct OpenIosAccountPayload {
   pub provider_name: String,
   pub uuid: String,
   pub alias: String,
+  pub timezone: Option<String>,
+  pub language: Option<String>,
   pub auto_alias: bool,
   pub entry_url: String,
   pub allowed_hosts: Vec<String>,
@@ -390,6 +392,22 @@ pub enum IosSessionEvent {
     provider_id: String,
     uuid: String,
   },
+  #[serde(rename_all = "camelCase")]
+  ForegroundTaskCatchUp {
+    targets: Vec<ForegroundTaskTarget>,
+    resumed_at_ms: u64,
+  },
+}
+
+#[cfg(target_os = "ios")]
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ForegroundTaskTarget {
+  pub uuid: String,
+  pub thread_id: Option<String>,
+  #[serde(default)]
+  pub primary: bool,
+  pub parked_at_ms: u64,
 }
 
 #[cfg(target_os = "ios")]
@@ -436,6 +454,41 @@ pub async fn check_capabilities(app: &AppHandle) -> Result<IosCapabilitiesRespon
     .run_mobile_plugin_async("checkCapabilities", serde_json::json!({}))
     .await
     .map_err(|e| e.to_string())
+}
+
+#[cfg(target_os = "ios")]
+pub struct FingerprintForeground {
+  app: AppHandle,
+  task_id: String,
+}
+
+#[cfg(target_os = "ios")]
+impl Drop for FingerprintForeground {
+  fn drop(&mut self) {
+    let app = self.app.clone();
+    let task_id = self.task_id.clone();
+    tauri::async_runtime::spawn(async move {
+      let bridge = app.state::<IosSessionBridge<tauri::Wry>>();
+      let _ = bridge.0.run_mobile_plugin_async::<serde_json::Value>(
+        "setFingerprintForeground",
+        serde_json::json!({ "taskId": task_id }),
+      ).await;
+    });
+  }
+}
+
+#[cfg(target_os = "ios")]
+pub async fn keep_fingerprint_foreground(
+  app: &AppHandle,
+  task_id: String,
+  interrupted: Channel<serde_json::Value>,
+) -> Result<FingerprintForeground, String> {
+  let bridge = app.state::<IosSessionBridge<tauri::Wry>>();
+  bridge.0.run_mobile_plugin_async::<serde_json::Value>(
+    "setFingerprintForeground",
+    serde_json::json!({ "taskId": task_id, "interrupted": interrupted }),
+  ).await.map_err(|error| error.to_string())?;
+  Ok(FingerprintForeground { app: app.clone(), task_id })
 }
 
 #[cfg(target_os = "ios")]
@@ -527,6 +580,17 @@ pub async fn get_session_cookies(app: &AppHandle, uuid: &str) -> Result<Vec<IosS
   Ok(res.cookies)
 }
 
+#[cfg(target_os = "ios")]
+pub async fn get_hark_api_cookies(app: &AppHandle, uuid: &str) -> Result<Vec<IosSessionCookie>, String> {
+  let bridge = app.state::<IosSessionBridge<tauri::Wry>>();
+  let res: SessionCookiesResponse = bridge
+    .0
+    .run_mobile_plugin_async("getSessionCookies", serde_json::json!({ "uuid": uuid, "provider": "hark" }))
+    .await
+    .map_err(|_| "读取 Hark 登录态失败".to_string())?;
+  Ok(res.cookies)
+}
+
 /// 0.1.16: pushes the aggregate unread state (any account with an
 /// unread reply) to the native session view, which shows/hides the
 /// dot on the "← 账号" button.
@@ -580,6 +644,95 @@ pub async fn fetch_text(
     .map_err(|e| e.to_string())
 }
 
+/// #11/#16（补 W）：把每账号代理写入 iOS 侧 WKWebView 配置。
+///
+/// iOS 17+ 只有 `WKWebsiteDataStore.proxyConfigurations` 能影响 WKWebView 的
+/// 出站，Rust 侧的 reqwest / 网关隧道都管不到它，所以必须单独下发一次。
+/// 口令不走这个接口：Swift 侧按 `proxy-<uuid>` 从同一个 Keychain service
+/// 读取（见主 crate `secrets.rs` 的 `SERVICE`）。
+#[cfg(target_os = "ios")]
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SetAccountProxyPayload {
+  pub uuid: String,
+  /// http | https | socks5 | socks5h
+  pub scheme: String,
+  pub host: String,
+  pub port: u16,
+  #[serde(skip_serializing_if = "Option::is_none")]
+  pub username: Option<String>,
+  pub enabled: bool,
+}
+
+#[cfg(target_os = "ios")]
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SetAccountProxyResponse {
+  /// 配置是否已实际应用（iOS < 17 或参数非法时为 false）。
+  #[serde(default)]
+  pub applied: bool,
+  /// 该账号的会话当前正打开：新配置要重新打开会话才生效。
+  #[serde(default)]
+  pub session_open: bool,
+  /// WebView 出口是否处于隔离态（下发失败时保持隔离）。
+  #[serde(default)]
+  pub quarantined: bool,
+  #[serde(default)]
+  pub reason: Option<String>,
+}
+
+/// #11/#16（补 W）：隔离某账号 WebView 出口的参数。
+/// Rust 在保存新代理**之前**调用，用来关掉「保存与下发之间」的时间窗口。
+#[cfg(target_os = "ios")]
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct QuarantineProxyPayload {
+  pub uuid: String,
+  #[serde(skip_serializing_if = "Option::is_none")]
+  pub reason: Option<String>,
+}
+
+#[cfg(target_os = "ios")]
+#[derive(Debug, Clone, Deserialize, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct QuarantineProxyResponse {
+  /// 是否已把该 data store 的出口换成不可达端点。
+  #[serde(default)]
+  pub engaged: bool,
+  /// 该账号的会话当前正打开（已被阻断）。
+  #[serde(default)]
+  pub session_open: bool,
+  #[serde(default)]
+  pub reason: Option<String>,
+}
+
+#[cfg(target_os = "ios")]
+pub async fn set_account_proxy(
+  app: &AppHandle,
+  payload: SetAccountProxyPayload,
+) -> Result<SetAccountProxyResponse, String> {
+  let bridge = app.state::<IosSessionBridge<tauri::Wry>>();
+  bridge
+    .0
+    .run_mobile_plugin_async("setAccountProxy", payload)
+    .await
+    .map_err(|e| e.to_string())
+}
+
+/// #11/#16（补 W）：在改配置前隔离该账号的 WebView 出口。
+#[cfg(target_os = "ios")]
+pub async fn quarantine_account_proxy(
+  app: &AppHandle,
+  payload: QuarantineProxyPayload,
+) -> Result<QuarantineProxyResponse, String> {
+  let bridge = app.state::<IosSessionBridge<tauri::Wry>>();
+  bridge
+    .0
+    .run_mobile_plugin_async("quarantineAccountProxy", payload)
+    .await
+    .map_err(|e| e.to_string())
+}
+
 // Batch-1: background quota sync (iOS). Rust passes the accounts to sync
 // (already filtered: enabled, not the active one); Swift probes each
 // account's parked page or a hidden one-shot webview and returns the
@@ -591,6 +744,7 @@ pub struct SyncQuotaTarget {
   pub provider_id: String,
   pub uuid: String,
   pub entry_url: String,
+  pub timezone: Option<String>,
 }
 
 #[cfg(target_os = "ios")]
@@ -599,6 +753,8 @@ pub struct SyncQuotaTarget {
 pub struct SyncQuotaResult {
   pub provider_id: String,
   pub uuid: String,
+  pub observation: String,
+  pub authenticated: bool,
   #[serde(default)]
   pub identity: String,
   #[serde(default)]
@@ -625,15 +781,159 @@ pub struct SyncQuotasResponse {
 pub async fn sync_account_quotas(
   app: &AppHandle,
   accounts: Vec<SyncQuotaTarget>,
+  fresh: bool,
 ) -> Result<Vec<SyncQuotaResult>, String> {
   let bridge = app.state::<IosSessionBridge<tauri::Wry>>();
   let res: SyncQuotasResponse = bridge
     .0
     .run_mobile_plugin_async(
       "syncAccountQuotas",
-      serde_json::json!({ "accounts": accounts }),
+      serde_json::json!({ "accounts": accounts, "fresh": fresh }),
     )
     .await
     .map_err(|e| e.to_string())?;
   Ok(res.results)
+}
+
+#[cfg(target_os = "ios")]
+pub async fn transfer_profile_cookies(
+  app: &AppHandle,
+  provider: &str,
+  uuid: &str,
+  cookies: Option<&[impl serde::Serialize]>,
+  inspect: bool,
+) -> Result<ProfileCookieSummary, String> {
+  let bridge = app.state::<IosSessionBridge<tauri::Wry>>();
+  bridge.0.run_mobile_plugin_async(
+    "transferProfileCookies",
+    serde_json::json!({ "provider": provider, "uuid": uuid, "cookies": cookies, "inspect": inspect }),
+  ).await.map_err(|e| e.to_string())
+}
+
+#[cfg(target_os = "ios")]
+#[derive(Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ProfileCookieSummary {
+  pub count: usize,
+  pub next_expiry: Option<f64>,
+  pub cookie_export_json: Option<String>,
+}
+
+#[cfg(target_os = "ios")]
+pub async fn copy_local_text(app: &AppHandle, text: &str) -> Result<(), String> {
+  let bridge = app.state::<IosSessionBridge<tauri::Wry>>();
+  bridge.0.run_mobile_plugin_async::<serde_json::Value>(
+    "copyLocalText", serde_json::json!({ "text": text }),
+  ).await.map_err(|_| "无法写入本机剪贴板".to_string())?;
+  Ok(())
+}
+
+#[cfg(target_os = "ios")]
+pub async fn copy_profile_cookies(
+  app: &AppHandle, provider: &str, uuid: &str, text: &str, count: usize, seconds: u16,
+) -> Result<(), String> {
+  let bridge = app.state::<IosSessionBridge<tauri::Wry>>();
+  bridge.0.run_mobile_plugin_async::<ProfileCookieSummary>(
+    "transferProfileCookies",
+    serde_json::json!({ "provider": provider, "uuid": uuid, "clipboardText": text, "clipboardCount": count, "clipboardSeconds": seconds }),
+  ).await.map(|_| ()).map_err(|error| error.to_string())
+}
+
+#[cfg(target_os = "ios")]
+pub async fn ios_network_preferences(app: &AppHandle, isolate: Option<bool>, quota_minutes: Option<u16>) -> Result<serde_json::Value, String> {
+  let bridge = app.state::<IosSessionBridge<tauri::Wry>>();
+  bridge.0.run_mobile_plugin_async("iosNetworkPreferences", serde_json::json!({ "isolate":isolate, "quotaMinutes":quota_minutes }))
+    .await.map_err(|error| error.to_string())
+}
+
+#[cfg(target_os = "ios")]
+pub async fn lan_backup_ui(app: &AppHandle, action: &str, code: Option<&str>) -> Result<serde_json::Value, String> {
+  let bridge = app.state::<IosSessionBridge<tauri::Wry>>();
+  bridge.0.run_mobile_plugin_async("lanBackupUi", serde_json::json!({ "action":action, "code":code }))
+    .await.map_err(|error| error.to_string())
+}
+
+#[cfg(target_os = "ios")]
+pub async fn share_account_backup(app: &AppHandle, contents: &str) -> Result<bool, String> {
+  #[derive(Deserialize)]
+  struct ShareResult { shared: bool }
+  let bridge = app.state::<IosSessionBridge<tauri::Wry>>();
+  let response: ShareResult = bridge.0.run_mobile_plugin_async(
+    "shareAccountBackup", serde_json::json!({ "contents": contents }),
+  ).await.map_err(|e| e.to_string())?;
+  Ok(response.shared)
+}
+
+#[cfg(target_os = "ios")]
+pub async fn read_parked_task_state(app: &AppHandle, uuid: &str) -> Result<Option<String>, String> {
+  #[derive(Deserialize)]
+  struct TaskState { activity: Option<String> }
+  let bridge = app.state::<IosSessionBridge<tauri::Wry>>();
+  let response: TaskState = bridge.0.run_mobile_plugin_async(
+    "readParkedTaskState", serde_json::json!({ "uuid": uuid, "provider": "muse" }),
+  ).await.map_err(|e| e.to_string())?;
+  Ok(response.activity)
+}
+
+#[cfg(target_os = "ios")]
+pub async fn task_notification_permission(app: &AppHandle) -> Result<bool, String> {
+  #[derive(Deserialize)]
+  struct Permission { granted: bool }
+  let bridge = app.state::<IosSessionBridge<tauri::Wry>>();
+  let result: Permission = bridge.0.run_mobile_plugin_async(
+    "requestTaskNotificationPermission", serde_json::json!({}),
+  ).await.map_err(|e| e.to_string())?;
+  Ok(result.granted)
+}
+
+#[cfg(target_os = "ios")]
+pub async fn post_task_notification(app: &AppHandle, identifier: &str, kind: &str, approval: Option<serde_json::Value>) {
+  let bridge = app.state::<IosSessionBridge<tauri::Wry>>();
+  let _ = bridge.0.run_mobile_plugin_async::<serde_json::Value>(
+    "postTaskNotification", serde_json::json!({ "identifier": identifier, "kind": kind, "approval": approval }),
+  ).await;
+}
+
+#[cfg(target_os = "ios")]
+pub async fn read_approval_notification_actions(app: &AppHandle) -> Result<Vec<serde_json::Value>, String> {
+  #[derive(Deserialize)]
+  struct Pending { actions: Vec<serde_json::Value> }
+  let bridge = app.state::<IosSessionBridge<tauri::Wry>>();
+  let result: Pending = bridge.0.run_mobile_plugin_async("readApprovalNotificationActions", serde_json::json!({}))
+    .await.map_err(|e| e.to_string())?;
+  Ok(result.actions)
+}
+
+#[cfg(target_os = "ios")]
+pub async fn finish_approval_notification_action(app: &AppHandle, action_id: &str) -> Result<(), String> {
+  let bridge = app.state::<IosSessionBridge<tauri::Wry>>();
+  bridge.0.run_mobile_plugin_async::<serde_json::Value>("finishApprovalNotificationAction", serde_json::json!({ "actionId": action_id }))
+    .await.map_err(|_| "通知审批结果已处理，本机通知队列尚未更新".to_string())?;
+  Ok(())
+}
+
+#[cfg(target_os = "ios")]
+pub async fn enforce_local_data_protection(app: &AppHandle, directory: &str) -> Result<serde_json::Value, String> {
+  let bridge = app.state::<IosSessionBridge<tauri::Wry>>();
+  bridge.0.run_mobile_plugin_async("enforceLocalDataProtection", serde_json::json!({ "directory":directory }))
+    .await.map_err(|_| "本机资料保护尚未核验".into())
+}
+
+#[cfg(target_os = "ios")]
+pub async fn automatic_task_polling_available(app: &AppHandle) -> Result<bool, String> {
+  #[derive(Deserialize)]
+  struct Availability { available: bool }
+  let bridge = app.state::<IosSessionBridge<tauri::Wry>>();
+  let result: Availability = bridge.0.run_mobile_plugin_async(
+    "isAutomaticTaskPollingAvailable", serde_json::json!({}),
+  ).await.map_err(|e| e.to_string())?;
+  Ok(result.available)
+}
+
+#[cfg(target_os = "ios")]
+pub async fn update_manager_glass(
+  app: &AppHandle, layout: serde_json::Value, events: Option<Channel<serde_json::Value>>,
+) -> Result<serde_json::Value, String> {
+  let bridge = app.state::<IosSessionBridge<tauri::Wry>>();
+  bridge.0.run_mobile_plugin_async("updateManagerGlass", serde_json::json!({ "layout": layout, "events": events })).await.map_err(|error| error.to_string())
 }
