@@ -390,7 +390,7 @@ async fn refresh_account_unread(
     let provider = providers::ProviderId::parse(&provider_id).ok_or("服务标识无效")?;
     let uuid = storage::normalize_uuid(&uuid).ok_or("账号标识无效")?;
     let proxy_lock = mgr.proxy_write_lock.lock().await;
-    let (mut token, guard) = cancel.register(&uuid, "account_unread_count");
+    let (mut token, _guard) = cancel.register(&uuid, "account_unread_count");
     let snapshot = mgr.get_snapshot().await;
     drop(proxy_lock);
     let account = snapshot.accounts.iter().find(|account| account.provider_id == provider && account.uuid == uuid
@@ -406,7 +406,6 @@ async fn refresh_account_unread(
     let app = app.clone();
     let mgr = Arc::clone(&mgr);
     tokio::spawn(async move {
-      let _guard = guard;
       let request = Box::pin(async {
         match provider {
           providers::ProviderId::Muse => Box::pin(muse_sessions::fetch_unread_total(&app, &uuid, route.as_ref())).await,
