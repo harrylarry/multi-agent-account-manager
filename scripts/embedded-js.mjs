@@ -128,7 +128,7 @@ export function parseExtraScripts(paths) {
 export function loadEmbeddedScripts() {
   const ios = parseSwiftScripts(readFileSync(SWIFT_SCRIPTS_PATH, "utf8"));
   const android = parseKotlinScripts(readFileSync(KOTLIN_ACTIVITY_PATH, "utf8"));
-  const extras = parseExtraScripts([SWIFT_TASK_WATCHER_PATH]);
+  const extras = parseExtraScripts([SWIFT_TASK_WATCHER_PATH, join(dirname(SWIFT_SCRIPTS_PATH), "MuseAvatarVideo.swift")]);
   return { ios, android, extras };
 }
 

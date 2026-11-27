@@ -533,6 +533,14 @@ final class AccountWebViewController: UIViewController, WKNavigationDelegate, WK
           forMainFrameOnly: true
         )
       )
+      if spec.providerId == "muse" {
+        config.userContentController.addUserScript(WKUserScript(
+          source: MuseAvatarVideo.paintScript,
+          injectionTime: .atDocumentStart,
+          forMainFrameOnly: true,
+          in: .defaultClient
+        ))
+      }
       webView = WKWebView(frame: .zero, configuration: config)
     }
 

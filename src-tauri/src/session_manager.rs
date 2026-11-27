@@ -1727,7 +1727,9 @@ impl SessionManager {
         } else if !enabled {
           None
         } else {
-          locked.selected_provider_id = key.provider_id;
+          if !cfg!(target_os = "ios") || self.current_seq.load(Ordering::SeqCst) == 1 {
+            locked.selected_provider_id = key.provider_id;
+          }
           Some(key)
         }
       } else {
@@ -1735,7 +1737,8 @@ impl SessionManager {
       }
     };
 
-    if let Some(key) = candidate {
+    // On iPhone the saved key selects the service, while opening a page requires a tap.
+    if let Some(key) = candidate.filter(|_| !cfg!(target_os = "ios")) {
       let _ = self.switch_account_internal(app, key, true, None).await;
     } else {
       let snap = self.get_snapshot().await;
@@ -4351,13 +4354,15 @@ impl SessionManager {
       IosSessionEvent::RecreateRequested { previous_switch_seq } => {
         let fallback = {
           let mut locked = self.inner.lock().await;
-          if self.current_seq.load(Ordering::SeqCst) == previous_switch_seq {
-            locked.active_slot = None;
-          }
-          locked.store.last_committed.clone()
+          if self.current_seq.load(Ordering::SeqCst) != previous_switch_seq { return; }
+          let key = locked.active_slot.as_ref()
+            .filter(|slot| slot.switch_seq == previous_switch_seq && slot.committed)
+            .map(|slot| slot.account_key.clone());
+          if key.is_some() { locked.active_slot = None; }
+          key
         };
-        if let Some(committed_key) = fallback {
-          let _ = self.switch_account_internal(app, committed_key, true, None).await;
+        if let Some(key) = fallback {
+          let _ = self.switch_account_internal(app, key, true, None).await;
         } else {
           let snap = self.get_snapshot().await;
           self.emit_snapshot(app, &snap);

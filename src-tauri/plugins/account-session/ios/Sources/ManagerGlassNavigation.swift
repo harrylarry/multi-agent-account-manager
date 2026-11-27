@@ -32,6 +32,8 @@ final class ManagerGlassNavigation: UIView, UITextFieldDelegate {
   private let query = UITextField()
   private let accountTab = UIButton(type: .system)
   private let sessionTab = UIButton(type: .system)
+  private let tabIndicator = UIVisualEffectView(effect: UIGlassEffect(style: .regular))
+  private var indicatorTab: UIButton?
   private let compose = UIButton(type: .system)
   private var primary: UIStackView!
   private var search: UIStackView!
@@ -92,6 +94,10 @@ final class ManagerGlassNavigation: UIView, UITextFieldDelegate {
 
     let dock = makeGlass()
     dock.cornerConfiguration = .corners(radius: 26)
+    tabIndicator.cornerConfiguration = .corners(radius: 21)
+    tabIndicator.isUserInteractionEnabled = false
+    tabIndicator.isAccessibilityElement = false
+    dock.contentView.addSubview(tabIndicator)
     configureTab(accountTab, title: "账号", action: "accounts")
     configureTab(sessionTab, title: "会话", action: "sessions")
     let tabs = row([accountTab, sessionTab])
@@ -196,18 +202,28 @@ final class ManagerGlassNavigation: UIView, UITextFieldDelegate {
     plain.baseForegroundColor = .label
     plain.automaticallyUpdateForSelection = false
 
-    var glass = UIButton.Configuration.glass()
-    glass.title = title
-    // The 42pt tab is inset by 5pt in the 52pt dock: 21pt and 26pt are concentric.
-    glass.cornerStyle = .capsule
-    glass.baseForegroundColor = .systemBlue
-    glass.automaticallyUpdateForSelection = false
-
     button.configuration = plain
     button.accessibilityIdentifier = "manager-" + action
     button.addAction(UIAction { [weak self] _ in self?.send(action) }, for: .touchUpInside)
     button.configurationUpdateHandler = { tab in
-      tab.configuration = tab.isSelected ? glass : plain
+      var configuration = plain
+      configuration.baseForegroundColor = tab.isSelected ? .systemBlue : .label
+      tab.configuration = configuration
+    }
+  }
+
+  private func layoutTabIndicator(animated: Bool) {
+    guard let tab = indicatorTab, let container = tabIndicator.superview else { return }
+    let target = tab.convert(tab.bounds, to: container)
+    guard !target.isEmpty, target != tabIndicator.frame else { return }
+    if animated && !tabIndicator.frame.isEmpty && !UIAccessibility.isReduceMotionEnabled {
+      UIView.animate(withDuration: 0.34, delay: 0, usingSpringWithDamping: 0.62, initialSpringVelocity: 0,
+                     options: [.beginFromCurrentState, .allowUserInteraction]) {
+        self.tabIndicator.frame = target
+      }
+    } else {
+      tabIndicator.layer.removeAllAnimations()
+      tabIndicator.frame = target
     }
   }
 
@@ -255,6 +271,10 @@ final class ManagerGlassNavigation: UIView, UITextFieldDelegate {
       query.resignFirstResponder()
     }
     layoutIfNeeded()
+    if main {
+      indicatorTab = page == .accounts ? accountTab : sessionTab
+      layoutTabIndicator(animated: wasMain && modeChanged)
+    }
     if slide {
       let direction: CGFloat = (page == .manage || previous == .manage) ? -1 : 1
       let entering = [Page.manage, .overview, .search].contains(page)
@@ -311,6 +331,7 @@ final class ManagerGlassNavigation: UIView, UITextFieldDelegate {
 
   override func layoutSubviews() {
     super.layoutSubviews()
+    layoutTabIndicator(animated: false)
     publishInsets()
   }
 

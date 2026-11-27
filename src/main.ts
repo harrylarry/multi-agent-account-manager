@@ -155,6 +155,7 @@ let iphoneSearchScope: "all" | "sessions" | "accounts" = "all";
 let iphoneMenuOpen = false;
 let iphonePanelRequest = 0;
 const enteredIphoneSessionServices = new Set<ProviderId>();
+const initializingIphoneSessionServices = new Set<ProviderId>();
 let iphoneSearchOrigin: ProviderId | null = null;
 let iphoneDetail: AccountKey | null = null;
 let iphoneDiagnosticAccount: AccountKey | null = null;
@@ -1089,19 +1090,32 @@ async function refreshIphoneSessionBatch(mode: "initial" | "refresh" | "retry"):
   const providerId = snapshot.selectedProviderId;
   const accounts = snapshot.accounts.filter((account) => account.authState === "authenticated"
     && (iphonePage === "search" || account.providerId === providerId));
-  if (mode === "initial") {
-    if (iphonePage !== "sessions" || enteredIphoneSessionServices.has(providerId) || !accounts.length) return;
-    enteredIphoneSessionServices.add(providerId);
-    if (accounts.some((account) => iphoneSessionsFor(account).cached)) return;
-  }
-  const targets = mode === "retry" ? accounts.filter((account) => iphoneSessionsFor(account).failed) : accounts;
+  const initial = mode === "initial";
+  if (initial && (iphonePage !== "sessions" || enteredIphoneSessionServices.has(providerId)
+    || initializingIphoneSessionServices.has(providerId))) return;
+  const targets = mode === "refresh" ? accounts : accounts.filter((account) => {
+    const cached = iphoneSessionsFor(account);
+    return initial ? !cached.cached : cached.failed;
+  });
+  if (!targets.length) return;
+  if (initial) initializingIphoneSessionServices.add(providerId);
+
   const request = ++iphonePanelRequest;
   const refreshView = () => { if (snapshot) syncIphoneViews(snapshot, currentProvider(snapshot)); };
-  for (const account of targets) {
-    if (request !== iphonePanelRequest) break;
-    const work = updateIphoneSessions(account, refreshView);
-    refreshView();
-    await work;
+  let loaded = false;
+  try {
+    for (const account of targets) {
+      if (request !== iphonePanelRequest) break;
+      const work = updateIphoneSessions(account, refreshView);
+      refreshView();
+      await work;
+      if (initial && iphoneSessionsFor(account).cached) loaded = true;
+    }
+  } finally {
+    if (initial) {
+      initializingIphoneSessionServices.delete(providerId);
+      if (loaded) enteredIphoneSessionServices.add(providerId);
+    }
   }
 }
 
@@ -3936,7 +3950,8 @@ async function submitNewAccount(view: Extract<ModalMode, { kind: "add" }>): Prom
 async function submitIphoneConversation(view: Extract<ModalMode, { kind: "compose" }>, verify = false): Promise<void> {
   if (modal !== view || view.pending || !snapshot) return;
   const { uuid, providerId } = view;
-  const draft = iphoneConversationDraft.get(uuid);
+  const draftKey = iphoneAccountKey({ uuid, providerId });
+  const draft = iphoneConversationDraft.get(draftKey);
   if (!draft?.text.trim() || (draft.status === "UNKNOWN") !== verify || !snapshot.accounts.some((item) =>
     item.uuid === uuid && item.providerId === providerId && item.authState === "authenticated")) return;
   view.pending = true;
@@ -3955,7 +3970,7 @@ async function submitIphoneConversation(view: Extract<ModalMode, { kind: "compos
       snapshot = await invoke<ManagerSnapshot>(command, { uuid, threadId: draft.threadId });
       const destination = snapshot.switchingAccount ?? snapshot.activeAccount;
       if (destination?.uuid === uuid && destination.providerId === providerId) {
-        iphoneConversationDraft.delete(uuid);
+        iphoneConversationDraft.delete(draftKey);
         await setModal({ kind: "none" });
       }
     }
@@ -3967,9 +3982,8 @@ async function submitIphoneConversation(view: Extract<ModalMode, { kind: "compos
   }
 }
 
-function renderIphoneConversation(view: Extract<ModalMode, { kind: "compose" }>): string {
-  const accounts = snapshot?.accounts.filter((account) => account.providerId === view.providerId) ?? [];
-  const draft = iphoneConversationDraft.get(view.uuid);
+function iphoneConversationState(view: Extract<ModalMode, { kind: "compose" }>) {
+  const draft = iphoneConversationDraft.get(iphoneAccountKey(view));
   const unknown = draft?.status === "UNKNOWN";
   const confirmed = Boolean(draft?.threadId);
   const waiting = view.pending;
@@ -3979,6 +3993,21 @@ function renderIphoneConversation(view: Extract<ModalMode, { kind: "compose" }>)
       ? "消息未发出。检查该账号的登录与代理后可重试。"
       : draft?.status === "BUSY" ? "账号已有操作正在发送。等该操作结束后重试。" : "";
   const sendLabel = confirmed ? "打开会话" : "发送并打开";
+  return { draft, unknown, confirmed, waiting, status, sendLabel };
+}
+
+function renderIphoneConversationAccounts(accounts: AccountRecord[], uuid: string): string {
+  return accounts.map((account) => `<label class="iphone-compose-account">
+    <input class="iphone-sr-only" type="radio" name="iphone-compose-account" value="${escapeHtml(account.uuid)}" ${account.uuid === uuid ? "checked" : ""} ${account.authState !== "authenticated" ? "disabled" : ""}>
+    <span class="iphone-symbol">${iphoneIcon("account")}</span>
+    <span class="iphone-row-copy"><strong>${escapeHtml(account.alias)}</strong><small>${account.authState === "authenticated" ? "已登录" : "需要登录"}</small></span>
+    <span class="iphone-choice-mark" aria-hidden="true">✓</span>
+  </label>`).join("") || '<div class="iphone-empty-state">还没有可用账号。</div>';
+}
+
+function renderIphoneConversation(view: Extract<ModalMode, { kind: "compose" }>): string {
+  const accounts = snapshot?.accounts.filter((account) => account.providerId === view.providerId) ?? [];
+  const { draft, unknown, confirmed, waiting, status, sendLabel } = iphoneConversationState(view);
   return `<div class="inline-modal iphone-screen-modal iphone-compose-screen" role="dialog" aria-modal="true" aria-labelledby="iphone-compose-title">
     <div class="modal-card">
       <button id="modal-cancel-btn" class="iphone-back" type="button" aria-label="返回" ${waiting ? "disabled" : ""}>‹</button>
@@ -3986,20 +4015,13 @@ function renderIphoneConversation(view: Extract<ModalMode, { kind: "compose" }>)
         <h1 id="iphone-compose-title" class="iphone-task-title">新建对话</h1>
         <p class="iphone-compose-prompt">今天想聊些什么？</p>
         <fieldset class="iphone-choice-group" ${waiting ? "disabled" : ""}><legend>选择发送账号</legend>
-          <div class="iphone-group">
-          ${accounts.map((account) => `<label class="iphone-compose-account">
-            <input class="iphone-sr-only" type="radio" name="iphone-compose-account" value="${escapeHtml(account.uuid)}" ${account.uuid === view.uuid ? "checked" : ""} ${account.authState !== "authenticated" ? "disabled" : ""}>
-            <span class="iphone-symbol">${iphoneIcon("account")}</span>
-            <span class="iphone-row-copy"><strong>${escapeHtml(account.alias)}</strong><small>${account.authState === "authenticated" ? "已登录" : "需要登录"}</small></span>
-            <span class="iphone-choice-mark" aria-hidden="true">✓</span>
-          </label>`).join("") || '<div class="iphone-empty-state">还没有可用账号。</div>'}
-          </div>
+          <div class="iphone-group" id="iphone-compose-accounts">${renderIphoneConversationAccounts(accounts, view.uuid)}</div>
         </fieldset>
       </div>
       <div class="iphone-composer">
         <p role="status" class="iphone-caption">${escapeHtml(status)}</p>
-        ${unknown ? `<div class="modal-footer"><button type="button" class="btn" id="iphone-compose-check" ${waiting ? "disabled" : ""}>打开账号核对</button>
-          <button type="button" class="btn primary" id="iphone-compose-verify" ${waiting ? "disabled" : ""}>检查发送结果</button></div>` : ""}
+        <div class="modal-footer" id="iphone-compose-reconcile" ${unknown ? "" : "hidden"}><button type="button" class="btn" id="iphone-compose-check" ${waiting ? "disabled" : ""}>打开账号核对</button>
+          <button type="button" class="btn primary" id="iphone-compose-verify" ${waiting ? "disabled" : ""}>检查发送结果</button></div>
         <div class="iphone-composer-input">
           <label for="iphone-first-message" class="iphone-sr-only">首条消息</label>
           <textarea class="modal-input" id="iphone-first-message" maxlength="16000" rows="2" placeholder="${view.uuid ? "输入首条消息" : "先选择发送账号"}" ${waiting || unknown || confirmed || !view.uuid ? "readonly" : ""}>${escapeHtml(draft?.text ?? "")}</textarea>
@@ -4009,6 +4031,51 @@ function renderIphoneConversation(view: Extract<ModalMode, { kind: "compose" }>)
     </div>
   </div>`;
 
+}
+
+function syncIphoneConversation(mount: HTMLElement, view: Extract<ModalMode, { kind: "compose" }>): void {
+  const accounts = snapshot?.accounts.filter((account) => account.providerId === view.providerId) ?? [];
+  const { draft, unknown, confirmed, waiting, status, sendLabel } = iphoneConversationState(view);
+  const group = mount.querySelector<HTMLElement>("#iphone-compose-accounts");
+  if (group) {
+    let radios = [...group.querySelectorAll<HTMLInputElement>("input")];
+    if (radios.length !== accounts.length || radios.some((radio, index) => radio.value !== accounts[index].uuid)) {
+      group.innerHTML = renderIphoneConversationAccounts(accounts, view.uuid);
+      radios = [...group.querySelectorAll<HTMLInputElement>("input")];
+    }
+    radios.forEach((radio, index) => {
+      const account = accounts[index];
+      radio.checked = account.uuid === view.uuid;
+      radio.disabled = account.authState !== "authenticated";
+      const label = radio.closest("label");
+      const alias = label?.querySelector("strong");
+      const auth = label?.querySelector("small");
+      if (alias && alias.textContent !== account.alias) alias.textContent = account.alias;
+      const authText = radio.disabled ? "需要登录" : "已登录";
+      if (auth && auth.textContent !== authText) auth.textContent = authText;
+    });
+  }
+
+  const input = mount.querySelector<HTMLTextAreaElement>("#iphone-first-message");
+  if (input) {
+    const value = draft?.text ?? "";
+    if (input.value !== value) input.value = value;
+    input.readOnly = waiting || unknown || confirmed || !view.uuid;
+    input.placeholder = view.uuid ? "输入首条消息" : "先选择发送账号";
+  }
+  const send = mount.querySelector<HTMLButtonElement>("#iphone-compose-send");
+  if (send) {
+    send.disabled = waiting || unknown || !draft?.text.trim();
+    send.setAttribute("aria-label", sendLabel);
+    const label = confirmed ? "打开" : "↑";
+    if (send.textContent !== label) send.textContent = label;
+  }
+  const message = mount.querySelector(".iphone-composer [role='status']");
+  if (message && message.textContent !== status) message.textContent = status;
+  mount.querySelector("#iphone-compose-reconcile")?.toggleAttribute("hidden", !unknown);
+  for (const control of mount.querySelectorAll<HTMLButtonElement | HTMLFieldSetElement>(
+    ".iphone-choice-group, #modal-cancel-btn, #iphone-compose-check, #iphone-compose-verify"
+  )) control.disabled = waiting;
 }
 
 function renderModal(provider: ProviderInfo): string {
@@ -4567,6 +4634,7 @@ function modalIdentityKey(_provider: ProviderInfo): string | null {
       // 内容在打开时确定，不会在显示期间变化；标题 + 长度足以区分。
       return `confirm:${modal.title}:${modal.desc.length}:${modal.confirmLabel}`;
     case "compose":
+      return `compose:${modal.providerId}`;
     case "approvals":
     case "harkReplies":
     case "harkDiagnostic":
@@ -4586,11 +4654,16 @@ function modalIdentityKey(_provider: ProviderInfo): string | null {
 function renderModalRoot(provider: ProviderInfo): void {
   const mount = document.querySelector<HTMLElement>("#modal-root");
   if (!mount) return;
-  const html = renderModal(provider);
-  const key = modalIdentityKey(provider) ?? html;
+  const identity = modalIdentityKey(provider);
   document.querySelectorAll<HTMLElement>(".iphone-column > :not(#modal-root)").forEach((element) => {
     element.inert = modal.kind !== "none";
   });
+  if (modal.kind === "compose" && mount === lastModalMount && identity === lastModalKey) {
+    syncIphoneConversation(mount, modal);
+    return;
+  }
+  const html = renderModal(provider);
+  const key = identity ?? html;
   if (mount === lastModalMount && key === lastModalKey) return;
   if (modal.kind === "cookies" && mount === lastModalMount && mount.querySelector("#cookie-title")) {
     const template = document.createElement("template");
@@ -5895,7 +5968,8 @@ function bindDelegatedEvents(): void {
     view.kind !== "compose" || view.pending || !snapshot?.accounts.some((account) =>
       account.providerId === view.providerId && account.uuid === input.value && account.authState === "authenticated")) return;
   view.uuid = input.value;
-  void setModal(view);
+  const mount = document.getElementById("modal-root");
+  if (mount) syncIphoneConversation(mount, view);
 });
 
 root.addEventListener("change", async (ev) => {
@@ -6037,10 +6111,11 @@ root.addEventListener("change", async (ev) => {
       return;
     }
     if (input.id === "iphone-first-message" && modal.kind === "compose" && modal.uuid && !modal.pending) {
-      const draft = iphoneConversationDraft.get(modal.uuid) ?? { text: "", status: "" };
+      const draftKey = iphoneAccountKey(modal);
+      const draft = iphoneConversationDraft.get(draftKey) ?? { text: "", status: "" };
       if (draft.status === "UNKNOWN" || draft.threadId) return;
       draft.text = input.value;
-      iphoneConversationDraft.set(modal.uuid, draft);
+      iphoneConversationDraft.set(draftKey, draft);
       const send = document.querySelector<HTMLButtonElement>("#iphone-compose-send");
       if (send) send.disabled = !draft.text.trim();
       return;
