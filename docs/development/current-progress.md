@@ -2,6 +2,8 @@
 
 ## iPhone 重构验收修正
 
+修正包 Spike 0.1.26 基于 `027e24b8ae29c7d0af4148fbcf988a978c1bac65`。解压后的 IPA SHA-256 为 `23f16cb0f1b4b47492cb3282daa073ecb0d29d5ad4b85d56b718baee0c932baa`。已下载并核对包标识、版本和最低 iOS 26.0。CI 与 Xcode 均通过，真机待验。[下载 IPA](https://github.com/harrylarry/multi-agent-account-manager/actions/runs/45918293892/artifacts/15163541954) · [Quick checks](https://github.com/harrylarry/multi-agent-account-manager/actions/runs/45918270002) · [iOS 构建](https://github.com/harrylarry/multi-agent-account-manager/actions/runs/45918293892)
+
 真机回报 22d0fc0 的新功能调用失败。对照 Tauri 运行时和仓库三处声明，确认 11 个命令只注册了处理函数，缺少本地管理页 IPC 授权。旧包版本和 SHA-256 校验通过，但相关真机功能为 FAIL。新检查逐项核对 Rust 处理器、构建命令、管理页 capability 及生成的 TOML，同时验证管理页授予范围。
 
 前台与后台网页额度同步保留原生额度记录，包括窗口、重置时间和陈旧标记。网页仍能更新登录和身份资料，并可填充尚无原生记录的账号。设置为跟随系统的请求在当前代码中发送空字符串，后端会清除时区；需要用真机复核设置保存和重新打开账号后的效果。回前台红点延迟待真机分段计时。

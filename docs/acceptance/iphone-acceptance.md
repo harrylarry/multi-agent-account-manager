@@ -5,9 +5,13 @@
 
 ## iPhone 最终方案 · 重构真机验收
 
+修正包 Spike 0.1.26 基于 `027e24b8ae29c7d0af4148fbcf988a978c1bac65`。解压后的 IPA SHA-256 为 `23f16cb0f1b4b47492cb3282daa073ecb0d29d5ad4b85d56b718baee0c932baa`。已下载并核对包标识、版本和最低 iOS 26.0。CI 与 Xcode 均通过，真机待验。[下载 IPA](https://github.com/harrylarry/multi-agent-account-manager/actions/runs/45918293892/artifacts/15163541954) · [Quick checks](https://github.com/harrylarry/multi-agent-account-manager/actions/runs/45918270002) · [iOS 构建](https://github.com/harrylarry/multi-agent-account-manager/actions/runs/45918293892)
+
+修正包先验证管理页权限。打开 Muse 与 Hark 的会话列表和项目，展开产物，再各发一条唯一测试消息。删除一个空分组，在账号代理页检测待选代理，观察首页批量额度刷新。验证原生额度后再用网页刷新，窗口和重置时间应保留。时区选东京并保存后改回「跟随系统」，重开设置及网页核对。红点延迟请从账号详情的「任务与通知」回传一行「红点计时」，并注明回前台后约第几秒亮起。
+
 Spike 0.1.26 的源码提交为 `22d0fc0123ad33adf460f41946207f11961b8e5c`。包标识 `com.ldjx.accountmanager.spike`，最低系统 iOS 26.0。解压后的 IPA SHA-256 为 `866815c047482120a374a008c1d2fd84f5d5eb95b453b89b1025e6b9a06d6e73`。[下载](https://github.com/harrylarry/multi-agent-account-manager/actions/runs/45915130323/artifacts/15161784175) · [Quick checks](https://github.com/harrylarry/multi-agent-account-manager/actions/runs/45915114122) · [iOS 构建](https://github.com/harrylarry/multi-agent-account-manager/actions/runs/45915130323)
 
-22d0fc0 的产物记录保留用于追溯。该包遗漏 11 个 Tauri 权限，涉及新建对话、浏览与产物、删除分组、原生玻璃、代理检测和批量额度等入口，真机验收失败。请按后续修正包复测。
+22d0fc0 的产物记录保留用于追溯。该包遗漏 11 个 Tauri 权限，涉及新建对话、浏览与产物、删除分组、原生玻璃、代理检测和批量额度等入口，真机验收失败。请用本节修正包复测。
 
 使用 iOS 26 上的 Spike 候选覆盖安装。开始前在原版本保留一份加密文件备份。使用两个已登录的 Muse 测试账号及一个 Hark 测试账号。代理故障使用专用测试条目。
 
