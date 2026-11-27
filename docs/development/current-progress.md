@@ -2,6 +2,10 @@
 
 ## iPhone 真机回报修正
 
+Spike 0.1.26 基于 `74e3cf67392c716511eb28ffa1dc3fe8d7f04278`，最低 iOS 26.0。`CI_PASSED`。Swift 插件、Rust iOS 目标和 Xcode 打包通过。下载后核对归档、IPA、Bundle ID 和包内 120×120 主图标，像素与新图稿一致。IPA SHA-256 为 `fd20442dafaff2619fa7b2804402a05bb9051cb69463cc8e668b0be0623690e3`。[下载 IPA](https://github.com/harrylarry/multi-agent-account-manager/actions/runs/45969403734/artifacts/15184349912) · [Quick checks](https://github.com/harrylarry/multi-agent-account-manager/actions/runs/45969388240) · [iOS 构建](https://github.com/harrylarry/multi-agent-account-manager/actions/runs/45969403734)
+
+本地前端构建、14 项 JS/IPC 和 92 项 Rust 测试通过。320×568 深色及 390×844 浅色 WebKit 回归使用模拟 IPC 覆盖短拉回弹、达到阈值、未读超时时任务先返回、弹窗实际字号、代理编辑确认、密码显隐、复制与出口分类。早期 iOS 检查发现取消注册守卫生命周期错误，最终提交沿用现有命令级守卫作用域。真实手势、原生底栏、新主屏图标、Muse/Hark 未读返回以及经测试代理访问 IPQuery 仍需按[真机步骤](../acceptance/iphone-acceptance.md#iphone-真机回报修正复测)复测。
+
 账号首页拉动列表并显示阈值提示，任务与未读独立刷新，账号未读显示计数或失败原因。仅通过计数发现的变化不写回复时间。弹窗统一 20px，原生底栏只有选中项有色底，iOS 和桌面图标换成原创双人剪影。代理池区分当前绑定、认证、服务连通和出口归属，支持确认后本机短时复制链接。IPQuery 查询仅在手动确认后走所选代理，缺失字段显示未分类。两个计数端点和真实出口检测均待设备验证。
 
 ## iPhone 统一页面
