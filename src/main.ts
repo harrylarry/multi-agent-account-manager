@@ -148,6 +148,8 @@ let iphoneDetail: AccountKey | null = null;
 let iphoneDiagnosticAccount: AccountKey | null = null;
 let iphoneSearchOpen = false;
 let renderedModal: ModalMode | null = null;
+const iphoneSessionScroll: Record<ProviderId, number> = { muse: 0, hark: 0 };
+let iphoneSearchScroll = 0;
 const iphoneConversationDraft = new Map<string, { text: string; status: string; threadId?: string }>();
 const iphoneQuotaRefresh: Record<ProviderId, { running: boolean; message: string }> = {
   muse: { running: false, message: "" }, hark: { running: false, message: "" },
@@ -1166,9 +1168,13 @@ function syncIphoneViews(state: ManagerSnapshot, provider: ProviderInfo): void {
   const panel = shell.querySelector<HTMLElement>(".iphone-account-panel");
   if (panel && (pageMode === "sessions" || pageMode === "overview" || pageMode === "search")) {
     const html = renderIphonePanel(state, provider, pageMode);
-    if (panel.dataset.content !== html) {
+    const key = pageMode === "sessions" ? `sessions:${provider.id}` : pageMode;
+    if (panel.dataset.content !== html || panel.dataset.scrollKey !== key) {
       panel.dataset.content = html;
+      panel.dataset.scrollKey = key;
       panel.innerHTML = html;
+      panel.scrollTop = pageMode === "sessions" ? iphoneSessionScroll[provider.id] :
+        pageMode === "search" ? iphoneSearchScroll : 0;
     }
   }
   for (const button of shell.querySelectorAll<HTMLButtonElement>(".iphone-nav [data-iphone-page]")) {
@@ -2846,7 +2852,7 @@ function renderUpdateModal(): string {
 }
 
 function renderApprovalsModal(view: Extract<ModalMode, { kind: "approvals" }>): string {
-  const { account, loading, result, fetchedAt, decisionMessage } = view;
+  const { loading, result, fetchedAt, decisionMessage } = view;
   const formatTime = (ts: number) => ts > 0 && ts < 8.64e15 ? new Date(ts).toLocaleString() : "未提供";
   const reason = result?.phase === "schema" || result?.phase === "parse"
     ? "审批响应格式无法识别，请打开账号核对。"
@@ -2871,7 +2877,7 @@ function renderApprovalsModal(view: Extract<ModalMode, { kind: "approvals" }>): 
   return `
     <div class="inline-modal" role="dialog" aria-modal="true" aria-labelledby="approval-title">
       <div class="modal-card approval-modal">
-        <div class="modal-title" id="approval-title">待审批 · ${escapeHtml(account.alias)}</div>
+        <div class="modal-title" id="approval-title">审批</div>
         <div class="modal-desc">提交前会复查账号、会话与有效期。${fetchedAt ? ` 最近读取 ${formatTime(fetchedAt)}` : ""}</div>
         ${result?.ok && !loading && items.length ? content : `<div role="status">${content}</div>`}
         ${decisionMessage ? `<div role="status">${escapeHtml(decisionMessage)}</div>` : ""}
@@ -2933,7 +2939,6 @@ function renderTasks(view: Extract<ModalMode, { kind: "tasks" }>): string {
     <div class="inline-modal" role="dialog" aria-modal="true" aria-labelledby="account-task-title">
       <div class="modal-card">
         <div class="modal-title" id="account-task-title">${{tasks:"任务与通知", quota:"账号额度", models:"模型指纹"}[section]}</div>
-        <p class="modal-desc">${escapeHtml(account.alias)}</p>
         ${section === "tasks" ? `<div role="status">${checking ? "正在检查任务…" : escapeHtml(status[observation?.activity ?? "unknown"])}</div>
         ${observation?.observedAtMs ? `<div class="modal-desc">最近一次成功检测 ${new Date(observation.observedAtMs).toLocaleString()} · ${observation.source === "native" ? "原生" : "停驻页面"}</div>` : ""}
         ${observation?.tier ? `<div class="modal-desc">监听档位 · ${{live:"持续观察",watch:"短时监听",idle:"空闲抽查"}[observation.tier]}</div>` : ""}
@@ -4682,6 +4687,15 @@ function bindDelegatedEvents(): void {
   const root = document.querySelector<HTMLElement>("#app");
   if (!root) return;
 
+  root.addEventListener("scroll", (event) => {
+    const panel = event.target;
+    if (!(panel instanceof HTMLElement) || !panel.matches(".iphone-account-panel") || panel.hidden ||
+      !panel.getClientRects().length) return;
+    if (panel.dataset.scrollKey === "search") iphoneSearchScroll = panel.scrollTop;
+    else if (panel.dataset.scrollKey === "sessions:muse") iphoneSessionScroll.muse = panel.scrollTop;
+    else if (panel.dataset.scrollKey === "sessions:hark") iphoneSessionScroll.hark = panel.scrollTop;
+  }, { capture: true, passive: true });
+
   root.addEventListener("click", async (ev) => {
     if (!snapshot) return;
     if (!(ev.target instanceof Element)) return;
@@ -4727,7 +4741,7 @@ function bindDelegatedEvents(): void {
         if (next === "search" || next === "overview" || next === "manage") iphoneReturn = previous;
         iphonePage = next ?? iphoneReturn;
       }
-      if (next === "search") { iphoneSearchOrigin = provider.id; iphoneQuery = ""; }
+      if (next === "search") { iphoneSearchOrigin = provider.id; iphoneQuery = ""; iphoneSearchScroll = 0; }
       if (!next && previous === "search") {
         iphoneSearchOrigin = null;
         if (origin && origin !== snapshot.selectedProviderId) await callCommand("select_provider", { providerId: origin });
@@ -5587,6 +5601,7 @@ root.addEventListener("change", async (ev) => {
     const input = ev.target as HTMLInputElement;
     if (input.id === "iphone-global-search" && snapshot) {
       iphoneQuery = input.value;
+      iphoneSearchScroll = 0;
       syncIphoneViews(snapshot, currentProvider(snapshot));
       return;
     }
