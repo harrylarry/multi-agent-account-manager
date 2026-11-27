@@ -57,6 +57,10 @@ enum MuseAvatarVideo {
         }
         return;
       }
+      // The WKWebView setting also requires the actual video element
+      // to opt in. Scope this to autoplay avatars; message videos keep
+      // their original inline/fullscreen behavior.
+      if (!video.playsInline) video.playsInline = true;
       if (previous && !newSource) return;
       if (previous) show(video, previous);
       const pending = newSource || (video.readyState < 2 && video.currentTime === 0);
@@ -102,7 +106,7 @@ enum MuseAvatarVideo {
         }
       }
     }).observe(document, { subtree: true, childList: true, attributes: true,
-      attributeFilter: ['src', 'autoplay', 'data-hatch-avatar-host', 'data-hatch-media-owner'] });
+      attributeFilter: ['src', 'autoplay', 'playsinline', 'data-hatch-avatar-host', 'data-hatch-media-owner'] });
   })();
   """#
 }

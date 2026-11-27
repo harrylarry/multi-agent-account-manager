@@ -30,13 +30,7 @@ final class ManagerGlassNavigation: UIView, UITextFieldDelegate {
   private let overview = UIButton(type: .system)
   private let back = UIButton(type: .system)
   private let query = UITextField()
-  private let accountTab = UIButton(type: .system)
-  private let sessionTab = UIButton(type: .system)
-  private let tabIndicator = UIVisualEffectView(effect: UIGlassEffect(style: .regular))
-  private let tabIndicatorCarrier = UIView()
-  private var indicatorTab: UIButton?
-  private var indicatorTarget = CGRect.null
-  private var indicatorAnimator: UIViewPropertyAnimator?
+  private let tabs = UISegmentedControl(items: ["账号", "会话"])
   private let compose = UIButton(type: .system)
   private var primary: UIStackView!
   private var search: UIStackView!
@@ -61,7 +55,7 @@ final class ManagerGlassNavigation: UIView, UITextFieldDelegate {
     spacer.isUserInteractionEnabled = false
     primary = row([manage, service, spacer, overview, searchButton])
 
-    let searchGlass = makeGlass()
+    let searchGlass = UIVisualEffectView(effect: UIGlassEffect(style: .regular))
     searchGlass.cornerConfiguration = .corners(radius: 14)
     let searchIcon = UIImageView(image: UIImage(systemName: "magnifyingglass"))
     searchIcon.tintColor = .secondaryLabel
@@ -95,31 +89,19 @@ final class ManagerGlassNavigation: UIView, UITextFieldDelegate {
       back.bottomAnchor.constraint(equalTo: top.bottomAnchor),
     ])
 
-    let dock = makeGlass()
-    dock.cornerConfiguration = .corners(radius: 26)
-    tabIndicator.cornerConfiguration = .corners(radius: 21)
-    tabIndicator.isUserInteractionEnabled = false
-    tabIndicatorCarrier.isUserInteractionEnabled = false
-    tabIndicatorCarrier.accessibilityElementsHidden = true
-    dock.contentView.addSubview(tabIndicatorCarrier)
-    embed(tabIndicator, in: tabIndicatorCarrier)
-    configureTab(accountTab, title: "账号", action: "accounts")
-    configureTab(sessionTab, title: "会话", action: "sessions")
-    let tabs = row([accountTab, sessionTab])
-    tabs.distribution = .fillEqually
-    tabs.spacing = 4
-    embed(tabs, in: dock.contentView, horizontal: 5, vertical: 5)
-
+    // UIKit owns the glass thumb, touch tracking and accessibility of both segments.
+    // An additional glass track would layer a second material beneath the control.
+    tabs.accessibilityIdentifier = "manager-navigation-tabs"
+    tabs.selectedSegmentIndex = 0
+    tabs.addTarget(self, action: #selector(tabChanged), for: .valueChanged)
     configure(compose, icon: "plus", title: nil, label: "新建对话", action: "compose", prominent: true, size: 52)
     bottom.axis = .horizontal
     bottom.spacing = 10
-    bottom.addArrangedSubview(dock)
+    bottom.addArrangedSubview(tabs)
     bottom.addArrangedSubview(compose)
-    let dockGroup = UIGlassContainerEffect()
-    dockGroup.spacing = 6
-    let dockContainer = UIVisualEffectView(effect: dockGroup)
+    let dockContainer = UIView()
     add(dockContainer, to: self)
-    embed(bottom, in: dockContainer.contentView)
+    embed(bottom, in: dockContainer)
     NSLayoutConstraint.activate([
       dockContainer.leadingAnchor.constraint(equalTo: safeAreaLayoutGuide.leadingAnchor, constant: 16),
       dockContainer.trailingAnchor.constraint(equalTo: safeAreaLayoutGuide.trailingAnchor, constant: -16),
@@ -128,8 +110,6 @@ final class ManagerGlassNavigation: UIView, UITextFieldDelegate {
     ])
     top.isHidden = true
     bottom.isHidden = true
-    NotificationCenter.default.addObserver(self, selector: #selector(reduceMotionChanged),
-      name: UIAccessibility.reduceMotionStatusDidChangeNotification, object: nil)
     NotificationCenter.default.addObserver(self, selector: #selector(keyboardFrameChanged(_:)),
       name: UIResponder.keyboardWillChangeFrameNotification, object: nil)
   }
@@ -166,13 +146,6 @@ final class ManagerGlassNavigation: UIView, UITextFieldDelegate {
     ])
   }
 
-  private func makeGlass() -> UIVisualEffectView {
-    let effect = UIGlassEffect(style: .regular)
-    effect.isInteractive = true
-    let view = UIVisualEffectView(effect: effect)
-    return view
-  }
-
   private func button(_ icon: String?, title: String?, label: String, action: String) -> UIButton {
     let result = UIButton(type: .system)
     configure(result, icon: icon, title: title, label: label, action: action)
@@ -203,58 +176,12 @@ final class ManagerGlassNavigation: UIView, UITextFieldDelegate {
     }
   }
 
-  private func configureTab(_ button: UIButton, title: String, action: String) {
-    var plain = UIButton.Configuration.plain()
-    plain.title = title
-    plain.baseForegroundColor = .label
-    plain.automaticallyUpdateForSelection = false
-
-    button.configuration = plain
-    button.accessibilityIdentifier = "manager-" + action
-    button.addAction(UIAction { [weak self] _ in self?.send(action) }, for: .touchUpInside)
-    button.configurationUpdateHandler = { tab in
-      var configuration = plain
-      configuration.baseForegroundColor = tab.isSelected ? .systemBlue : .label
-      tab.configuration = configuration
+  @objc private func tabChanged() {
+    switch tabs.selectedSegmentIndex {
+    case 0: send("accounts")
+    case 1: send("sessions")
+    default: break
     }
-  }
-
-  @objc private func reduceMotionChanged() {
-    if UIAccessibility.isReduceMotionEnabled {
-      indicatorAnimator?.stopAnimation(true)
-      indicatorAnimator = nil
-      if !indicatorTarget.isNull { tabIndicatorCarrier.frame = indicatorTarget }
-    }
-  }
-
-  private func layoutTabIndicator(animated: Bool) {
-    guard let tab = indicatorTab, let container = tabIndicatorCarrier.superview else { return }
-    let target = tab.convert(tab.bounds, to: container)
-    guard !target.isEmpty, target != indicatorTarget else { return }
-
-    // Keep layout passes from resetting the animation. When retargeting,
-    // start at the layer's visible position rather than its model endpoint.
-    let visible = tabIndicatorCarrier.layer.presentation()?.frame ?? tabIndicatorCarrier.frame
-    indicatorAnimator?.stopAnimation(true)
-    indicatorAnimator = nil
-    indicatorTarget = target
-    guard animated, !visible.isEmpty,
-          !UIAccessibility.isReduceMotionEnabled else {
-      tabIndicatorCarrier.frame = target
-      return
-    }
-    tabIndicatorCarrier.frame = visible
-    let destination = CGPoint(x: target.midX, y: target.midY)
-    let animator = UIViewPropertyAnimator(duration: 0.36, dampingRatio: 0.62) { [weak self] in
-      guard let carrier = self?.tabIndicatorCarrier else { return }
-      carrier.center = destination
-      if carrier.bounds.size != target.size {
-        carrier.bounds.size = target.size
-        carrier.layoutIfNeeded()
-      }
-    }
-    indicatorAnimator = animator
-    animator.startAnimation()
   }
 
   func apply(_ state: ManagerGlassArgs.Layout, events: Channel?) {
@@ -282,10 +209,12 @@ final class ManagerGlassNavigation: UIView, UITextFieldDelegate {
     bottom.isHidden = !main && !(slide && wasMain)
     bottom.isUserInteractionEnabled = main
     if main {
-      accountTab.isSelected = page == .accounts
-      sessionTab.isSelected = page == .sessions
-      accountTab.accessibilityTraits = page == .accounts ? [.button, .selected] : [.button]
-      sessionTab.accessibilityTraits = page == .sessions ? [.button, .selected] : [.button]
+      let index = page == .accounts ? 0 : 1
+      // Leave the native touch interaction alone. JS echoes the selection
+      // back through this bridge after the control has already changed it.
+      if (!wasMain || modeChanged) && !tabs.isTracking && tabs.selectedSegmentIndex != index {
+        tabs.selectedSegmentIndex = index
+      }
     }
     if selectedProvider != state.provider {
       selectedProvider = state.provider
@@ -301,10 +230,6 @@ final class ManagerGlassNavigation: UIView, UITextFieldDelegate {
       query.resignFirstResponder()
     }
     layoutIfNeeded()
-    if main {
-      indicatorTab = page == .accounts ? accountTab : sessionTab
-      layoutTabIndicator(animated: wasMain && modeChanged)
-    }
     if slide {
       let direction: CGFloat = (page == .manage || previous == .manage) ? -1 : 1
       let entering = [Page.manage, .overview, .search].contains(page)
@@ -361,7 +286,6 @@ final class ManagerGlassNavigation: UIView, UITextFieldDelegate {
 
   override func layoutSubviews() {
     super.layoutSubviews()
-    layoutTabIndicator(animated: false)
     publishInsets()
   }
 
