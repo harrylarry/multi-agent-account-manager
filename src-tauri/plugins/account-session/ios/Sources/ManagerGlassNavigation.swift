@@ -30,7 +30,8 @@ final class ManagerGlassNavigation: UIView, UITextFieldDelegate {
   private let overview = UIButton(type: .system)
   private let back = UIButton(type: .system)
   private let query = UITextField()
-  private let tabs = UISegmentedControl(items: ["账号", "会话"])
+  private let accountTab = UIButton(type: .system)
+  private let sessionTab = UIButton(type: .system)
   private let compose = UIButton(type: .system)
   private var primary: UIStackView!
   private var search: UIStackView!
@@ -91,10 +92,11 @@ final class ManagerGlassNavigation: UIView, UITextFieldDelegate {
 
     let dock = makeGlass()
     dock.cornerConfiguration = .corners(radius: 26)
-    tabs.accessibilityLabel = "账号和会话"
-    tabs.accessibilityIdentifier = "manager-navigation-tabs"
-    tabs.selectedSegmentIndex = 0
-    tabs.addTarget(self, action: #selector(tabChanged), for: .valueChanged)
+    configureTab(accountTab, title: "账号", action: "accounts")
+    configureTab(sessionTab, title: "会话", action: "sessions")
+    let tabs = row([accountTab, sessionTab])
+    tabs.distribution = .fillEqually
+    tabs.spacing = 4
     embed(tabs, in: dock.contentView, horizontal: 5, vertical: 5)
 
     configure(compose, icon: "plus", title: nil, label: "新建对话", action: "compose", prominent: true, size: 52)
@@ -188,6 +190,22 @@ final class ManagerGlassNavigation: UIView, UITextFieldDelegate {
     }
   }
 
+  private func configureTab(_ button: UIButton, title: String, action: String) {
+    var config = UIButton.Configuration.plain()
+    config.title = title
+    config.cornerStyle = .capsule
+    button.configuration = config
+    button.accessibilityIdentifier = "manager-" + action
+    button.addAction(UIAction { [weak self] _ in self?.send(action) }, for: .touchUpInside)
+    button.configurationUpdateHandler = { tab in
+      var configuration = tab.configuration
+      configuration?.baseForegroundColor = tab.isSelected ? .systemBlue : .label
+      configuration?.background.backgroundColor = tab.isSelected
+        ? UIColor.systemBlue.withAlphaComponent(0.18) : .clear
+      tab.configuration = configuration
+    }
+  }
+
   func apply(_ state: ManagerGlassArgs.Layout, events: Channel?) {
     if let events {
       event = { data in try? events.send(data) }
@@ -212,7 +230,12 @@ final class ManagerGlassNavigation: UIView, UITextFieldDelegate {
     compose.isEnabled = state.composeEnabled
     bottom.isHidden = !main && !(slide && wasMain)
     bottom.isUserInteractionEnabled = main
-    if main { tabs.selectedSegmentIndex = page == .sessions ? 1 : 0 }
+    if main {
+      accountTab.isSelected = page == .accounts
+      sessionTab.isSelected = page == .sessions
+      accountTab.accessibilityTraits = page == .accounts ? [.button, .selected] : [.button]
+      sessionTab.accessibilityTraits = page == .sessions ? [.button, .selected] : [.button]
+    }
     if selectedProvider != state.provider {
       selectedProvider = state.provider
       updateService(animated: previous != nil)
@@ -275,7 +298,6 @@ final class ManagerGlassNavigation: UIView, UITextFieldDelegate {
     event?(data)
   }
 
-  @objc private func tabChanged() { send(tabs.selectedSegmentIndex == 1 ? "sessions" : "accounts") }
   @objc private func queryChanged() { send("query", value: query.text ?? "") }
   func textFieldShouldReturn(_ textField: UITextField) -> Bool {
     textField.resignFirstResponder()

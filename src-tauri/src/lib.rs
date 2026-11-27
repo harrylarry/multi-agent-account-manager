@@ -277,7 +277,6 @@ async fn observe_account_tasks(
   timezone: String,
   automatic: Option<bool>,
   tier: Option<String>,
-  include_unread: Option<bool>,
 ) -> Result<serde_json::Value, String> {
   #[cfg(target_os = "ios")]
   {
@@ -349,41 +348,28 @@ async fn observe_account_tasks(
       if token.is_cancelled() {
         return Err("账号出站配置已变化，已停止检测".into());
       }
-      let unread_request = Box::pin(async {
-        if include_unread != Some(true) { return None; }
-        let request = Box::pin(async {
-          match provider {
-            providers::ProviderId::Muse => Box::pin(muse_sessions::fetch_unread_total(&app, &uuid, proxy.as_ref())).await,
-            providers::ProviderId::Hark => Box::pin(hark_send::fetch_unread_total(&app, &uuid, proxy.as_ref(), &timezone)).await,
-          }
-        });
-        tokio::time::timeout(std::time::Duration::from_secs(20), request).await.ok().and_then(Result::ok).flatten()
-      });
-      let ((native, completed), approvals, unread) = tokio::select! {
+      let ((native, completed), approvals) = tokio::select! {
         biased;
         _ = token.cancelled() => return Err("账号出站配置已变化，已停止检测".into()),
         status = tokio::time::timeout(std::time::Duration::from_secs(32), Box::pin(async {
-          tokio::join!(native, approval_poll, unread_request)
+          tokio::join!(native, approval_poll)
         })) => status.unwrap_or_default(),
       };
       if automatic && !platform::ios::automatic_task_polling_available(&app).await? {
         return Err("系统已暂停自动任务监听".into());
       }
       mgr.record_task_observations(&app, provider, &uuid, &completed, approvals.as_deref()).await?;
-      if let Some(count) = unread {
-        mgr.apply_manual_unread(&app, provider, &uuid, proxy.as_ref(), count).await?;
-      }
       if let Some(activity) = native {
-        return Ok(serde_json::json!({ "activity": activity, "source": "native", "observedAtMs": storage::now_ms(), "tier":mode, "unreadObserved":unread.is_some() }));
+        return Ok(serde_json::json!({ "activity": activity, "source": "native", "observedAtMs": storage::now_ms(), "tier":mode }));
       }
       if provider == providers::ProviderId::Muse && !token.is_cancelled() {
         let fallback = tokio::time::timeout(std::time::Duration::from_secs(3), platform::ios::read_parked_task_state(&app, &uuid))
           .await.ok().and_then(Result::ok).flatten();
         if let Some(activity) = fallback {
-          return Ok(serde_json::json!({ "activity": activity, "source": "page", "observedAtMs": storage::now_ms(), "tier":mode, "unreadObserved":unread.is_some() }));
+          return Ok(serde_json::json!({ "activity": activity, "source": "page", "observedAtMs": storage::now_ms(), "tier":mode }));
         }
       }
-      Ok(serde_json::json!({ "activity": "unknown", "source": null, "observedAtMs": null, "tier":mode, "unreadObserved":unread.is_some() }))
+      Ok(serde_json::json!({ "activity": "unknown", "source": null, "observedAtMs": null, "tier":mode }))
     });
     observation.await.map_err(|_| "任务检测未能完成".to_string())?
   }
@@ -391,6 +377,56 @@ async fn observe_account_tasks(
   {
     Err("此功能需要 iOS".into())
   }
+}
+
+#[tauri::command]
+#[cfg_attr(not(target_os = "ios"), allow(unused_variables))]
+async fn refresh_account_unread(
+  app: AppHandle, mgr: State<'_, Arc<SessionManager>>, cancel: State<'_, Arc<probe_cancel::ProbeCancel>>,
+  provider_id: String, uuid: String, timezone: String,
+) -> Result<u64, String> {
+  #[cfg(target_os = "ios")]
+  {
+    let provider = providers::ProviderId::parse(&provider_id).ok_or("服务标识无效")?;
+    let uuid = storage::normalize_uuid(&uuid).ok_or("账号标识无效")?;
+    let proxy_lock = mgr.proxy_write_lock.lock().await;
+    let (mut token, guard) = cancel.register(&uuid, "account_unread_count");
+    let snapshot = mgr.get_snapshot().await;
+    drop(proxy_lock);
+    let account = snapshot.accounts.iter().find(|account| account.provider_id == provider && account.uuid == uuid
+      && account.auth_state == storage::AuthState::Authenticated).ok_or("需要登录")?;
+    if snapshot.conflicts.iter().any(|item| item.uuid == uuid)
+      || snapshot.pending_cleanup.iter().any(|item| item.uuid == uuid) { return Err("账号暂不可用".into()); }
+    let route = account.proxy.clone();
+    let timezone = account.timezone.clone().unwrap_or(timezone);
+    if timezone.is_empty() || timezone.len() > 96
+      || !timezone.bytes().all(|byte| byte.is_ascii_alphanumeric() || b"/_+-".contains(&byte)) {
+      return Err("时区格式无效".into());
+    }
+    let app = app.clone();
+    let mgr = Arc::clone(&mgr);
+    tokio::spawn(async move {
+      let _guard = guard;
+      let request = Box::pin(async {
+        match provider {
+          providers::ProviderId::Muse => Box::pin(muse_sessions::fetch_unread_total(&app, &uuid, route.as_ref())).await,
+          providers::ProviderId::Hark => Box::pin(hark_send::fetch_unread_total(&app, &uuid, route.as_ref(), &timezone)).await,
+        }
+      });
+      let count = tokio::select! {
+        biased;
+        _ = token.cancelled() => return Err("账号连接已变化".into()),
+        result = tokio::time::timeout(std::time::Duration::from_secs(20), request) =>
+          result.map_err(|_| "未读查询超时")??.ok_or("服务未返回可核验的计数")?,
+      };
+      if !mgr.apply_manual_unread(&app, provider, &uuid, route.as_ref(), count).await? {
+        return Err("账号连接已变化".into());
+      }
+      Ok(count)
+    }).await.map_err(|_| "未读查询未完成")?
+  }
+  #[cfg(not(target_os = "ios"))]
+  Err("此功能需要 iOS".into())
 }
 
 #[tauri::command]
@@ -1807,7 +1843,7 @@ async fn manage_proxy_pool(
       pool.save(&secrets)?;
     }
     "edit" => {
-      pool.edit_manual(entry_id.ok_or("缺少代理标识")?, input.as_deref().ok_or("请输入代理")?)?;
+      pool.edit_details(entry_id.ok_or("缺少代理标识")?, input.as_deref().ok_or("请输入代理")?)?;
       pool.save(&secrets)?;
     }
     "subscribe" => {
@@ -1872,10 +1908,36 @@ async fn load_proxy_pool_entry(
 }
 
 #[tauri::command]
+#[cfg_attr(not(target_os = "ios"), allow(unused_variables))]
+async fn proxy_pool_entry_credentials(
+  app: AppHandle, mgr: State<'_, Arc<SessionManager>>, gate: State<'_, proxy_pool::ProxyPoolGate>,
+  entry_id: uuid::Uuid, copy: bool,
+) -> Result<serde_json::Value, String> {
+  #[cfg(target_os = "ios")]
+  {
+    let _guard = gate.0.lock().await;
+    if copy {
+      let dir = app.path().app_data_dir().map_err(|_| "无法读取应用目录")?;
+      let pool = proxy_pool::ProxyPool::read(&secrets::Secrets::new(&dir))?;
+      let uri = match pool.copy_uri(entry_id) {
+        Some(uri) => uri,
+        None => zeroize::Zeroizing::new(load_proxy_pool_entry(&app, &mgr, entry_id).await?.endpoint),
+      };
+      tauri_plugin_account_session::copy_local_text(&app, &uri).await?;
+      return Ok(serde_json::Value::Null);
+    }
+    let entry = load_proxy_pool_entry(&app, &mgr, entry_id).await?;
+    Ok(serde_json::json!({ "username": entry.username, "password": entry.password }))
+  }
+  #[cfg(not(target_os = "ios"))]
+  Err("此功能需要 iOS".into())
+}
+
+#[tauri::command]
 #[cfg_attr(target_os = "android", allow(unused_variables))]
 async fn measure_proxy_pool_entry(
   app: AppHandle, mgr: State<'_, Arc<SessionManager>>, gate: State<'_, proxy_pool::ProxyPoolGate>,
-  provider_id: String, entry_id: uuid::Uuid,
+  provider_id: String, entry_id: uuid::Uuid, inspect_exit: Option<bool>,
 ) -> Result<serde_json::Value, String> {
   #[cfg(not(target_os = "android"))]
   {
@@ -1890,10 +1952,27 @@ async fn measure_proxy_pool_entry(
     ).map_err(|_| "代理格式或认证信息无效")?;
     let client = outbound.http_client(std::time::Duration::from_secs(15), false)
       .map_err(|_| "无法初始化代理测速")?;
-    let started = std::time::Instant::now();
-    let response = client.head(providers::get_provider(provider).info.entry_url).send().await
-      .map_err(|error| egress::safe_http_error("代理 HTTPS", &error))?;
-    Ok(serde_json::json!({ "milliseconds": started.elapsed().as_millis(), "status": response.status().as_u16() }))
+    let measurement = async {
+      let started = std::time::Instant::now();
+      let response = client.head(providers::get_provider(provider).info.entry_url).send().await
+        .map_err(|error| egress::safe_http_error("代理 HTTPS", &error))?;
+      Ok::<_, String>((started.elapsed().as_millis(), response.status().as_u16()))
+    };
+    if inspect_exit == Some(true) {
+      let (reachability, exit) = tokio::join!(measurement, proxy_pool::inspect_exit(&client));
+      let (time, status, reachability_error) = match reachability {
+        Ok((time, status)) => (Some(time), Some(status), None),
+        Err(error) => (None, None, Some(error)),
+      };
+      let (exit, exit_error) = match exit {
+        Ok(exit) => (Some(exit), None),
+        Err(error) => (None, Some(error)),
+      };
+      return Ok(serde_json::json!({ "milliseconds": time, "status": status,
+        "reachabilityError": reachability_error, "exit": exit, "exitError": exit_error }));
+    }
+    let (milliseconds, status) = measurement.await?;
+    Ok(serde_json::json!({ "milliseconds": milliseconds, "status": status }))
   }
   #[cfg(target_os = "android")]
   Err("此操作在 Android 上不可用".into())
@@ -2339,6 +2418,7 @@ pub fn run() {
       muse_native_diagnose,
       muse_native_watch_probe,
       observe_account_tasks,
+      refresh_account_unread,
       stop_foreground_task_watch,
       set_account_task_notifications,
       hark_native_watch_probe,
@@ -2362,6 +2442,7 @@ pub fn run() {
       manage_proxy_pool,
       measure_account_proxy,
       measure_proxy_pool_entry,
+      proxy_pool_entry_credentials,
       apply_proxy_pool_entry,
       muse_native_clear_account_proxy,
       muse_native_cancel_probe,

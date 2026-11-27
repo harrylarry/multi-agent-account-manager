@@ -820,6 +820,15 @@ pub struct ProfileCookieSummary {
 }
 
 #[cfg(target_os = "ios")]
+pub async fn copy_local_text(app: &AppHandle, text: &str) -> Result<(), String> {
+  let bridge = app.state::<IosSessionBridge<tauri::Wry>>();
+  bridge.0.run_mobile_plugin_async::<serde_json::Value>(
+    "copyLocalText", serde_json::json!({ "text": text }),
+  ).await.map_err(|_| "无法写入本机剪贴板".to_string())?;
+  Ok(())
+}
+
+#[cfg(target_os = "ios")]
 pub async fn copy_profile_cookies(
   app: &AppHandle, provider: &str, uuid: &str, text: &str, count: usize, seconds: u16,
 ) -> Result<(), String> {

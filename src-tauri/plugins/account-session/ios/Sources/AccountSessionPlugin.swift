@@ -663,6 +663,18 @@ class AccountSessionPlugin: Plugin {
     }
   }
 
+  @objc public func copyLocalText(_ invoke: Invoke) throws {
+    struct Args: Decodable { let text: String }
+    let args = try invoke.parseArgs(Args.self)
+    Task { @MainActor in
+      UIPasteboard.general.setItems(
+        [["public.utf8-plain-text": args.text]],
+        options: [.localOnly: true, .expirationDate: Date().addingTimeInterval(60)]
+      )
+      invoke.resolve(["copied": true])
+    }
+  }
+
   @objc public func transferProfileCookies(_ invoke: Invoke) throws {
     let args = try invoke.parseArgs(TransferProfileCookiesArgs.self)
     Task { @MainActor in

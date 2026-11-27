@@ -81,7 +81,9 @@ pub(crate) async fn fetch_unread_total(
 ) -> Result<Option<u64>, String> {
   let (client, cookie) = crate::hark_native::account_http(app, uuid, setting).await?;
   let transport = Transport { client, cookie, timezone, origin: "https://app.hark.com" };
-  let raw = transport.read(transport.request(Method::GET, "/conversations/unread-count", &[])?).await?;
+  let response = transport.request(Method::GET, "/conversations/unread-count", &[])?.send().await
+    .map_err(|error| crate::egress::safe_http_error("Hark 未读查询", &error))?;
+  let raw = checked_json(response).await?;
   Ok(crate::muse_sessions::parse_unread_total(&raw))
 }
 

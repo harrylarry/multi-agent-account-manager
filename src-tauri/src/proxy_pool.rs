@@ -70,6 +70,44 @@ pub struct ApplyEntry {
   pub password: Option<String>,
 }
 
+#[derive(Deserialize, Zeroize, ZeroizeOnDrop)]
+#[serde(rename_all = "camelCase")]
+struct ManualEdit {
+  endpoint: String,
+  username: String,
+  password: String,
+  remove_auth: bool,
+}
+
+#[cfg(not(target_os = "android"))]
+pub async fn inspect_exit(client: &reqwest::Client) -> Result<serde_json::Value, String> {
+  let mut response = client.get("https://api.ipquery.io/?format=json").send().await
+    .map_err(|error| crate::egress::safe_http_error("出口检测", &error))?;
+  if !response.status().is_success() { return Err(format!("出口检测 HTTP {}", response.status().as_u16())); }
+  let mut body = Vec::new();
+  while let Some(chunk) = response.chunk().await.map_err(|_| "出口检测响应读取失败")? {
+    if body.len().saturating_add(chunk.len()) > 32 * 1024 { return Err("出口检测响应过大".into()); }
+    body.extend(chunk);
+  }
+  let payload = serde_json::from_slice(&body).map_err(|_| "出口检测响应格式无效")?;
+  parse_exit(&payload).ok_or_else(|| "未取得可核验的出口地址".into())
+}
+
+#[cfg(not(target_os = "android"))]
+fn parse_exit(payload: &serde_json::Value) -> Option<serde_json::Value> {
+  let ip = payload["ip"].as_str()?.parse::<std::net::IpAddr>().ok()?;
+  let location = &payload["location"];
+  let short_text = |key: &str| location[key].as_str().map(str::trim)
+    .filter(|value| !value.is_empty() && value.chars().all(|c| !c.is_control()))
+    .map(|value| value.chars().take(96).collect::<String>());
+  let risk = &payload["risk"];
+  Some(serde_json::json!({
+    "ip": ip.to_string(), "country": short_text("country"), "region": short_text("state"), "city": short_text("city"),
+    "proxy": risk["is_proxy"].as_bool(), "datacenter": risk["is_datacenter"].as_bool(),
+    "vpn": risk["is_vpn"].as_bool(), "tor": risk["is_tor"].as_bool(),
+  }))
+}
+
 fn parse_lines(raw: &str) -> Result<Vec<String>, String> {
   if raw.len() > MAX_INPUT { return Err("代理列表过大".into()); }
   let mut unique = HashSet::new();
@@ -172,6 +210,38 @@ impl ProxyPool {
     std::mem::swap(&mut self.entries[index].uri, &mut new_uri);
     new_uri.zeroize();
     Ok(())
+  }
+
+  pub fn edit_details(&mut self, id: Uuid, raw: &str) -> Result<(), String> {
+    let edit: ManualEdit = serde_json::from_str(raw).map_err(|_| "代理编辑资料无效")?;
+    let candidates = Zeroizing::new(parse_lines(&edit.endpoint)?);
+    let [endpoint] = candidates.as_slice() else { return Err("请输入一条代理地址".into()); };
+    if endpoint.contains('@') { return Err("账号和密码请填写在认证栏".into()); }
+    let entry = self.selected(id)?;
+    if edit.remove_auth { return self.edit_manual(id, endpoint); }
+    if endpoint != &entry.endpoint && entry.password.is_some()
+      && (edit.username.is_empty() || edit.password.is_empty()) {
+      return Err("代理地址已变更，请重新填写认证信息或明确移除认证".into());
+    }
+    let saved_username = entry.username.map(Zeroizing::new);
+    let saved_password = entry.password.map(Zeroizing::new);
+    let username = if edit.username.is_empty() { saved_username.as_deref().map(String::as_str) } else { Some(edit.username.as_str()) };
+    let password = if edit.password.is_empty() { saved_password.as_deref().map(String::as_str) } else { Some(edit.password.as_str()) };
+    if username.is_none() && password.is_none() { return self.edit_manual(id, endpoint); }
+    let (Some(username), Some(password)) = (username, password) else { return Err("代理用户名和密码需要同时提供".into()); };
+    let (scheme, authority) = endpoint.split_once("://").ok_or("代理地址无效")?;
+    let encode = |text: &str| url::form_urlencoded::byte_serialize(text.as_bytes())
+      .collect::<String>().replace('+', "%20");
+    let encoded_user = Zeroizing::new(encode(username));
+    let encoded_password = Zeroizing::new(encode(password));
+    let uri = Zeroizing::new(format!("{scheme}://{encoded_user}:{encoded_password}@{authority}",
+      encoded_user = encoded_user.as_str(), encoded_password = encoded_password.as_str()));
+    self.edit_manual(id, &uri)
+  }
+
+  #[cfg(target_os = "ios")]
+  pub fn copy_uri(&self, id: Uuid) -> Option<Zeroizing<String>> {
+    self.entries.iter().find(|entry| entry.id == id).map(|entry| Zeroizing::new(entry.uri.clone()))
   }
 
   fn replace_entries(&mut self, source: Option<Uuid>, incoming: Vec<String>) -> Result<(), String> {
@@ -286,6 +356,38 @@ pub fn restored_entry_id(entry: &ProxyPoolProfile) -> Uuid {
 #[cfg(test)]
 mod tests {
   use super::*;
+
+  #[test]
+  fn detailed_edit_keeps_same_route_credentials_and_requires_explicit_auth_for_a_new_route() {
+    let mut pool = ProxyPool::default();
+    pool.import("socks5://user:old@proxy.example:1080").unwrap();
+    let id = pool.entries[0].id;
+    let edit = |endpoint, username, password, remove_auth| serde_json::json!({
+      "endpoint": endpoint, "username": username, "password": password, "removeAuth": remove_auth,
+    }).to_string();
+    let old_route = "socks5://proxy.example:1080";
+    let new_route = "socks5://other.example:1080";
+    pool.edit_details(id, &edit(old_route, "", "", false)).unwrap();
+    assert_eq!(pool.selected(id).unwrap().password.as_deref(), Some("old"));
+    assert!(pool.edit_details(id, &edit(new_route, "", "", false)).is_err());
+    assert_eq!(pool.selected(id).unwrap().endpoint, old_route);
+    pool.edit_details(id, &edit(new_route, "user name", "p%@;", false)).unwrap();
+    assert_eq!(pool.selected(id).unwrap().username.as_deref(), Some("user name"));
+    assert_eq!(pool.selected(id).unwrap().password.as_deref(), Some("p%@;"));
+    pool.edit_details(id, &edit(new_route, "", "", true)).unwrap();
+    assert!(pool.selected(id).unwrap().password.is_none());
+  }
+
+  #[cfg(not(target_os = "android"))]
+  #[test]
+  fn exit_result_keeps_missing_classifications_unknown() {
+    assert!(parse_exit(&serde_json::json!({"ip":"not-an-ip"})).is_none());
+    let row = parse_exit(&serde_json::json!({"ip":"192.0.2.1","location":{"country":"Test"},
+      "risk":{"is_proxy":false,"is_datacenter":true}})).unwrap();
+    assert_eq!(row["proxy"], false);
+    assert_eq!(row["datacenter"], true);
+    assert!(row["vpn"].is_null());
+  }
 
   #[test]
   fn manual_edit_preserves_binding_id_and_rejects_duplicate_or_invalid_input() {

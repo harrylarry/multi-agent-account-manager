@@ -59,9 +59,9 @@ async fn request(gateway: &mut crate::egress::AccountGateway, path: &str) -> Res
     path: path.into(),
     headers: Vec::new(),
     body: Vec::new(),
-  }).await.map_err(|_| "Muse 会话查询未完成")?;
-  if !(200..300).contains(&status) { return Err(format!("会话列表请求失败（HTTP {status}）")); }
-  if body.len() > 2 * 1024 * 1024 { return Err("会话列表响应过大".into()); }
+  }).await.map_err(|_| "Muse 查询未完成")?;
+  if !(200..300).contains(&status) { return Err(format!("Muse 请求失败（HTTP {status}）")); }
+  if body.len() > 2 * 1024 * 1024 { return Err("Muse 响应过大".into()); }
   Ok(body)
 }
 

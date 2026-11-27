@@ -41,6 +41,7 @@
     "allow-muse-native-diagnose",
     "allow-muse-native-watch-probe",
     "allow-observe-account-tasks",
+    "allow-refresh-account-unread",
     "allow-stop-foreground-task-watch",
     "allow-set-account-task-notifications",
     "allow-hark-native-watch-probe",
@@ -78,6 +79,7 @@
     "allow-send-new-hark-conversation",
     "allow-check-new-muse-conversation",
     "allow-measure-proxy-pool-entry",
+    "allow-proxy-pool-entry-credentials",
     "allow-is-spike-build"
   ]
 }

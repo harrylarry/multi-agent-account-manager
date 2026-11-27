@@ -59,6 +59,7 @@ export interface AccountRecord {
   taskNotifications?: boolean;
   pendingApprovalCount?: number | null;
   museUnreadStatus?: string | null;
+  proxy?: { enabled: boolean; poolEntryId?: string | null } | null;
 }
 
 export interface ConflictItem {

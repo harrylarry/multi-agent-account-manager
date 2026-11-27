@@ -328,9 +328,9 @@
 }
 .iphone-shell .iphone-subpage .modal-card > * { flex-shrink: 0; }
 .iphone-shell .iphone-subpage .modal-title {
-  font-size: 28px;
-  font-weight: 700;
-  line-height: 1.18;
+  font-size: 20px;
+  font-weight: 600;
+  line-height: 1.25;
   overflow-wrap: anywhere;
 }
 .iphone-shell .iphone-subpage .iphone-back {
@@ -377,7 +377,7 @@
 .iphone-screen-modal #iphone-add-cookie-fields { display: grid; gap: 8px; }
 .iphone-screen-modal #add-cookie-input { min-height: 96px; padding: 10px 12px; }
 
-.iphone-nav-tabs { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); border-radius: 24px; background: var(--dh-surface); }
+.iphone-nav-tabs { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); border-radius: 24px; }
 .iphone-page-exit { position: fixed; z-index: 8; background: var(--dh-page); pointer-events: none; }
 .iphone-compose-account { display: flex; align-items: center; gap: 9px; min-height: 44px; }
 /* Native bars overlay the WKWebView. Padding belongs to each scroller, so
@@ -427,7 +427,28 @@
 .iphone-shell .iphone-search-chips { display: flex; gap: 8px; flex-wrap: wrap; margin-bottom: 16px; }
 .iphone-shell .iphone-search-chips button { font: inherit; font-size: 14px; min-height: 44px; padding: 0 14px; border: 1px solid var(--dh-line); border-radius: var(--dh-field-radius); background: var(--dh-surface); color: var(--dh-ink); }
 .iphone-shell .iphone-search-chips [aria-pressed="true"] { background: var(--dh-mist); color: var(--dh-blue); font-weight: 600; }
-.iphone-shell .account-list { overscroll-behavior-y: contain; }
+.iphone-shell .account-list { position: relative; overscroll-behavior-y: none; }
+.iphone-shell .account-list > :not(.iphone-pull-indicator) {
+  translate: 0 var(--iphone-pull-offset, 0px);
+  transition: translate 180ms ease-out;
+}
+.iphone-shell .account-list[data-pulling] > :not(.iphone-pull-indicator) { transition: none; }
+.iphone-shell .account-list[data-refreshing]:not([data-pulling]) { --iphone-pull-offset: 36px; }
+.iphone-shell .iphone-pull-indicator {
+  position: absolute;
+  inset: var(--iphone-top-clearance, 0px) 0 auto;
+  height: var(--iphone-pull-offset, 0px);
+  display: grid;
+  place-items: center;
+  overflow: hidden;
+  pointer-events: none;
+  font-size: 13px;
+  color: var(--dh-secondary);
+}
+.iphone-shell #iphone-unread-refresh { margin-block: 0 8px; }
+@media (prefers-reduced-motion: reduce) {
+  .iphone-shell .account-list > :not(.iphone-pull-indicator) { transition: none; }
+}
 .iphone-shell .iphone-group-filter { padding-bottom: 8px; }
 .iphone-shell #iphone-account-groups { font-size: inherit; font-weight: inherit; text-align: left; padding-inline: 0; }
 .iphone-shell .iphone-accessible-action:focus-visible { position: static; width: auto; height: auto; clip-path: none; }
@@ -462,3 +483,9 @@
 .iphone-shell .iphone-switch input::before { content: ""; position: absolute; left: 2px; top: 2px; width: 22px; height: 22px; border-radius: 50%; background: white; }
 .iphone-shell .iphone-switch input:checked { background: var(--dh-blue); }
 .iphone-shell .iphone-switch input:checked::before { translate: 18px 0; }
+
+.iphone-shell .iphone-password-field { display: grid; grid-template-columns: minmax(0, 1fr) 44px; gap: 4px; }
+.iphone-shell .iphone-password-toggle { min-height: 44px; border: 0; border-radius: var(--dh-field-radius); color: var(--dh-blue); background: transparent; }
+.iphone-shell .iphone-proxy-entry { display: grid; gap: 10px; min-width: 0; padding: 12px; border: 1px solid var(--dh-line); border-radius: var(--dh-card-radius); background: var(--dh-surface); }
+.iphone-shell .iphone-proxy-entry strong { overflow-wrap: anywhere; }
+.iphone-shell .iphone-proxy-entry .iphone-status-list { padding-inline: 0; }

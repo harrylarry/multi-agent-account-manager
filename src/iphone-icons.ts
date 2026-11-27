@@ -14,6 +14,8 @@ const paths = {
   pulse: '<path d="M3 12h4l3-7 4 14 3-7h4"/>',
   globe: '<circle cx="12" cy="12" r="9"/><ellipse cx="12" cy="12" rx="4" ry="9"/><path d="M3 12h18"/>',
   cookie: '<path d="M20 11a8 8 0 1 1-8-8 4 4 0 0 0 4 4 4 4 0 0 0 4 4Z"/><path d="M8 12h.01m5 3h.01m-3-7h.01"/>',
+  eye: '<path d="M2 12s3.5-6 10-6 10 6 10 6-3.5 6-10 6-10-6-10-6Z"/><circle cx="12" cy="12" r="2.5"/>',
+  eyeOff: '<path d="m3 3 18 18M10 6a13 13 0 0 1 2 0c6.5 0 10 6 10 6a16 16 0 0 1-3 3.5M16 17a12 12 0 0 1-4 1c-6.5 0-10-6-10-6a16 16 0 0 1 4.2-4.4"/>',
   quota: '<path d="M5 18a9 9 0 1 1 14 0M12 14l4-5"/>',
 } as const;
 

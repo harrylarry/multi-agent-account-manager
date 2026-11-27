@@ -34,6 +34,7 @@ const APP_COMMANDS: &[&str] = &[
   "muse_native_diagnose",
   "muse_native_watch_probe",
   "observe_account_tasks",
+  "refresh_account_unread",
   "stop_foreground_task_watch",
   "set_account_task_notifications",
   "hark_native_watch_probe",
@@ -70,6 +71,7 @@ const APP_COMMANDS: &[&str] = &[
   "send_new_hark_conversation",
   "check_new_muse_conversation",
   "measure_proxy_pool_entry",
+  "proxy_pool_entry_credentials",
   "is_spike_build",
 ];
 

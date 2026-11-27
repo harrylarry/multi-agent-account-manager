@@ -1445,22 +1445,21 @@ impl SessionManager {
   #[cfg(target_os = "ios")]
   pub(crate) async fn apply_manual_unread(
     &self, app: &AppHandle, provider: ProviderId, uuid: &str, route: Option<&ProxySetting>, count: u64,
-  ) -> Result<(), String> {
+  ) -> Result<bool, String> {
     let mut locked = self.inner.lock().await;
     if locked.active_slot.as_ref().is_some_and(|slot| slot.account_key.uuid == uuid)
       || locked.conflicts.iter().any(|item| item.uuid == uuid)
-      || locked.store.pending_cleanup.iter().any(|item| item.uuid == uuid) { return Ok(()); }
+      || locked.store.pending_cleanup.iter().any(|item| item.uuid == uuid) { return Ok(false); }
     let Some(index) = locked.store.accounts.iter().position(|account| {
       account.provider_id == provider && account.uuid == uuid && account.auth_state == AuthState::Authenticated
         && account.proxy.as_ref() == route
-    }) else { return Ok(()); };
+    }) else { return Ok(false); };
     let account = &mut locked.store.accounts[index];
     let previous = account.clone();
     let has_unread = count > 0;
-    if has_unread && !account.has_unread_reply { account.last_task_reply_at_ms = Some(now_ms()); }
     account.has_unread_reply = has_unread;
     if provider == ProviderId::Muse { account.muse_unread_status = Some(if has_unread { "unread" } else { "zero" }.into()); }
-    if *account == previous { return Ok(()); }
+    if *account == previous { return Ok(true); }
     if let Err(error) = save_store_atomic(&locked.store_path, &locked.store) {
       locked.store.accounts[index] = previous;
       return Err(error);
@@ -1470,7 +1469,7 @@ impl SessionManager {
     drop(locked);
     self.emit_snapshot(app, &snapshot);
     let _ = crate::platform::ios::set_unread_badge(app, any_unread).await;
-    Ok(())
+    Ok(true)
   }
 
   #[cfg(target_os = "ios")]
@@ -1562,10 +1561,7 @@ impl SessionManager {
         }
         Ok(Ok((Some(counts), _, status))) => {
           let new_reply = crate::muse_sessions::update_unread_counts(&mut account.muse_unread_counts, &counts);
-          if new_reply && !account.has_unread_reply {
-            account.has_unread_reply = true;
-            account.last_task_reply_at_ms = Some(now_ms());
-          }
+          if new_reply { account.has_unread_reply = true; }
           if counts.values().any(|count| *count > 0) { "unread" } else if thread.is_some() || target.primary { status } else { "zero" }
         }
         Ok(Ok((None, _, status))) => status,

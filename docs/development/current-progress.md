@@ -1,5 +1,9 @@
 # 当前开发进度
 
+## iPhone 真机回报修正
+
+账号首页拉动列表并显示阈值提示，任务与未读独立刷新，账号未读显示计数或失败原因。仅通过计数发现的变化不写回复时间。弹窗统一 20px，原生底栏只有选中项有色底，iOS 和桌面图标换成原创双人剪影。代理池区分当前绑定、认证、服务连通和出口归属，支持确认后本机短时复制链接。IPQuery 查询仅在手动确认后走所选代理，缺失字段显示未分类。两个计数端点和真实出口检测均待设备验证。
+
 ## iPhone 统一页面
 
 Spike 0.1.26 基于 `a9e7c7175ddba37d0674dcb29ec7776b6565baff`，最低 iOS 26.0，Bundle ID `com.ldjx.accountmanager.spike`。`CI_PASSED`。Swift 插件、Rust iOS 目标与 Xcode 打包均通过，下载后已核对归档和内部 IPA。IPA SHA-256 为 `d86b69eb9e2671af2be447ea0d5edea7df4db1672930b5f606342566e29e7715`。[下载 IPA](https://github.com/harrylarry/multi-agent-account-manager/actions/runs/45962267476/artifacts/15182705128) · [Quick checks](https://github.com/harrylarry/multi-agent-account-manager/actions/runs/45962255225) · [iOS 构建](https://github.com/harrylarry/multi-agent-account-manager/actions/runs/45962267476)
