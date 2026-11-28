@@ -1,0 +1,201 @@
+// !$*UTF8*$!
+{
+	archiveVersion = 1;
+	classes = {};
+	objectVersion = 56;
+	objects = {
+		100000000000000000000001 /* Project */ = {
+			isa = PBXProject;
+			attributes = {
+				LastUpgradeCheck = 2600;
+				TargetAttributes = {
+					100000000000000000000004 = { CreatedOnToolsVersion = 26.0; };
+					100000000000000000000005 = { CreatedOnToolsVersion = 26.0; TestTargetID = 100000000000000000000004; };
+				};
+			};
+			buildConfigurationList = 100000000000000000000020;
+			compatibilityVersion = "Xcode 14.0";
+			developmentRegion = en;
+			knownRegions = (en, Base);
+			mainGroup = 100000000000000000000002;
+			productRefGroup = 100000000000000000000003;
+			projectDirPath = "";
+			projectRoot = "";
+			targets = (100000000000000000000004, 100000000000000000000005);
+		};
+		100000000000000000000002 /* Root */ = {
+			isa = PBXGroup;
+			children = (100000000000000000000006, 100000000000000000000007, 100000000000000000000003);
+			sourceTree = "<group>";
+		};
+		100000000000000000000003 /* Products */ = {
+			isa = PBXGroup;
+			children = (100000000000000000000008, 100000000000000000000009);
+			name = Products;
+			sourceTree = "<group>";
+		};
+		100000000000000000000004 /* Diehao */ = {
+			isa = PBXNativeTarget;
+			buildConfigurationList = 100000000000000000000021;
+			buildPhases = (10000000000000000000000A);
+			buildRules = ();
+			dependencies = ();
+			name = Diehao;
+			productName = Diehao;
+			productReference = 100000000000000000000008;
+			productType = "com.apple.product-type.application";
+		};
+		100000000000000000000005 /* DiehaoUITests */ = {
+			isa = PBXNativeTarget;
+			buildConfigurationList = 100000000000000000000022;
+			buildPhases = (10000000000000000000000B);
+			buildRules = ();
+			dependencies = (10000000000000000000000C);
+			name = DiehaoUITests;
+			productName = DiehaoUITests;
+			productReference = 100000000000000000000009;
+			productType = "com.apple.product-type.bundle.ui-testing";
+		};
+		100000000000000000000006 /* Diehao */ = {
+			isa = PBXGroup;
+			children = (100000000000000000000010, 100000000000000000000011, 100000000000000000000012);
+			path = Diehao;
+			sourceTree = "<group>";
+		};
+		100000000000000000000007 /* DiehaoUITests */ = {
+			isa = PBXGroup;
+			children = (100000000000000000000013);
+			path = DiehaoUITests;
+			sourceTree = "<group>";
+		};
+		100000000000000000000008 /* Diehao.app */ = {isa = PBXFileReference; explicitFileType = wrapper.application; path = Diehao.app; sourceTree = BUILT_PRODUCTS_DIR; };
+		100000000000000000000009 /* DiehaoUITests.xctest */ = {isa = PBXFileReference; explicitFileType = wrapper.cfbundle; path = DiehaoUITests.xctest; sourceTree = BUILT_PRODUCTS_DIR; };
+		10000000000000000000000A /* App sources */ = {
+			isa = PBXSourcesBuildPhase;
+			buildActionMask = 2147483647;
+			files = (100000000000000000000014, 100000000000000000000015, 100000000000000000000016);
+			runOnlyForDeploymentPostprocessing = 0;
+		};
+		10000000000000000000000B /* UI test sources */ = {
+			isa = PBXSourcesBuildPhase;
+			buildActionMask = 2147483647;
+			files = (100000000000000000000017);
+			runOnlyForDeploymentPostprocessing = 0;
+		};
+		10000000000000000000000C /* App dependency */ = {
+			isa = PBXTargetDependency;
+			target = 100000000000000000000004;
+			targetProxy = 10000000000000000000000D;
+		};
+		10000000000000000000000D /* App proxy */ = {
+			isa = PBXContainerItemProxy;
+			containerPortal = 100000000000000000000001;
+			proxyType = 1;
+			remoteGlobalIDString = 100000000000000000000004;
+			remoteInfo = Diehao;
+		};
+		100000000000000000000010 = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = DiehaoApp.swift; sourceTree = "<group>"; };
+		100000000000000000000011 = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = AccountStoreRegistry.swift; sourceTree = "<group>"; };
+		100000000000000000000012 = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = IsolationCheck.swift; sourceTree = "<group>"; };
+		100000000000000000000013 = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = IsolationTests.swift; sourceTree = "<group>"; };
+		100000000000000000000014 = {isa = PBXBuildFile; fileRef = 100000000000000000000010; };
+		100000000000000000000015 = {isa = PBXBuildFile; fileRef = 100000000000000000000011; };
+		100000000000000000000016 = {isa = PBXBuildFile; fileRef = 100000000000000000000012; };
+		100000000000000000000017 = {isa = PBXBuildFile; fileRef = 100000000000000000000013; };
+		100000000000000000000020 = {
+			isa = XCConfigurationList;
+			buildConfigurations = (100000000000000000000030, 100000000000000000000031);
+			defaultConfigurationIsVisible = 0;
+			defaultConfigurationName = Release;
+		};
+		100000000000000000000021 = {
+			isa = XCConfigurationList;
+			buildConfigurations = (100000000000000000000032, 100000000000000000000033);
+			defaultConfigurationIsVisible = 0;
+			defaultConfigurationName = Release;
+		};
+		100000000000000000000022 = {
+			isa = XCConfigurationList;
+			buildConfigurations = (100000000000000000000034, 100000000000000000000035);
+			defaultConfigurationIsVisible = 0;
+			defaultConfigurationName = Release;
+		};
+		100000000000000000000030 /* Project Debug */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				DEBUG_INFORMATION_FORMAT = dwarf;
+				IPHONEOS_DEPLOYMENT_TARGET = 26.0;
+				SDKROOT = iphoneos;
+				SUPPORTED_PLATFORMS = "iphoneos iphonesimulator";
+				SUPPORTS_MACCATALYST = NO;
+				SWIFT_OPTIMIZATION_LEVEL = "-Onone";
+				SWIFT_VERSION = 6.0;
+				TARGETED_DEVICE_FAMILY = 1;
+			};
+			name = Debug;
+		};
+		100000000000000000000031 /* Project Release */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				IPHONEOS_DEPLOYMENT_TARGET = 26.0;
+				SDKROOT = iphoneos;
+				SUPPORTED_PLATFORMS = "iphoneos iphonesimulator";
+				SUPPORTS_MACCATALYST = NO;
+				SWIFT_VERSION = 6.0;
+				TARGETED_DEVICE_FAMILY = 1;
+			};
+			name = Release;
+		};
+		100000000000000000000032 /* App Debug */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				CURRENT_PROJECT_VERSION = 1;
+				GENERATE_INFOPLIST_FILE = YES;
+				INFOPLIST_KEY_CFBundleDisplayName = "叠号 T1";
+				INFOPLIST_KEY_LSRequiresIPhoneOS = YES;
+				INFOPLIST_KEY_UIApplicationSceneManifest_Generation = YES;
+				INFOPLIST_KEY_UILaunchScreen_Generation = YES;
+				MARKETING_VERSION = 0.2.0;
+				PRODUCT_BUNDLE_IDENTIFIER = com.ldjx.accountmanager.swift-t1;
+				PRODUCT_NAME = "$(TARGET_NAME)";
+			};
+			name = Debug;
+		};
+		100000000000000000000033 /* App Release */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				CURRENT_PROJECT_VERSION = 1;
+				GENERATE_INFOPLIST_FILE = YES;
+				INFOPLIST_KEY_CFBundleDisplayName = "叠号 T1";
+				INFOPLIST_KEY_LSRequiresIPhoneOS = YES;
+				INFOPLIST_KEY_UIApplicationSceneManifest_Generation = YES;
+				INFOPLIST_KEY_UILaunchScreen_Generation = YES;
+				MARKETING_VERSION = 0.2.0;
+				PRODUCT_BUNDLE_IDENTIFIER = com.ldjx.accountmanager.swift-t1;
+				PRODUCT_NAME = "$(TARGET_NAME)";
+			};
+			name = Release;
+		};
+		100000000000000000000034 /* UI Test Debug */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				GENERATE_INFOPLIST_FILE = YES;
+				PRODUCT_BUNDLE_IDENTIFIER = com.ldjx.accountmanager.swiftUITests;
+				PRODUCT_NAME = "$(TARGET_NAME)";
+				TEST_TARGET_NAME = Diehao;
+			};
+			name = Debug;
+		};
+		100000000000000000000035 /* UI Test Release */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				GENERATE_INFOPLIST_FILE = YES;
+				PRODUCT_BUNDLE_IDENTIFIER = com.ldjx.accountmanager.swiftUITests;
+				PRODUCT_NAME = "$(TARGET_NAME)";
+				TEST_TARGET_NAME = Diehao;
+			};
+			name = Release;
+		};
+	};
+	rootObject = 100000000000000000000001;
+}

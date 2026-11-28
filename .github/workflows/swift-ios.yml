@@ -1,0 +1,82 @@
+name: Swift iOS foundation
+
+on:
+  pull_request:
+    paths:
+      - 'native-ios/**'
+      - '.github/workflows/swift-ios.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: swift-ios-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  ios:
+    name: Build and test native iOS
+    runs-on: macos-15
+    timeout-minutes: 35
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - name: Select Xcode 26
+        run: sudo xcode-select --switch /Applications/Xcode_26.3.app/Contents/Developer
+      - name: Build unsigned T1 IPA
+        run: |
+          version=$(python3 -c 'import json; print(json.load(open("package.json"))["version"])')
+          xcodebuild -project native-ios/Diehao.xcodeproj -scheme Diehao \
+            -configuration Release -sdk iphoneos -destination 'generic/platform=iOS' \
+            -derivedDataPath "$RUNNER_TEMP/swift-ios-device" \
+            CODE_SIGNING_ALLOWED=NO PRODUCT_BUNDLE_IDENTIFIER=com.ldjx.accountmanager.swift-t1 build
+          plist="$RUNNER_TEMP/swift-ios-device/Build/Products/Release-iphoneos/Diehao.app/Info.plist"
+          test "$(plutil -extract CFBundleShortVersionString raw "$plist")" = "$version"
+          test "$(plutil -extract CFBundleIdentifier raw "$plist")" = "com.ldjx.accountmanager.swift-t1"
+          test "$(plutil -extract MinimumOSVersion raw "$plist")" = "26.0"
+          mkdir -p "$RUNNER_TEMP/ipa/Payload"
+          cp -R "$RUNNER_TEMP/swift-ios-device/Build/Products/Release-iphoneos/Diehao.app" "$RUNNER_TEMP/ipa/Payload/"
+          cd "$RUNNER_TEMP/ipa"
+          ditto -c -k --keepParent Payload ../diehao-swift-t1-unsigned.ipa
+          cd "$RUNNER_TEMP"
+          shasum -a 256 diehao-swift-t1-unsigned.ipa | tee diehao-swift-t1-unsigned.ipa.sha256
+      - uses: actions/upload-artifact@v7
+        with:
+          name: diehao-swift-t1-ipa
+          path: |
+            ${{ runner.temp }}/diehao-swift-t1-unsigned.ipa
+            ${{ runner.temp }}/diehao-swift-t1-unsigned.ipa.sha256
+          if-no-files-found: error
+      - name: Test isolation A on iOS Simulator
+        run: |
+          xcrun simctl list devices available --json > "$RUNNER_TEMP/swift-ios-simulators.json"
+          simulator=$(python3 - "$RUNNER_TEMP/swift-ios-simulators.json" <<'PY'
+          import json
+          import sys
+
+          with open(sys.argv[1]) as manifest:
+              devices = json.load(manifest)["devices"]
+          for runtime in sorted(devices, reverse=True):
+              if not runtime.startswith("com.apple.CoreSimulator.SimRuntime.iOS-26"):
+                  continue
+              for device in devices[runtime]:
+                  if device["name"].startswith("iPhone") and device.get("isAvailable"):
+                      print(device["udid"])
+                      sys.exit()
+          sys.exit("An available iOS 26 iPhone Simulator is required")
+          PY
+          )
+          xcrun simctl boot "$simulator"
+          xcrun simctl bootstatus "$simulator" -b
+          xcodebuild -project native-ios/Diehao.xcodeproj -scheme Diehao \
+            -destination "platform=iOS Simulator,id=$simulator" \
+            -derivedDataPath "$RUNNER_TEMP/swift-ios-simulator" \
+            -parallel-testing-enabled NO -resultBundlePath "$RUNNER_TEMP/IsolationA.xcresult" test
+      - uses: actions/upload-artifact@v7
+        if: always()
+        with:
+          name: diehao-swift-t1-isolation-result
+          path: ${{ runner.temp }}/IsolationA.xcresult
+          if-no-files-found: ignore
