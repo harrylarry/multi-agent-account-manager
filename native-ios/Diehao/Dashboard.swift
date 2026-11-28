@@ -141,12 +141,17 @@ struct Dashboard: View {
                 }
             }
             Section("同步") {
-                Picker("前台轮询", selection: $savedInterval) {
-                    ForEach(ForegroundPollInterval.allCases) { interval in
-                        Text("\(interval.rawValue) 秒").tag(interval.rawValue)
+                Menu {
+                    Picker("前台轮询", selection: $savedInterval) {
+                        ForEach(ForegroundPollInterval.allCases) { interval in
+                            Text("\(interval.rawValue) 秒").tag(interval.rawValue)
+                        }
                     }
+                } label: {
+                    LabeledContent("前台轮询", value: "\(pollSeconds) 秒")
                 }
-                .pickerStyle(.menu)
+                .accessibilityLabel("前台轮询")
+                .accessibilityValue("\(pollSeconds) 秒")
                 .accessibilityIdentifier("dashboard.poll")
                 NavigationLink("隔离自检") { IsolationDiagnostics(check: check) }
                     .accessibilityIdentifier("dashboard.isolation")
@@ -222,13 +227,16 @@ private struct DashboardCompose: View {
                     } else if signedIn.isEmpty {
                         Text("暂无已确认登录的账号。请从账号资料打开 Muse 登录。")
                     } else {
-                        Picker("账号", selection: $selection) {
-                            Text("请选择").tag(UUID?.none)
-                            ForEach(signedIn) { account in
-                                Text(account.displayName).tag(Optional(account.id))
+                        Menu {
+                            Picker("账号", selection: $selection) {
+                                Text("请选择").tag(UUID?.none)
+                                ForEach(signedIn) { account in
+                                    Text(account.displayName).tag(Optional(account.id))
+                                }
                             }
+                        } label: {
+                            LabeledContent("账号", value: signedIn.first { $0.id == selection }?.displayName ?? "请选择")
                         }
-                        .pickerStyle(.menu)
                         .accessibilityIdentifier("compose.account")
                     }
                 }
@@ -248,6 +256,7 @@ private struct DashboardCompose: View {
                     Text("发送功能将在 T7 接入。").foregroundStyle(.secondary)
                 }
             }
+            .scrollDismissesKeyboard(.interactively)
             .navigationTitle("新建对话")
             .toolbar { ToolbarItem(placement: .cancellationAction) { Button("关闭") { dismiss() } } }
             .task { await verifyAccounts() }

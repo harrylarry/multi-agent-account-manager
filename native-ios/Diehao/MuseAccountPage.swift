@@ -281,7 +281,13 @@ enum CookieTransfer {
     private static func replace(_ cookies: [HTTPCookie], in store: WKHTTPCookieStore) async throws {
         for old in await scopedCookies(store) { await store.delete(old) }
         for cookie in cookies { await store.setCookie(cookie) }
-        guard fingerprints(await scopedCookies(store)) == fingerprints(cookies) else { throw CookieError.verification }
+        let expected = fingerprints(cookies)
+        // WebKit's write callback can precede visibility in the cookie readback.
+        for attempt in 0...4 {
+            if fingerprints(await scopedCookies(store)) == expected { return }
+            if attempt < 4 { try? await Task.sleep(for: .milliseconds(150 * (attempt + 1))) }
+        }
+        throw CookieError.writeVerification
     }
 
     private static func fingerprints(_ cookies: [HTTPCookie]) -> [String: Data] {

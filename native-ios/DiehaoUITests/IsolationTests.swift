@@ -61,7 +61,7 @@ final class IsolationTests: XCTestCase {
         clean(app: app, button: cleanup, status: status)
         let bc = app.buttons["isolationBC.run"]
         bc.tap()
-        let bcProgress = NSPredicate(format: "label CONTAINS %@ OR label CONTAINS %@", "B / C 组通过", "请彻底退出并重开叠号")
+        let bcProgress = NSPredicate(format: "NOT (label BEGINSWITH %@ OR label CONTAINS %@)", "正在", "A 组通过")
         XCTAssertEqual(
             XCTWaiter.wait(for: [XCTNSPredicateExpectation(predicate: bcProgress, object: status)], timeout: 90),
             .completed, status.label
@@ -76,7 +76,11 @@ final class IsolationTests: XCTestCase {
             )
             bc.tap()
         }
-        wait(for: status, toContain: "B / C 组通过")
+        XCTAssertEqual(
+            XCTWaiter.wait(for: [XCTNSPredicateExpectation(predicate: bcProgress, object: status)], timeout: 90),
+            .completed, status.label
+        )
+        XCTAssertTrue(status.label.contains("B / C 组通过"), status.label)
     }
 
     @MainActor
