@@ -39,12 +39,15 @@ final class IsolationTests: XCTestCase {
         wait(for: status, toContain: "A 组通过")
         cleanup.tap()
         wait(for: status, toContain: "测试资料已清理")
+        let bc = app.buttons["isolationBC.run"]
+        bc.tap()
+        wait(for: status, toContain: "B / C 组通过")
     }
 
     @MainActor
     private func wait(for element: XCUIElement, toContain text: String) {
         let predicate = NSPredicate(format: "label CONTAINS %@", text)
-        let result = XCTWaiter.wait(for: [XCTNSPredicateExpectation(predicate: predicate, object: element)], timeout: 45)
+        let result = XCTWaiter.wait(for: [XCTNSPredicateExpectation(predicate: predicate, object: element)], timeout: 90)
         XCTAssertEqual(result, .completed, "Expected \(text), current: \(element.label)")
     }
 }

@@ -13,6 +13,8 @@ struct AccountIdentity: Codable, Identifiable {
     let purpose: Purpose
     var usesLegacyDefault = false
     var requiresProxy = false
+    var alias: String? = nil
+    var proxy: AccountProxySettings? = nil
 }
 
 enum RegistryError: LocalizedError {
@@ -22,6 +24,7 @@ enum RegistryError: LocalizedError {
     case legacyStoreIsShared
     case removalInProgress
     case storeStillExists
+    case unavailableProxyCredential
 
     var errorDescription: String? {
         switch self {
@@ -31,6 +34,7 @@ enum RegistryError: LocalizedError {
         case .legacyStoreIsShared: "旧默认资料由旧版管理。"
         case .removalInProgress: "正在删除这个资料。"
         case .storeStillExists: "WebKit 仍报告该资料存在，可以重试清理。"
+        case .unavailableProxyCredential: "代理配置或钥匙串凭据不可读，已阻止连接。"
         }
     }
 }
@@ -59,6 +63,7 @@ final class AccountStoreRegistry {
         var identities: [AccountIdentity] = []
         var pendingRemoval: Set<UUID> = []
         var legacyReferencesChecked = false
+        var pendingCookieWrites: Set<UUID>? = nil
     }
 
     private final class WeakView {
@@ -99,6 +104,30 @@ final class AccountStoreRegistry {
         index.identities.count { $0.purpose == .account }
     }
 
+    var accounts: [AccountIdentity] {
+        index.identities.filter { $0.purpose == .account && !index.pendingRemoval.contains($0.id) }
+    }
+
+    func retryPendingRemoval() async {
+        for id in index.pendingRemoval {
+            // A failed WebKit/Keychain removal remains queued in the index.
+            try? await remove(id)
+        }
+    }
+
+    func createAccount(alias: String, reserving formerID: UUID? = nil, pendingImport: Bool = false) async throws -> AccountIdentity {
+        _ = WKWebsiteDataStore.default()
+        let existing = await WKWebsiteDataStore.allDataStoreIdentifiers
+        var ids = Set(index.identities.map(\.id)).union(existing)
+        if let formerID { ids.insert(formerID) }
+        let identity = AccountIdentity(id: uniqueID(reserving: &ids), purpose: .account, alias: alias)
+        var next = index
+        next.identities.append(identity)
+        if pendingImport { next.pendingCookieWrites = (next.pendingCookieWrites ?? []).union([identity.id]) }
+        try save(next)
+        return identity
+    }
+
     func createIsolationPair() async throws -> (a: UUID, b: UUID) {
         _ = WKWebsiteDataStore.default()
         let existing = await WKWebsiteDataStore.allDataStoreIdentifiers
@@ -128,17 +157,72 @@ final class AccountStoreRegistry {
     }
 
     func makeWebView(for id: UUID) throws -> AccountWebView {
+        guard index.pendingCookieWrites?.contains(id) != true else { throw CookieError.rollback }
+        return try makeConfiguredWebView(for: id)
+    }
+
+    func makeVerificationView(for id: UUID) throws -> AccountWebView {
+        try makeConfiguredWebView(for: id)
+    }
+
+    private func makeConfiguredWebView(for id: UUID) throws -> AccountWebView {
         let identity = try activeIdentity(id)
-        guard !identity.requiresProxy || proxyConfigurations[id]?.isEmpty == false else {
-            throw RegistryError.proxyUnavailable
+        if identity.requiresProxy && proxyConfigurations[id]?.isEmpty != false {
+            guard let settings = identity.proxy else { throw RegistryError.proxyUnavailable }
+            let resolved = try settings.configuration()
+            let store = try dataStore(for: id)
+            store.proxyConfigurations = [resolved]
+            proxyConfigurations[id] = [resolved]
         }
         let configuration = WKWebViewConfiguration()
         configuration.websiteDataStore = try dataStore(for: id)
         configuration.preferences.javaScriptCanOpenWindowsAutomatically = false
+        if identity.requiresProxy {
+            configuration.userContentController.addUserScript(AccountProxySettings.restrictions)
+        }
         let handle = AccountWebView(configuration: configuration)
         webViews[id, default: []].removeAll { $0.value == nil }
         webViews[id, default: []].append(WeakView(handle))
         return handle
+    }
+
+    func setCookieWritePending(_ pending: Bool, for id: UUID) throws {
+        _ = try activeIdentity(id)
+        var next = index
+        if pending {
+            next.pendingCookieWrites = (next.pendingCookieWrites ?? []).union([id])
+        } else {
+            next.pendingCookieWrites?.remove(id)
+        }
+        try save(next)
+        if pending { invalidateViews(for: id) }
+    }
+
+    func setProxy(_ settings: AccountProxySettings?, password: String, for id: UUID) throws {
+        let identity = try activeIdentity(id)
+        guard !identity.usesLegacyDefault else { throw RegistryError.legacyStoreIsShared }
+        // Store each credential under a fresh reference. A failed index write
+        // cannot replace the credential still used by the previous profile.
+        let configuration = try settings?.configuration(password: password)
+        if let key = settings?.credentialID { try T2Keychain.save(Data(password.utf8), as: key) }
+        do {
+            var next = index
+            guard let position = next.identities.firstIndex(where: { $0.id == id }) else {
+                throw RegistryError.unavailableIdentity
+            }
+            next.identities[position].proxy = settings
+            next.identities[position].requiresProxy = settings != nil
+            try save(next)
+        } catch {
+            if let key = settings?.credentialID { try? T2Keychain.delete(key) }
+            throw error
+        }
+        invalidateViews(for: id)
+        let configs = configuration.map { [$0] } ?? []
+        proxyConfigurations[id] = configs
+        let store = try dataStore(for: id)
+        store.proxyConfigurations = configs
+        if let old = identity.proxy?.credentialID { try? T2Keychain.delete(old) }
     }
 
     // Store configuration is applied before the next view is created. Old views
@@ -182,9 +266,12 @@ final class AccountStoreRegistry {
         }
         let remaining = await WKWebsiteDataStore.allDataStoreIdentifiers
         guard !remaining.contains(id) else { throw RegistryError.storeStillExists }
+        if let key = identity.proxy?.credentialID { try T2Keychain.delete(key) }
+        try T2Keychain.delete("cookie-rollback." + id.uuidString)
         next = index
         next.identities.removeAll { $0.id == id }
         next.pendingRemoval.remove(id)
+        next.pendingCookieWrites?.remove(id)
         try save(next)
     }
 
