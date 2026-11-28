@@ -1,6 +1,6 @@
 import Foundation
 
-enum MuseActivityError: Error { case unavailable, signIn, timeout, invalidFrame, disconnected }
+enum MuseActivityError: Error { case unavailable, signIn, timeout, invalidFrame, disconnected, rejected(Int) }
 
 @MainActor
 protocol MuseActivityConnection: AnyObject {
@@ -19,25 +19,31 @@ private final class MuseWire {
     }
     deinit { diehao_wire_free(handle) }
 
-    func start() throws -> Data { try read(diehao_wire_message_one(handle)) }
+    func start() throws -> Data { try Self.read(diehao_wire_message_one(handle)) }
     func finish(_ data: Data) throws -> Data { try invoke(data, using: diehao_wire_message_three) }
     func request(_ path: String) throws -> Data { try invoke(Data(path.utf8), using: diehao_wire_request) }
     func receive(_ data: Data) throws -> Data { try invoke(data, using: diehao_wire_receive) }
-    func decide(_ path: String, body: Data) throws -> Data {
+    func post(_ path: String, body: Data) throws -> Data {
         try Data(path.utf8).withUnsafeBytes { route in
             try body.withUnsafeBytes { payload in
-                try read(diehao_wire_approval_decision(handle, route.bindMemory(to: UInt8.self).baseAddress, route.count,
+                try Self.read(diehao_wire_post(handle, route.bindMemory(to: UInt8.self).baseAddress, route.count,
                     payload.bindMemory(to: UInt8.self).baseAddress, payload.count))
             }
         }
     }
 
-    private func invoke(_ data: Data, using call: (OpaquePointer?, UnsafePointer<UInt8>?, Int) -> OpaquePointer?) throws -> Data {
-        try data.withUnsafeBytes { bytes in
-            try read(call(handle, bytes.bindMemory(to: UInt8.self).baseAddress, bytes.count))
+    static func ack(_ line: Data) throws -> Data {
+        try line.withUnsafeBytes {
+            try read(diehao_wire_chat_ack($0.bindMemory(to: UInt8.self).baseAddress, $0.count))
         }
     }
-    private func read(_ handle: OpaquePointer?) throws -> Data {
+
+    private func invoke(_ data: Data, using call: (OpaquePointer?, UnsafePointer<UInt8>?, Int) -> OpaquePointer?) throws -> Data {
+        try data.withUnsafeBytes { bytes in
+            try Self.read(call(handle, bytes.bindMemory(to: UInt8.self).baseAddress, bytes.count))
+        }
+    }
+    private static func read(_ handle: OpaquePointer?) throws -> Data {
         guard let handle else { throw MuseActivityError.invalidFrame }
         defer { diehao_wire_blob_free(handle) }
         var size = 0
@@ -68,7 +74,7 @@ final class NativeMuseActivityConnection: MuseActivityConnection {
 
     static func open(registry: AccountStoreRegistry, id: UUID) async throws -> NativeMuseActivityConnection {
         let (store, configuration) = try registry.accountResources(for: id)
-        let cookies = try await MuseQuotaHTTP.readCookies(store)
+        let cookies = try await MuseQuotaHTTP.readCookies(store, timeout: .seconds(15))
         let cookie = MuseQuotaHTTP.cookieHeader(cookies, path: "/")
         guard !cookie.isEmpty else { throw MuseActivityError.signIn }
         let control = URLSession(configuration: configuration, delegate: MuseRedirectPolicy(), delegateQueue: nil)
@@ -184,13 +190,14 @@ final class NativeMuseActivityConnection: MuseActivityConnection {
         pending.removeAll()
     }
 
-    private func issue(_ route: String, persistent: Bool, body: Data? = nil) throws -> AsyncThrowingStream<Data, Error> {
+    private func issue(_ route: String, persistent: Bool, body: Data? = nil,
+                       deadline: Duration = .seconds(12)) throws -> AsyncThrowingStream<Data, Error> {
         guard !closed else { throw MuseActivityError.disconnected }
-        let encoded = try body.map { try wire.decide(route, body: $0) } ?? wire.request(route)
+        let encoded = try body.map { try wire.post(route, body: $0) } ?? wire.request(route)
         guard let streamID: UInt64 = encoded.integer(at: 0) else { throw MuseActivityError.invalidFrame }
         let (stream, continuation) = AsyncThrowingStream<Data, Error>.makeStream(bufferingPolicy: .bufferingOldest(128))
         let timeout = Task { [weak self] in
-            do { try await Task.sleep(for: .seconds(12)) } catch { return }
+            do { try await Task.sleep(for: deadline) } catch { return }
             self?.finish(streamID, error: MuseActivityError.timeout)
         }
         pending[streamID] = Pending(continuation: continuation, persistent: persistent, timeout: timeout)
@@ -222,8 +229,8 @@ final class NativeMuseActivityConnection: MuseActivityConnection {
         guard var entry = pending[stream] else { return }
         switch frame[0] {
         case 1:
-            guard (200..<300).contains(status) else {
-                finish(stream, error: [401, 403].contains(status) ? MuseActivityError.signIn : MuseActivityError.unavailable)
+            guard status == 0 || (200..<300).contains(status) else {
+                finish(stream, error: [401, 403].contains(status) ? MuseActivityError.signIn : MuseActivityError.rejected(Int(status)))
                 return
             }
             if entry.persistent {
@@ -250,6 +257,36 @@ final class NativeMuseActivityConnection: MuseActivityConnection {
             result.append(bytes)
         }
         return result
+    }
+
+    func sendNew(_ text: String, thread: String, key: UUID) async throws -> MuseSendAck {
+        let body = try JSONSerialization.data(withJSONObject: [
+            "items": [["type": "text", "text": text]],
+            "node_id": "", "session_id": thread, "new_conversation": true,
+            "idempotencyKey": key.uuidString.lowercased(), "clientMessageId": key.uuidString.lowercased(),
+            "capabilities": ["hotel_results", "chat_cancel", "delta_stream", "custom_reactions",
+                             "custom_reactions_facebook_thumbs_up_v1"]
+        ])
+        let stream = try issue("/chat/stream", persistent: false, body: body, deadline: .seconds(30))
+        var buffer = Data()
+        for try await chunk in stream {
+            guard buffer.count + chunk.count <= 1_048_576 else { throw MuseActivityError.invalidFrame }
+            buffer.append(chunk)
+            while let newline = buffer.firstIndex(of: 10) {
+                let line = Data(buffer.prefix(upTo: newline))
+                buffer.removeSubrange(...newline)
+                if let ack = try Self.parseAck(line) { return ack }
+            }
+        }
+        if let ack = try Self.parseAck(buffer) { return ack }
+        throw MuseActivityError.disconnected
+    }
+
+    private static func parseAck(_ line: Data) throws -> MuseSendAck? {
+        guard !line.isEmpty else { return nil }
+        let body = try MuseWire.ack(line)
+        guard !body.isEmpty else { return nil }
+        return try JSONDecoder().decode(MuseSendAck.self, from: body)
     }
 
     private func finish(_ id: UInt64, error: Error? = nil) {

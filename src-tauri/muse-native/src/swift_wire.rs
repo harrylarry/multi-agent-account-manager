@@ -1,6 +1,7 @@
 //! Apple bridge for the existing Rust Noise handshake and frame codec.
 //! The Swift caller owns the network connection and serializes access to each state.
 use crate::collect::subscription_request;
+use crate::chat_send::{start_session_request, validate_ack, AckReject};
 use crate::gateway::is_owner_rv_challenge;
 use crate::noise::NoiseXXInitiator;
 use crate::protobuf::PbWriter;
@@ -82,6 +83,7 @@ unsafe extern "C" fn diehao_wire_request(wire: *mut Wire, route: *const u8, leng
   let Ok(path) = std::str::from_utf8(std::slice::from_raw_parts(route, length)) else { return std::ptr::null_mut() };
   let request = match path {
     "/chat/subscribe" => subscription_request(),
+    "/session/start" => start_session_request(),
     path if path == "/api/session/list" || path.starts_with("/chat/history?")
         || path == "/approvals" || approval_route(path) => HttpRequest {
       service: if path.starts_with("/approvals") { Service::Sentinel } else { Service::Daemon },
@@ -100,23 +102,48 @@ unsafe extern "C" fn diehao_wire_request(wire: *mut Wire, route: *const u8, leng
 }
 
 #[no_mangle]
-unsafe extern "C" fn diehao_wire_approval_decision(
+unsafe extern "C" fn diehao_wire_post(
   wire: *mut Wire, route: *const u8, route_length: usize, body: *const u8, body_length: usize,
 ) -> *mut Vec<u8> {
   let Some(Wire::Transport(transport)) = wire.as_mut() else { return std::ptr::null_mut() };
   if route.is_null() || route_length == 0 || route_length > 160
-      || body.is_null() || body_length == 0 || body_length > 4096 {
+      || body.is_null() || body_length == 0 || body_length > 524_288 {
     return std::ptr::null_mut();
   }
   let Ok(path) = std::str::from_utf8(std::slice::from_raw_parts(route, route_length)) else { return std::ptr::null_mut() };
-  if !path.strip_suffix("/decide").is_some_and(approval_route) { return std::ptr::null_mut() }
+  let service = if path == "/chat/stream" {
+    Service::Daemon
+  } else if body_length <= 4096 && path.strip_suffix("/decide").is_some_and(approval_route) {
+    Service::Sentinel
+  } else {
+    return std::ptr::null_mut();
+  };
   encode(transport, HttpRequest {
-    service: Service::Sentinel,
+    service,
     verb: "POST".to_owned(),
     path: path.to_owned(),
     headers: vec![("Content-Type".to_owned(), "application/json".to_owned()), ("x-app-id".to_owned(), "hatch-web".to_owned())],
     body: std::slice::from_raw_parts(body, body_length).to_vec(),
   })
+}
+
+#[no_mangle]
+unsafe extern "C" fn diehao_wire_chat_ack(bytes: *const u8, length: usize) -> *mut Vec<u8> {
+  if bytes.is_null() || length == 0 || length > 1_048_576 {
+    return std::ptr::null_mut();
+  }
+  let Ok(value) = serde_json::from_slice::<serde_json::Value>(std::slice::from_raw_parts(bytes, length)) else {
+    return boxed(Vec::new());
+  };
+  if value["type"] == "event" {
+    return boxed(Vec::new());
+  }
+  let value = match validate_ack(&value, None) {
+    Ok(ack) => serde_json::json!({"message": ack.message_id, "thread": ack.session_id}),
+    Err(AckReject::NotAck) => return boxed(Vec::new()),
+    Err(AckReject::Error(_)) => serde_json::json!({"rejected":true}),
+  };
+  serde_json::to_vec(&value).map(boxed).unwrap_or(std::ptr::null_mut())
 }
 
 #[no_mangle]

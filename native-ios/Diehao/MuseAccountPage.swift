@@ -86,6 +86,7 @@ final class MusePageDelegate: NSObject, WKNavigationDelegate, WKUIDelegate {
 struct MuseAccountPage: UIViewRepresentable {
     let webView: WKWebView
     let retry: Int
+    let entryURL: URL
     let onResult: (String?) -> Void
     var onPage: ((WKWebView) -> Void)? = nil
 
@@ -108,7 +109,7 @@ struct MuseAccountPage: UIViewRepresentable {
     func makeUIView(context: Context) -> WKWebView {
         webView.navigationDelegate = context.coordinator
         webView.uiDelegate = context.coordinator
-        webView.load(URLRequest(url: MusePageDelegate.entryURL, timeoutInterval: 30))
+        webView.load(URLRequest(url: entryURL, timeoutInterval: 30))
         return webView
     }
 
@@ -117,7 +118,7 @@ struct MuseAccountPage: UIViewRepresentable {
         context.coordinator.appliedRetry = retry
         // Restart at the entry instead of resubmitting a failed login form.
         context.coordinator.close()
-        uiView.load(URLRequest(url: MusePageDelegate.entryURL, timeoutInterval: 30))
+        uiView.load(URLRequest(url: entryURL, timeoutInterval: 30))
     }
 
     static func dismantleUIView(_ uiView: WKWebView, coordinator: MusePageDelegate) {
@@ -250,7 +251,7 @@ enum CookieTransfer {
     static func apply(_ preview: CookiePreview, id: UUID, registry: AccountStoreRegistry,
                       verify: () async throws -> Void) async throws {
         let store = try registry.dataStore(for: id).httpCookieStore
-        let existing = await scopedCookies(store)
+        let existing = try await registry.storeStep(for: id) { await scopedCookies(store) }
         try saveRollback(existing.map(MuseCookie.init), id: id)
         do { try registry.setCookieWritePending(true, for: id) }
         catch {
@@ -258,17 +259,25 @@ enum CookieTransfer {
             throw error
         }
         do {
-            try await replace(try preview.cookies.map { try $0.native() }, in: store)
+            let incoming = try preview.cookies.map { try $0.native() }
+            try await registry.storeStep(for: id) { try await replace(incoming, in: store) }
             try await verify()
-            guard Set(await scopedCookies(store).map { MuseCookie($0).family ?? "" }) == ["muse.ai", "meta.com"] else {
+            let domains = try await registry.storeStep(for: id) {
+                Set(await scopedCookies(store).map { MuseCookie($0).family ?? "" })
+            }
+            guard domains == ["muse.ai", "meta.com"] else {
                 throw CookieError.missingDomain
             }
             try registry.setCookieWritePending(false, for: id)
+        } catch RegistryError.storeAwaitingRestart {
+            throw RegistryError.storeAwaitingRestart
         } catch {
             let cause = error
             do {
-                try await replace(existing, in: store)
+                try await registry.storeStep(for: id) { try await replace(existing, in: store) }
                 try registry.setCookieWritePending(false, for: id)
+            } catch RegistryError.storeAwaitingRestart {
+                throw RegistryError.storeAwaitingRestart
             } catch {
                 throw CookieError.rollback
             }
@@ -312,7 +321,7 @@ enum CookieTransfer {
         let backup = try JSONDecoder().decode([MuseCookie].self, from: stored)
         let previous = try backup.map { try $0.native() }
         let store = try registry.dataStore(for: id).httpCookieStore
-        try await replace(previous, in: store)
+        try await registry.storeStep(for: id) { try await replace(previous, in: store) }
         try registry.setCookieWritePending(false, for: id)
         try T2Keychain.delete(key)
     }
