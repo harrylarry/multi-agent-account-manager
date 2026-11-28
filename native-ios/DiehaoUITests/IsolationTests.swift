@@ -136,7 +136,8 @@ final class DashboardTests: XCTestCase {
         fingerprint.tap()
         XCTAssertTrue(app.staticTexts["fingerprint.empty"].waitForExistence(timeout: 10))
         app.buttons["fingerprint.measure"].tap()
-        let confirm = app.buttons["fingerprint.confirm"]
+        // SwiftUI exposes the confirmation action as two nested accessibility buttons.
+        let confirm = app.sheets.firstMatch.buttons.matching(identifier: "fingerprint.confirm").firstMatch
         XCTAssertTrue(confirm.waitForExistence(timeout: 10))
         XCTAssertFalse(app.buttons["fingerprint.result"].exists)
         confirm.tap()
