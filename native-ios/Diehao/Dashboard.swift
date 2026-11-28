@@ -228,10 +228,15 @@ private struct DashboardCompose: View {
                         Text("暂无已确认登录的账号。请从账号资料打开 Muse 登录。")
                     } else {
                         Menu {
-                            Picker("账号", selection: $selection) {
-                                Text("请选择").tag(UUID?.none)
-                                ForEach(signedIn) { account in
-                                    Text(account.displayName).tag(Optional(account.id))
+                            ForEach(signedIn) { account in
+                                Button {
+                                    selection = account.id
+                                } label: {
+                                    if selection == account.id {
+                                        Label("用 \(account.displayName) 发送", systemImage: "checkmark")
+                                    } else {
+                                        Text("用 \(account.displayName) 发送")
+                                    }
                                 }
                             }
                         } label: {

@@ -150,8 +150,10 @@ final class DashboardTests: XCTestCase {
         let account = app.buttons["compose.account"]
         XCTAssertTrue(account.waitForExistence(timeout: 10))
         account.tap()
-        XCTAssertFalse(app.buttons["测试账号 B"].exists)
-        app.buttons["测试账号 A"].tap()
+        XCTAssertFalse(app.buttons["用 测试账号 B 发送"].exists)
+        let signedIn = app.buttons["用 测试账号 A 发送"]
+        XCTAssertTrue(signedIn.waitForExistence(timeout: 5))
+        signedIn.tap()
         let send = app.buttons["compose.send"]
         XCTAssertFalse(send.isEnabled)
         let message = app.textViews["compose.message"]
