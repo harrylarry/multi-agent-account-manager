@@ -156,6 +156,7 @@ struct AccountDetail: View {
     var quota: QuotaCoordinator? = nil
     var museActivity: MuseActivityCoordinator? = nil
     var approvals: MuseApprovalQueue? = nil
+    var initialThread: String? = nil
     @State private var scheme: AccountProxySettings.Scheme = .http
     @State private var host = ""
     @State private var port = ""
@@ -177,18 +178,14 @@ struct AccountDetail: View {
     @State private var showPage = false
     @State private var pageError: String?
     @State private var pageRetry = 0
+    @State private var pageEntry = MusePageDelegate.entryURL
     @State private var deletePrompt = false
 
     var body: some View {
         Form {
             Section {
                 Button("打开 Muse 登录") {
-                    do {
-                        page = try registry.makeWebView(for: account.id)
-                        pageError = nil
-                        pageRetry = 0
-                        showPage = true
-                    } catch { status = error.localizedDescription }
+                    openMuse()
                 }
                 .accessibilityIdentifier("account.openMuse")
                 Text("资料 ID · " + String(account.id.uuidString.prefix(8)))
@@ -249,6 +246,9 @@ struct AccountDetail: View {
                 username = proxy.username
             }
             loadPool()
+            if let initialThread, let id = UUID(uuidString: initialThread) {
+                openMuse(entry: MusePageDelegate.entryURL.appending(path: "thread/" + id.uuidString.lowercased()))
+            }
         }
         .navigationDestination(isPresented: $showPage) {
             if let webView = page?.view {
@@ -264,7 +264,7 @@ struct AccountDetail: View {
                         }
                         .padding()
                     }
-                    MuseAccountPage(webView: webView, retry: pageRetry, onResult: { pageError = $0 },
+                    MuseAccountPage(webView: webView, retry: pageRetry, entryURL: pageEntry, onResult: { pageError = $0 },
                         onPage: { view in
                             guard let quota else { return }
                             Task { await quota.refresh(account.id, trigger: .account, page: view) }
@@ -387,6 +387,16 @@ struct AccountDetail: View {
                 else { status = error.localizedDescription }
             }
         }
+    }
+
+    private func openMuse(entry: URL = MusePageDelegate.entryURL) {
+        do {
+            page = try registry.makeWebView(for: account.id)
+            pageEntry = entry
+            pageError = nil
+            pageRetry = 0
+            showPage = true
+        } catch { status = error.localizedDescription }
     }
 
     nonisolated private static func readCookieFile(_ url: URL) throws -> Data {

@@ -1,5 +1,14 @@
 # 当前开发进度
 
+## Swift T7 新对话发送 · 交接
+
+[Issue #30](https://github.com/harrylarry/multi-agent-account-manager/issues/30) 的工作树位于 D:/Codex/swift-t7，分支 feat/swift-t7-send，基于 T6 模拟器通过提交 5e3523e。当前是交接中的 WIP，仅检查了 Git diff，尚未核验 Xcode、Rust 链接或模拟器。
+
+- 已写入 Compose 到 Rust Noise 的发送接线、基于钥匙串密钥的加密 SQLite 发送台账、26 秒只读历史核对和合成超时测试。台账存消息 HMAC，无正文。重点核对 new_conversation 与预分配会话 ID 的服务端行为，结果不明时保持不自动重发。
+- 先核查 T7 CI，修复编译与回归失败。补足忙碌、明确失败、重启续查、一次人工重试和未知状态的可见回执。模拟器通过后依次做 T8 加密备份、T9 模型指纹和 T10 Noise 原生化。
+- [T3 模拟器 3/3](https://github.com/harrylarry/multi-agent-account-manager/actions/runs/46147399099) · [T4 模拟器 4/4](https://github.com/harrylarry/multi-agent-account-manager/actions/runs/46150389610) · [T5 模拟器 5/5](https://github.com/harrylarry/multi-agent-account-manager/actions/runs/46152112658) · [T6 模拟器 6/6](https://github.com/harrylarry/multi-agent-account-manager/actions/runs/46154325352)。
+- T2 缺口仍在 [#20](https://github.com/harrylarry/multi-agent-account-manager/issues/20)。构建号 4 真机有 muse.ai 9 条和 meta.com 2 条，Cookie 池缺邮箱绑定证据，文件选择器点 JSON 无响应，三协议真实出口待验。真机集中到 T10 后，使用非主力账号，验收前保持草稿且不合入。
+
 ## Swift T6 审批与审计
 
 [Issue #28](https://github.com/harrylarry/multi-agent-account-manager/issues/28) 基于 T5 的模拟器通过提交 b502aae。前台按 12 秒轮询，运行中按 3 秒轮询，待审批事件可立即触发核对。每次决定前复查同账号、审批 ID、会话和期限。四类硬拒绝优先，任务授权仅在已识别的同一 run 和目标内有效。叠号每个 run 的审批额度为 20 次、单工具 5 次，尝试计入预算。审计链由设备钥匙串保护密钥和末尾签名。真实载荷、自动过期拒绝和长期授权以统一真机为准。

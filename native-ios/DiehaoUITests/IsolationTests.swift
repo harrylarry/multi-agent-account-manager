@@ -123,6 +123,32 @@ final class IsolationTests: XCTestCase {
 
 final class DashboardTests: XCTestCase {
     @MainActor
+    func testUnknownSendReconcilesWithoutSendingAgain() {
+        continueAfterFailure = false
+        let app = XCUIApplication()
+        app.launchArguments = ["-diehao-send-fixtures"]
+        app.launch()
+
+        let compose = app.buttons["dashboard.compose"]
+        XCTAssertTrue(compose.waitForExistence(timeout: 20))
+        compose.tap()
+        let picker = app.buttons["compose.account"]
+        XCTAssertTrue(picker.waitForExistence(timeout: 10))
+        picker.tap()
+        app.buttons["用 测试账号 A 发送"].tap()
+        app.textViews["compose.message"].tap()
+        app.typeText("Simulator send")
+        let send = app.buttons["compose.send"]
+        if !send.isHittable { app.swipeUp() }
+        send.tap()
+        let check = app.buttons["compose.checkSend"]
+        XCTAssertTrue(check.waitForExistence(timeout: 10))
+        if !check.isHittable { app.swipeUp() }
+        check.tap()
+        XCTAssertTrue(app.buttons["account.openMuse"].waitForExistence(timeout: 15))
+    }
+
+    @MainActor
     func testApprovalQueueScopesActionsAndConfirmsOneTimeGrant() {
         continueAfterFailure = false
         let app = XCUIApplication()

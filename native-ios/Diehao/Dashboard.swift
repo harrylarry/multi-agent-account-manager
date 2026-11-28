@@ -22,6 +22,8 @@ enum ForegroundPollInterval: Int, CaseIterable, Identifiable {
 
 enum ComposeResult {
     case notConnected
+    case failed, busy, unknown, retryAvailable
+    case confirmed(String)
 }
 
 @MainActor
@@ -30,6 +32,8 @@ struct DashboardServices {
     var activity: @MainActor () async -> [UUID: DashboardActivity]?
     var hasSession: @MainActor (UUID) async -> Bool
     var send: @MainActor (UUID, String) async -> ComposeResult
+    var checkSend: @MainActor (UUID, String) async -> ComposeResult = { _, _ in .unknown }
+    var retrySend: @MainActor (UUID, String) async -> ComposeResult = { _, _ in .unknown }
 
     init(registry: AccountStoreRegistry) {
         accounts = { registry.accounts }
@@ -79,6 +83,7 @@ struct Dashboard: View {
     @State private var quota: QuotaCoordinator
     @State private var activityCoordinator: MuseActivityCoordinator
     @State private var approvals: MuseApprovalQueue
+    @State private var sender: MuseSendCoordinator
     @Environment(\.scenePhase) private var scenePhase
     @AppStorage("dashboard.foregroundPollSeconds") private var savedInterval = ForegroundPollInterval.normal.rawValue
     @State private var rows: [AccountIdentity] = []
@@ -86,13 +91,29 @@ struct Dashboard: View {
     @State private var refreshing = false
     @State private var activityEnabled = false
     @State private var selected: AccountIdentity?
+    @State private var selectedThread: String?
+    @State private var confirmedRoute: (UUID, String)?
     @State private var showCompose = false
 
     init(registry: AccountStoreRegistry, check: IsolationCheck) {
         self.registry = registry
         self.check = check
         let activityCoordinator: MuseActivityCoordinator
+        let sender = MuseSendCoordinator(registry: registry)
+        _sender = State(initialValue: sender)
         #if DEBUG && targetEnvironment(simulator)
+        if ProcessInfo.processInfo.arguments.contains("-diehao-send-fixtures") {
+            var fixtures = DashboardServices.fixtures(registry: registry)
+            let simulatedSender = MuseSendCoordinator.fixtures()
+            fixtures.send = { await simulatedSender.submit(account: $0, message: $1) }
+            fixtures.checkSend = { await simulatedSender.check(account: $0, message: $1) }
+            fixtures.retrySend = { await simulatedSender.submit(account: $0, message: $1, retry: true) }
+            _services = State(initialValue: fixtures)
+            _quota = State(initialValue: .fixtures(accounts: fixtures.accounts()))
+            _activityCoordinator = State(initialValue: .fixtures(account: nil))
+            _approvals = State(initialValue: .fixtures(account: nil))
+            return
+        }
         if ProcessInfo.processInfo.arguments.contains("-diehao-approval-fixtures") {
             let fixtures = DashboardServices.fixtures(registry: registry)
             _services = State(initialValue: fixtures)
@@ -124,7 +145,11 @@ struct Dashboard: View {
         activityCoordinator = MuseActivityCoordinator(registry: registry)
         _activityCoordinator = State(initialValue: activityCoordinator)
         _approvals = State(initialValue: Self.makeApprovals(activityCoordinator))
-        _services = State(initialValue: DashboardServices(registry: registry))
+        var services = DashboardServices(registry: registry)
+        services.send = { await sender.submit(account: $0, message: $1) }
+        services.checkSend = { await sender.check(account: $0, message: $1) }
+        services.retrySend = { await sender.submit(account: $0, message: $1, retry: true) }
+        _services = State(initialValue: services)
         _quota = State(initialValue: QuotaCoordinator(registry: registry,
             cacheURL: URL.applicationSupportDirectory.appending(path: "DiehaoNative/quota.json")))
     }
@@ -170,7 +195,10 @@ struct Dashboard: View {
             Section("账号") {
                 if rows.isEmpty { Text("暂无账号").foregroundStyle(.secondary) }
                 ForEach(rows) { account in
-                    Button { selected = account } label: {
+                    Button {
+                        selectedThread = nil
+                        selected = account
+                    } label: {
                         Label {
                             VStack(alignment: .leading, spacing: 3) {
                                 Text(account.displayName)
@@ -246,6 +274,11 @@ struct Dashboard: View {
                 do { try await Task.sleep(for: .seconds(1)) } catch { return }
             }
         }
+        .task(id: scenePhase == .active) {
+            guard scenePhase == .active else { return }
+            let accounts = registry.accounts
+            if !accounts.isEmpty { await sender.resume(accounts: Set(accounts.map(\.id))) }
+        }
         .task(id: scenePhase == .active ? pollSeconds : 0) {
             guard scenePhase == .active else { return }
             await refresh()
@@ -255,17 +288,26 @@ struct Dashboard: View {
             }
         }
         .sheet(item: $selected, onDismiss: { Task {
+            selectedThread = nil
             await activityCoordinator.reconcileParked()
             await refresh()
         } }) { account in
             NavigationStack {
                 AccountDetail(registry: registry, account: account, quota: quota,
-                    museActivity: activityCoordinator, approvals: approvals)
+                    museActivity: activityCoordinator, approvals: approvals, initialThread: selectedThread)
             }
                 .interactiveDismissDisabled()
         }
-        .sheet(isPresented: $showCompose) {
-            DashboardCompose(accounts: rows, services: services)
+        .sheet(isPresented: $showCompose, onDismiss: {
+            guard let (id, thread) = confirmedRoute else { return }
+            confirmedRoute = nil
+            selectedThread = thread
+            selected = rows.first { $0.id == id }
+        }) {
+            DashboardCompose(accounts: rows, services: services) { id, thread in
+                confirmedRoute = (id, thread)
+                showCompose = false
+            }
         }
     }
 
@@ -358,6 +400,7 @@ struct QuotaSummary: View {
 private struct DashboardCompose: View {
     let accounts: [AccountIdentity]
     let services: DashboardServices
+    let onConfirmed: (UUID, String) -> Void
     @Environment(\.dismiss) private var dismiss
     @State private var signedIn: [AccountIdentity] = []
     @State private var selection: UUID?
@@ -365,6 +408,10 @@ private struct DashboardCompose: View {
     @State private var status = ""
     @State private var checking = true
     @State private var sending = false
+    @State private var canCheck = false
+    @State private var canRetry = false
+    @State private var pendingText: String?
+    @State private var pendingAccount: UUID?
 
     private var allowed: Bool {
         selection != nil && (1...16_000).contains(message.count)
@@ -411,7 +458,14 @@ private struct DashboardCompose: View {
                     if !status.isEmpty {
                         Text(status).accessibilityIdentifier("compose.status")
                     }
-                    Text("发送功能将在 T7 接入。").foregroundStyle(.secondary)
+                    if canCheck {
+                        Button("核对发送结果") { verifySend() }
+                            .disabled(sending)
+                            .accessibilityIdentifier("compose.checkSend")
+                    }
+                    if canRetry {
+                        Button("手动重试一次") { verifySend(retry: true) }.disabled(sending)
+                    }
                 }
             }
             .scrollDismissesKeyboard(.interactively)
@@ -438,9 +492,39 @@ private struct DashboardCompose: View {
         let text = message
         Task {
             defer { sending = false }
-            switch await services.send(selection, text) {
-            case .notConnected: status = "发送接口已调用，当前版本未发送消息。"
-            }
+            handle(await services.send(selection, text), id: selection, text: text)
+        }
+    }
+
+    private func verifySend(retry: Bool = false) {
+        guard !sending, let id = pendingAccount, let text = pendingText else { return }
+        sending = true
+        Task {
+            defer { sending = false }
+            let outcome = retry ? await services.retrySend(id, text) : await services.checkSend(id, text)
+            handle(outcome, id: id, text: text)
+        }
+    }
+
+    private func handle(_ result: ComposeResult, id: UUID, text: String) {
+        canCheck = false
+        canRetry = false
+        switch result {
+        case .notConnected: status = "发送接口已调用，当前版本未发送消息。"
+        case .failed: status = "发送未完成。请检查账号状态。"
+        case .busy: status = "这个账号正在发送或核对。"
+        case .unknown:
+            status = "发送结果未知，可核对历史。"
+            pendingAccount = id
+            pendingText = text
+            canCheck = true
+        case .retryAvailable:
+            status = "历史已确认该会话为空，可手动重试一次。"
+            pendingAccount = id
+            pendingText = text
+            canRetry = true
+        case .confirmed(let thread):
+            onConfirmed(id, thread)
         }
     }
 }

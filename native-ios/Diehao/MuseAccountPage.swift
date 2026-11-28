@@ -86,6 +86,7 @@ final class MusePageDelegate: NSObject, WKNavigationDelegate, WKUIDelegate {
 struct MuseAccountPage: UIViewRepresentable {
     let webView: WKWebView
     let retry: Int
+    let entryURL: URL
     let onResult: (String?) -> Void
     var onPage: ((WKWebView) -> Void)? = nil
 
@@ -108,7 +109,7 @@ struct MuseAccountPage: UIViewRepresentable {
     func makeUIView(context: Context) -> WKWebView {
         webView.navigationDelegate = context.coordinator
         webView.uiDelegate = context.coordinator
-        webView.load(URLRequest(url: MusePageDelegate.entryURL, timeoutInterval: 30))
+        webView.load(URLRequest(url: entryURL, timeoutInterval: 30))
         return webView
     }
 
@@ -117,7 +118,7 @@ struct MuseAccountPage: UIViewRepresentable {
         context.coordinator.appliedRetry = retry
         // Restart at the entry instead of resubmitting a failed login form.
         context.coordinator.close()
-        uiView.load(URLRequest(url: MusePageDelegate.entryURL, timeoutInterval: 30))
+        uiView.load(URLRequest(url: entryURL, timeoutInterval: 30))
     }
 
     static func dismantleUIView(_ uiView: WKWebView, coordinator: MusePageDelegate) {
