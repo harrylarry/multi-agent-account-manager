@@ -183,6 +183,9 @@ final class AccountStoreRegistry {
         let configuration = WKWebViewConfiguration()
         configuration.websiteDataStore = try dataStore(for: id)
         configuration.preferences.javaScriptCanOpenWindowsAutomatically = false
+        configuration.allowsInlineMediaPlayback = true
+        configuration.mediaTypesRequiringUserActionForPlayback = .all
+        configuration.userContentController.addUserScript(MusePageDelegate.inlineVideo)
         if identity.requiresProxy {
             configuration.userContentController.addUserScript(AccountProxySettings.restrictions)
         }

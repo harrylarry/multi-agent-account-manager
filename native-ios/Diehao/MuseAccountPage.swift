@@ -4,10 +4,22 @@ import WebKit
 
 @MainActor
 final class MusePageDelegate: NSObject, WKNavigationDelegate, WKUIDelegate {
+    static let entryURL = URL(string: "https://muse.ai/")!
+    static let inlineVideo = WKUserScript(source: """
+        const prepareInlineVideos = () => {
+            for (const video of document.querySelectorAll('video:not([playsinline])')) {
+                video.setAttribute('playsinline', '');
+            }
+        };
+        new MutationObserver(prepareInlineVideos).observe(document, {childList: true, subtree: true});
+        prepareInlineVideos();
+        """, injectionTime: .atDocumentStart, forMainFrameOnly: false)
+
     private let root: WKWebView
     private let onFinish: (WKWebView, WKNavigation?) -> Void
     private let onError: (Error) -> Void
     private var popup: WKWebView?
+    var appliedRetry = 0
 
     init(root: WKWebView, onFinish: @escaping (WKWebView, WKNavigation?) -> Void, onError: @escaping (Error) -> Void) {
         self.root = root
@@ -20,11 +32,11 @@ final class MusePageDelegate: NSObject, WKNavigationDelegate, WKUIDelegate {
     }
 
     func webView(_ webView: WKWebView, didFail navigation: WKNavigation!, withError error: Error) {
-        onError(error)
+        if (error as? URLError)?.code != .cancelled { onError(error) }
     }
 
     func webView(_ webView: WKWebView, didFailProvisionalNavigation navigation: WKNavigation!, withError error: Error) {
-        onError(error)
+        if (error as? URLError)?.code != .cancelled { onError(error) }
     }
 
     func webView(_ webView: WKWebView, didReceive challenge: URLAuthenticationChallenge,
@@ -73,22 +85,36 @@ final class MusePageDelegate: NSObject, WKNavigationDelegate, WKUIDelegate {
 
 struct MuseAccountPage: UIViewRepresentable {
     let webView: WKWebView
-    let onError: (String) -> Void
+    let retry: Int
+    let onResult: (String?) -> Void
 
     func makeCoordinator() -> MusePageDelegate {
-        MusePageDelegate(root: webView, onFinish: { _, _ in }, onError: { _ in
-            onError("页面未能加载。若账号已绑定代理，请检查代理连通性或认证。")
+        MusePageDelegate(root: webView, onFinish: { _, _ in onResult(nil) }, onError: { error in
+            if (error as? URLError)?.code == .timedOut {
+                onResult("Muse 页面请求超时。可在当前账号重试。")
+            } else if let error = error as? RegistryError {
+                onResult(error.localizedDescription)
+            } else {
+                let code = (error as NSError).code
+                onResult("Muse 页面未能加载（\(code)）。可在当前账号重试。")
+            }
         })
     }
 
     func makeUIView(context: Context) -> WKWebView {
         webView.navigationDelegate = context.coordinator
         webView.uiDelegate = context.coordinator
-        webView.load(URLRequest(url: URL(string: "https://muse.ai/")!))
+        webView.load(URLRequest(url: MusePageDelegate.entryURL, timeoutInterval: 30))
         return webView
     }
 
-    func updateUIView(_ uiView: WKWebView, context: Context) {}
+    func updateUIView(_ uiView: WKWebView, context: Context) {
+        guard context.coordinator.appliedRetry != retry else { return }
+        context.coordinator.appliedRetry = retry
+        // Restart at the entry instead of resubmitting a failed login form.
+        context.coordinator.close()
+        uiView.load(URLRequest(url: MusePageDelegate.entryURL, timeoutInterval: 30))
+    }
 
     static func dismantleUIView(_ uiView: WKWebView, coordinator: MusePageDelegate) {
         coordinator.close()
@@ -106,7 +132,7 @@ final class CookieLoginProbe {
         guard expected.range(of: #"^[^\s@]+@[^\s@]+\.[^\s@]+$"#, options: .regularExpression) != nil else {
             throw CookieError.invalidEmail
         }
-        let museURL = URL(string: "https://muse.ai/")!
+        let museURL = MusePageDelegate.entryURL
         defer {
             delegate?.close()
             delegate = nil
@@ -115,24 +141,33 @@ final class CookieLoginProbe {
         try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<Void, Error>) in
             self.continuation = continuation
             let observer = MusePageDelegate(root: webView, onFinish: { [weak self] page, _ in
-                guard page.url?.host == "muse.ai" else { self?.finish(CookieError.verification); return }
+                guard page.url?.scheme == "https", page.url?.host == museURL.host else {
+                    self?.finish(CookieError.sessionUnconfirmed)
+                    return
+                }
                 self?.finish(nil)
-            }, onError: { [weak self] _ in self?.finish(CookieError.verification) })
+            }, onError: { [weak self] error in
+                self?.finish((error as? URLError)?.code == .timedOut ? CookieError.verificationTimeout : CookieError.sessionUnconfirmed)
+            })
             delegate = observer
             webView.navigationDelegate = observer
             var request = URLRequest(url: museURL)
-            request.timeoutInterval = 20
+            request.timeoutInterval = 30
             watchdog = Task { [weak self] in
-                do { try await Task.sleep(for: .seconds(20)) } catch { return }
-                self?.finish(CookieError.verification)
+                do { try await Task.sleep(for: .seconds(30)) } catch { return }
+                self?.finish(CookieError.verificationTimeout)
             }
             webView.load(request)
         }
         let result = try? await webView.callAsyncJavaScript(Self.identityScript,
-            arguments: ["expected": expected], in: nil, contentWorld: .page)
-        guard let result = result as? String else { throw CookieError.verification }
-        if result == "mismatch" { throw CookieError.wrongIdentity }
-        guard result == "verified" else { throw CookieError.verification }
+            arguments: ["expected": expected], in: nil, contentWorld: .defaultClient)
+        switch result as? String {
+        case "verified": return
+        case "mismatch": throw CookieError.wrongIdentity
+        case "timeout": throw CookieError.verificationTimeout
+        case "identityUnavailable": throw CookieError.identityUnavailable
+        default: throw CookieError.sessionUnconfirmed
+        }
     }
 
     private func finish(_ error: Error?) {
@@ -144,26 +179,42 @@ final class CookieLoginProbe {
     }
 
     private static let identityScript = #"""
-        const proof = await fetch('/api/auth/check', {
-            method: 'POST', credentials: 'same-origin',
-            headers: {'Content-Type': 'application/json'}, body: '{}',
-            signal: AbortSignal.timeout(10000)
-        }).then(r => r.ok ? r.json() : null).catch(() => null);
-        if (proof?.ok !== true || !proof.viewer_id) return 'unverified';
+        if (location.origin !== 'https://muse.ai') return 'sessionUnconfirmed';
+        let proof;
+        try {
+            const response = await fetch('/api/auth/check', {
+                method: 'POST', credentials: 'same-origin', redirect: 'error', cache: 'no-store',
+                headers: {'Content-Type': 'application/json'}, body: '{}',
+                signal: AbortSignal.timeout(15000)
+            });
+            if (!response.ok) return 'sessionUnconfirmed';
+            proof = await response.json();
+        } catch (error) {
+            return error.name === 'TimeoutError' ? 'timeout' : 'sessionUnconfirmed';
+        }
+        if (proof?.ok !== true || typeof proof.viewer_id !== 'string' || !proof.viewer_id) return 'sessionUnconfirmed';
         const proofs = new Set();
         const paths = ['viewer', 'user', 'account', 'profile', 'session', 'props', 'pageProps', 'data'];
+        const add = email => {
+            if (typeof email === 'string' && /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email.trim())) {
+                proofs.add(email.trim().toLowerCase());
+            }
+        };
         const visit = (object, depth) => {
             if (!object || typeof object !== 'object' || depth > 5) return;
-            if (typeof object.email === 'string') {
-                const id = object.viewer_id ?? object.user_id ?? object.id;
-                if (id == null || String(id) === String(proof.viewer_id)) proofs.add(object.email.toLowerCase());
+            const id = object.viewer_id ?? object.viewerId ?? object.user_id ?? object.userId ?? object.id;
+            if (id != null && String(id) === proof.viewer_id) {
+                add(object.email);
+                add(object.viewer_email);
+                add(object.viewerEmail);
             }
             for (const key of paths) visit(object[key], depth + 1);
         };
+        visit(proof, 0);
         for (const script of document.querySelectorAll('script#__NEXT_DATA__, script#client-bootstrap, script[data-client-bootstrap]')) {
             try { visit(JSON.parse(script.textContent), 0); } catch {}
         }
-        if (proofs.size !== 1) return 'unverified';
+        if (proofs.size !== 1) return 'identityUnavailable';
         return proofs.has(expected) ? 'verified' : 'mismatch';
         """#
 }

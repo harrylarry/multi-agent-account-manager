@@ -2,6 +2,26 @@ import XCTest
 
 final class IsolationTests: XCTestCase {
     @MainActor
+    func testNewAccountCanOpenAndCloseMuse() {
+        continueAfterFailure = false
+        let app = XCUIApplication()
+        app.launch()
+
+        let accounts = app.buttons["账号资料、代理与 Cookie"]
+        XCTAssertTrue(accounts.waitForExistence(timeout: 20))
+        accounts.tap()
+        app.buttons["新增独立账号"].tap()
+
+        let open = app.buttons["account.openMuse"]
+        XCTAssertTrue(open.waitForExistence(timeout: 10))
+        open.tap()
+        let close = app.buttons["account.closeMuse"]
+        XCTAssertTrue(close.waitForExistence(timeout: 10))
+        close.tap()
+        XCTAssertTrue(open.waitForExistence(timeout: 10))
+    }
+
+    @MainActor
     func testTwoIdentitiesShareNothingAcrossLaunch() throws {
         continueAfterFailure = false
         let app = XCUIApplication()

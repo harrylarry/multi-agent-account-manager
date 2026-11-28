@@ -1,10 +1,11 @@
 import CryptoKit
 import Network
 import SwiftUI
+import UIKit
 import UniformTypeIdentifiers
 
 struct CookieFile: FileDocument {
-    static let readableContentTypes: [UTType] = [.data, .json, .plainText]
+    static let readableContentTypes: [UTType] = [.json]
     var data: Data
 
     init(data: Data) { self.data = data }
@@ -14,6 +15,34 @@ struct CookieFile: FileDocument {
     }
     func fileWrapper(configuration: WriteConfiguration) throws -> FileWrapper {
         FileWrapper(regularFileWithContents: data)
+    }
+}
+
+private struct CookieDocumentPicker: UIViewControllerRepresentable {
+    let onPick: (URL?) -> Void
+
+    func makeCoordinator() -> Coordinator { Coordinator(onPick: onPick) }
+
+    func makeUIViewController(context: Context) -> UIDocumentPickerViewController {
+        let picker = UIDocumentPickerViewController(forOpeningContentTypes: [.item], asCopy: false)
+        picker.delegate = context.coordinator
+        picker.allowsMultipleSelection = false
+        return picker
+    }
+
+    func updateUIViewController(_ controller: UIDocumentPickerViewController, context: Context) {}
+
+    @MainActor
+    final class Coordinator: NSObject, UIDocumentPickerDelegate {
+        private let onPick: (URL?) -> Void
+
+        init(onPick: @escaping (URL?) -> Void) { self.onPick = onPick }
+
+        func documentPicker(_ controller: UIDocumentPickerViewController, didPickDocumentsAt urls: [URL]) {
+            onPick(urls.first)
+        }
+
+        func documentPickerWasCancelled(_ controller: UIDocumentPickerViewController) { onPick(nil) }
     }
 }
 
@@ -126,14 +155,18 @@ private struct AccountDetail: View {
     @State private var archivePassword = ""
     @State private var counts = ""
     @State private var status = ""
+    @State private var cookieStatus = ""
     @State private var busy = false
     @State private var chooseFile = false
     @State private var exportFile = false
     @State private var file: CookieFile?
     @State private var preview: CookiePreview?
+    @State private var selectedFile: URL?
     @State private var pool: [SavedCookies.Entry] = []
     @State private var page: AccountWebView?
     @State private var showPage = false
+    @State private var pageError: String?
+    @State private var pageRetry = 0
     @State private var deletePrompt = false
 
     var body: some View {
@@ -142,9 +175,12 @@ private struct AccountDetail: View {
                 Button("打开 Muse 登录") {
                     do {
                         page = try registry.makeWebView(for: account.id)
+                        pageError = nil
+                        pageRetry = 0
                         showPage = true
                     } catch { status = error.localizedDescription }
                 }
+                .accessibilityIdentifier("account.openMuse")
                 Text("资料 ID · " + String(account.id.uuidString.prefix(8)))
                     .font(.caption)
                 if !status.isEmpty { Text(status).accessibilityIdentifier("account.status") }
@@ -174,46 +210,7 @@ private struct AccountDetail: View {
                     status = "本账号代理已清除。"
                 } }
             }
-            Section("双域 Cookie") {
-                TextField("要验证的 Muse 邮箱", text: $email)
-                    .keyboardType(.emailAddress).textInputAutocapitalization(.never)
-                SecureField("备份文件口令", text: $archivePassword)
-                if !counts.isEmpty { Text(counts) }
-                Button("按域清点") { perform {
-                    counts = try await capture().counts
-                } }
-                Button("验证并保存到 Cookie 池") { perform {
-                    try await saveCurrent()
-                    status = "已验证并加密保存。"
-                } }
-                Button("加密导出 Cookie") { perform {
-                    let records = try await capture()
-                    counts = records.counts
-                    let sealed = try await CookieArchive.seal(records.cookies, password: archivePassword)
-                    file = CookieFile(data: sealed)
-                    archivePassword = ""
-                    exportFile = true
-                } }
-                Button("选择 Cookie 文件") { chooseFile = true }
-                ForEach(pool) { entry in
-                    Button("选择已保存的 Cookie · " + entry.email) {
-                        do {
-                            preview = try CookiePreview(entry.records)
-                            email = entry.email
-                        } catch { status = error.localizedDescription }
-                    }
-                }
-                if let preview {
-                    Text(preview.counts)
-                    ForEach(preview.notes, id: \.self) { Text($0).font(.caption) }
-                    Button("验证并覆盖此账号") { perform { try await restore(preview, newAccount: false) } }
-                    Button("验证并新建独立账号") { perform { try await restore(preview, newAccount: true) } }
-                }
-                Button("恢复导入前的 Cookie") { perform {
-                    try await CookieTransfer.recover(id: account.id, registry: registry)
-                    status = "已恢复导入前的 Cookie。"
-                } }
-            }
+            cookieSection
             Section {
                 Button("删除账号", role: .destructive) { deletePrompt = true }
             }
@@ -230,33 +227,46 @@ private struct AccountDetail: View {
             }
             loadPool()
         }
-        .sheet(isPresented: $showPage, onDismiss: { page = nil }) {
-            NavigationStack {
-                if let webView = page?.view {
-                    MuseAccountPage(webView: webView) { status = $0; showPage = false }
-                        .toolbar { ToolbarItem(placement: .confirmationAction) {
-                            Button("关闭 Muse") { showPage = false }
-                        } }
+        .navigationDestination(isPresented: $showPage) {
+            if let webView = page?.view {
+                VStack(spacing: 0) {
+                    if let pageError {
+                        HStack {
+                            Text(pageError)
+                            Spacer()
+                            Button("重试") {
+                                self.pageError = nil
+                                pageRetry += 1
+                            }
+                        }
+                        .padding()
+                    }
+                    MuseAccountPage(webView: webView, retry: pageRetry) { pageError = $0 }
                 }
+                .navigationTitle("Muse")
+                .navigationBarTitleDisplayMode(.inline)
+                .toolbar { ToolbarItem(placement: .confirmationAction) {
+                    Button("关闭 Muse") { showPage = false }
+                        .accessibilityIdentifier("account.closeMuse")
+                } }
             }
         }
-        .fileImporter(isPresented: $chooseFile, allowedContentTypes: CookieFile.readableContentTypes) { result in
-            perform {
-                let url = try result.get()
-                let accessed = url.startAccessingSecurityScopedResource()
-                defer { if accessed { url.stopAccessingSecurityScopedResource() } }
-                let values = try url.resourceValues(forKeys: [.fileSizeKey])
-                guard (values.fileSize ?? Int.max) <= 6_000_000 else { throw CookieError.invalidFile }
-                let data = try Data(contentsOf: url)
-                preview = try CookiePreview(await CookieArchive.open(data, password: archivePassword))
-                archivePassword = ""
-                status = "请核对域计数和预期邮箱。"
+        .onChange(of: showPage) { _, presented in
+            if !presented { page = nil }
+        }
+        .sheet(isPresented: $chooseFile) {
+            CookieDocumentPicker { url in
+                chooseFile = false
+                guard let url else { return }
+                selectedFile = url
+                preview = nil
+                cookieStatus = "加密备份请先输入口令，再点「读取并预览 Cookie」。"
             }
         }
         .fileExporter(isPresented: $exportFile, document: file, contentType: .json,
                       defaultFilename: "diehao-cookies.encrypted.json") { result in
             file = nil
-            if case .failure(let error) = result { status = error.localizedDescription }
+            if case .failure(let error) = result { cookieStatus = error.localizedDescription }
         }
         .confirmationDialog("删除前保留 Cookie？", isPresented: $deletePrompt, titleVisibility: .visible) {
             Button("加密保留并删除", role: .destructive) { perform {
@@ -271,14 +281,95 @@ private struct AccountDetail: View {
         }
     }
 
-    private func perform(_ operation: @escaping @MainActor () async throws -> Void) {
+    private var cookieSection: some View {
+        Section("双域 Cookie") {
+            TextField("要验证的 Muse 邮箱", text: $email)
+                .keyboardType(.emailAddress).textInputAutocapitalization(.never)
+            SecureField("备份文件口令", text: $archivePassword)
+            if !counts.isEmpty { Text(counts) }
+            if !cookieStatus.isEmpty { Text(cookieStatus).accessibilityIdentifier("cookie.status") }
+            Button("按域清点") { perform(cookie: true) {
+                counts = try await capture().counts
+            } }
+            Button("验证并保存到 Cookie 池") { perform(cookie: true) {
+                try await saveCurrent()
+                cookieStatus = "已验证并加密保存。"
+            } }
+            Button("加密导出 Cookie") { perform(cookie: true) {
+                let records = try await capture()
+                counts = records.counts
+                let sealed = try await CookieArchive.seal(records.cookies, password: archivePassword)
+                file = CookieFile(data: sealed)
+                archivePassword = ""
+                exportFile = true
+            } }
+            Button("选择 Cookie 文件") { chooseFile = true }
+            if let selectedFile {
+                Text("已选择 \(selectedFile.lastPathComponent)")
+                Button("读取并预览 Cookie") { perform(cookie: true) {
+                    let data = try await Task.detached(priority: .userInitiated) {
+                        try Self.readCookieFile(selectedFile)
+                    }.value
+                    preview = try CookiePreview(await CookieArchive.open(data, password: archivePassword))
+                    archivePassword = ""
+                    self.selectedFile = nil
+                    cookieStatus = "请核对域计数和预期邮箱。"
+                } }
+            }
+            ForEach(pool) { entry in
+                Button("选择已保存的 Cookie · " + entry.email) {
+                    do {
+                        preview = try CookiePreview(entry.records)
+                        selectedFile = nil
+                        email = entry.email
+                    } catch { cookieStatus = error.localizedDescription }
+                }
+            }
+            if let preview {
+                Text(preview.counts)
+                ForEach(preview.notes, id: \.self) { Text($0).font(.caption) }
+                Button("验证并覆盖此账号") { perform(cookie: true) { try await restore(preview, newAccount: false) } }
+                Button("验证并新建独立账号") { perform(cookie: true) { try await restore(preview, newAccount: true) } }
+            }
+            Button("恢复导入前的 Cookie") { perform(cookie: true) {
+                try await CookieTransfer.recover(id: account.id, registry: registry)
+                cookieStatus = "已恢复导入前的 Cookie。"
+            } }
+        }
+    }
+
+    private func perform(cookie: Bool = false, _ operation: @escaping @MainActor () async throws -> Void) {
         guard !busy else { return }
+        if cookie { cookieStatus = "" }
+        else { status = "" }
         busy = true
         Task {
             defer { busy = false }
             do { try await operation() }
-            catch { status = error.localizedDescription }
+            catch {
+                if cookie { cookieStatus = error.localizedDescription }
+                else { status = error.localizedDescription }
+            }
         }
+    }
+
+    nonisolated private static func readCookieFile(_ url: URL) throws -> Data {
+        let accessed = url.startAccessingSecurityScopedResource()
+        defer { if accessed { url.stopAccessingSecurityScopedResource() } }
+        var coordinationError: NSError?
+        var result: Result<Data, Error>?
+        NSFileCoordinator().coordinate(readingItemAt: url, options: [], error: &coordinationError) { file in
+            result = Result {
+                let values = try file.resourceValues(forKeys: [.isRegularFileKey, .fileSizeKey])
+                guard values.isRegularFile == true, (values.fileSize ?? Int.max) <= 6_000_000 else {
+                    throw CookieError.invalidFile
+                }
+                return try Data(contentsOf: file)
+            }
+        }
+        if let coordinationError { throw coordinationError }
+        guard let result else { throw CookieError.invalidFile }
+        return try result.get()
     }
 
     private func capture() async throws -> CookiePreview {
@@ -288,7 +379,7 @@ private struct AccountDetail: View {
 
     private func loadPool() {
         do { pool = try SavedCookies.load() }
-        catch { status = error.localizedDescription }
+        catch { cookieStatus = error.localizedDescription }
     }
 
     private func saveCurrent() async throws {
@@ -337,38 +428,56 @@ private struct AccountDetail: View {
         loadPool()
         counts = preview.counts
         self.preview = nil
-        status = newAccount ? "已验证，已建独立账号。" : "已验证，保留原账号 UUID。"
+        cookieStatus = newAccount ? "已验证，已建独立账号。" : "已验证，保留原账号 UUID。"
     }
 }
 
 enum ProxyTest {
+    @MainActor
     static func run(_ settings: AccountProxySettings) async throws -> String {
         let configuration = URLSessionConfiguration.ephemeral
         configuration.proxyConfigurations = [try settings.configuration()]
         configuration.httpCookieStorage = nil
         configuration.urlCache = nil
-        configuration.timeoutIntervalForResource = 10
+        configuration.timeoutIntervalForResource = 20
         let session = URLSession(configuration: configuration)
         defer { session.invalidateAndCancel() }
+
         let start = Date()
-        var live = URLRequest(url: URL(string: "https://www.google.com/generate_204")!)
-        live.timeoutInterval = 5
-        let (_, response) = try await session.data(for: live)
-        guard (response as? HTTPURLResponse)?.statusCode == 204 else { throw RegistryError.proxyUnavailable }
-        let latency = Date().timeIntervalSince(start)
-        var speed = URLRequest(url: URL(string: "https://speed.cloudflare.com/__down?bytes=10000000")!)
-        speed.timeoutInterval = 10
-        let begin = Date()
-        let (stream, download) = try await session.bytes(for: speed)
-        guard (download as? HTTPURLResponse)?.statusCode == 200 else { throw RegistryError.proxyUnavailable }
-        let headers = Date().timeIntervalSince(begin)
-        var received = 0
-        for try await _ in stream {
-            received += 1
-            if received == 10_000_000 { break }
+        var live = URLRequest(url: MusePageDelegate.entryURL, cachePolicy: .reloadIgnoringLocalCacheData, timeoutInterval: 12)
+        live.httpMethod = "HEAD"
+        let response: URLResponse
+        do { response = try await session.data(for: live).1 }
+        catch let error as URLError where error.code == .timedOut {
+            return "代理下 Muse 入口请求超时。"
         }
-        guard received == 10_000_000 else { throw RegistryError.proxyUnavailable }
-        let bandwidth = Double(received) * 8 / max(0.001, Date().timeIntervalSince(begin)) / 1_000_000
-        return "代理有效 · 延迟 \(Int(latency * 1000)) ms · TTFB \(Int(headers * 1000)) ms · \(String(format: "%.1f", bandwidth)) Mbps"
+        guard let http = response as? HTTPURLResponse else { throw RegistryError.proxyUnavailable }
+        guard (200..<300).contains(http.statusCode), http.url?.scheme == "https",
+              http.url?.host == MusePageDelegate.entryURL.host else {
+            return "代理下 Muse 入口检测失败（HTTP \(http.statusCode) 或跳转到其他站点）。"
+        }
+        let latency = Date().timeIntervalSince(start)
+        let reachability = "代理下 Muse 入口可达 · \(Int(latency * 1000)) ms"
+        let speed = URLRequest(url: URL(string: "https://speed.cloudflare.com/__down?bytes=10000000")!, timeoutInterval: 15)
+        let begin = Date()
+        do {
+            let (stream, download) = try await session.bytes(for: speed)
+            guard (download as? HTTPURLResponse)?.statusCode == 200 else {
+                return reachability + " · 下载测速未完成"
+            }
+            let headers = Date().timeIntervalSince(begin)
+            var received = 0
+            for try await _ in stream {
+                received += 1
+                if received == 10_000_000 { break }
+            }
+            guard received == 10_000_000 else { return reachability + " · 下载测速未完成" }
+            let bandwidth = Double(received) * 8 / max(0.001, Date().timeIntervalSince(begin) - headers) / 1_000_000
+            return reachability + " · 测速首包 \(Int(headers * 1000)) ms · \(String(format: "%.1f", bandwidth)) Mbps"
+        } catch let error as URLError where error.code == .timedOut {
+            return reachability + " · 下载测速超时"
+        } catch {
+            return reachability + " · 下载测速未完成"
+        }
     }
 }
