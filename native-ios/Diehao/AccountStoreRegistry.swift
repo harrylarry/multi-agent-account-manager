@@ -24,6 +24,7 @@ enum RegistryError: LocalizedError {
     case legacyStoreIsShared
     case removalInProgress
     case storeStillExists
+    case storeAwaitingRestart
     case unavailableProxyCredential
 
     var errorDescription: String? {
@@ -34,6 +35,7 @@ enum RegistryError: LocalizedError {
         case .legacyStoreIsShared: "旧默认资料由旧版管理。"
         case .removalInProgress: "正在删除这个资料。"
         case .storeStillExists: "WebKit 仍报告该资料存在，可以重试清理。"
+        case .storeAwaitingRestart: "WebKit 尚在释放测试或账号资料。请彻底退出并重开叠号，再重试清理。"
         case .unavailableProxyCredential: "代理配置或钥匙串凭据不可读，已阻止连接。"
         }
     }
@@ -108,11 +110,13 @@ final class AccountStoreRegistry {
         index.identities.filter { $0.purpose == .account && !index.pendingRemoval.contains($0.id) }
     }
 
-    func retryPendingRemoval() async {
+    @discardableResult
+    func retryPendingRemoval() async -> Bool {
         for id in index.pendingRemoval {
             // A failed WebKit/Keychain removal remains queued in the index.
             try? await remove(id)
         }
+        return index.pendingRemoval.isEmpty
     }
 
     func createAccount(alias: String, reserving formerID: UUID? = nil, pendingImport: Bool = false) async throws -> AccountIdentity {
@@ -262,7 +266,22 @@ final class AccountStoreRegistry {
         _ = WKWebsiteDataStore.default()
         let existing = await WKWebsiteDataStore.allDataStoreIdentifiers
         if existing.contains(id) {
-            try await WKWebsiteDataStore.remove(forIdentifier: id)
+            do {
+                try await WKWebsiteDataStore.remove(forIdentifier: id)
+            } catch where Self.isStoreInUse(error) {
+                // Clear the target's WebKit caches and storage. WebKit also
+                // releases cached processes for this session during this call.
+                await Self.purgeWebsiteData(for: id)
+                for delay in [200, 500, 1_000] {
+                    try await Task.sleep(for: .milliseconds(delay))
+                    do {
+                        try await WKWebsiteDataStore.remove(forIdentifier: id)
+                        break
+                    } catch where Self.isStoreInUse(error) {
+                        if delay == 1_000 { throw RegistryError.storeAwaitingRestart }
+                    }
+                }
+            }
         }
         let remaining = await WKWebsiteDataStore.allDataStoreIdentifiers
         guard !remaining.contains(id) else { throw RegistryError.storeStillExists }
@@ -273,6 +292,17 @@ final class AccountStoreRegistry {
         next.pendingRemoval.remove(id)
         next.pendingCookieWrites?.remove(id)
         try save(next)
+    }
+
+    private static func isStoreInUse(_ error: Error) -> Bool {
+        let native = error as NSError
+        return (native.domain == "WKWebSiteDataStore" || native.domain == WKErrorDomain) &&
+            native.localizedDescription.lowercased().contains("data store is in use")
+    }
+
+    private static func purgeWebsiteData(for id: UUID) async {
+        let store = WKWebsiteDataStore(forIdentifier: id)
+        await store.removeData(ofTypes: WKWebsiteDataStore.allWebsiteDataTypes(), modifiedSince: .distantPast)
     }
 
     func referenceLegacyProfiles(in applicationSupport: URL, bundleID: String) async throws {

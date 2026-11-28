@@ -41,6 +41,20 @@ final class IsolationTests: XCTestCase {
         wait(for: status, toContain: "测试资料已清理")
         let bc = app.buttons["isolationBC.run"]
         bc.tap()
+        let bcProgress = NSPredicate(format: "label CONTAINS %@ OR label CONTAINS %@", "B / C 组通过", "请彻底退出并重开叠号")
+        XCTAssertEqual(
+            XCTWaiter.wait(for: [XCTNSPredicateExpectation(predicate: bcProgress, object: status)], timeout: 90),
+            .completed, status.label
+        )
+        if status.label.contains("请彻底退出并重开叠号") {
+            app.terminate()
+            app.launch()
+            XCTAssertEqual(
+                XCTWaiter.wait(for: [XCTNSPredicateExpectation(predicate: verifyReady, object: bc)], timeout: 10),
+                .completed
+            )
+            bc.tap()
+        }
         wait(for: status, toContain: "B / C 组通过")
     }
 
