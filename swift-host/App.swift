@@ -61,6 +61,7 @@ final class ManagerController: UIViewController, WKNavigationDelegate {
     private func showError(_ message: String) {
         let label = UILabel()
         label.text = message
+        label.accessibilityIdentifier = "manager.host.error"
         label.textAlignment = .center
         label.numberOfLines = 0
         view.backgroundColor = .systemBackground
@@ -72,9 +73,28 @@ final class ManagerController: UIViewController, WKNavigationDelegate {
         decisionHandler(action.targetFrame?.isMainFrame == true && action.request.url == ManagerAssets.entry ? .allow : .cancel)
     }
 
+    func webView(_ webView: WKWebView, didFailProvisionalNavigation navigation: WKNavigation!, withError error: Error) {
+        showError("管理页资源加载失败（\((error as NSError).code)）。")
+    }
+
+    func webView(_ webView: WKWebView, didFinish navigation: WKNavigation!) {
+        #if DEBUG
+        // The first app command can be pending on WebKit when navigation finishes.
+        Task { @MainActor [weak self, weak webView] in
+            try? await Task.sleep(for: .seconds(4))
+            guard let self, let webView else { return }
+            let hasPage = try? await webView.evaluateJavaScript("Boolean(document.querySelector('.iphone-shell'))") as? Bool
+            if hasPage != true {
+                let hasBridge = try? await webView.evaluateJavaScript("Boolean(window.webkit?.messageHandlers?.diehaoManager)") as? Bool
+                self.showError(hasBridge == true ? "管理页脚本未完成启动。" : "管理页消息桥不可用。")
+            }
+        }
+        #endif
+    }
+
     fileprivate func request(_ message: WKScriptMessage, reply: (Any?, String?) -> Void) {
         guard message.webView === webView, message.frameInfo.isMainFrame,
-              message.frameInfo.request.url == ManagerAssets.entry,
+              webView?.url == ManagerAssets.entry,
               let data = message.body as? [String: Any],
               let command = data["command"] as? String,
               let args = data["args"] as? [String: Any],
@@ -141,15 +161,20 @@ private final class ManagerMessageHandler: NSObject, WKScriptMessageHandlerWithR
 
 private final class ManagerAssets: NSObject, WKURLSchemeHandler {
     static let scheme = "diehao-manager"
-    static let entry = URL(string: "\(scheme)://local/index.html")!
+    static let entry = URL(string: "\(scheme)://localhost/index.html")!
     private let directory: URL
+    private let directoryPrefix: String
 
-    init(directory: URL) { self.directory = directory.resolvingSymlinksInPath() }
+    init(directory: URL) {
+        self.directory = directory.resolvingSymlinksInPath().standardizedFileURL
+        let path = self.directory.path
+        directoryPrefix = path.hasSuffix("/") ? path : path + "/"
+    }
 
     func webView(_ webView: WKWebView, start task: WKURLSchemeTask) {
-        guard let url = task.request.url, url.scheme == Self.scheme, url.host == "local",
+        guard let url = task.request.url, url.scheme == Self.scheme, url.host == "localhost",
               url.user == nil, url.password == nil, url.port == nil,
-              url.query == nil, task.request.httpMethod == "GET" else {
+              url.query == nil, (task.request.httpMethod ?? "GET") == "GET" else {
             task.didFailWithError(URLError(.resourceUnavailable))
             return
         }
@@ -159,14 +184,14 @@ private final class ManagerAssets: NSObject, WKURLSchemeHandler {
             "js": "text/javascript; charset=utf-8", "svg": "image/svg+xml",
             "png": "image/png", "webp": "image/webp", "ico": "image/x-icon",
         ]
-        guard resource.path.hasPrefix(directory.path + "/"), let type = contentTypes[resource.pathExtension],
+        guard resource.path.hasPrefix(directoryPrefix), let type = contentTypes[resource.pathExtension],
               let bytes = try? Data(contentsOf: resource) else {
             task.didFailWithError(URLError(.resourceUnavailable))
             return
         }
         let headers = [
             "Content-Type": type,
-            "Content-Security-Policy": "default-src 'none'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data: https:; base-uri 'none'; form-action 'none'; frame-ancestors 'none'",
+            "Content-Security-Policy": "default-src 'none'; script-src diehao-manager:; style-src diehao-manager: 'unsafe-inline'; img-src diehao-manager: data:; base-uri 'none'; form-action 'none'; frame-ancestors 'none'",
         ]
         guard let response = HTTPURLResponse(url: url, statusCode: 200, httpVersion: nil, headerFields: headers) else {
             task.didFailWithError(URLError(.badServerResponse))
