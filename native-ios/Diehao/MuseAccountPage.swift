@@ -40,7 +40,7 @@ final class MusePageDelegate: NSObject, WKNavigationDelegate, WKUIDelegate {
     }
 
     func webView(_ webView: WKWebView, didReceive challenge: URLAuthenticationChallenge,
-                 completionHandler: @escaping (URLSession.AuthChallengeDisposition, URLCredential?) -> Void) {
+                 completionHandler: @escaping @MainActor @Sendable (URLSession.AuthChallengeDisposition, URLCredential?) -> Void) {
         if challenge.protectionSpace.isProxy() {
             completionHandler(.cancelAuthenticationChallenge, nil)
             onError(RegistryError.unavailableProxyCredential)
@@ -50,7 +50,7 @@ final class MusePageDelegate: NSObject, WKNavigationDelegate, WKUIDelegate {
     }
 
     func webView(_ webView: WKWebView, decidePolicyFor action: WKNavigationAction,
-                 decisionHandler: @escaping (WKNavigationActionPolicy) -> Void) {
+                 decisionHandler: @escaping @MainActor @Sendable (WKNavigationActionPolicy) -> Void) {
         let scheme = action.request.url?.scheme?.lowercased()
         decisionHandler(scheme == "https" || action.request.url?.absoluteString == "about:blank" ? .allow : .cancel)
     }
@@ -279,7 +279,7 @@ enum CookieTransfer {
     }
 
     private static func replace(_ cookies: [HTTPCookie], in store: WKHTTPCookieStore) async throws {
-        for old in await scopedCookies(store) { await store.delete(old) }
+        for old in await scopedCookies(store) { await store.deleteCookie(old) }
         for cookie in cookies { await store.setCookie(cookie) }
         let expected = fingerprints(cookies)
         // WebKit's write callback can precede visibility in the cookie readback.
