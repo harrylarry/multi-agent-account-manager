@@ -47,7 +47,7 @@ struct DashboardServices {
         send = { _, _ in .notConnected }
     }
 
-    #if DEBUG
+    #if DEBUG && targetEnvironment(simulator)
     static func fixtures(registry: AccountStoreRegistry) -> Self {
         let a = AccountIdentity(id: UUID(), purpose: .account, alias: "测试账号 A")
         let b = AccountIdentity(id: UUID(), purpose: .account, alias: "测试账号 B")
@@ -87,7 +87,7 @@ struct Dashboard: View {
     init(registry: AccountStoreRegistry, check: IsolationCheck) {
         self.registry = registry
         self.check = check
-        #if DEBUG
+        #if DEBUG && targetEnvironment(simulator)
         if ProcessInfo.processInfo.arguments.contains("-diehao-dashboard-fixtures") {
             _services = State(initialValue: .fixtures(registry: registry))
             return
@@ -108,12 +108,9 @@ struct Dashboard: View {
     var body: some View {
         List {
             Section("总览") {
-                LabeledContent("需要处理", value: totals.map { "\($0.pendingApprovals)" } ?? "未同步")
-                    .accessibilityIdentifier("dashboard.approvals")
-                LabeledContent("未读回复", value: totals.map { "\($0.unreadReplies)" } ?? "未同步")
-                    .accessibilityIdentifier("dashboard.unread")
-                LabeledContent("进行中的任务", value: totals.map { "\($0.runningTasks)" } ?? "未同步")
-                    .accessibilityIdentifier("dashboard.running")
+                activityRow("需要处理", count: totals?.pendingApprovals, identifier: "dashboard.approvals")
+                activityRow("未读回复", count: totals?.unreadReplies, identifier: "dashboard.unread")
+                activityRow("进行中的任务", count: totals?.runningTasks, identifier: "dashboard.running")
                 if totals?.isEmpty == true {
                     Text("暂无待处理事项").foregroundStyle(.secondary)
                 } else if totals == nil {
@@ -149,6 +146,7 @@ struct Dashboard: View {
                         Text("\(interval.rawValue) 秒").tag(interval.rawValue)
                     }
                 }
+                .pickerStyle(.menu)
                 .accessibilityIdentifier("dashboard.poll")
                 NavigationLink("隔离自检") { IsolationDiagnostics(check: check) }
                     .accessibilityIdentifier("dashboard.isolation")
@@ -177,6 +175,15 @@ struct Dashboard: View {
         .sheet(isPresented: $showCompose) {
             DashboardCompose(accounts: rows, services: services)
         }
+    }
+
+    private func activityRow(_ title: String, count: Int?, identifier: String) -> some View {
+        let value = count.map { String($0) } ?? "未同步"
+        return LabeledContent(title, value: value)
+            .accessibilityElement(children: .ignore)
+            .accessibilityLabel(title)
+            .accessibilityValue(value)
+            .accessibilityIdentifier(identifier)
     }
 
     private func refresh() async {
@@ -221,6 +228,7 @@ private struct DashboardCompose: View {
                                 Text(account.displayName).tag(Optional(account.id))
                             }
                         }
+                        .pickerStyle(.menu)
                         .accessibilityIdentifier("compose.account")
                     }
                 }

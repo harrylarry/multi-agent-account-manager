@@ -125,10 +125,12 @@ final class DashboardTests: XCTestCase {
         app.launchArguments = ["-diehao-dashboard-fixtures"]
         app.launch()
 
-        XCTAssertTrue(app.staticTexts["需要处理"].waitForExistence(timeout: 20))
-        XCTAssertTrue(app.staticTexts["2"].exists)
-        XCTAssertTrue(app.staticTexts["4"].exists)
-        XCTAssertTrue(app.staticTexts["1"].exists)
+        let approvals = app.descendants(matching: .any)["dashboard.approvals"]
+        XCTAssertTrue(approvals.waitForExistence(timeout: 20))
+        let ready = NSPredicate(format: "value == %@", "2")
+        XCTAssertEqual(XCTWaiter.wait(for: [XCTNSPredicateExpectation(predicate: ready, object: approvals)], timeout: 10), .completed)
+        XCTAssertEqual(app.descendants(matching: .any)["dashboard.unread"].value as? String, "4")
+        XCTAssertEqual(app.descendants(matching: .any)["dashboard.running"].value as? String, "1")
         let poll = app.buttons["dashboard.poll"]
         if !poll.isHittable { app.swipeUp() }
         XCTAssertEqual(poll.value as? String, "20 秒")
