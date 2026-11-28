@@ -165,7 +165,9 @@ final class IsolationCheck {
                 }
                 throw IsolationError.mismatch("C 组应拒绝错误邮箱")
             } catch CookieError.wrongIdentity {}
-            let after = try await CookieTransfer.capture(store: tests.dataStore(for: original.id))
+            let after = try await tests.storeStep(for: original.id) {
+                try await CookieTransfer.capture(store: tests.dataStore(for: original.id))
+            }
             guard Set(tests.accounts.map(\.id)) == [original.id, restored.id],
                   Set(after.cookies.map(\.value)) == Set(values.map(\.value)) else {
                 throw IsolationError.mismatch("C 组覆盖与回滚")
@@ -192,7 +194,10 @@ final class IsolationCheck {
         var checkpoint = saved
         if !checkpoint.checkedTargetRemoval {
             try await tests.remove(checkpoint.restored)
-            let remaining = try await CookieTransfer.capture(store: tests.dataStore(for: checkpoint.original))
+            let original = checkpoint.original
+            let remaining = try await tests.storeStep(for: original) {
+                try await CookieTransfer.capture(store: tests.dataStore(for: original))
+            }
             guard opened?.view == nil, tests.accounts.map(\.id) == [checkpoint.original],
                   Set(remaining.cookies.map(\.value)) == checkpoint.expected else {
                 throw IsolationError.mismatch("B 组仅删除目标资料")

@@ -135,7 +135,7 @@ struct MuseCookie: Codable, Sendable {
     }
 }
 
-struct CookiePreview {
+struct CookiePreview: Sendable {
     let cookies: [MuseCookie]
     let notes: [String]
 
