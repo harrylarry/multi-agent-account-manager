@@ -12,17 +12,42 @@ protocol MuseActivityConnection: AnyObject {
 
 private final class MuseWire {
     private let handle: OpaquePointer
+    private let swiftNoise: SwiftNoiseXX?
 
     init() throws {
-        guard let handle = diehao_wire_new() else { throw MuseActivityError.unavailable }
+        let useSwift = UserDefaults.standard.bool(forKey: SwiftNoiseXX.preference)
+        let handle = useSwift ? diehao_wire_plaintext_new() : diehao_wire_new()
+        guard let handle else { throw MuseActivityError.unavailable }
         self.handle = handle
+        swiftNoise = useSwift ? SwiftNoiseXX() : nil
     }
     deinit { diehao_wire_free(handle) }
 
-    func start() throws -> Data { try Self.read(diehao_wire_message_one(handle)) }
-    func finish(_ data: Data) throws -> Data { try invoke(data, using: diehao_wire_message_three) }
+    func start() throws -> Data {
+        if let swiftNoise { return try swiftNoise.start() }
+        return try Self.read(diehao_wire_message_one(handle))
+    }
+
+    func finish(_ data: Data) throws -> Data {
+        if let swiftNoise {
+            return try swiftNoise.finish(data) { payload in
+                payload.withUnsafeBytes {
+                    diehao_wire_owner_challenge($0.bindMemory(to: UInt8.self).baseAddress, $0.count)
+                }
+            }
+        }
+        return try invoke(data, using: diehao_wire_message_three)
+    }
+
+    func protect(_ data: Data) throws -> Data {
+        if let swiftNoise { return try swiftNoise.seal(data) }
+        return data
+    }
     func request(_ path: String) throws -> Data { try invoke(Data(path.utf8), using: diehao_wire_request) }
-    func receive(_ data: Data) throws -> Data { try invoke(data, using: diehao_wire_receive) }
+    func receive(_ data: Data) throws -> Data {
+        let payload = try swiftNoise?.open(data) ?? data
+        return try invoke(payload, using: diehao_wire_receive)
+    }
     func post(_ path: String, body: Data) throws -> Data {
         try Data(path.utf8).withUnsafeBytes { route in
             try body.withUnsafeBytes { payload in
@@ -212,7 +237,14 @@ final class NativeMuseActivityConnection: MuseActivityConnection {
             }
             offset += 4
             let frame = encoded.subdata(in: offset..<(offset + Int(length)))
-            guard case .enqueued = outbound.yield(frame) else {
+            let protected: Data
+            do {
+                protected = try wire.protect(frame)
+            } catch {
+                close()
+                throw error
+            }
+            guard case .enqueued = outbound.yield(protected) else {
                 close()
                 throw MuseActivityError.disconnected
             }

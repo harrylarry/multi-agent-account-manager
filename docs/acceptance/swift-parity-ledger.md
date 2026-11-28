@@ -12,9 +12,9 @@ Swift 各阶段在这里与 0.1.26 日常版逐项对照。基线是 main `0bd43
 | T4 | 额度 | 进 App N 个账号额度 N/N，带更新时间、来源和 stale。L1 失败仅经相应条件转 L2 一次，进入账号触发 L3。30 分钟内重进不重复刷新，0% 与未观测分开。 | T0 S1、S2 已明确原生额度路径及取消被动层 |
 | T5 | 订阅、未读、红点（B1） | 两项出入账号的未读场景、断线重连与回填无丢重、看到最新消息后清除，诊断能区分订阅、轮询与回填。 | [Issue #26](https://github.com/harrylarry/multi-agent-account-manager/issues/26) · 真机统一验收 |
 | T6 | 审批（B2） | 总览和红点准确。事件和轮询备援、四类硬拒绝、过期与重启未决队列通过。按 T0 裁决用工具与 entity/domain 匹配长期授权，分类自动放行默认关闭。 | [Issue #28](https://github.com/harrylarry/multi-agent-account-manager/issues/28) · T0 S4 已跳过摘要验收 |
-| T7 | 发送（B4） | HTTP/HTTPS/SOCKS5 账号代理下发送新对话。四态明确，UNKNOWN 走 T0 S3 的 26 秒对账，重启后可续核对，发送不重复。 | T0 S3 已验证降级路径 |
-| T8 | 加密备份与恢复 | 三模式真机往返，坏包零改动，覆盖/合并可预测并能回滚，独立恢复码有效，快照保留可调。Cookie 用逐条备份。 | T0 S5 已确定逐条方案 |
-| T9 | 模型指纹 | 手动运行，结果和置信度正确显示，按账号留历史，进 App 或切换账号不触发。 | 待实现与验收 |
-| T10 | Noise | Noise XX AESGCM 向量、Rust 互通和真机发送/订阅回归均通过。未过则继续用 Rust 桥接并记录未完成。 | 待实现与验收 |
+| T7 | 发送（B4） | HTTP/HTTPS/SOCKS5 账号代理下发送新对话。四态明确，UNKNOWN 走 T0 S3 的 26 秒对账，重启后可续核对，发送不重复。 | [Issue #30](https://github.com/harrylarry/multi-agent-account-manager/issues/30) · [模拟器 8/8](https://github.com/harrylarry/multi-agent-account-manager/actions/runs/46157755663) · 真机待验 |
+| T8 | 加密备份与恢复 | 三模式真机往返，坏包零改动，覆盖/合并可预测并能回滚，独立恢复码有效，快照保留可调。Cookie 用逐条备份。 | [Issue #32](https://github.com/harrylarry/multi-agent-account-manager/issues/32) · [模拟器 9/9](https://github.com/harrylarry/multi-agent-account-manager/actions/runs/46159700826) · 真机待验 |
+| T9 | 模型指纹 | 手动运行，结果和置信度正确显示，按账号留历史，进 App 或切换账号不触发。 | [Issue #34](https://github.com/harrylarry/multi-agent-account-manager/issues/34) · [模拟器 10/10](https://github.com/harrylarry/multi-agent-account-manager/actions/runs/46162943555) · 真机待验 |
+| T10 | Noise | Noise XX AESGCM 向量、Rust 互通和真机发送/订阅回归均通过。未过则继续用 Rust 桥接并记录未完成。 | [Issue #36](https://github.com/harrylarry/multi-agent-account-manager/issues/36) · [统一真机验收](swift-unified-iphone.md) |
 
 最终切换安装标识前，另用同容器升级验证 0.1.26 的 UUID profile 和更早可识别的旧默认 profile 都按引用续用。独立验收包用于隔离和构建验证，其容器无法读取日常版资料。

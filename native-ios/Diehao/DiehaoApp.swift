@@ -23,6 +23,10 @@ struct DiehaoApp: App {
 @MainActor
 struct IsolationDiagnostics: View {
     let check: IsolationCheck
+    @AppStorage(SwiftNoiseXX.preference) private var swiftNoise = false
+    #if DEBUG && targetEnvironment(simulator) && DIEHAO_NOISE_TESTS
+    @State private var noiseFixtureResult: String?
+    #endif
 
     var body: some View {
         List {
@@ -47,6 +51,27 @@ struct IsolationDiagnostics: View {
                 Button("验证删除与恢复") { Task { await check.runBC() } }
                     .disabled(!check.canSeed)
                     .accessibilityIdentifier("isolationBC.run")
+            }
+            Section("Muse 加密传输") {
+                Toggle("试用 Swift Noise", isOn: $swiftNoise)
+                Text("切换后请彻底关闭再重开 App。关闭此开关使用 Rust Noise。")
+                    .font(.caption)
+                #if DEBUG && targetEnvironment(simulator) && DIEHAO_NOISE_TESTS
+                if ProcessInfo.processInfo.arguments.contains("-diehao-noise-fixtures") {
+                    Button("检查 Noise 向量和 Rust 互通") {
+                        do {
+                            try SwiftNoiseXX.verifyFixtures()
+                            noiseFixtureResult = "Noise 向量与 Rust 互通通过。"
+                        } catch {
+                            noiseFixtureResult = "Noise 自检失败（\(error)）。"
+                        }
+                    }
+                    .accessibilityIdentifier("noise.fixture")
+                    if let noiseFixtureResult {
+                        Text(noiseFixtureResult).accessibilityIdentifier("noise.result")
+                    }
+                }
+                #endif
             }
             if check.referencedAccountCount > 0 {
                 Section("旧资料") {

@@ -1,10 +1,18 @@
 #include <stddef.h>
 #include <stdint.h>
+#include <stdbool.h>
 
 typedef struct DiehaoWire DiehaoWire;
 typedef struct DiehaoWireBlob DiehaoWireBlob;
 
 DiehaoWire *diehao_wire_new(void);
+DiehaoWire *diehao_wire_plaintext_new(void);
+bool diehao_wire_owner_challenge(const uint8_t *bytes, size_t length);
+
+typedef struct DiehaoNoiseTestPeer DiehaoNoiseTestPeer;
+DiehaoNoiseTestPeer *diehao_noise_test_new(void);
+DiehaoWireBlob *diehao_noise_test_step(DiehaoNoiseTestPeer *peer, const uint8_t *bytes, size_t length);
+void diehao_noise_test_free(DiehaoNoiseTestPeer *peer);
 void diehao_wire_free(DiehaoWire *wire);
 DiehaoWireBlob *diehao_wire_message_one(DiehaoWire *wire);
 DiehaoWireBlob *diehao_wire_message_three(DiehaoWire *wire, const uint8_t *bytes, size_t length);

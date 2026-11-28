@@ -30,7 +30,11 @@ jobs:
         run: |
           rustup target add aarch64-apple-ios aarch64-apple-ios-sim
           for target in aarch64-apple-ios aarch64-apple-ios-sim; do
-            cargo rustc --release --lib --crate-type staticlib \
+            feature_flags=()
+            if [[ "$target" == "aarch64-apple-ios-sim" ]]; then
+              feature_flags=(--features swift-noise-tests)
+            fi
+            cargo rustc --release --lib --crate-type staticlib "${feature_flags[@]}" \
               --manifest-path src-tauri/muse-native/Cargo.toml --target-dir "$RUNNER_TEMP/swift-rust" --target "$target"
           done
       - name: Build unsigned Swift IPA
@@ -48,15 +52,15 @@ jobs:
           mkdir -p "$RUNNER_TEMP/ipa/Payload"
           cp -R "$RUNNER_TEMP/swift-ios-device/Build/Products/Release-iphoneos/Diehao.app" "$RUNNER_TEMP/ipa/Payload/"
           cd "$RUNNER_TEMP/ipa"
-          ditto -c -k --keepParent Payload ../diehao-swift-t2-unsigned.ipa
+          ditto -c -k --keepParent Payload ../diehao-swift-t10-unsigned.ipa
           cd "$RUNNER_TEMP"
-          shasum -a 256 diehao-swift-t2-unsigned.ipa | tee diehao-swift-t2-unsigned.ipa.sha256
+          shasum -a 256 diehao-swift-t10-unsigned.ipa | tee diehao-swift-t10-unsigned.ipa.sha256
       - uses: actions/upload-artifact@v7
         with:
-          name: diehao-swift-t2-ipa
+          name: diehao-swift-t10-ipa
           path: |
-            ${{ runner.temp }}/diehao-swift-t2-unsigned.ipa
-            ${{ runner.temp }}/diehao-swift-t2-unsigned.ipa.sha256
+            ${{ runner.temp }}/diehao-swift-t10-unsigned.ipa
+            ${{ runner.temp }}/diehao-swift-t10-unsigned.ipa.sha256
           if-no-files-found: error
       - name: Test isolation A–C on iOS Simulator
         run: |
@@ -84,10 +88,11 @@ jobs:
             -derivedDataPath "$RUNNER_TEMP/swift-ios-simulator" \
             -parallel-testing-enabled NO -resultBundlePath "$RUNNER_TEMP/IsolationABC.xcresult" \
             ARCHS=arm64 ONLY_ACTIVE_ARCH=YES \
+            SWIFT_ACTIVE_COMPILATION_CONDITIONS='$(inherited) DEBUG DIEHAO_NOISE_TESTS' \
             DIEHAO_RUST_LIB="$RUNNER_TEMP/swift-rust/aarch64-apple-ios-sim/release/libmuse_native.a" test
       - uses: actions/upload-artifact@v7
         if: always()
         with:
-          name: diehao-swift-t2-isolation-result
+          name: diehao-swift-t10-isolation-result
           path: ${{ runner.temp }}/IsolationABC.xcresult
           if-no-files-found: ignore

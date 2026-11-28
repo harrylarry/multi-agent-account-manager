@@ -122,6 +122,28 @@ final class IsolationTests: XCTestCase {
 }
 
 final class DashboardTests: XCTestCase {
+    #if DIEHAO_NOISE_TESTS
+    @MainActor
+    func testSwiftNoiseVectorAndRustInterop() {
+        continueAfterFailure = false
+        let app = XCUIApplication()
+        app.launchArguments = ["-diehao-noise-fixtures"]
+        app.launch()
+        let isolation = app.buttons["dashboard.isolation"]
+        XCTAssertTrue(app.navigationBars["总览"].waitForExistence(timeout: 20))
+        if !isolation.isHittable { app.swipeUp() }
+        XCTAssertTrue(isolation.waitForExistence(timeout: 10))
+        isolation.tap()
+        let fixture = app.buttons["noise.fixture"]
+        if !fixture.isHittable { app.swipeUp() }
+        XCTAssertTrue(fixture.waitForExistence(timeout: 10))
+        fixture.tap()
+        let status = app.staticTexts["noise.result"]
+        XCTAssertTrue(status.waitForExistence(timeout: 10))
+        XCTAssertEqual(status.label, "Noise 向量与 Rust 互通通过。")
+    }
+    #endif
+
     @MainActor
     func testFingerprintRunsOnlyOnExplicitConfirmation() {
         continueAfterFailure = false
