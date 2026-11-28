@@ -417,8 +417,8 @@ final class MuseApprovalQueue {
 
     private func record(account: UUID, item: MuseApproval, decision: ApprovalDecision, phase: String) throws {
         guard storageValid else { throw MuseActivityError.unavailable }
-        var receipt = Receipt(approval: item.id, account: account, decision: decision, phase: phase,
-                              session: item.session, run: item.run, tool: item.tool,
+        var receipt = Receipt(approval: item.id, account: account, decision: decision,
+                              session: item.session, run: item.run, tool: item.tool, phase: phase,
                               at: .now, previous: receipts.last?.signature ?? Data())
         let encoder = Self.encoder()
         receipt.signature = Data(HMAC<SHA256>.authenticationCode(for: try encoder.encode(receipt), using: try auditKey()))
