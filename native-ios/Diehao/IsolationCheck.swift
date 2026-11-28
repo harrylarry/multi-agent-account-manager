@@ -252,6 +252,7 @@ private final class IsolationPage: NSObject, WKNavigationDelegate {
     private static let cookieName = "diehao_t1_isolation"
     private let handle: AccountWebView
     private var navigation: CheckedContinuation<Void, Error>?
+    private var activeNavigation: WKNavigation?
     private var watchdog: Task<Void, Never>?
 
     init(registry: AccountStoreRegistry, id: UUID) throws {
@@ -261,6 +262,19 @@ private final class IsolationPage: NSObject, WKNavigationDelegate {
     func open() async throws {
         let view = try activeView()
         view.navigationDelegate = self
+        do {
+            try await load(view)
+        } catch IsolationError.navigation {
+            view.stopLoading()
+            try await load(view)
+        }
+        let actualOrigin = try await view.evaluateJavaScript("location.origin") as? String
+        guard actualOrigin == "https://isolation.diehao.invalid" else {
+            throw IsolationError.mismatch("自检页来源")
+        }
+    }
+
+    private func load(_ view: WKWebView) async throws {
         try await withCheckedThrowingContinuation { continuation in
             navigation = continuation
             watchdog = Task { [weak self] in
@@ -268,11 +282,7 @@ private final class IsolationPage: NSObject, WKNavigationDelegate {
                 self?.finish(throwing: IsolationError.navigation)
             }
             let page = "<!doctype html><meta charset=utf-8><title>Isolation Check</title>"
-            view.loadSimulatedRequest(URLRequest(url: Self.origin), responseHTML: page)
-        }
-        let actualOrigin = try await view.evaluateJavaScript("location.origin") as? String
-        guard actualOrigin == "https://isolation.diehao.invalid" else {
-            throw IsolationError.mismatch("自检页来源")
+            activeNavigation = view.loadSimulatedRequest(URLRequest(url: Self.origin), responseHTML: page)
         }
     }
 
@@ -299,14 +309,17 @@ private final class IsolationPage: NSObject, WKNavigationDelegate {
     }
 
     func webView(_ webView: WKWebView, didFinish navigation: WKNavigation!) {
+        guard navigation === activeNavigation else { return }
         finish()
     }
 
     func webView(_ webView: WKWebView, didFail navigation: WKNavigation!, withError error: Error) {
+        guard navigation === activeNavigation else { return }
         finish(throwing: error)
     }
 
     func webView(_ webView: WKWebView, didFailProvisionalNavigation navigation: WKNavigation!, withError error: Error) {
+        guard navigation === activeNavigation else { return }
         finish(throwing: error)
     }
 
@@ -322,6 +335,7 @@ private final class IsolationPage: NSObject, WKNavigationDelegate {
     private func finish(throwing error: Error? = nil) {
         guard let continuation = navigation else { return }
         navigation = nil
+        activeNavigation = nil
         watchdog?.cancel()
         watchdog = nil
         if let error { continuation.resume(throwing: error) } else { continuation.resume() }

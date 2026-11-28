@@ -6,7 +6,7 @@ import WebKit
 
 enum CookieError: LocalizedError {
     case invalidFile, missingDomain, invalidEmail, credentials, verification, wrongIdentity, rollback
-    case sessionUnconfirmed, identityUnavailable, verificationTimeout
+    case sessionUnconfirmed, identityUnavailable, verificationTimeout, writeVerification
 
     var errorDescription: String? {
         switch self {
@@ -18,6 +18,7 @@ enum CookieError: LocalizedError {
         case .sessionUnconfirmed: "Muse 未确认这个资料的登录态。请先在同一账号资料打开 Muse 并确认已登录。"
         case .identityUnavailable: "Muse 已确认登录，但未提供可与当前账号绑定的邮箱。无法安全完成验证。"
         case .verificationTimeout: "验证 Muse 登录状态时超时。请检查当前账号的网络或代理后重试。"
+        case .writeVerification: "WebKit Cookie 写入回读与预期不一致。"
         case .wrongIdentity: "实际登录邮箱与预期不一致。"
         case .rollback: "导入失败，无法完整恢复之前的 Cookie。此账号已暂停使用。"
         }

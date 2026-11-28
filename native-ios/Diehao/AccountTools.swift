@@ -109,7 +109,7 @@ struct AccountTools: View {
         List {
             Section("Muse 账号") {
                 ForEach(accounts) { account in
-                    Button(account.alias ?? "Muse · " + String(account.id.uuidString.prefix(8))) {
+                    Button(account.displayName) {
                         selected = account
                     }
                 }
@@ -142,7 +142,7 @@ struct AccountTools: View {
 }
 
 @MainActor
-private struct AccountDetail: View {
+struct AccountDetail: View {
     @Environment(\.dismiss) private var dismiss
     let registry: AccountStoreRegistry
     let account: AccountIdentity

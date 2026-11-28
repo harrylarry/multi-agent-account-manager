@@ -1,5 +1,9 @@
 # 当前开发进度
 
+## Swift T3 总览与 Compose
+
+[Issue #22](https://github.com/harrylarry/multi-agent-account-manager/issues/22) 基于 T2 构建号 4 继续开发。先用模拟器核对总览、账号列表、轮询档位与 Compose。真实活动数据由 T5 接入，实际发送由 T7 接入。iPhone 验收集中到开发阶段完成后，与 T2 的 Cookie 池、JSON 选择和三协议出口一起复测。
+
 ## Swift T2 隔离、代理与 Cookie
 
 T2 从 `main` 的 `1155ef3` 开始，目标版本 0.2.1。进度见 [Issue #20](https://github.com/harrylarry/multi-agent-account-manager/issues/20) 与 [PR #21](https://github.com/harrylarry/multi-agent-account-manager/pull/21)。新 Swift 验收版沿用独立 Bundle ID，与日常版并存。真机只用测试账号。按[真机验收说明](../acceptance/swift-t2-iphone.md)验证隔离 A–C、三协议代理出口及双域 Cookie。代理订阅缺真实测试地址。

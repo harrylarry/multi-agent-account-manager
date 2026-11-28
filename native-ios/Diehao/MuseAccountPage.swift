@@ -40,7 +40,7 @@ final class MusePageDelegate: NSObject, WKNavigationDelegate, WKUIDelegate {
     }
 
     func webView(_ webView: WKWebView, didReceive challenge: URLAuthenticationChallenge,
-                 completionHandler: @escaping (URLSession.AuthChallengeDisposition, URLCredential?) -> Void) {
+                 completionHandler: @escaping @MainActor @Sendable (URLSession.AuthChallengeDisposition, URLCredential?) -> Void) {
         if challenge.protectionSpace.isProxy() {
             completionHandler(.cancelAuthenticationChallenge, nil)
             onError(RegistryError.unavailableProxyCredential)
@@ -50,7 +50,7 @@ final class MusePageDelegate: NSObject, WKNavigationDelegate, WKUIDelegate {
     }
 
     func webView(_ webView: WKWebView, decidePolicyFor action: WKNavigationAction,
-                 decisionHandler: @escaping (WKNavigationActionPolicy) -> Void) {
+                 decisionHandler: @escaping @MainActor @Sendable (WKNavigationActionPolicy) -> Void) {
         let scheme = action.request.url?.scheme?.lowercased()
         decisionHandler(scheme == "https" || action.request.url?.absoluteString == "about:blank" ? .allow : .cancel)
     }
@@ -132,6 +132,14 @@ final class CookieLoginProbe {
         guard expected.range(of: #"^[^\s@]+@[^\s@]+\.[^\s@]+$"#, options: .regularExpression) != nil else {
             throw CookieError.invalidEmail
         }
+        try await check(webView, expected: expected)
+    }
+
+    func verifySession(_ webView: WKWebView) async throws {
+        try await check(webView, expected: nil)
+    }
+
+    private func check(_ webView: WKWebView, expected: String?) async throws {
         let museURL = MusePageDelegate.entryURL
         defer {
             delegate?.close()
@@ -160,7 +168,7 @@ final class CookieLoginProbe {
             webView.load(request)
         }
         let result = try? await webView.callAsyncJavaScript(Self.identityScript,
-            arguments: ["expected": expected], in: nil, contentWorld: .defaultClient)
+            arguments: ["expected": expected.map { $0 as Any } ?? NSNull()], in: nil, contentWorld: .defaultClient)
         switch result as? String {
         case "verified": return
         case "mismatch": throw CookieError.wrongIdentity
@@ -193,6 +201,7 @@ final class CookieLoginProbe {
             return error.name === 'TimeoutError' ? 'timeout' : 'sessionUnconfirmed';
         }
         if (proof?.ok !== true || typeof proof.viewer_id !== 'string' || !proof.viewer_id) return 'sessionUnconfirmed';
+        if (expected === null) return 'verified';
         const proofs = new Set();
         const paths = ['viewer', 'user', 'account', 'profile', 'session', 'props', 'pageProps', 'data'];
         const add = email => {
@@ -270,9 +279,15 @@ enum CookieTransfer {
     }
 
     private static func replace(_ cookies: [HTTPCookie], in store: WKHTTPCookieStore) async throws {
-        for old in await scopedCookies(store) { await store.delete(old) }
+        for old in await scopedCookies(store) { await store.deleteCookie(old) }
         for cookie in cookies { await store.setCookie(cookie) }
-        guard fingerprints(await scopedCookies(store)) == fingerprints(cookies) else { throw CookieError.verification }
+        let expected = fingerprints(cookies)
+        // WebKit's write callback can precede visibility in the cookie readback.
+        for attempt in 0...4 {
+            if fingerprints(await scopedCookies(store)) == expected { return }
+            if attempt < 4 { try? await Task.sleep(for: .milliseconds(150 * (attempt + 1))) }
+        }
+        throw CookieError.writeVerification
     }
 
     private static func fingerprints(_ cookies: [HTTPCookie]) -> [String: Data] {
