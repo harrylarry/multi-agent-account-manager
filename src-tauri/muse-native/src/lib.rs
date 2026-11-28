@@ -44,5 +44,7 @@ pub mod protobuf;
 pub mod proxy;
 pub mod transport;
 pub mod watch;
+#[cfg(target_os = "ios")]
+mod swift_wire;
 #[cfg(not(target_os = "android"))]
 mod wire_trace;

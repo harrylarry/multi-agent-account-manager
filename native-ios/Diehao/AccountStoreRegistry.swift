@@ -173,7 +173,7 @@ final class AccountStoreRegistry {
         try makeConfiguredWebView(for: id)
     }
 
-    func quotaResources(for id: UUID) throws -> (WKHTTPCookieStore, URLSessionConfiguration) {
+    func accountResources(for id: UUID) throws -> (WKHTTPCookieStore, URLSessionConfiguration) {
         guard index.pendingCookieWrites?.contains(id) != true else { throw CookieError.rollback }
         let identity = try activeIdentity(id)
         let configuration = URLSessionConfiguration.ephemeral

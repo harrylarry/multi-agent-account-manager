@@ -77,11 +77,13 @@ struct Dashboard: View {
     let check: IsolationCheck
     @State private var services: DashboardServices
     @State private var quota: QuotaCoordinator
+    @State private var activityCoordinator: MuseActivityCoordinator
     @Environment(\.scenePhase) private var scenePhase
     @AppStorage("dashboard.foregroundPollSeconds") private var savedInterval = ForegroundPollInterval.normal.rawValue
     @State private var rows: [AccountIdentity] = []
     @State private var activity: [UUID: DashboardActivity]?
     @State private var refreshing = false
+    @State private var activityEnabled = false
     @State private var selected: AccountIdentity?
     @State private var showCompose = false
 
@@ -89,14 +91,23 @@ struct Dashboard: View {
         self.registry = registry
         self.check = check
         #if DEBUG && targetEnvironment(simulator)
+        if ProcessInfo.processInfo.arguments.contains("-diehao-activity-fixtures") {
+            let fixtures = DashboardServices.fixtures(registry: registry)
+            _services = State(initialValue: fixtures)
+            _quota = State(initialValue: .fixtures(accounts: fixtures.accounts()))
+            _activityCoordinator = State(initialValue: .fixtures(account: fixtures.accounts().first?.id))
+            return
+        }
         if ProcessInfo.processInfo.arguments.contains("-diehao-dashboard-fixtures") ||
             ProcessInfo.processInfo.arguments.contains("-diehao-quota-fixtures") {
             let fixtures = DashboardServices.fixtures(registry: registry)
             _services = State(initialValue: fixtures)
             _quota = State(initialValue: .fixtures(accounts: fixtures.accounts()))
+            _activityCoordinator = State(initialValue: .fixtures(account: nil))
             return
         }
         #endif
+        _activityCoordinator = State(initialValue: MuseActivityCoordinator(registry: registry))
         _services = State(initialValue: DashboardServices(registry: registry))
         _quota = State(initialValue: QuotaCoordinator(registry: registry,
             cacheURL: URL.applicationSupportDirectory.appending(path: "DiehaoNative/quota.json")))
@@ -104,7 +115,15 @@ struct Dashboard: View {
 
     private var totals: DashboardActivity? {
         if rows.isEmpty { return DashboardActivity() }
-        return activity.map { counts in rows.compactMap { counts[$0.id] }.reduce(DashboardActivity(), +) }
+        return displayedActivity.map { counts in rows.compactMap { counts[$0.id] }.reduce(DashboardActivity(), +) }
+    }
+
+    private var displayedActivity: [UUID: DashboardActivity]? {
+        #if DEBUG && targetEnvironment(simulator)
+        if ProcessInfo.processInfo.arguments.contains("-diehao-dashboard-fixtures") ||
+            ProcessInfo.processInfo.arguments.contains("-diehao-quota-fixtures") { return activity }
+        #endif
+        return activityCoordinator.activity()
     }
 
     private var pollSeconds: Int {
@@ -120,7 +139,7 @@ struct Dashboard: View {
                 if totals?.isEmpty == true {
                     Text("暂无待处理事项").foregroundStyle(.secondary)
                 } else if totals == nil {
-                    Text("活动同步将在后续版本接入。").foregroundStyle(.secondary)
+                    Text("尚未收到 Muse 活动记录。").foregroundStyle(.secondary)
                 }
             }
             Section("账号") {
@@ -137,7 +156,7 @@ struct Dashboard: View {
                         } icon: {
                             Image(systemName: "person.crop.circle")
                                 .overlay(alignment: .topTrailing) {
-                                    if activity?[account.id]?.needsAttention == true {
+                                    if displayedActivity?[account.id]?.needsAttention == true {
                                         Circle().fill(.red).frame(width: 7, height: 7)
                                             .accessibilityHidden(true)
                                     }
@@ -148,7 +167,7 @@ struct Dashboard: View {
                     .accessibilityValue(accountSummary(account.id))
                 }
                 NavigationLink("管理账号、代理与 Cookie") {
-                    AccountTools(registry: registry, quota: quota)
+                    AccountTools(registry: registry, quota: quota, museActivity: activityCoordinator)
                         .onDisappear { rows = services.accounts() }
                 }
             }
@@ -184,8 +203,17 @@ struct Dashboard: View {
         }
         .refreshable { await refreshManually() }
         .task(id: scenePhase) {
-            guard scenePhase == .active else { return }
+            let accounts = services.accounts()
+            guard scenePhase == .active else {
+                activityEnabled = false
+                activityCoordinator.configure(accounts, active: false, interval: pollSeconds)
+                return
+            }
             await quota.refresh(services.accounts().map(\.id), trigger: .foreground)
+            if !Task.isCancelled {
+                activityEnabled = true
+                activityCoordinator.configure(services.accounts(), active: true, interval: pollSeconds)
+            }
         }
         .task(id: scenePhase == .active ? pollSeconds : 0) {
             guard scenePhase == .active else { return }
@@ -195,8 +223,13 @@ struct Dashboard: View {
                 await refresh()
             }
         }
-        .sheet(item: $selected, onDismiss: { Task { await refresh() } }) { account in
-            NavigationStack { AccountDetail(registry: registry, account: account, quota: quota) }
+        .sheet(item: $selected, onDismiss: { Task {
+            await activityCoordinator.reconcileParked()
+            await refresh()
+        } }) { account in
+            NavigationStack {
+                AccountDetail(registry: registry, account: account, quota: quota, museActivity: activityCoordinator)
+            }
                 .interactiveDismissDisabled()
         }
         .sheet(isPresented: $showCompose) {
@@ -215,7 +248,7 @@ struct Dashboard: View {
 
     private func accountSummary(_ id: UUID) -> String {
         let card = quota.card(for: id, at: .now)
-        var summary = activity?[id]?.needsAttention == true ? ["有待处理事项"] : []
+        var summary = displayedActivity?[id]?.needsAttention == true ? ["有待处理事项"] : []
         if card.unavailable {
             summary.append("Muse 会话已失效")
         } else if let allowance = card.allowance, allowance.exhausted {
@@ -234,6 +267,7 @@ struct Dashboard: View {
         refreshing = true
         defer { refreshing = false }
         rows = services.accounts()
+        if activityEnabled { activityCoordinator.configure(rows, active: scenePhase == .active, interval: pollSeconds) }
         let updated = await services.activity()
         if !Task.isCancelled { activity = updated }
     }

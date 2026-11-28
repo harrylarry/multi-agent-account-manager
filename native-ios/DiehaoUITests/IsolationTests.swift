@@ -123,6 +123,22 @@ final class IsolationTests: XCTestCase {
 
 final class DashboardTests: XCTestCase {
     @MainActor
+    func testActivityReconcilesReconnectWithoutDuplicateUnread() {
+        continueAfterFailure = false
+        let app = XCUIApplication()
+        app.launchArguments = ["-diehao-activity-fixtures"]
+        app.launch()
+
+        let unread = app.descendants(matching: .any)["dashboard.unread"]
+        XCTAssertTrue(unread.waitForExistence(timeout: 20))
+        let two = NSPredicate(format: "value == %@", "2")
+        XCTAssertEqual(XCTWaiter.wait(for: [XCTNSPredicateExpectation(predicate: two, object: unread)],
+                                      timeout: 20), .completed)
+        XCTAssertTrue((app.buttons["测试账号 A"].value as? String)?.contains("有待处理事项") == true)
+        XCTAssertFalse((app.buttons["测试账号 B"].value as? String)?.contains("有待处理事项") == true)
+    }
+
+    @MainActor
     func testQuotaSeparatesZeroUseUnknownAndExhaustion() {
         continueAfterFailure = false
         let app = XCUIApplication()
