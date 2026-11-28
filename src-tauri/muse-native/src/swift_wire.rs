@@ -1,6 +1,7 @@
 //! Apple bridge for the existing Rust Noise handshake and frame codec.
 //! The Swift caller owns the network connection and serializes access to each state.
-use crate::collect::subscription_request;
+use crate::collect::{completed_history_reply, subscription_request};
+use crate::fingerprint::{FingerprintDetector, Sample};
 use crate::chat_send::{start_session_request, validate_ack, AckReject};
 use crate::gateway::is_owner_rv_challenge;
 use crate::noise::NoiseXXInitiator;
@@ -144,6 +145,47 @@ unsafe extern "C" fn diehao_wire_chat_ack(bytes: *const u8, length: usize) -> *m
     Err(AckReject::Error(_)) => serde_json::json!({"rejected":true}),
   };
   serde_json::to_vec(&value).map(boxed).unwrap_or(std::ptr::null_mut())
+}
+
+#[no_mangle]
+unsafe extern "C" fn diehao_fingerprint_reply(bytes: *const u8, length: usize) -> *mut Vec<u8> {
+  #[derive(serde::Deserialize)]
+  struct Input {
+    history: String,
+    thread: String,
+    message: String,
+  }
+  if bytes.is_null() || length == 0 || length > 10 * 1_048_576 { return std::ptr::null_mut() }
+  let Ok(input) = serde_json::from_slice::<Input>(std::slice::from_raw_parts(bytes, length)) else {
+    return std::ptr::null_mut();
+  };
+  if input.thread.is_empty() || input.message.is_empty() { return std::ptr::null_mut() }
+  let bytes = input.history.as_bytes();
+  let Ok(raw) = serde_json::from_slice::<serde_json::Value>(bytes) else { return boxed(Vec::new()) };
+  let data = raw.get("result").unwrap_or(&raw);
+  if raw["cache_hit"] == true || data["cache_hit"] == true { return std::ptr::null_mut() }
+  boxed(completed_history_reply(bytes, &input.thread, &input.message)
+    .filter(|text| text.len() <= 128_000).unwrap_or_default().into_bytes())
+}
+
+#[no_mangle]
+unsafe extern "C" fn diehao_fingerprint_score(bytes: *const u8, length: usize) -> *mut Vec<u8> {
+  #[derive(serde::Deserialize)]
+  struct Input {
+    text: String,
+    count: u64,
+  }
+  if bytes.is_null() || length == 0 || length > 512_000 { return std::ptr::null_mut() }
+  let Ok(inputs) = serde_json::from_slice::<Vec<Input>>(std::slice::from_raw_parts(bytes, length)) else {
+    return std::ptr::null_mut();
+  };
+  if inputs.is_empty() || inputs.len() > 3 || inputs.iter().any(|row| !(292..=332).contains(&row.count)) {
+    return std::ptr::null_mut();
+  }
+  let samples = inputs.into_iter().map(|row| Sample { text: row.text, expected_count: row.count }).collect::<Vec<_>>();
+  let Ok(detector) = FingerprintDetector::load() else { return std::ptr::null_mut() };
+  let Ok(result) = detector.score(&samples) else { return std::ptr::null_mut() };
+  serde_json::to_vec(&result).map(boxed).unwrap_or(std::ptr::null_mut())
 }
 
 #[no_mangle]

@@ -1,5 +1,14 @@
 # 当前开发进度
 
+## Swift T9 模型指纹
+
+[Issue #34](https://github.com/harrylarry/multi-agent-account-manager/issues/34) 从 T8 模拟器通过提交 2aec822 开发。每个账号手动确认后最多每 30 分钟测量一次。三条固定英文模板分别使用独立会话，检查空历史、发送回执和消息归属，拒绝标明缓存命中的结果。测量记录保存参考库版本和校准状态，不保存回复正文。
+
+- [Ikaleio lm-detector](https://github.com/Ikaleio/lm-detector/blob/643587185bf9c54b0c94ec6b2bed600f764177ec/sdk/rust/src/templates.json) 提供 MIT 英文模板及参考库，评分复用项目已有 Rust lmfpd。闭集置信度仅表示对当前参考库的相对匹配。Muse 网页的系统提示和采样参数无法对齐，仍须设备复测。[模板许可](../acceptance/swift-t9-template-license.txt)
+- [dake2482 参考](https://github.com/dake2482/lm-fingerprint-skill#参考库如何保持新鲜) 描述 64 模型、15 家族，下载仍指向 lmfpd 官方库。本轮未把它重复加入 Muse 参考库。
+- [NumPrint 论文](https://arxiv.org/abs/2611.14010) 报告 51 模型和 5,036 条样本。未找到作者公开的完整数据下载入口。
+- [Bruckner Zenodo](https://zenodo.org/records/21278557) 有公开下载。165 模型是 OpenRouter API 单 token 分布，对照单独记录，本轮未用于 Muse 序列评分。
+
 ## Swift T8 加密备份
 
 基于 T7 模拟器 8/8 通过提交 fff605b。备份采用 Argon2id 包装数据密钥，恢复码以独立槽解锁。覆盖仅更新备份内同 UUID 的资料，其他资料不删。已导出的旧备份仍可用旧密钥解开，吊销在本机生效。真实 Cookie、代理和导入验证留到统一真机验收。
