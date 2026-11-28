@@ -99,9 +99,12 @@ final class AccountStoreRegistry {
         index.identities.count { $0.purpose == .account }
     }
 
-    func createIsolationPair() throws -> (a: UUID, b: UUID) {
+    func createIsolationPair() async throws -> (a: UUID, b: UUID) {
+        _ = WKWebsiteDataStore.default()
+        let existing = await WKWebsiteDataStore.allDataStoreIdentifiers
         guard isolationIdentities.isEmpty else { throw RegistryError.invalidIndex }
         var registered = Set(index.identities.map(\.id))
+        registered.formUnion(existing)
         let a = uniqueID(reserving: &registered)
         let b = uniqueID(reserving: &registered)
         var next = index
@@ -191,7 +194,7 @@ final class AccountStoreRegistry {
         let references = try LegacyAccountReferences.read(legacyURL)
         let defaultStore = WKWebsiteDataStore.default()
         let existing = Set(await WKWebsiteDataStore.allDataStoreIdentifiers)
-        let records = await defaultStore.dataRecords(ofTypes: [WKWebsiteDataTypeCookies])
+        let records = references.canUseDefault ? await defaultStore.dataRecords(ofTypes: [WKWebsiteDataTypeCookies]) : []
         let hasDefaultMuseCookies = records.contains {
             $0.displayName == "muse.ai" || $0.displayName.hasSuffix(".muse.ai")
         }
@@ -200,8 +203,8 @@ final class AccountStoreRegistry {
         for (position, reference) in references.accounts.enumerated() {
             // Only an older index with no other Muse slot can unambiguously use
             // the default profile. v2 rows always point at their original UUID.
-            let usesDefault = references.isLegacy && references.accounts.count == 1 &&
-                position == 0 && !existing.contains(reference.id) && hasDefaultMuseCookies
+            let usesDefault = references.canUseDefault && position == 0 &&
+                !existing.contains(reference.id) && hasDefaultMuseCookies
             guard existing.contains(reference.id) || usesDefault,
                   registered.insert(reference.id).inserted else { continue }
             next.identities.append(AccountIdentity(
@@ -249,17 +252,52 @@ private struct LegacyAccountReferences {
     private struct File: Decodable {
         struct Row: Decodable {
             struct Proxy: Decodable { let enabled: Bool? }
+            enum CodingKeys: String, CodingKey { case providerId, provider_id, uuid, id, proxy }
             let providerId: String?
             let uuid: UUID
             let proxy: Proxy?
+
+            init(from decoder: Decoder) throws {
+                let fields = try decoder.container(keyedBy: CodingKeys.self)
+                providerId = try fields.decodeIfPresent(String.self, forKey: .providerId) ??
+                    fields.decodeIfPresent(String.self, forKey: .provider_id)
+                uuid = try fields.decodeIfPresent(UUID.self, forKey: .uuid) ?? fields.decode(UUID.self, forKey: .id)
+                proxy = try fields.decodeIfPresent(Proxy.self, forKey: .proxy)
+            }
         }
-        struct Key: Decodable { let uuid: UUID }
+        struct Key: Decodable {
+            enum CodingKeys: String, CodingKey { case uuid, accountUuid, id, providerId, provider_id }
+            let uuid: UUID
+            let providerId: String
+
+            init(from decoder: Decoder) throws {
+                if let id = try? decoder.singleValueContainer().decode(UUID.self) {
+                    uuid = id
+                    providerId = "muse"
+                    return
+                }
+                let fields = try decoder.container(keyedBy: CodingKeys.self)
+                uuid = try fields.decodeIfPresent(UUID.self, forKey: .uuid) ??
+                    fields.decodeIfPresent(UUID.self, forKey: .accountUuid) ?? fields.decode(UUID.self, forKey: .id)
+                providerId = try fields.decodeIfPresent(String.self, forKey: .providerId) ??
+                    fields.decodeIfPresent(String.self, forKey: .provider_id) ?? "muse"
+            }
+        }
+        enum CodingKeys: String, CodingKey { case version, accounts, pendingCleanup, pending_cleanup }
         let version: Int?
         let accounts: [Row]
         let pendingCleanup: [Key]?
+
+        init(from decoder: Decoder) throws {
+            let fields = try decoder.container(keyedBy: CodingKeys.self)
+            version = try fields.decodeIfPresent(Int.self, forKey: .version)
+            accounts = try fields.decodeIfPresent([Row].self, forKey: .accounts) ?? []
+            pendingCleanup = try fields.decodeIfPresent([Key].self, forKey: .pendingCleanup) ??
+                fields.decodeIfPresent([Key].self, forKey: .pending_cleanup)
+        }
     }
 
-    let isLegacy: Bool
+    let canUseDefault: Bool
     let accounts: [Account]
 
     static func read(_ url: URL) throws -> Self {
@@ -267,15 +305,15 @@ private struct LegacyAccountReferences {
         do {
             file = try JSONDecoder().decode(File.self, from: Data(contentsOf: url))
         } catch let error as CocoaError where error.code == .fileReadNoSuchFile {
-            return Self(isLegacy: false, accounts: [])
+            return Self(canUseDefault: false, accounts: [])
         }
         let version = file.version ?? 1
-        guard (1...2).contains(version) else { throw RegistryError.invalidIndex }
-        let pending = Set((file.pendingCleanup ?? []).map(\.uuid))
+        guard (0...2).contains(version) else { throw RegistryError.invalidIndex }
+        let pending = Set((file.pendingCleanup ?? []).filter { $0.providerId == "muse" }.map(\.uuid))
         let eligible = file.accounts.filter {
             !pending.contains($0.uuid) && ($0.providerId == "muse" || ($0.providerId == nil && version < 2))
         }
-        return Self(isLegacy: version < 2, accounts: eligible.map {
+        return Self(canUseDefault: version < 2 && file.accounts.count == 1, accounts: eligible.map {
             Account(id: $0.uuid, requiresProxy: $0.proxy.map { $0.enabled != false } ?? false)
         })
     }

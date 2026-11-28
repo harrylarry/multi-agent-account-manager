@@ -70,7 +70,7 @@ final class IsolationCheck {
         guard canSeed, let registry else { return }
         await perform("正在写入和检查两个测试资料…") {
             self.savePhase("")
-            let pair = try registry.createIsolationPair()
+            let pair = try await registry.createIsolationPair()
             self.hasTestSlots = true
             try self.verifyProxyWiring(registry, a: pair.a, b: pair.b)
 

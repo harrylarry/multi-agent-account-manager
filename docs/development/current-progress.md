@@ -1,5 +1,11 @@
 # 当前开发进度
 
+## Swift T1 原生骨架
+
+从 `main` 的 `0bd4341` 建立 0.2.0 并行 Swift 验收包。T0 已在 [#17](https://github.com/harrylarry/multi-agent-account-manager/issues/17) 收口。T1 在 [Issue #18](https://github.com/harrylarry/multi-agent-account-manager/issues/18) 和 [PR #19](https://github.com/harrylarry/multi-agent-account-manager/pull/19) 推进。
+
+验收包标识为 `com.ldjx.accountmanager.swift-t1`，安装时和旧日常版并存。A 组真机回执前保持 PR 未合入。验收记录和下一阶段边界见[台账](../acceptance/swift-parity-ledger.md)及[真机步骤](../acceptance/swift-t1-iphone.md)。
+
 ## PR #16 已合入 main
 
 2026-11-27 20:59（CST），用户将 PR #16（181 个提交，167 个文件，+27838/−449）合入 `main`，合并提交 `d0a19ecc`（基线 `d5cd5aa6` → `d0a19ecc`）。合入后 `main` CI 全绿：Quick checks（run 46003223545）与 IPA 构建（run 46003223632）均 success。日常版 IPA（`com.ldjx.accountmanager`，0.1.26，最低 iOS 26.0）SHA-256 `40fe5b53aefc7322955da067b552a523bcf71225efdddc7e33e2345bcb69e11e`，5,750,990 字节。
