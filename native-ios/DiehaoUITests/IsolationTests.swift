@@ -7,7 +7,7 @@ final class IsolationTests: XCTestCase {
         let app = XCUIApplication()
         app.launch()
 
-        let accounts = app.buttons["账号资料、代理与 Cookie"]
+        let accounts = app.buttons["管理账号、代理与 Cookie"]
         XCTAssertTrue(accounts.waitForExistence(timeout: 20))
         accounts.tap()
         app.buttons["新增独立账号"].tap()
@@ -26,6 +26,7 @@ final class IsolationTests: XCTestCase {
         continueAfterFailure = false
         let app = XCUIApplication()
         app.launch()
+        openDiagnostics(app)
 
         let status = app.staticTexts["isolationA.status"]
         let seed = app.buttons["isolationA.seed"]
@@ -48,6 +49,7 @@ final class IsolationTests: XCTestCase {
         wait(for: status, toContain: "请彻底退出并重新打开")
         app.terminate()
         app.launch()
+        openDiagnostics(app)
 
         let verifyReady = NSPredicate(format: "enabled == true")
         XCTAssertEqual(
@@ -67,6 +69,7 @@ final class IsolationTests: XCTestCase {
         if status.label.contains("请彻底退出并重开叠号") {
             app.terminate()
             app.launch()
+            openDiagnostics(app)
             XCTAssertEqual(
                 XCTWaiter.wait(for: [XCTNSPredicateExpectation(predicate: verifyReady, object: bc)], timeout: 10),
                 .completed
@@ -87,6 +90,7 @@ final class IsolationTests: XCTestCase {
         if status.label.contains("请彻底退出并重开叠号") {
             app.terminate()
             app.launch()
+            openDiagnostics(app)
             let enabled = NSPredicate(format: "enabled == true")
             XCTAssertEqual(
                 XCTWaiter.wait(for: [XCTNSPredicateExpectation(predicate: enabled, object: button)], timeout: 10),
@@ -98,9 +102,57 @@ final class IsolationTests: XCTestCase {
     }
 
     @MainActor
+    private func openDiagnostics(_ app: XCUIApplication) {
+        let link = app.buttons["dashboard.isolation"]
+        XCTAssertTrue(link.waitForExistence(timeout: 20))
+        if !link.isHittable { app.swipeUp() }
+        link.tap()
+    }
+
+    @MainActor
     private func wait(for element: XCUIElement, toContain text: String) {
         let predicate = NSPredicate(format: "label CONTAINS %@", text)
         let result = XCTWaiter.wait(for: [XCTNSPredicateExpectation(predicate: predicate, object: element)], timeout: 90)
         XCTAssertEqual(result, .completed, "Expected \(text), current: \(element.label)")
+    }
+}
+
+final class DashboardTests: XCTestCase {
+    @MainActor
+    func testActivityPollingAndComposeInterface() {
+        continueAfterFailure = false
+        let app = XCUIApplication()
+        app.launchArguments = ["-diehao-dashboard-fixtures"]
+        app.launch()
+
+        XCTAssertTrue(app.staticTexts["需要处理"].waitForExistence(timeout: 20))
+        XCTAssertTrue(app.staticTexts["2"].exists)
+        XCTAssertTrue(app.staticTexts["4"].exists)
+        XCTAssertTrue(app.staticTexts["1"].exists)
+        let poll = app.buttons["dashboard.poll"]
+        if !poll.isHittable { app.swipeUp() }
+        XCTAssertEqual(poll.value as? String, "20 秒")
+        poll.tap()
+        XCTAssertTrue(app.buttons["10 秒"].exists)
+        XCTAssertTrue(app.buttons["20 秒"].exists)
+        app.buttons["30 秒"].tap()
+        XCTAssertEqual(poll.value as? String, "30 秒")
+        app.swipeDown()
+        XCTAssertTrue(app.staticTexts["暂无待处理事项"].waitForExistence(timeout: 10))
+
+        app.buttons["dashboard.compose"].tap()
+        let account = app.buttons["compose.account"]
+        XCTAssertTrue(account.waitForExistence(timeout: 10))
+        account.tap()
+        XCTAssertFalse(app.buttons["测试账号 B"].exists)
+        app.buttons["测试账号 A"].tap()
+        let send = app.buttons["compose.send"]
+        XCTAssertFalse(send.isEnabled)
+        let message = app.textViews["compose.message"]
+        message.tap()
+        app.typeText("Simulator compose")
+        if !send.isHittable { app.swipeUp() }
+        send.tap()
+        XCTAssertTrue(app.staticTexts["compose.status"].waitForExistence(timeout: 10))
     }
 }

@@ -132,6 +132,14 @@ final class CookieLoginProbe {
         guard expected.range(of: #"^[^\s@]+@[^\s@]+\.[^\s@]+$"#, options: .regularExpression) != nil else {
             throw CookieError.invalidEmail
         }
+        try await check(webView, expected: expected)
+    }
+
+    func verifySession(_ webView: WKWebView) async throws {
+        try await check(webView, expected: nil)
+    }
+
+    private func check(_ webView: WKWebView, expected: String?) async throws {
         let museURL = MusePageDelegate.entryURL
         defer {
             delegate?.close()
@@ -160,7 +168,7 @@ final class CookieLoginProbe {
             webView.load(request)
         }
         let result = try? await webView.callAsyncJavaScript(Self.identityScript,
-            arguments: ["expected": expected], in: nil, contentWorld: .defaultClient)
+            arguments: ["expected": expected.map { $0 as Any } ?? NSNull()], in: nil, contentWorld: .defaultClient)
         switch result as? String {
         case "verified": return
         case "mismatch": throw CookieError.wrongIdentity
@@ -193,6 +201,7 @@ final class CookieLoginProbe {
             return error.name === 'TimeoutError' ? 'timeout' : 'sessionUnconfirmed';
         }
         if (proof?.ok !== true || typeof proof.viewer_id !== 'string' || !proof.viewer_id) return 'sessionUnconfirmed';
+        if (expected === null) return 'verified';
         const proofs = new Set();
         const paths = ['viewer', 'user', 'account', 'profile', 'session', 'props', 'pageProps', 'data'];
         const add = email => {

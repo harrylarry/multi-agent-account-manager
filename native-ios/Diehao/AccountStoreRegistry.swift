@@ -15,6 +15,8 @@ struct AccountIdentity: Codable, Identifiable {
     var requiresProxy = false
     var alias: String? = nil
     var proxy: AccountProxySettings? = nil
+
+    var displayName: String { alias ?? "Muse · " + String(id.uuidString.prefix(8)) }
 }
 
 enum RegistryError: LocalizedError {
