@@ -11,7 +11,7 @@ Swift 各阶段在这里与 0.1.26 日常版逐项对照。基线是 main `0bd43
 | T3 | 总览、账号列表、Compose | 正确聚合未读、待审批、进行中并显示空态。前台轮询 10/20/30 秒可换，默认 20 秒。Compose 可手动选择账号、输入 1–16,000 字并调用发送接口。 | [Issue #22](https://github.com/harrylarry/multi-agent-account-manager/issues/22) · [模拟器 3/3](https://github.com/harrylarry/multi-agent-account-manager/actions/runs/46147399099) · 真机统一验收 |
 | T4 | 额度 | 进 App N 个账号额度 N/N，带更新时间、来源和 stale。L1 失败仅经相应条件转 L2 一次，进入账号触发 L3。30 分钟内重进不重复刷新，0% 与未观测分开。 | T0 S1、S2 已明确原生额度路径及取消被动层 |
 | T5 | 订阅、未读、红点（B1） | 两项出入账号的未读场景、断线重连与回填无丢重、看到最新消息后清除，诊断能区分订阅、轮询与回填。 | [Issue #26](https://github.com/harrylarry/multi-agent-account-manager/issues/26) · 真机统一验收 |
-| T6 | 审批（B2） | 总览和红点准确。事件和轮询备援、四类硬拒绝、过期与重启未决队列通过。按 T0 裁决用工具与 entity/domain 匹配长期授权，分类自动放行默认关闭。 | T0 S4 已跳过摘要验收 |
+| T6 | 审批（B2） | 总览和红点准确。事件和轮询备援、四类硬拒绝、过期与重启未决队列通过。按 T0 裁决用工具与 entity/domain 匹配长期授权，分类自动放行默认关闭。 | [Issue #28](https://github.com/harrylarry/multi-agent-account-manager/issues/28) · T0 S4 已跳过摘要验收 |
 | T7 | 发送（B4） | HTTP/HTTPS/SOCKS5 账号代理下发送新对话。四态明确，UNKNOWN 走 T0 S3 的 26 秒对账，重启后可续核对，发送不重复。 | T0 S3 已验证降级路径 |
 | T8 | 加密备份与恢复 | 三模式真机往返，坏包零改动，覆盖/合并可预测并能回滚，独立恢复码有效，快照保留可调。Cookie 用逐条备份。 | T0 S5 已确定逐条方案 |
 | T9 | 模型指纹 | 手动运行，结果和置信度正确显示，按账号留历史，进 App 或切换账号不触发。 | 待实现与验收 |

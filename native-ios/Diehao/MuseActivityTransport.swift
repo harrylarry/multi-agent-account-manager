@@ -23,6 +23,14 @@ private final class MuseWire {
     func finish(_ data: Data) throws -> Data { try invoke(data, using: diehao_wire_message_three) }
     func request(_ path: String) throws -> Data { try invoke(Data(path.utf8), using: diehao_wire_request) }
     func receive(_ data: Data) throws -> Data { try invoke(data, using: diehao_wire_receive) }
+    func decide(_ path: String, body: Data) throws -> Data {
+        try Data(path.utf8).withUnsafeBytes { route in
+            try body.withUnsafeBytes { payload in
+                try read(diehao_wire_approval_decision(handle, route.bindMemory(to: UInt8.self).baseAddress, route.count,
+                    payload.bindMemory(to: UInt8.self).baseAddress, payload.count))
+            }
+        }
+    }
 
     private func invoke(_ data: Data, using call: (OpaquePointer?, UnsafePointer<UInt8>?, Int) -> OpaquePointer?) throws -> Data {
         try data.withUnsafeBytes { bytes in
@@ -176,9 +184,9 @@ final class NativeMuseActivityConnection: MuseActivityConnection {
         pending.removeAll()
     }
 
-    private func issue(_ route: String, persistent: Bool) throws -> AsyncThrowingStream<Data, Error> {
+    private func issue(_ route: String, persistent: Bool, body: Data? = nil) throws -> AsyncThrowingStream<Data, Error> {
         guard !closed else { throw MuseActivityError.disconnected }
-        let encoded = try wire.request(route)
+        let encoded = try body.map { try wire.decide(route, body: $0) } ?? wire.request(route)
         guard let streamID: UInt64 = encoded.integer(at: 0) else { throw MuseActivityError.invalidFrame }
         let (stream, continuation) = AsyncThrowingStream<Data, Error>.makeStream(bufferingPolicy: .bufferingOldest(128))
         let timeout = Task { [weak self] in
@@ -234,9 +242,9 @@ final class NativeMuseActivityConnection: MuseActivityConnection {
         if frame[11] == 1 { finish(stream) }
     }
 
-    private func call(_ route: String) async throws -> Data {
+    func call(_ route: String, approvalDecision: Data? = nil) async throws -> Data {
         var result = Data()
-        let stream = try issue(route, persistent: false)
+        let stream = try issue(route, persistent: false, body: approvalDecision)
         for try await bytes in stream {
             guard result.count + bytes.count <= 4_194_304 else { throw MuseActivityError.invalidFrame }
             result.append(bytes)

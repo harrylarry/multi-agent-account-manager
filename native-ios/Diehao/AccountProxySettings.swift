@@ -36,6 +36,12 @@ enum T2Keychain {
         guard status == errSecSuccess || status == errSecItemNotFound else { throw KeyError.status(status) }
     }
 
+    static func replace(_ data: Data, as account: String) throws {
+        let status = SecItemUpdate(query(account) as CFDictionary, [kSecValueData as String: data] as CFDictionary)
+        if status == errSecItemNotFound { try save(data, as: account); return }
+        guard status == errSecSuccess else { throw KeyError.status(status) }
+    }
+
     private enum KeyError: LocalizedError {
         case status(OSStatus)
 

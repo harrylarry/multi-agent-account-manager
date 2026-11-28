@@ -16,6 +16,22 @@ fn boxed(bytes: Vec<u8>) -> *mut Vec<u8> {
   Box::into_raw(Box::new(bytes))
 }
 
+fn encode(transport: &mut NoiseTransport, request: HttpRequest) -> *mut Vec<u8> {
+  let Ok((stream, frames)) = transport.encrypt_request(&request) else { return std::ptr::null_mut() };
+  let mut data = stream.to_le_bytes().to_vec();
+  for frame in frames {
+    data.extend((frame.len() as u32).to_le_bytes());
+    data.extend(frame);
+  }
+  boxed(data)
+}
+
+fn approval_route(path: &str) -> bool {
+  path.strip_prefix("/approvals/").is_some_and(|id| {
+    !id.is_empty() && id.len() <= 128 && id.bytes().all(|b| b.is_ascii_alphanumeric() || b"-_".contains(&b))
+  })
+}
+
 #[no_mangle]
 extern "C" fn diehao_wire_new() -> *mut Wire {
   Box::into_raw(Box::new(Wire::Handshake(NoiseXXInitiator::new())))
@@ -66,8 +82,9 @@ unsafe extern "C" fn diehao_wire_request(wire: *mut Wire, route: *const u8, leng
   let Ok(path) = std::str::from_utf8(std::slice::from_raw_parts(route, length)) else { return std::ptr::null_mut() };
   let request = match path {
     "/chat/subscribe" => subscription_request(),
-    path if path == "/api/session/list" || path.starts_with("/chat/history?") => HttpRequest {
-      service: Service::Daemon,
+    path if path == "/api/session/list" || path.starts_with("/chat/history?")
+        || path == "/approvals" || approval_route(path) => HttpRequest {
+      service: if path.starts_with("/approvals") { Service::Sentinel } else { Service::Daemon },
       verb: "GET".to_owned(),
       path: path.to_owned(),
       headers: vec![
@@ -79,13 +96,27 @@ unsafe extern "C" fn diehao_wire_request(wire: *mut Wire, route: *const u8, leng
     },
     _ => return std::ptr::null_mut(),
   };
-  let Ok((stream, frames)) = transport.encrypt_request(&request) else { return std::ptr::null_mut() };
-  let mut data = stream.to_le_bytes().to_vec();
-  for frame in frames {
-    data.extend((frame.len() as u32).to_le_bytes());
-    data.extend(frame);
+  encode(transport, request)
+}
+
+#[no_mangle]
+unsafe extern "C" fn diehao_wire_approval_decision(
+  wire: *mut Wire, route: *const u8, route_length: usize, body: *const u8, body_length: usize,
+) -> *mut Vec<u8> {
+  let Some(Wire::Transport(transport)) = wire.as_mut() else { return std::ptr::null_mut() };
+  if route.is_null() || route_length == 0 || route_length > 160
+      || body.is_null() || body_length == 0 || body_length > 4096 {
+    return std::ptr::null_mut();
   }
-  boxed(data)
+  let Ok(path) = std::str::from_utf8(std::slice::from_raw_parts(route, route_length)) else { return std::ptr::null_mut() };
+  if !path.strip_suffix("/decide").is_some_and(approval_route) { return std::ptr::null_mut() }
+  encode(transport, HttpRequest {
+    service: Service::Sentinel,
+    verb: "POST".to_owned(),
+    path: path.to_owned(),
+    headers: vec![("Content-Type".to_owned(), "application/json".to_owned()), ("x-app-id".to_owned(), "hatch-web".to_owned())],
+    body: std::slice::from_raw_parts(body, body_length).to_vec(),
+  })
 }
 
 #[no_mangle]

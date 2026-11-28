@@ -101,6 +101,7 @@ struct AccountTools: View {
     let registry: AccountStoreRegistry
     var quota: QuotaCoordinator? = nil
     var museActivity: MuseActivityCoordinator? = nil
+    var approvals: MuseApprovalQueue? = nil
     @State private var accounts: [AccountIdentity] = []
     @State private var alias = ""
     @State private var status = ""
@@ -135,7 +136,10 @@ struct AccountTools: View {
         .navigationTitle("账号资料")
         .onAppear(perform: refresh)
         .sheet(item: $selected, onDismiss: refresh) { account in
-            NavigationStack { AccountDetail(registry: registry, account: account, quota: quota, museActivity: museActivity) }
+            NavigationStack {
+                AccountDetail(registry: registry, account: account, quota: quota,
+                    museActivity: museActivity, approvals: approvals)
+            }
                 .interactiveDismissDisabled()
         }
     }
@@ -151,6 +155,7 @@ struct AccountDetail: View {
     let account: AccountIdentity
     var quota: QuotaCoordinator? = nil
     var museActivity: MuseActivityCoordinator? = nil
+    var approvals: MuseApprovalQueue? = nil
     @State private var scheme: AccountProxySettings.Scheme = .http
     @State private var host = ""
     @State private var port = ""
@@ -189,6 +194,14 @@ struct AccountDetail: View {
                 Text("资料 ID · " + String(account.id.uuidString.prefix(8)))
                     .font(.caption)
                 if !status.isEmpty { Text(status).accessibilityIdentifier("account.status") }
+            }
+            if let approvals {
+                Section {
+                    NavigationLink("待审批 \(approvals.queue(account.id).count) 项") {
+                        MuseApprovalView(account: account, queue: approvals)
+                    }
+                    .accessibilityIdentifier("account.approvals")
+                }
             }
             Section("账号代理") {
                 Picker("协议", selection: $scheme) {

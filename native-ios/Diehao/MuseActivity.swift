@@ -108,6 +108,8 @@ private struct ActivityRecord: Codable {
 @MainActor
 @Observable
 final class MuseActivityCoordinator {
+    @ObservationIgnored var onNeedsApproval: (@MainActor (UUID) -> Void)?
+    @ObservationIgnored var onRunEnded: (@MainActor (UUID) -> Void)?
     private let storage: URL
     private let open: @MainActor (UUID) async throws -> any MuseActivityConnection
     private var records: [UUID: ActivityRecord]
@@ -178,6 +180,15 @@ final class MuseActivityCoordinator {
     }
 
     func focus(_ account: UUID?) { focused = account }
+
+    var runningAccounts: Set<UUID> { Set(busyAt.keys) }
+
+    func approvalCall(_ id: UUID, path: String, decision: Data?) async throws -> Data {
+        guard let connection = connections[id] as? NativeMuseActivityConnection else {
+            throw MuseActivityError.unavailable
+        }
+        return try await connection.call(path, approvalDecision: decision)
+    }
 
     func checkVisibleReply(in view: WKWebView, account: UUID) async {
         guard focused == account, view.url?.scheme == "https", view.url?.host == "muse.ai",
@@ -325,8 +336,11 @@ final class MuseActivityCoordinator {
         if event == "agent.status" {
             let busyCodes: Set<String> = ["running", "thinking", "working", "responding", "tool_call",
                 "waiting_for_input", "waiting_for_subagents", "compacting", "needs_approval"]
-            updateBusy(account, busy: busyCodes.contains(fields["activity_code"] as? String ?? ""))
+            let code = fields["activity_code"] as? String ?? ""
+            updateBusy(account, busy: busyCodes.contains(code))
+            if code == "needs_approval" { onNeedsApproval?(account) }
         }
+        if event == "needs_approval" || event == "egress.approval_requested" { onNeedsApproval?(account) }
         if event == "message.assistant" || event == "delta.message_done",
            fields["display_text_ready"] as? Bool != false,
            let thread = MuseReply.token(fields["session_id"] ?? fields["thread_id"]),
@@ -342,7 +356,10 @@ final class MuseActivityCoordinator {
         busyChanges[id] = Task {
             do { try await Task.sleep(for: .milliseconds(1_500)) } catch { return }
             if busy { busyAt[id] = busyAt[id] ?? .now }
-            else { busyAt.removeValue(forKey: id) }
+            else {
+                busyAt.removeValue(forKey: id)
+                onRunEnded?(id)
+            }
         }
     }
 
