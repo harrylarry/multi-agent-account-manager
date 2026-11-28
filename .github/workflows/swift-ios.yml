@@ -17,7 +17,7 @@ concurrency:
 jobs:
   ios:
     name: Build and test native iOS
-    runs-on: macos-15-intel
+    runs-on: macos-15
     timeout-minutes: 35
     steps:
       - uses: actions/checkout@v7
@@ -68,6 +68,8 @@ jobs:
           sys.exit("An available iOS 26 iPhone Simulator is required")
           PY
           )
+          xcrun simctl boot "$simulator"
+          xcrun simctl bootstatus "$simulator" -b
           xcodebuild -project native-ios/Diehao.xcodeproj -scheme Diehao \
             -destination "platform=iOS Simulator,id=$simulator" \
             -derivedDataPath "$RUNNER_TEMP/swift-ios-simulator" \
