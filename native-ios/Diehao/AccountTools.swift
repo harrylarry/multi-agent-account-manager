@@ -99,6 +99,7 @@ enum SavedCookies {
 @MainActor
 struct AccountTools: View {
     let registry: AccountStoreRegistry
+    var quota: QuotaCoordinator? = nil
     @State private var accounts: [AccountIdentity] = []
     @State private var alias = ""
     @State private var status = ""
@@ -133,7 +134,7 @@ struct AccountTools: View {
         .navigationTitle("账号资料")
         .onAppear(perform: refresh)
         .sheet(item: $selected, onDismiss: refresh) { account in
-            NavigationStack { AccountDetail(registry: registry, account: account) }
+            NavigationStack { AccountDetail(registry: registry, account: account, quota: quota) }
                 .interactiveDismissDisabled()
         }
     }
@@ -146,6 +147,7 @@ struct AccountDetail: View {
     @Environment(\.dismiss) private var dismiss
     let registry: AccountStoreRegistry
     let account: AccountIdentity
+    var quota: QuotaCoordinator? = nil
     @State private var scheme: AccountProxySettings.Scheme = .http
     @State private var host = ""
     @State private var port = ""
@@ -241,7 +243,11 @@ struct AccountDetail: View {
                         }
                         .padding()
                     }
-                    MuseAccountPage(webView: webView, retry: pageRetry) { pageError = $0 }
+                    MuseAccountPage(webView: webView, retry: pageRetry, onResult: { pageError = $0 },
+                        onPage: { view in
+                            guard let quota else { return }
+                            Task { await quota.refresh(account.id, trigger: .account, page: view) }
+                        })
                 }
                 .navigationTitle("Muse")
                 .navigationBarTitleDisplayMode(.inline)

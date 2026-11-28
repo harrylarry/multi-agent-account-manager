@@ -123,6 +123,29 @@ final class IsolationTests: XCTestCase {
 
 final class DashboardTests: XCTestCase {
     @MainActor
+    func testQuotaSeparatesZeroUseUnknownAndExhaustion() {
+        continueAfterFailure = false
+        let app = XCUIApplication()
+        app.launchArguments = ["-diehao-quota-fixtures"]
+        app.launch()
+
+        let available = app.buttons["测试账号 A"]
+        let unknown = app.buttons["测试账号 B"]
+        XCTAssertTrue(available.waitForExistence(timeout: 20))
+        let hasValue = NSPredicate(format: "value CONTAINS %@", "额度剩余 100%")
+        XCTAssertEqual(XCTWaiter.wait(for: [XCTNSPredicateExpectation(predicate: hasValue, object: available)],
+                                      timeout: 10), .completed)
+        XCTAssertTrue((unknown.value as? String)?.contains("额度未观测") == true)
+        let refresh = app.buttons["dashboard.refreshQuota"]
+        XCTAssertTrue(refresh.waitForExistence(timeout: 5))
+        refresh.tap()
+        let depleted = NSPredicate(format: "value CONTAINS %@", "额度已用尽")
+        XCTAssertEqual(XCTWaiter.wait(for: [XCTNSPredicateExpectation(predicate: depleted, object: unknown)],
+                                      timeout: 10), .completed, String(describing: unknown.value))
+        XCTAssertTrue((available.value as? String)?.contains("额度剩余 100%") == true)
+    }
+
+    @MainActor
     func testActivityPollingAndComposeInterface() {
         continueAfterFailure = false
         let app = XCUIApplication()
