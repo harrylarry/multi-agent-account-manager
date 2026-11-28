@@ -123,6 +123,30 @@ final class IsolationTests: XCTestCase {
 
 final class DashboardTests: XCTestCase {
     @MainActor
+    func testApprovalQueueScopesActionsAndConfirmsOneTimeGrant() {
+        continueAfterFailure = false
+        let app = XCUIApplication()
+        app.launchArguments = ["-diehao-approval-fixtures"]
+        app.launch()
+
+        let approvals = app.descendants(matching: .any)["dashboard.approvals"]
+        XCTAssertTrue(approvals.waitForExistence(timeout: 20))
+        let onePending = NSPredicate(format: "value == %@", "1")
+        XCTAssertEqual(XCTWaiter.wait(for: [XCTNSPredicateExpectation(predicate: onePending, object: approvals)],
+                                      timeout: 20), .completed)
+        app.buttons["测试账号 A"].tap()
+        let queue = app.buttons["account.approvals"]
+        XCTAssertTrue(queue.waitForExistence(timeout: 10))
+        queue.tap()
+        let allow = app.buttons["approval.once.safe"]
+        XCTAssertTrue(allow.waitForExistence(timeout: 10))
+        XCTAssertFalse(app.buttons["approval.once.blocked"].exists)
+        allow.tap()
+        XCTAssertTrue(app.staticTexts["Muse 已确认审批结果。"].waitForExistence(timeout: 10))
+        XCTAssertTrue(app.staticTexts["暂无待审批请求。"].exists)
+    }
+
+    @MainActor
     func testActivityReconcilesReconnectWithoutDuplicateUnread() {
         continueAfterFailure = false
         let app = XCUIApplication()

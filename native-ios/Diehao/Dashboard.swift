@@ -78,6 +78,7 @@ struct Dashboard: View {
     @State private var services: DashboardServices
     @State private var quota: QuotaCoordinator
     @State private var activityCoordinator: MuseActivityCoordinator
+    @State private var approvals: MuseApprovalQueue
     @Environment(\.scenePhase) private var scenePhase
     @AppStorage("dashboard.foregroundPollSeconds") private var savedInterval = ForegroundPollInterval.normal.rawValue
     @State private var rows: [AccountIdentity] = []
@@ -90,12 +91,23 @@ struct Dashboard: View {
     init(registry: AccountStoreRegistry, check: IsolationCheck) {
         self.registry = registry
         self.check = check
+        let activityCoordinator: MuseActivityCoordinator
         #if DEBUG && targetEnvironment(simulator)
+        if ProcessInfo.processInfo.arguments.contains("-diehao-approval-fixtures") {
+            let fixtures = DashboardServices.fixtures(registry: registry)
+            _services = State(initialValue: fixtures)
+            _quota = State(initialValue: .fixtures(accounts: fixtures.accounts()))
+            _activityCoordinator = State(initialValue: .fixtures(account: nil))
+            _approvals = State(initialValue: .fixtures(account: fixtures.accounts().first?.id))
+            return
+        }
         if ProcessInfo.processInfo.arguments.contains("-diehao-activity-fixtures") {
             let fixtures = DashboardServices.fixtures(registry: registry)
             _services = State(initialValue: fixtures)
             _quota = State(initialValue: .fixtures(accounts: fixtures.accounts()))
-            _activityCoordinator = State(initialValue: .fixtures(account: fixtures.accounts().first?.id))
+            activityCoordinator = .fixtures(account: fixtures.accounts().first?.id)
+            _activityCoordinator = State(initialValue: activityCoordinator)
+            _approvals = State(initialValue: Self.makeApprovals(activityCoordinator))
             return
         }
         if ProcessInfo.processInfo.arguments.contains("-diehao-dashboard-fixtures") ||
@@ -103,11 +115,15 @@ struct Dashboard: View {
             let fixtures = DashboardServices.fixtures(registry: registry)
             _services = State(initialValue: fixtures)
             _quota = State(initialValue: .fixtures(accounts: fixtures.accounts()))
-            _activityCoordinator = State(initialValue: .fixtures(account: nil))
+            activityCoordinator = .fixtures(account: nil)
+            _activityCoordinator = State(initialValue: activityCoordinator)
+            _approvals = State(initialValue: Self.makeApprovals(activityCoordinator))
             return
         }
         #endif
-        _activityCoordinator = State(initialValue: MuseActivityCoordinator(registry: registry))
+        activityCoordinator = MuseActivityCoordinator(registry: registry)
+        _activityCoordinator = State(initialValue: activityCoordinator)
+        _approvals = State(initialValue: Self.makeApprovals(activityCoordinator))
         _services = State(initialValue: DashboardServices(registry: registry))
         _quota = State(initialValue: QuotaCoordinator(registry: registry,
             cacheURL: URL.applicationSupportDirectory.appending(path: "DiehaoNative/quota.json")))
@@ -123,7 +139,16 @@ struct Dashboard: View {
         if ProcessInfo.processInfo.arguments.contains("-diehao-dashboard-fixtures") ||
             ProcessInfo.processInfo.arguments.contains("-diehao-quota-fixtures") { return activity }
         #endif
-        return activityCoordinator.activity()
+        let counts = approvals.counts()
+        if let observed = activityCoordinator.activity() { return observed.merging(counts, uniquingKeysWith: +) }
+        return counts.isEmpty ? nil : counts
+    }
+
+    private static func makeApprovals(_ activity: MuseActivityCoordinator) -> MuseApprovalQueue {
+        let queue = MuseApprovalQueue(call: { try await activity.approvalCall($0, path: $1, decision: $2) })
+        activity.onNeedsApproval = { [weak queue] id in Task { await queue?.refresh(id) } }
+        activity.onRunEnded = { [weak queue] in queue?.finishRuns(for: $0) }
+        return queue
     }
 
     private var pollSeconds: Int {
@@ -167,7 +192,7 @@ struct Dashboard: View {
                     .accessibilityValue(accountSummary(account.id))
                 }
                 NavigationLink("管理账号、代理与 Cookie") {
-                    AccountTools(registry: registry, quota: quota, museActivity: activityCoordinator)
+                    AccountTools(registry: registry, quota: quota, museActivity: activityCoordinator, approvals: approvals)
                         .onDisappear { rows = services.accounts() }
                 }
             }
@@ -207,12 +232,18 @@ struct Dashboard: View {
             guard scenePhase == .active else {
                 activityEnabled = false
                 activityCoordinator.configure(accounts, active: false, interval: pollSeconds)
+                approvals.configure([], active: false)
                 return
             }
             await quota.refresh(services.accounts().map(\.id), trigger: .foreground)
             if !Task.isCancelled {
                 activityEnabled = true
                 activityCoordinator.configure(services.accounts(), active: true, interval: pollSeconds)
+                approvals.configure(services.accounts().map(\.id), active: true)
+            }
+            while !Task.isCancelled {
+                await approvals.poll(running: activityCoordinator.runningAccounts)
+                do { try await Task.sleep(for: .seconds(1)) } catch { return }
             }
         }
         .task(id: scenePhase == .active ? pollSeconds : 0) {
@@ -228,7 +259,8 @@ struct Dashboard: View {
             await refresh()
         } }) { account in
             NavigationStack {
-                AccountDetail(registry: registry, account: account, quota: quota, museActivity: activityCoordinator)
+                AccountDetail(registry: registry, account: account, quota: quota,
+                    museActivity: activityCoordinator, approvals: approvals)
             }
                 .interactiveDismissDisabled()
         }
@@ -267,7 +299,10 @@ struct Dashboard: View {
         refreshing = true
         defer { refreshing = false }
         rows = services.accounts()
-        if activityEnabled { activityCoordinator.configure(rows, active: scenePhase == .active, interval: pollSeconds) }
+        if activityEnabled {
+            activityCoordinator.configure(rows, active: scenePhase == .active, interval: pollSeconds)
+            approvals.configure(rows.map(\.id), active: scenePhase == .active)
+        }
         let updated = await services.activity()
         if !Task.isCancelled { activity = updated }
     }

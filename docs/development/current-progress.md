@@ -1,5 +1,9 @@
 # 当前开发进度
 
+## Swift T6 审批与审计
+
+[Issue #28](https://github.com/harrylarry/multi-agent-account-manager/issues/28) 基于 T5 的模拟器通过提交 b502aae。前台按 12 秒轮询，运行中按 3 秒轮询，待审批事件可立即触发核对。每次决定前复查同账号、审批 ID、会话和期限。四类硬拒绝优先，任务授权仅在已识别的同一 run 和目标内有效。叠号每个 run 的审批额度为 20 次、单工具 5 次，尝试计入预算。审计链由设备钥匙串保护密钥和末尾签名。真实载荷、自动过期拒绝和长期授权以统一真机为准。
+
 ## Swift T5 订阅、回填和未读
 
 [Issue #26](https://github.com/harrylarry/multi-agent-account-manager/issues/26) 从 T4 模拟器通过提交 d0e98ae 推进。iOS 用每账号 URLSession 建立 WebSocket，握手和帧解析沿用 Rust。Rust 静态库在 Swift 工作流按真机和模拟器架构分别编译。真机用非主力账号统一验收。
