@@ -48,6 +48,7 @@ final class IsolationCheck {
                 .appending(path: "accounts.json")
             let registry = try AccountStoreRegistry(indexURL: path)
             try await registry.referenceLegacyProfiles(in: support, bundleID: Bundle.main.bundleIdentifier ?? "")
+            try? await AccountBackupService(registry: registry).recover()
             self.registry = registry
             await registry.retryPendingRemoval(includeIsolation: false)
             hasTestSlots = !registry.isolationIdentities.isEmpty

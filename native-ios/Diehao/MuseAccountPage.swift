@@ -137,14 +137,20 @@ final class CookieLoginProbe {
         guard expected.range(of: #"^[^\s@]+@[^\s@]+\.[^\s@]+$"#, options: .regularExpression) != nil else {
             throw CookieError.invalidEmail
         }
-        try await check(webView, expected: expected)
+        _ = try await check(webView, expected: expected)
     }
 
     func verifySession(_ webView: WKWebView) async throws {
-        try await check(webView, expected: nil)
+        _ = try await check(webView, expected: nil)
     }
 
-    private func check(_ webView: WKWebView, expected: String?) async throws {
+    func viewerHash(_ webView: WKWebView) async throws -> Data {
+        let viewer = try await check(webView, expected: nil)
+        guard let viewer, !viewer.isEmpty, viewer.utf8.count <= 256 else { throw CookieError.identityUnavailable }
+        return Data(SHA256.hash(data: Data(viewer.utf8)))
+    }
+
+    private func check(_ webView: WKWebView, expected: String?) async throws -> String? {
         let museURL = MusePageDelegate.entryURL
         defer {
             delegate?.close()
@@ -175,10 +181,12 @@ final class CookieLoginProbe {
         let result = try? await webView.callAsyncJavaScript(Self.identityScript,
             arguments: ["expected": expected.map { $0 as Any } ?? NSNull()], in: nil, contentWorld: .defaultClient)
         switch result as? String {
-        case "verified": return
+        case "verified": return nil
         case "mismatch": throw CookieError.wrongIdentity
         case "timeout": throw CookieError.verificationTimeout
         case "identityUnavailable": throw CookieError.identityUnavailable
+        case let result? where expected == nil && result.hasPrefix("viewer:"):
+            return String(result.dropFirst(7))
         default: throw CookieError.sessionUnconfirmed
         }
     }
@@ -206,7 +214,7 @@ final class CookieLoginProbe {
             return error.name === 'TimeoutError' ? 'timeout' : 'sessionUnconfirmed';
         }
         if (proof?.ok !== true || typeof proof.viewer_id !== 'string' || !proof.viewer_id) return 'sessionUnconfirmed';
-        if (expected === null) return 'verified';
+        if (expected === null) return 'viewer:' + proof.viewer_id;
         const proofs = new Set();
         const paths = ['viewer', 'user', 'account', 'profile', 'session', 'props', 'pageProps', 'data'];
         const add = email => {
@@ -291,7 +299,7 @@ enum CookieTransfer {
         await store.allCookies().filter { MuseCookie($0).family != nil }
     }
 
-    private static func replace(_ cookies: [HTTPCookie], in store: WKHTTPCookieStore) async throws {
+    static func replace(_ cookies: [HTTPCookie], in store: WKHTTPCookieStore) async throws {
         for old in await scopedCookies(store) { await store.deleteCookie(old) }
         for cookie in cookies { await store.setCookie(cookie) }
         let expected = fingerprints(cookies)
