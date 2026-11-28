@@ -1,0 +1,61 @@
+name: Original manager on Swift host
+
+on:
+  pull_request:
+    paths:
+      - 'src/**'
+      - 'src-tauri/src/**'
+      - 'src-tauri/plugins/account-session/ios/**'
+      - 'swift-host/**'
+      - 'scripts/package-swift-manager.mjs'
+      - 'vite.config.ts'
+      - '.github/workflows/swift-host.yml'
+
+permissions:
+  contents: read
+
+concurrency:
+  group: swift-original-host-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  original-manager:
+    runs-on: macos-15
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@v6
+        with:
+          node-version: 22
+          cache: npm
+      - run: npm ci
+      - run: npm run build && npm test && npm run build:swift-manager
+      - name: Build shared Rust service and test original account parsing
+        run: |
+          rustup target add aarch64-apple-ios-sim
+          cargo test --locked --manifest-path swift-host/core/Cargo.toml
+          cargo build --locked --release --manifest-path swift-host/core/Cargo.toml --target aarch64-apple-ios-sim
+      - name: Generate the Swift Xcode project
+        run: |
+          sudo xcode-select --switch /Applications/Xcode_26.3.app/Contents/Developer
+          command -v xcodegen >/dev/null || brew install xcodegen
+          xcodegen generate --spec swift-host/project.yml
+      - name: Test original manager and UIKit navigation
+        run: |
+          device=$(xcrun simctl list devices available --json | python3 -c '
+          import json, sys
+          devices = json.load(sys.stdin)["devices"]
+          print(next(d["udid"] for v in sorted(devices, reverse=True) if ".iOS-26" in v for d in devices[v] if d["name"].startswith("iPhone")))
+          ')
+          xcodebuild -project swift-host/DiehaoManager.xcodeproj -scheme DiehaoManager \
+            -destination "platform=iOS Simulator,id=$device" -parallel-testing-enabled NO \
+            -resultBundlePath "$RUNNER_TEMP/OriginalManager.xcresult" ARCHS=arm64 ONLY_ACTIVE_ARCH=YES \
+            DIEHAO_MANAGER_LIB="$PWD/swift-host/core/target/aarch64-apple-ios-sim/release/libdiehao_manager_core.a" test
+      - uses: actions/upload-artifact@v7
+        if: always()
+        with:
+          name: original-manager-simulator
+          path: ${{ runner.temp }}/OriginalManager.xcresult
+          if-no-files-found: ignore

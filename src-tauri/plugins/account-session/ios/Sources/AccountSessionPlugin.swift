@@ -207,6 +207,10 @@ class AccountSessionPlugin: Plugin {
   }
 
   @objc public func updateManagerGlass(_ invoke: Invoke) throws {
+    struct ManagerGlassArgs: Decodable {
+      let layout: ManagerGlassLayout
+      let events: Channel?
+    }
     let args = try invoke.parseArgs(ManagerGlassArgs.self)
     DispatchQueue.main.async {
       guard #available(iOS 26.0, *), let web = self.managerWebView,
@@ -235,7 +239,10 @@ class AccountSessionPlugin: Plugin {
         self.managerNavigation = navigation
       }
       parent.layoutIfNeeded()
-      navigation.apply(args.layout, events: args.events)
+      let events: (([String: String]) -> Void)? = args.events.map { channel in
+        { data in try? channel.send(data) }
+      }
+      navigation.apply(args.layout, events: events)
       invoke.resolve(["ready": true])
     }
   }

@@ -2,8 +2,13 @@ import { defineConfig } from "vite";
 
 const host = process.env.TAURI_DEV_HOST;
 
-export default defineConfig({
+export default defineConfig(({ mode }) => ({
   clearScreen: false,
+  build: mode === "swift-manager" ? {
+    outDir: "swift-host/Assets",
+    modulePreload: false,
+    rollupOptions: { output: { format: "iife", inlineDynamicImports: true } },
+  } : undefined,
   server: {
     port: 1420,
     strictPort: true,
@@ -19,4 +24,4 @@ export default defineConfig({
       ignored: ["**/src-tauri/**"],
     },
   },
-});
+}));

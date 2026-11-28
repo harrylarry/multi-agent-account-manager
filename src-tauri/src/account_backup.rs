@@ -1,5 +1,6 @@
 use crate::providers::ProviderId;
 use crate::storage::{normalize_account_group, normalize_uuid, AccountRecord, ProxySetting};
+pub use crate::storage::ProxyPoolProfile;
 use base64::{engine::general_purpose::STANDARD, Engine};
 use ring::{aead, pbkdf2, rand::{SecureRandom, SystemRandom}};
 use serde::{Deserialize, Serialize};
@@ -57,15 +58,6 @@ pub struct CredentialPreview {
   pub cookie_count: usize,
   pub proxy_password: bool,
   pub will_restore: bool,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
-#[serde(rename_all = "camelCase")]
-pub struct ProxyPoolProfile {
-  #[serde(default, skip_serializing_if = "Option::is_none")]
-  pub entry_id: Option<uuid::Uuid>,
-  pub endpoint: String,
-  pub requires_auth: bool,
 }
 
 #[derive(Deserialize, Serialize)]

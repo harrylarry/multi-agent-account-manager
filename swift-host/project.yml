@@ -1,0 +1,45 @@
+name: DiehaoManager
+options:
+  deploymentTarget:
+    iOS: "26.0"
+settings:
+  SWIFT_VERSION: "5.0"
+  TARGETED_DEVICE_FAMILY: "1"
+targets:
+  DiehaoManager:
+    type: application
+    platform: iOS
+    sources:
+      - App.swift
+      - ManagerSnapshot.swift
+      - ../src-tauri/plugins/account-session/ios/Sources/ManagerGlassNavigation.swift
+      - path: Assets
+        type: folder
+        buildPhase: resources
+    settings:
+      PRODUCT_BUNDLE_IDENTIFIER: com.ldjx.accountmanager.migration-preview
+      SWIFT_OBJC_BRIDGING_HEADER: ManagerBridge.h
+      OTHER_LDFLAGS: "$(inherited) $(DIEHAO_MANAGER_LIB)"
+      GENERATE_INFOPLIST_FILE: YES
+      INFOPLIST_KEY_CFBundleDisplayName: 叠号迁移预览
+      INFOPLIST_KEY_UILaunchScreen_Generation: YES
+      MARKETING_VERSION: "0.1.26"
+      CURRENT_PROJECT_VERSION: "1"
+  DiehaoManagerTests:
+    type: bundle.ui-testing
+    platform: iOS
+    sources:
+      - ManagerTests.swift
+    dependencies:
+      - target: DiehaoManager
+    settings:
+      PRODUCT_BUNDLE_IDENTIFIER: com.ldjx.accountmanager.migration-preview.tests
+      GENERATE_INFOPLIST_FILE: YES
+schemes:
+  DiehaoManager:
+    build:
+      targets:
+        DiehaoManager: all
+    test:
+      targets:
+        - DiehaoManagerTests

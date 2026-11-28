@@ -6,6 +6,7 @@
   "scripts": {
     "dev": "vite",
     "build": "tsc && vite build",
+    "build:swift-manager": "tsc && vite build --mode swift-manager && node scripts/package-swift-manager.mjs",
     "preview": "vite preview",
     "tauri": "tauri",
     "check:embedded-js": "node scripts/sync-embedded-js.mjs --check",

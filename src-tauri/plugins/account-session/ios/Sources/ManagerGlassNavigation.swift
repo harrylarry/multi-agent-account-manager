@@ -1,20 +1,14 @@
-import Tauri
 import UIKit
 
-struct ManagerGlassArgs: Decodable {
-  struct Layout: Decodable {
-    enum Page: String, Decodable {
-      case accounts, sessions, manage, overview, search, detail, diagnostics, modal, hidden
-    }
-    let page: Page
-    let provider: String
-    let composeEnabled: Bool
-    let backEnabled: Bool
-    let query: String
+struct ManagerGlassLayout: Decodable {
+  enum Page: String, Decodable {
+    case accounts, sessions, manage, overview, search, detail, diagnostics, modal, hidden
   }
-
-  let layout: Layout
-  let events: Channel?
+  let page: Page
+  let provider: String
+  let composeEnabled: Bool
+  let backEnabled: Bool
+  let query: String
 }
 
 /// Lives above the manager WebView. Only the native controls intercept touches;
@@ -22,7 +16,7 @@ struct ManagerGlassArgs: Decodable {
 @available(iOS 26.0, *)
 @MainActor
 final class ManagerGlassNavigation: UIView, UITextFieldDelegate {
-  typealias Page = ManagerGlassArgs.Layout.Page
+  typealias Page = ManagerGlassLayout.Page
 
   private let top = UIView()
   private let bottom = UIStackView()
@@ -184,9 +178,9 @@ final class ManagerGlassNavigation: UIView, UITextFieldDelegate {
     }
   }
 
-  func apply(_ state: ManagerGlassArgs.Layout, events: Channel?) {
+  func apply(_ state: ManagerGlassLayout, events: (([String: String]) -> Void)?) {
     if let events {
-      event = { data in try? events.send(data) }
+      event = events
       lastInsets = []
     }
     let page = state.page

@@ -287,6 +287,15 @@ pub struct ConflictItem {
   pub providers: Vec<ProviderId>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ProxyPoolProfile {
+  #[serde(default, skip_serializing_if = "Option::is_none")]
+  pub entry_id: Option<Uuid>,
+  pub endpoint: String,
+  pub requires_auth: bool,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct AccountsStoreFile {
@@ -299,7 +308,7 @@ pub struct AccountsStoreFile {
   #[serde(default)]
   pub approval_attempts: BTreeMap<String, bool>,
   #[serde(default, skip_serializing_if = "Vec::is_empty")]
-  pub restored_proxy_pool: Vec<crate::account_backup::ProxyPoolProfile>,
+  pub restored_proxy_pool: Vec<ProxyPoolProfile>,
 }
 
 impl Default for AccountsStoreFile {
@@ -402,7 +411,7 @@ fn parse_key_or_legacy_muse(val: &Value) -> Option<AccountKey> {
   Some(AccountKey { provider_id, uuid })
 }
 
-fn migrate_from_value(root: Value) -> Result<(AccountsStoreFile, bool), String> {
+pub(crate) fn migrate_from_value(root: Value) -> Result<(AccountsStoreFile, bool), String> {
   let obj = root
     .as_object()
     .ok_or_else(|| "accounts.json 根节点不是对象".to_string())?;

@@ -1,5 +1,4 @@
-import { Channel, invoke } from "@tauri-apps/api/core";
-import { listen } from "@tauri-apps/api/event";
+import { Channel, invoke, listen, isSwiftHost } from "./manager-transport";
 import "./styles.css";
 import "./iphone.css";
 import { iphoneIcon } from "./iphone-icons";
@@ -6345,6 +6344,7 @@ async function bootstrap(): Promise<void> {
 
   snapshot = await invoke<ManagerSnapshot>("get_manager_state");
   render();
+  if (isSwiftHost) return;
   // Batch-1: silent sync on app entry and whenever the app becomes
   // active again (foreground / focus). No periodic background sync.
   triggerAutoSync();

@@ -1,6 +1,9 @@
 node_modules
 dist
 dist-ssr
+swift-host/Assets/
+swift-host/DiehaoManager.xcodeproj/
+swift-host/core/target/
 *.local
 .DS_Store
 src-tauri/target
