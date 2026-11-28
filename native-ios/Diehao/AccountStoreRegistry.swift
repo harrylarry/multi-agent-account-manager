@@ -173,6 +173,26 @@ final class AccountStoreRegistry {
         try makeConfiguredWebView(for: id)
     }
 
+    func quotaResources(for id: UUID) throws -> (WKHTTPCookieStore, URLSessionConfiguration) {
+        guard index.pendingCookieWrites?.contains(id) != true else { throw CookieError.rollback }
+        let identity = try activeIdentity(id)
+        let configuration = URLSessionConfiguration.ephemeral
+        configuration.httpCookieStorage = nil
+        configuration.httpShouldSetCookies = false
+        configuration.urlCache = nil
+        configuration.timeoutIntervalForRequest = 8
+        configuration.timeoutIntervalForResource = 10
+        if identity.requiresProxy {
+            if let configured = proxyConfigurations[id], !configured.isEmpty {
+                configuration.proxyConfigurations = configured
+            } else {
+                guard let proxy = identity.proxy else { throw RegistryError.proxyUnavailable }
+                configuration.proxyConfigurations = [try proxy.configuration()]
+            }
+        }
+        return (try dataStore(for: id).httpCookieStore, configuration)
+    }
+
     private func makeConfiguredWebView(for id: UUID) throws -> AccountWebView {
         let identity = try activeIdentity(id)
         if identity.requiresProxy && proxyConfigurations[id]?.isEmpty != false {

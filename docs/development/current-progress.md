@@ -1,5 +1,9 @@
 # 当前开发进度
 
+## Swift T4 三层额度同步
+
+[Issue #24](https://github.com/harrylarry/multi-agent-account-manager/issues/24) 基于 T3 的模拟器通过提交 113d87d。同步按账号 UUID 取 Cookie 和出口配置，额度与花费各自显示来源和观察时间。开发阶段使用模拟数据验证，真实账号的三层读数留到统一真机验收。
+
 ## Swift T3 总览与 Compose
 
 [Issue #22](https://github.com/harrylarry/multi-agent-account-manager/issues/22) 基于 T2 构建号 4 继续开发。先用模拟器核对总览、账号列表、轮询档位与 Compose。真实活动数据由 T5 接入，实际发送由 T7 接入。iPhone 验收集中到开发阶段完成后，与 T2 的 Cookie 池、JSON 选择和三协议出口一起复测。

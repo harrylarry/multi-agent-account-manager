@@ -87,9 +87,13 @@ struct MuseAccountPage: UIViewRepresentable {
     let webView: WKWebView
     let retry: Int
     let onResult: (String?) -> Void
+    var onPage: ((WKWebView) -> Void)? = nil
 
     func makeCoordinator() -> MusePageDelegate {
-        MusePageDelegate(root: webView, onFinish: { _, _ in onResult(nil) }, onError: { error in
+        MusePageDelegate(root: webView, onFinish: { page, _ in
+            onResult(nil)
+            if page === webView { onPage?(page) }
+        }, onError: { error in
             if (error as? URLError)?.code == .timedOut {
                 onResult("Muse 页面请求超时。可在当前账号重试。")
             } else if let error = error as? RegistryError {

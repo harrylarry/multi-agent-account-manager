@@ -76,6 +76,7 @@ struct Dashboard: View {
     let registry: AccountStoreRegistry
     let check: IsolationCheck
     @State private var services: DashboardServices
+    @State private var quota: QuotaCoordinator
     @Environment(\.scenePhase) private var scenePhase
     @AppStorage("dashboard.foregroundPollSeconds") private var savedInterval = ForegroundPollInterval.normal.rawValue
     @State private var rows: [AccountIdentity] = []
@@ -88,12 +89,17 @@ struct Dashboard: View {
         self.registry = registry
         self.check = check
         #if DEBUG && targetEnvironment(simulator)
-        if ProcessInfo.processInfo.arguments.contains("-diehao-dashboard-fixtures") {
-            _services = State(initialValue: .fixtures(registry: registry))
+        if ProcessInfo.processInfo.arguments.contains("-diehao-dashboard-fixtures") ||
+            ProcessInfo.processInfo.arguments.contains("-diehao-quota-fixtures") {
+            let fixtures = DashboardServices.fixtures(registry: registry)
+            _services = State(initialValue: fixtures)
+            _quota = State(initialValue: .fixtures(accounts: fixtures.accounts()))
             return
         }
         #endif
         _services = State(initialValue: DashboardServices(registry: registry))
+        _quota = State(initialValue: QuotaCoordinator(registry: registry,
+            cacheURL: URL.applicationSupportDirectory.appending(path: "DiehaoNative/quota.json")))
     }
 
     private var totals: DashboardActivity? {
@@ -122,7 +128,12 @@ struct Dashboard: View {
                 ForEach(rows) { account in
                     Button { selected = account } label: {
                         Label {
-                            Text(account.displayName)
+                            VStack(alignment: .leading, spacing: 3) {
+                                Text(account.displayName)
+                                TimelineView(.periodic(from: .now, by: 60)) { context in
+                                    QuotaSummary(card: quota.card(for: account.id, at: context.date), now: context.date)
+                                }
+                            }
                         } icon: {
                             Image(systemName: "person.crop.circle")
                                 .overlay(alignment: .topTrailing) {
@@ -133,10 +144,11 @@ struct Dashboard: View {
                                 }
                         }
                     }
-                    .accessibilityValue(activity?[account.id]?.needsAttention == true ? "有待处理事项" : "")
+                    .accessibilityLabel(account.displayName)
+                    .accessibilityValue(accountSummary(account.id))
                 }
                 NavigationLink("管理账号、代理与 Cookie") {
-                    AccountTools(registry: registry)
+                    AccountTools(registry: registry, quota: quota)
                         .onDisappear { rows = services.accounts() }
                 }
             }
@@ -164,7 +176,14 @@ struct Dashboard: View {
                     .accessibilityIdentifier("dashboard.compose")
             }
         }
-        .refreshable { await refresh() }
+        .refreshable {
+            await quota.refresh(services.accounts().map(\.id), trigger: .manual)
+            await refresh()
+        }
+        .task(id: scenePhase) {
+            guard scenePhase == .active else { return }
+            await quota.refresh(services.accounts().map(\.id), trigger: .foreground)
+        }
         .task(id: scenePhase == .active ? pollSeconds : 0) {
             guard scenePhase == .active else { return }
             await refresh()
@@ -174,7 +193,7 @@ struct Dashboard: View {
             }
         }
         .sheet(item: $selected, onDismiss: { Task { await refresh() } }) { account in
-            NavigationStack { AccountDetail(registry: registry, account: account) }
+            NavigationStack { AccountDetail(registry: registry, account: account, quota: quota) }
                 .interactiveDismissDisabled()
         }
         .sheet(isPresented: $showCompose) {
@@ -191,6 +210,22 @@ struct Dashboard: View {
             .accessibilityIdentifier(identifier)
     }
 
+    private func accountSummary(_ id: UUID) -> String {
+        let card = quota.card(for: id, at: .now)
+        var summary = activity?[id]?.needsAttention == true ? ["有待处理事项"] : []
+        if card.unavailable {
+            summary.append("Muse 会话已失效")
+        } else if let allowance = card.allowance, allowance.exhausted {
+            summary.append("额度已用尽")
+        } else if let remaining = card.allowance?.remaining {
+            summary.append("额度剩余 \(remaining)%")
+        } else {
+            summary.append("额度未观测")
+        }
+        if card.stale { summary.append("读数已过期") }
+        return summary.joined(separator: "，")
+    }
+
     private func refresh() async {
         guard !refreshing else { return }
         refreshing = true
@@ -198,6 +233,47 @@ struct Dashboard: View {
         rows = services.accounts()
         let updated = await services.activity()
         if !Task.isCancelled { activity = updated }
+    }
+}
+
+struct QuotaSummary: View {
+    let card: QuotaCard
+    let now: Date
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 2) {
+            if card.unavailable { Text("Muse 会话已失效") }
+            if let allowance = card.allowance {
+                let remaining = allowance.remaining.map { "剩余 \($0)%" } ?? "额度未观测"
+                Text([allowance.plan, allowance.exhausted ? "额度已用尽" : remaining]
+                    .compactMap { $0 }.joined(separator: " · "))
+                Text(readingTime(allowance, stale: card.stale))
+                if let reset = allowance.reset {
+                    ViewThatFits(in: .horizontal) {
+                        Text("重置 \(reset, format: .dateTime.month().day().hour().minute()) · \(reset, style: .relative)")
+                        Text("重置 \(reset, style: .relative)")
+                    }
+                }
+            } else {
+                Text(card.stale ? "额度未观测 · 同步未完成" : "额度未观测")
+            }
+            if let extra = card.extra, let remaining = extra.remaining {
+                Text("额外额度剩余 \(remaining)% · \(readingTime(extra))")
+            }
+            if let spending = card.spending, let remaining = spending.remaining {
+                Text("花费额度剩余 \(remaining)% · \(readingTime(spending))")
+            } else {
+                Text("花费未观测")
+            }
+        }
+        .font(.caption)
+        .foregroundStyle(.secondary)
+    }
+
+    private func readingTime(_ reading: QuotaReading, stale: Bool = false) -> String {
+        let stale = stale || now.timeIntervalSince(reading.asOf) >= 1_800
+        return reading.source.rawValue + " · " + reading.asOf.formatted(date: .omitted, time: .shortened)
+            + (stale ? " · 读数已过期" : "")
     }
 }
 
