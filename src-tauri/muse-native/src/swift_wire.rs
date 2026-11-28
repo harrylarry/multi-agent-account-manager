@@ -4,7 +4,7 @@ use crate::collect::{completed_history_reply, subscription_request};
 use crate::fingerprint::{FingerprintDetector, Sample};
 use crate::chat_send::{start_session_request, validate_ack, AckReject};
 use crate::gateway::is_owner_rv_challenge;
-use crate::noise::NoiseXXInitiator;
+use crate::noise::{CipherState, NoiseXXInitiator};
 use crate::protobuf::PbWriter;
 use crate::transport::{HttpRequest, InboundFrame, NoiseTransport, Service};
 
@@ -37,6 +37,20 @@ fn approval_route(path: &str) -> bool {
 #[no_mangle]
 extern "C" fn diehao_wire_new() -> *mut Wire {
   Box::into_raw(Box::new(Wire::Handshake(NoiseXXInitiator::new())))
+}
+
+/// Frame codec only. The Swift Noise state authenticates every frame before using this handle.
+#[no_mangle]
+extern "C" fn diehao_wire_plaintext_new() -> *mut Wire {
+  Box::into_raw(Box::new(Wire::Transport(NoiseTransport::new(
+    CipherState::new(None), CipherState::new(None),
+  ))))
+}
+
+#[no_mangle]
+unsafe extern "C" fn diehao_wire_owner_challenge(bytes: *const u8, length: usize) -> bool {
+  if length == 0 { return false }
+  bytes.is_null() || length > 65_535 || is_owner_rv_challenge(std::slice::from_raw_parts(bytes, length))
 }
 
 #[no_mangle]

@@ -122,6 +122,28 @@ final class IsolationTests: XCTestCase {
 }
 
 final class DashboardTests: XCTestCase {
+    #if DIEHAO_NOISE_TESTS
+    @MainActor
+    func testSwiftNoiseVectorAndRustInterop() {
+        continueAfterFailure = false
+        let app = XCUIApplication()
+        app.launchArguments = ["-diehao-noise-fixtures"]
+        app.launch()
+        let isolation = app.buttons["dashboard.isolation"]
+        XCTAssertTrue(app.navigationBars["总览"].waitForExistence(timeout: 20))
+        if !isolation.isHittable { app.swipeUp() }
+        XCTAssertTrue(isolation.waitForExistence(timeout: 10))
+        isolation.tap()
+        let fixture = app.buttons["noise.fixture"]
+        if !fixture.isHittable { app.swipeUp() }
+        XCTAssertTrue(fixture.waitForExistence(timeout: 10))
+        fixture.tap()
+        let status = app.staticTexts["noise.result"]
+        XCTAssertTrue(status.waitForExistence(timeout: 10))
+        XCTAssertEqual(status.label, "Noise 向量与 Rust 互通通过。")
+    }
+    #endif
+
     @MainActor
     func testFingerprintRunsOnlyOnExplicitConfirmation() {
         continueAfterFailure = false
@@ -266,7 +288,9 @@ final class DashboardTests: XCTestCase {
         let hasValue = NSPredicate(format: "value CONTAINS %@", "额度剩余 100%")
         XCTAssertEqual(XCTWaiter.wait(for: [XCTNSPredicateExpectation(predicate: hasValue, object: available)],
                                       timeout: 10), .completed)
-        XCTAssertTrue((unknown.value as? String)?.contains("额度未观测") == true)
+        let signedOut = NSPredicate(format: "value CONTAINS %@", "Muse 会话已失效")
+        XCTAssertEqual(XCTWaiter.wait(for: [XCTNSPredicateExpectation(predicate: signedOut, object: unknown)],
+                                      timeout: 10), .completed)
         let refresh = app.buttons["dashboard.refreshQuota"]
         XCTAssertTrue(refresh.waitForExistence(timeout: 5))
         refresh.tap()

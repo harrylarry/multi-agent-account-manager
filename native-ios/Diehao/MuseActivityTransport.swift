@@ -1,6 +1,41 @@
+import CryptoKit
 import Foundation
 
-enum MuseActivityError: Error { case unavailable, signIn, timeout, invalidFrame, disconnected, rejected(Int) }
+enum MuseActivityError: LocalizedError {
+    case unavailable, signIn, timeout, invalidFrame, disconnected, rejected(Int)
+    case stage(MuseRequestStage, MuseRequestFailure)
+
+    var errorDescription: String? {
+        switch self {
+        case .unavailable: "Muse 原生服务暂不可用。"
+        case .signIn: "Muse 原生服务未确认登录，请检查当前资料。"
+        case .timeout: "Muse 原生请求超时。"
+        case .invalidFrame: "Muse 原生服务返回了无法识别的响应。"
+        case .disconnected: "Muse 原生连接已断开。"
+        case .rejected(let status): "Muse 原生服务返回 HTTP \(status)。"
+        case .stage(let stage, let failure): "\(stage.rawValue)：\(failure.description)"
+        }
+    }
+}
+
+enum MuseRequestStage: String {
+    case lease = "Muse 虚拟机分配", liveSession = "Muse 当前虚拟机", token = "Muse 网关凭证"
+    case handshake = "Muse 网关握手", sessionStart = "Muse 新会话", sessionList = "Muse 会话列表"
+    case history = "Muse 历史回读", subscription = "Muse 订阅", send = "Muse 发送", approval = "Muse 审批"
+}
+
+enum MuseRequestFailure {
+    case timeout, response, transport, http(Int)
+
+    var description: String {
+        switch self {
+        case .timeout: "请求超时。"
+        case .response: "响应格式不符合预期。"
+        case .transport: "连接未完成，请检查当前资料的网络与代理。"
+        case .http(let status): "HTTP \(status)。"
+        }
+    }
+}
 
 @MainActor
 protocol MuseActivityConnection: AnyObject {
@@ -12,17 +47,42 @@ protocol MuseActivityConnection: AnyObject {
 
 private final class MuseWire {
     private let handle: OpaquePointer
+    private let swiftNoise: SwiftNoiseXX?
 
     init() throws {
-        guard let handle = diehao_wire_new() else { throw MuseActivityError.unavailable }
+        let useSwift = UserDefaults.standard.bool(forKey: SwiftNoiseXX.preference)
+        let handle = useSwift ? diehao_wire_plaintext_new() : diehao_wire_new()
+        guard let handle else { throw MuseActivityError.unavailable }
         self.handle = handle
+        swiftNoise = useSwift ? SwiftNoiseXX() : nil
     }
     deinit { diehao_wire_free(handle) }
 
-    func start() throws -> Data { try Self.read(diehao_wire_message_one(handle)) }
-    func finish(_ data: Data) throws -> Data { try invoke(data, using: diehao_wire_message_three) }
+    func start() throws -> Data {
+        if let swiftNoise { return try swiftNoise.start() }
+        return try Self.read(diehao_wire_message_one(handle))
+    }
+
+    func finish(_ data: Data) throws -> Data {
+        if let swiftNoise {
+            return try swiftNoise.finish(data) { payload in
+                payload.withUnsafeBytes {
+                    diehao_wire_owner_challenge($0.bindMemory(to: UInt8.self).baseAddress, $0.count)
+                }
+            }
+        }
+        return try invoke(data, using: diehao_wire_message_three)
+    }
+
+    func protect(_ data: Data) throws -> Data {
+        if let swiftNoise { return try swiftNoise.seal(data) }
+        return data
+    }
     func request(_ path: String) throws -> Data { try invoke(Data(path.utf8), using: diehao_wire_request) }
-    func receive(_ data: Data) throws -> Data { try invoke(data, using: diehao_wire_receive) }
+    func receive(_ data: Data) throws -> Data {
+        let payload = try swiftNoise?.open(data) ?? data
+        return try invoke(payload, using: diehao_wire_receive)
+    }
     func post(_ path: String, body: Data) throws -> Data {
         try Data(path.utf8).withUnsafeBytes { route in
             try body.withUnsafeBytes { payload in
@@ -59,6 +119,7 @@ final class NativeMuseActivityConnection: MuseActivityConnection {
     private struct Pending {
         let continuation: AsyncThrowingStream<Data, Error>.Continuation
         let persistent: Bool
+        let stage: MuseRequestStage
         var timeout: Task<Void, Never>?
     }
 
@@ -75,11 +136,12 @@ final class NativeMuseActivityConnection: MuseActivityConnection {
     static func open(registry: AccountStoreRegistry, id: UUID) async throws -> NativeMuseActivityConnection {
         let (store, configuration) = try registry.accountResources(for: id)
         let cookies = try await MuseQuotaHTTP.readCookies(store, timeout: .seconds(15))
-        let cookie = MuseQuotaHTTP.cookieHeader(cookies, path: "/")
-        guard !cookie.isEmpty else { throw MuseActivityError.signIn }
+        guard !MuseQuotaHTTP.cookieHeader(cookies, path: "/api/hatch/lease-vm").isEmpty else {
+            throw MuseActivityError.signIn
+        }
         let control = URLSession(configuration: configuration, delegate: MuseRedirectPolicy(), delegateQueue: nil)
         defer { control.invalidateAndCancel() }
-        let url = try await gatewayURL(control: control, cookie: cookie)
+        let url = try await gatewayURL(control: control, cookies: cookies)
         try Task.checkCancellation()
         configuration.timeoutIntervalForResource = 24 * 60 * 60
         let session = URLSession(configuration: configuration, delegate: MuseRedirectPolicy(), delegateQueue: nil)
@@ -115,14 +177,27 @@ final class NativeMuseActivityConnection: MuseActivityConnection {
     private func start() async throws {
         socket.resume()
         let socket = self.socket
-        let watchdog = Task {
+        var expired = false
+        let watchdog = Task { @MainActor in
             do { try await Task.sleep(for: .seconds(10)) } catch { return }
+            expired = true
             socket.cancel(with: .goingAway, reason: nil)
         }
         defer { watchdog.cancel() }
-        try await socket.send(.data(wire.start()))
-        guard case .data(let answer) = try await socket.receive() else { throw MuseActivityError.invalidFrame }
-        try await socket.send(.data(wire.finish(answer)))
+        do {
+            try await socket.send(.data(wire.start()))
+            guard case .data(let answer) = try await socket.receive() else { throw MuseActivityError.invalidFrame }
+            try await socket.send(.data(wire.finish(answer)))
+        } catch {
+            if Task.isCancelled { throw CancellationError() }
+            if expired || (error as? URLError)?.code == .timedOut {
+                throw MuseActivityError.stage(.handshake, .timeout)
+            }
+            if error is MuseActivityError || error is SwiftNoiseError || error is CryptoKitError {
+                throw MuseActivityError.stage(.handshake, .response)
+            }
+            throw MuseActivityError.stage(.handshake, .transport)
+        }
         receiver = Task { [weak self] in
             do {
                 while !Task.isCancelled {
@@ -195,12 +270,21 @@ final class NativeMuseActivityConnection: MuseActivityConnection {
         guard !closed else { throw MuseActivityError.disconnected }
         let encoded = try body.map { try wire.post(route, body: $0) } ?? wire.request(route)
         guard let streamID: UInt64 = encoded.integer(at: 0) else { throw MuseActivityError.invalidFrame }
+        let stage: MuseRequestStage
+        switch route {
+        case "/chat/subscribe": stage = .subscription
+        case "/chat/stream": stage = .send
+        case "/session/start": stage = .sessionStart
+        case "/api/session/list": stage = .sessionList
+        case let path where path.hasPrefix("/chat/history?"): stage = .history
+        default: stage = .approval
+        }
         let (stream, continuation) = AsyncThrowingStream<Data, Error>.makeStream(bufferingPolicy: .bufferingOldest(128))
         let timeout = Task { [weak self] in
             do { try await Task.sleep(for: deadline) } catch { return }
-            self?.finish(streamID, error: MuseActivityError.timeout)
+            self?.finish(streamID, error: MuseActivityError.stage(stage, .timeout))
         }
-        pending[streamID] = Pending(continuation: continuation, persistent: persistent, timeout: timeout)
+        pending[streamID] = Pending(continuation: continuation, persistent: persistent, stage: stage, timeout: timeout)
         continuation.onTermination = { [weak self] _ in
             Task { @MainActor in self?.finish(streamID) }
         }
@@ -212,7 +296,14 @@ final class NativeMuseActivityConnection: MuseActivityConnection {
             }
             offset += 4
             let frame = encoded.subdata(in: offset..<(offset + Int(length)))
-            guard case .enqueued = outbound.yield(frame) else {
+            let protected: Data
+            do {
+                protected = try wire.protect(frame)
+            } catch {
+                close()
+                throw error
+            }
+            guard case .enqueued = outbound.yield(protected) else {
                 close()
                 throw MuseActivityError.disconnected
             }
@@ -230,7 +321,8 @@ final class NativeMuseActivityConnection: MuseActivityConnection {
         switch frame[0] {
         case 1:
             guard status == 0 || (200..<300).contains(status) else {
-                finish(stream, error: [401, 403].contains(status) ? MuseActivityError.signIn : MuseActivityError.rejected(Int(status)))
+                let error: MuseActivityError = [401, 403].contains(status) ? .signIn : .stage(entry.stage, .http(Int(status)))
+                finish(stream, error: error)
                 return
             }
             if entry.persistent {
@@ -249,9 +341,9 @@ final class NativeMuseActivityConnection: MuseActivityConnection {
         if frame[11] == 1 { finish(stream) }
     }
 
-    func call(_ route: String, approvalDecision: Data? = nil) async throws -> Data {
+    func call(_ route: String, approvalDecision: Data? = nil, deadline: Duration = .seconds(12)) async throws -> Data {
         var result = Data()
-        let stream = try issue(route, persistent: false, body: approvalDecision)
+        let stream = try issue(route, persistent: false, body: approvalDecision, deadline: deadline)
         for try await bytes in stream {
             guard result.count + bytes.count <= 4_194_304 else { throw MuseActivityError.invalidFrame }
             result.append(bytes)
@@ -260,13 +352,18 @@ final class NativeMuseActivityConnection: MuseActivityConnection {
     }
 
     func createThread() async throws -> String {
-        let result = try MuseApproval.object(await call("/session/start"))
+        let response = try await call("/session/start", deadline: .seconds(25))
+        guard let result = try? MuseApproval.object(response) else {
+            throw MuseActivityError.stage(.sessionStart, .response)
+        }
         let data = result["data"] as? [String: Any] ?? result
         let scope = (data["session"] ?? data["thread"]) as? [String: Any] ?? data
         let raw = ["session_id", "sessionId", "thread_id", "threadId", "id"].compactMap { scope[$0] as? String }.first
-        guard let raw, let id = UUID(uuidString: raw) else { throw MuseActivityError.invalidFrame }
+        guard let raw, let id = UUID(uuidString: raw) else { throw MuseActivityError.stage(.sessionStart, .response) }
         let listed = try MuseReply.sessions(from: await call("/api/session/list"))
-        guard listed.contains(where: { UUID(uuidString: $0.id) == id }) else { throw MuseActivityError.invalidFrame }
+        guard listed.contains(where: { UUID(uuidString: $0.id) == id }) else {
+            throw MuseActivityError.stage(.sessionList, .response)
+        }
         return id.uuidString.lowercased()
     }
 
@@ -311,59 +408,79 @@ final class NativeMuseActivityConnection: MuseActivityConnection {
         entry.continuation.finish(throwing: error)
     }
 
-    private static func gatewayURL(control: URLSession, cookie: String) async throws -> URL {
-        _ = try? await controlCall("/api/hatch/vm/wake", body: ["retry_count": 0], session: control, cookie: cookie)
-        var lease: [String: Any]?
+    private static func gatewayURL(control: URLSession, cookies: [HTTPCookie]) async throws -> URL {
+        _ = try? await controlCall("/api/hatch/vm/wake", body: ["vm_id": NSNull(), "retry_count": 0],
+                                   session: control, cookies: cookies, stage: .lease)
+        var assignment: (address: String, id: String, name: String)?
         for kind in ["standard", "hatch_vm"] {
             do {
-                let row = try await controlCall("/api/hatch/lease-vm", body: ["vmType": kind], session: control, cookie: cookie)
+                let row = try await controlCall("/api/hatch/lease-vm", body: ["vmType": kind],
+                                                session: control, cookies: cookies, stage: .lease)
                 if row["status"] as? String == "assigned" {
-                    lease = row
-                    break
+                    assignment = gatewayAssignment(address: row["gatewayUrl"], id: row["vmId"], name: row["vmName"])
+                    if assignment != nil { break }
                 }
             } catch MuseActivityError.signIn {
                 throw MuseActivityError.signIn
-            } catch {}
+            } catch {
+                try Task.checkCancellation()
+            }
         }
-        if lease == nil {
-            let existing = try await controlCall("/api/session?vm_state=live", body: nil, session: control, cookie: cookie)
-            lease = ["vmId": existing["vm_id"] ?? "", "vmName": existing["vm_id"] ?? "",
-                     "gatewayUrl": existing["endpoint_url"] ?? ""]
+        if assignment == nil {
+            let existing = try await controlCall("/api/session?vm_state=live", body: nil, session: control,
+                                                 cookies: cookies, stage: .liveSession)
+            assignment = gatewayAssignment(address: existing["endpoint_url"], id: existing["vm_id"], name: existing["vm_id"])
+            if let assignment, (existing["vm_state"] as? String)?.lowercased() != "running" {
+                _ = try? await controlCall("/api/hatch/vm/wake", body: ["vm_id": assignment.id, "retry_count": 1],
+                                           session: control, cookies: cookies, stage: .liveSession)
+            }
         }
-        guard let lease, let address = lease["gatewayUrl"] as? String,
-              let endpoint = URLComponents(string: address), ["wss", "https"].contains(endpoint.scheme ?? ""),
-              endpoint.user == nil, endpoint.password == nil, endpoint.query == nil, endpoint.fragment == nil,
-              endpoint.port == nil || endpoint.port == 443, let host = endpoint.host,
-              host.hasSuffix(".metaaivm.com"), host != ".metaaivm.com" else { throw MuseActivityError.unavailable }
-        let vmID = lease["vmId"] as? String ?? String(host.dropLast(".metaaivm.com".count))
-        let vmName = (lease["vmName"] as? String).flatMap { $0.isEmpty ? nil : $0 } ?? vmID
-        guard !vmID.isEmpty, vmID.count <= 96 else { throw MuseActivityError.unavailable }
-        let response = try await controlCall("/api/hatch/token", body: ["vmAddress": address, "vmName": vmName],
-                                             session: control, cookie: cookie)
+        guard let assignment else { throw MuseActivityError.stage(.liveSession, .response) }
+        let response = try await controlCall("/api/hatch/token",
+            body: ["vmAddress": assignment.address, "vmName": assignment.name],
+            session: control, cookies: cookies, stage: .token)
         guard let token = response["token"] as? String, !token.isEmpty, token.count <= 16_384 else {
-            throw MuseActivityError.unavailable
+            throw MuseActivityError.stage(.token, .response)
         }
         var notary = response["notary_token"] as? String
         if notary?.isEmpty != false {
-            let result = try? await controlCall("/api/hatch/noise-notary-token", body: ["vmName": vmName],
-                                               session: control, cookie: cookie)
+            let result = try? await controlCall("/api/hatch/noise-notary-token", body: ["vmName": assignment.name],
+                                               session: control, cookies: cookies, stage: .token)
             notary = (result?["notaryToken"] ?? result?["notary_token"]) as? String
         }
         var components = URLComponents(string: "wss://hatch.metaaivm.com/v1/noise")!
-        components.queryItems = [.init(name: "vm_id", value: vmID), .init(name: "auth_token", value: token),
+        components.queryItems = [.init(name: "vm_id", value: assignment.id), .init(name: "auth_token", value: token),
                                  .init(name: "app_id", value: "hatch-web"), .init(name: "request_id", value: UUID().uuidString)]
         if let notary, !notary.isEmpty, notary.count <= 16_384, !notary.hasPrefix("delegation.") {
             components.queryItems?.append(.init(name: "notary_token", value: notary))
         }
+        components.percentEncodedQuery = components.percentEncodedQuery?.replacingOccurrences(of: "+", with: "%2B")
         guard let url = components.url else { throw MuseActivityError.unavailable }
         return url
     }
 
+    private static func gatewayAssignment(address: Any?, id: Any?, name: Any?) -> (address: String, id: String, name: String)? {
+        let suffix = ".metaaivm.com"
+        guard let address = address as? String, let endpoint = URLComponents(string: address),
+              ["wss", "https"].contains(endpoint.scheme ?? ""), endpoint.user == nil, endpoint.password == nil,
+              endpoint.query == nil, endpoint.fragment == nil, endpoint.port == nil || endpoint.port == 443,
+              let host = endpoint.host, host.hasSuffix(suffix) else { return nil }
+        let label = String(host.dropLast(suffix.count))
+        let alphanumeric = CharacterSet(charactersIn: "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789")
+        guard !label.isEmpty, label.unicodeScalars.allSatisfy(alphanumeric.union(CharacterSet(charactersIn: "-")).contains)
+        else { return nil }
+        let id = (id as? String).flatMap { $0.isEmpty ? nil : $0 } ?? label
+        let name = (name as? String).flatMap { $0.isEmpty ? nil : $0 } ?? id
+        let identifier = alphanumeric.union(CharacterSet(charactersIn: "-_"))
+        guard id.utf8.count <= 128, id.unicodeScalars.allSatisfy(identifier.contains), name.utf8.count <= 256 else { return nil }
+        return (address, id, name)
+    }
+
     private static func controlCall(_ path: String, body: [String: Any]?, session: URLSession,
-                                    cookie: String) async throws -> [String: Any] {
+                                    cookies: [HTTPCookie], stage: MuseRequestStage) async throws -> [String: Any] {
         guard let url = URL(string: "https://muse.ai" + path), url.host == "muse.ai" else { throw MuseActivityError.unavailable }
         var request = URLRequest(url: url, timeoutInterval: 8)
-        request.setValue(cookie, forHTTPHeaderField: "Cookie")
+        request.setValue(MuseQuotaHTTP.cookieHeader(cookies, path: url.path), forHTTPHeaderField: "Cookie")
         request.setValue("https://muse.ai", forHTTPHeaderField: "Origin")
         request.setValue("https://muse.ai/", forHTTPHeaderField: "Referer")
         request.setValue("application/json", forHTTPHeaderField: "Accept")
@@ -372,14 +489,20 @@ final class NativeMuseActivityConnection: MuseActivityConnection {
             request.httpBody = try JSONSerialization.data(withJSONObject: body)
             request.setValue("application/json", forHTTPHeaderField: "Content-Type")
         }
-        let (data, response) = try await session.data(for: request)
-        guard let response = response as? HTTPURLResponse else { throw MuseActivityError.unavailable }
-        if [401, 403].contains(response.statusCode) { throw MuseActivityError.signIn }
-        guard (200..<300).contains(response.statusCode), data.count <= 1_048_576,
-              let result = try JSONSerialization.jsonObject(with: data) as? [String: Any] else {
-            throw MuseActivityError.unavailable
+        let result: (Data, URLResponse)
+        do { result = try await session.data(for: request) }
+        catch {
+            if Task.isCancelled { throw CancellationError() }
+            throw MuseActivityError.stage(stage, (error as? URLError)?.code == .timedOut ? .timeout : .transport)
         }
-        return result
+        let (data, rawResponse) = result
+        guard let response = rawResponse as? HTTPURLResponse else { throw MuseActivityError.stage(stage, .response) }
+        if [401, 403].contains(response.statusCode) { throw MuseActivityError.signIn }
+        guard (200..<300).contains(response.statusCode) else { throw MuseActivityError.stage(stage, .http(response.statusCode)) }
+        guard data.count <= 1_048_576, let payload = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any] else {
+            throw MuseActivityError.stage(stage, .response)
+        }
+        return payload
     }
 }
 

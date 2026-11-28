@@ -6,6 +6,9 @@ rust-version = "1.85"
 description = "Muse.ai native Noise client for 叠号 (Spike 0.1.22): Noise_XX handshake, HTTP-over-Noise transport, HTTPS control plane. Ported from BotArk (MIT, qybaihe/botark v0.12.0)."
 license = "MIT"
 
+[features]
+swift-noise-tests = []
+
 [dependencies]
 aes-gcm = { version = "0.10", features = ["aes"] }
 futures-util = "0.3"

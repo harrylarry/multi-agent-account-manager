@@ -372,9 +372,134 @@ impl NoiseXXInitiator {
   }
 }
 
+#[cfg(any(test, feature = "swift-noise-tests"))]
+mod test_responder {
+  use super::*;
+
+  /// 仅测试用的 XX 响应方（BotArk 只有发起方；响应方按 Noise 规范镜像实现，
+  /// 与 Node 参考脚本交叉验证，见 transport 注释与 docs）。
+  pub(super) struct TestResponder {
+    pub(super) ss: SymmetricState,
+    e: Option<X25519KeyPair>,
+    re: Option<[u8; 32]>,
+    fixed_e: [u8; 32],
+    fixed_s: [u8; 32],
+  }
+
+  impl TestResponder {
+    pub(super) fn new(e_priv: [u8; 32], s_priv: [u8; 32]) -> Self {
+      Self {
+        ss: SymmetricState::new(),
+        e: None,
+        re: None,
+        fixed_e: e_priv,
+        fixed_s: s_priv,
+      }
+    }
+
+    pub(super) fn read_message1(&mut self, msg: &[u8]) -> Result<Vec<u8>, NoiseError> {
+      let mut re = [0u8; 32];
+      re.copy_from_slice(&msg[..32]);
+      self.ss.mix_hash(&re);
+      self.re = Some(re);
+      self.ss.decrypt_and_hash(&msg[32..])
+    }
+
+    pub(super) fn write_message2(&mut self, payload: &[u8]) -> Result<Vec<u8>, NoiseError> {
+      let e = X25519KeyPair::from_private(self.fixed_e)?;
+      let s = X25519KeyPair::from_private(self.fixed_s)?;
+      self.ss.mix_hash(&e.pub_bytes);
+      self.ss.mix_key(&e.dh(self.re.as_ref().unwrap()));
+      let c1 = self.ss.encrypt_and_hash(&s.pub_bytes)?;
+      // 'es' = DH(响应方 static, 发起方 ephemeral)。
+      self.ss.mix_key(&s.dh(self.re.as_ref().unwrap()));
+      let c2 = self.ss.encrypt_and_hash(payload)?;
+      self.e = Some(e);
+      let mut out = Vec::with_capacity(32 + c1.len() + c2.len());
+      out.extend_from_slice(&self.e.as_ref().unwrap().pub_bytes);
+      out.extend_from_slice(&c1);
+      out.extend_from_slice(&c2);
+      Ok(out)
+    }
+
+    pub(super) fn read_message3(&mut self, msg: &[u8]) -> Result<Vec<u8>, NoiseError> {
+      let rs_bytes = self.ss.decrypt_and_hash(&msg[..48])?;
+      let mut rs = [0u8; 32];
+      rs.copy_from_slice(&rs_bytes);
+      // 'se' = DH(发起方 static, 响应方 ephemeral)。
+      self.ss.mix_key(&self.e.as_ref().unwrap().dh(&rs));
+      self.ss.decrypt_and_hash(&msg[48..])
+    }
+
+    /// 返回响应方视角的 [send, recv]（与发起方相反：k2 发、k1 收）。
+    pub(super) fn split(&self) -> (CipherState, CipherState) {
+      let (k1, k2) = self.ss.split();
+      (k2, k1)
+    }
+  }
+
+}
+
+
+#[cfg(feature = "swift-noise-tests")]
+mod swift_test_peer {
+  use super::{test_responder::TestResponder, CipherState};
+
+  enum Peer {
+    Initial(TestResponder),
+    WaitingForFinal(TestResponder),
+    Transport { send: CipherState, receive: CipherState },
+    Closed,
+  }
+
+  #[no_mangle]
+  extern "C" fn diehao_noise_test_new() -> *mut Peer {
+    Box::into_raw(Box::new(Peer::Initial(TestResponder::new([0x33; 32], [0x44; 32]))))
+  }
+
+  #[no_mangle]
+  unsafe extern "C" fn diehao_noise_test_step(
+    peer: *mut Peer, bytes: *const u8, length: usize,
+  ) -> *mut Vec<u8> {
+    if bytes.is_null() || !(16..=65_535).contains(&length) { return std::ptr::null_mut() }
+    let Some(peer) = peer.as_mut() else { return std::ptr::null_mut() };
+    let frame = std::slice::from_raw_parts(bytes, length);
+    let output = match std::mem::replace(peer, Peer::Closed) {
+      Peer::Initial(mut responder) if frame.len() == 66 => {
+        let Ok(freshness) = responder.read_message1(frame) else { return std::ptr::null_mut() };
+        if freshness.len() != 34 || !freshness.starts_with(&[0x0a, 0x20]) { return std::ptr::null_mut() }
+        let Ok(output) = responder.write_message2(b"Rust responder") else { return std::ptr::null_mut() };
+        *peer = Peer::WaitingForFinal(responder);
+        output
+      }
+      Peer::WaitingForFinal(mut responder) if frame.len() == 64 => {
+        let Ok(payload) = responder.read_message3(frame) else { return std::ptr::null_mut() };
+        if !payload.is_empty() { return std::ptr::null_mut() }
+        let (send, receive) = responder.split();
+        *peer = Peer::Transport { send, receive };
+        responder.ss.handshake_hash().to_vec()
+      }
+      Peer::Transport { mut send, mut receive } => {
+        let Ok(plaintext) = receive.decrypt_with_ad(&[], frame) else { return std::ptr::null_mut() };
+        let Ok(output) = send.encrypt_with_ad(&[], &plaintext) else { return std::ptr::null_mut() };
+        *peer = Peer::Transport { send, receive };
+        output
+      }
+      _ => return std::ptr::null_mut(),
+    };
+    Box::into_raw(Box::new(output))
+  }
+
+  #[no_mangle]
+  unsafe extern "C" fn diehao_noise_test_free(peer: *mut Peer) {
+    if !peer.is_null() { drop(Box::from_raw(peer)) }
+  }
+}
+
 #[cfg(test)]
 mod tests {
   use super::*;
+  use super::test_responder::TestResponder;
 
   fn hex(b: &[u8]) -> String {
     b.iter().map(|x| format!("{x:02x}")).collect()
@@ -423,68 +548,6 @@ mod tests {
     assert_eq!(hex(i_recv.key.as_ref().unwrap()), K2, "发起方 recv key");
     assert_eq!(hex(r_send.key.as_ref().unwrap()), K2, "响应方 send key");
     assert_eq!(hex(r_recv.key.as_ref().unwrap()), K1, "响应方 recv key");
-  }
-
-  /// 仅测试用的 XX 响应方（BotArk 只有发起方；响应方按 Noise 规范镜像实现，
-  /// 与 Node 参考脚本交叉验证，见 transport 注释与 docs）。
-  struct TestResponder {
-    ss: SymmetricState,
-    e: Option<X25519KeyPair>,
-    re: Option<[u8; 32]>,
-    fixed_e: [u8; 32],
-    fixed_s: [u8; 32],
-  }
-
-  impl TestResponder {
-    fn new(e_priv: [u8; 32], s_priv: [u8; 32]) -> Self {
-      Self {
-        ss: SymmetricState::new(),
-        e: None,
-        re: None,
-        fixed_e: e_priv,
-        fixed_s: s_priv,
-      }
-    }
-
-    fn read_message1(&mut self, msg: &[u8]) -> Result<Vec<u8>, NoiseError> {
-      let mut re = [0u8; 32];
-      re.copy_from_slice(&msg[..32]);
-      self.ss.mix_hash(&re);
-      self.re = Some(re);
-      self.ss.decrypt_and_hash(&msg[32..])
-    }
-
-    fn write_message2(&mut self, payload: &[u8]) -> Result<Vec<u8>, NoiseError> {
-      let e = X25519KeyPair::from_private(self.fixed_e)?;
-      let s = X25519KeyPair::from_private(self.fixed_s)?;
-      self.ss.mix_hash(&e.pub_bytes);
-      self.ss.mix_key(&e.dh(self.re.as_ref().unwrap()));
-      let c1 = self.ss.encrypt_and_hash(&s.pub_bytes)?;
-      // 'es' = DH(响应方 static, 发起方 ephemeral)。
-      self.ss.mix_key(&s.dh(self.re.as_ref().unwrap()));
-      let c2 = self.ss.encrypt_and_hash(payload)?;
-      self.e = Some(e);
-      let mut out = Vec::with_capacity(32 + c1.len() + c2.len());
-      out.extend_from_slice(&self.e.as_ref().unwrap().pub_bytes);
-      out.extend_from_slice(&c1);
-      out.extend_from_slice(&c2);
-      Ok(out)
-    }
-
-    fn read_message3(&mut self, msg: &[u8]) -> Result<Vec<u8>, NoiseError> {
-      let rs_bytes = self.ss.decrypt_and_hash(&msg[..48])?;
-      let mut rs = [0u8; 32];
-      rs.copy_from_slice(&rs_bytes);
-      // 'se' = DH(发起方 static, 响应方 ephemeral)。
-      self.ss.mix_key(&self.e.as_ref().unwrap().dh(&rs));
-      self.ss.decrypt_and_hash(&msg[48..])
-    }
-
-    /// 返回响应方视角的 [send, recv]（与发起方相反：k2 发、k1 收）。
-    fn split(&self) -> (CipherState, CipherState) {
-      let (k1, k2) = self.ss.split();
-      (k2, k1)
-    }
   }
 
   #[test]

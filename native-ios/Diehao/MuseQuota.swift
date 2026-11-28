@@ -76,12 +76,19 @@ final class QuotaCoordinator {
     #if DEBUG && targetEnvironment(simulator)
     static func fixtures(accounts: [AccountIdentity]) -> QuotaCoordinator {
         let freshness = Date()
+        var firstRejection = true
         let readings = #"""
             1:{"success":true,"result":{"subscription":{"tier":{"name":"测试方案"},"usage":{"percentUsed":0},"extraUsage":{"percentUsed":25}}}}
             """#
         return QuotaCoordinator(cacheURL: URL.temporaryDirectory.appending(path: UUID().uuidString + ".json"),
             native: { id, _ in
-                guard id == accounts.first?.id else { throw QuotaFailure.transport }
+                guard id == accounts.first?.id else {
+                    if firstRejection {
+                        firstRejection = false
+                        throw QuotaFailure.signedOut
+                    }
+                    throw QuotaFailure.transport
+                }
                 guard let result = MuseQuotaPayload.parseFlight(readings, source: .serverAction, now: freshness) else {
                     throw QuotaFailure.unreadable
                 }
@@ -116,7 +123,7 @@ final class QuotaCoordinator {
         guard !inFlight.contains(id) else { return }
         let started = now()
         let cached = card(for: id, at: started)
-        guard trigger == .account || !cached.unavailable else { return }
+        guard trigger != .foreground || !cached.unavailable else { return }
         if trigger != .manual, !cached.stale,
            let asOf = cached.allowance?.asOf, started.timeIntervalSince(asOf) < 1_800 { return }
         if trigger != .manual, let failed = failedAt[id], started.timeIntervalSince(failed) < 15 { return }
@@ -253,6 +260,7 @@ enum MuseQuotaHTTP {
         let (store, configuration) = try registry.accountResources(for: account)
         let cookies = try await readCookies(store)
         guard !cookieHeader(cookies, path: "/").isEmpty else { throw QuotaFailure.signedOut }
+        configuration.timeoutIntervalForResource = deadlineSeconds
         let session = URLSession(configuration: configuration, delegate: MuseRedirectPolicy(), delegateQueue: nil)
         defer { session.invalidateAndCancel() }
         if let cachedAction {
@@ -306,6 +314,9 @@ enum MuseQuotaHTTP {
         request.setValue(actionID, forHTTPHeaderField: "Next-Action")
         request.setValue(origin, forHTTPHeaderField: "Origin")
         request.setValue(origin + "/", forHTTPHeaderField: "Referer")
+        request.setValue("same-origin", forHTTPHeaderField: "Sec-Fetch-Site")
+        request.setValue("cors", forHTTPHeaderField: "Sec-Fetch-Mode")
+        request.setValue("empty", forHTTPHeaderField: "Sec-Fetch-Dest")
         request.setValue(cookieHeader(cookies, path: "/"), forHTTPHeaderField: "Cookie")
         let (response, body) = try await fetch(request, session: session, deadline: deadline)
         try checkSignedOut(response)
@@ -329,12 +340,15 @@ enum MuseQuotaHTTP {
             }
         }
         var queue: [String] = []
-        for url in [settings, MusePageDelegate.entryURL] {
+        for url in [MusePageDelegate.entryURL, settings, MusePageDelegate.entryURL.appending(path: "subscriptions")] {
             var request = URLRequest(url: url)
             request.setValue(cookieHeader(cookies, path: url.path.isEmpty ? "/" : url.path), forHTTPHeaderField: "Cookie")
             let (response, body) = try await fetch(request, session: session, deadline: deadline)
             try checkSignedOut(response)
-            if response.statusCode == 200 { queue += chunks(in: body) }
+            if response.statusCode == 200 {
+                if let id = actionReference(in: body, pattern: reference) { return id }
+                queue += chunks(in: body)
+            }
         }
         var seen = Set<String>()
         var index = 0
@@ -342,17 +356,20 @@ enum MuseQuotaHTTP {
         while index < queue.count, seen.count < 96, totalBytes < 8 * 1024 * 1024 {
             let path = queue[index]
             index += 1
-            guard seen.insert(path).inserted, let url = URL(string: origin + path) else { continue }
-            let (response, script) = try await fetch(URLRequest(url: url), session: session, deadline: deadline)
-            guard response.statusCode == 200 else { continue }
+            guard seen.insert(path).inserted, let url = URL(string: origin + path),
+                  let (response, script) = try? await fetch(URLRequest(url: url), session: session, deadline: deadline),
+                  response.statusCode == 200 else { continue }
             totalBytes += script.utf8.count
-            if let match = reference.firstMatch(in: script, range: NSRange(script.startIndex..., in: script)),
-               let value = Range(match.range(at: 1), in: script) {
-                return String(script[value])
-            }
+            if let id = actionReference(in: script, pattern: reference) { return id }
             queue += chunks(in: script).prefix(128)
         }
         throw QuotaFailure.unreadable
+    }
+
+    private static func actionReference(in script: String, pattern: NSRegularExpression) -> String? {
+        guard let match = pattern.firstMatch(in: script, range: NSRange(script.startIndex..., in: script)),
+              let value = Range(match.range(at: 1), in: script) else { return nil }
+        return String(script[value])
     }
 
     private static func checkSignedOut(_ response: HTTPURLResponse) throws {

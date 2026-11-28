@@ -1,6 +1,20 @@
 # 当前开发进度
 
+## Swift T10 Noise
+
+构建号 12（7bb00d9）首轮统一真机回执部分通过：隔离自检、添加和检测代理、打开登录网页、内嵌视频及选择并预览 Cookie JSON。两次 Cookie 按域清点分别为 9/2 与 8/2。Cookie 池保存与恢复缺少服务端邮箱绑定证据。两种传输模式均报告原生功能失败。Rust 模式总览未同步，原生发送、额度刷新和指纹未通过。[回执和进度](https://github.com/harrylarry/multi-agent-account-manager/issues/36)
+
+构建号 13 优先定位共享的控制面与 RPC。账号资料里的「检查 Muse 原生连接」只建立连接并读会话列表。它报告握手、HTTP 或超时阶段，不展示会话内容。每次用原测试资料和原代理，先测 Rust，重启切到 Swift 再测。Cookie 池仍要求已登录邮箱的可信绑定。
+
+[Issue #36](https://github.com/harrylarry/multi-agent-account-manager/issues/36) 跟踪 CryptoKit Noise XX 发起端和 [统一真机验收](../acceptance/swift-unified-iphone.md)。现有 Rust Noise 是默认路径。Swift 模式仅在手动打开开关后对新连接生效，交换过程中不自动切模式或重发。
+
+- Swift 负责 Noise 握手、传输加密与认证。Rust 保留已有 Muse 帧格式和分片实现，Swift 模式下由 CryptoKit 在套接字收发边界保护每帧。现有 owner attestation 判定复用 Rust 解析。
+- 模拟器专项覆盖 Noise 协议 Wiki 所列 [Cacophony 向量](https://github.com/noiseprotocol/noise_wiki/wiki/Test-vectors)，向量取自上游提交 `8ee9d41e34a1a596cfa3ab12aa4069ff87dc1247`，原文件 SHA-256 为 `3bde7c09a6f349ee11c825c50fcc02649f8f02a47c857a459206b357f9386cae`。用项目内 Rust 测试响应端执行完整握手与双向传输。测试对端只在 CI 的模拟器构建启用。协议参考 [Noise rev34](https://noiseprotocol.org/noise.html)。
+- Swift 没有引入第三方 Noise 库。真实 Muse 发送、订阅和重连均需真机验证。失败时关闭开关并重启 App，使用 Rust 路径。旧 Tauri App 在台账验收前保留。
+
 ## Swift T9 模型指纹
+
+[模拟器 10/10](https://github.com/harrylarry/multi-agent-account-manager/actions/runs/46162943555)，提交 `dba7e1f`。真实 Muse 回复、测量校准与参考库扩充继续待验。
 
 [Issue #34](https://github.com/harrylarry/multi-agent-account-manager/issues/34) 从 T8 模拟器通过提交 2aec822 开发。每个账号手动确认后最多每 30 分钟测量一次。三条固定英文模板分别使用独立会话，检查空历史、发送回执和消息归属，拒绝标明缓存命中的结果。测量记录保存参考库版本和校准状态，不保存回复正文。
 
@@ -11,16 +25,15 @@
 
 ## Swift T8 加密备份
 
+[模拟器 9/9](https://github.com/harrylarry/multi-agent-account-manager/actions/runs/46159700826)，提交 `2aec822`。
+
 基于 T7 模拟器 8/8 通过提交 fff605b。备份采用 Argon2id 包装数据密钥，恢复码以独立槽解锁。覆盖仅更新备份内同 UUID 的资料，其他资料不删。已导出的旧备份仍可用旧密钥解开，吊销在本机生效。真实 Cookie、代理和导入验证留到统一真机验收。
 
-## Swift T7 新对话发送 · 交接
+## Swift T7 新对话发送
 
-[Issue #30](https://github.com/harrylarry/multi-agent-account-manager/issues/30) 的工作树位于 D:/Codex/swift-t7，分支 feat/swift-t7-send，基于 T6 模拟器通过提交 5e3523e。当前是交接中的 WIP，仅检查了 Git diff，尚未核验 Xcode、Rust 链接或模拟器。
+[Issue #30](https://github.com/harrylarry/multi-agent-account-manager/issues/30) · [草稿 PR #31](https://github.com/harrylarry/multi-agent-account-manager/pull/31) · [模拟器 8/8](https://github.com/harrylarry/multi-agent-account-manager/actions/runs/46157755663)。送出前使用发送台账保存消息 HMAC。26 秒历史核对和重启续查通过，重提已核对的消息会打开原会话。真机核对预分配会话 ID 与 Muse 发送回执。
 
-- 已写入 Compose 到 Rust Noise 的发送接线、基于钥匙串密钥的加密 SQLite 发送台账、26 秒只读历史核对和合成超时测试。台账存消息 HMAC，无正文。重点核对 new_conversation 与预分配会话 ID 的服务端行为，结果不明时保持不自动重发。
-- 先核查 T7 CI，修复编译与回归失败。补足忙碌、明确失败、重启续查、一次人工重试和未知状态的可见回执。模拟器通过后依次做 T8 加密备份、T9 模型指纹和 T10 Noise 原生化。
-- [T3 模拟器 3/3](https://github.com/harrylarry/multi-agent-account-manager/actions/runs/46147399099) · [T4 模拟器 4/4](https://github.com/harrylarry/multi-agent-account-manager/actions/runs/46150389610) · [T5 模拟器 5/5](https://github.com/harrylarry/multi-agent-account-manager/actions/runs/46152112658) · [T6 模拟器 6/6](https://github.com/harrylarry/multi-agent-account-manager/actions/runs/46154325352)。
-- T2 缺口仍在 [#20](https://github.com/harrylarry/multi-agent-account-manager/issues/20)。构建号 4 真机有 muse.ai 9 条和 meta.com 2 条，Cookie 池缺邮箱绑定证据，文件选择器点 JSON 无响应，三协议真实出口待验。真机集中到 T10 后，使用非主力账号，验收前保持草稿且不合入。
+- T2 的登录证据及代理按 [统一真机验收](../acceptance/swift-unified-iphone.md) 回填。构建号 4 曾观测 muse.ai 9 条、meta.com 2 条。Cookie 池缺邮箱绑定证据，旧文件选择器无法选 JSON，三协议实际出口待验。
 
 ## Swift T6 审批与审计
 

@@ -216,6 +216,8 @@ final class MuseSendCoordinator {
             let receipt = SendReceipt(key: UUID(), account: account, digest: digest, thread: thread,
                                       started: .now, updated: .now, phase: .sending)
             return await execute(receipt, message: message)
+        } catch let error as MuseActivityError {
+            return .connectionFailed(error)
         } catch { return .failed }
     }
 
@@ -247,6 +249,9 @@ final class MuseSendCoordinator {
         } catch MuseActivityError.rejected(let status) where [400, 404, 422].contains(status) {
             receipt.phase = .failed
             outcome = .failed
+        } catch MuseActivityError.stage(.send, .http(let status)) where [400, 404, 422].contains(status) {
+            receipt.phase = .failed
+            outcome = .connectionFailed(.stage(.send, .http(status)))
         } catch {
             receipt.phase = .unknown
             outcome = .unknown

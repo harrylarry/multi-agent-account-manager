@@ -16,7 +16,7 @@ enum CookieError: LocalizedError {
         case .credentials: "请输入至少 12 个字符的导出文件口令。"
         case .verification: "无法验证 Cookie 或登录状态。请重新登录后再试。"
         case .sessionUnconfirmed: "Muse 未确认这个资料的登录态。请先在同一账号资料打开 Muse 并确认已登录。"
-        case .identityUnavailable: "Muse 已确认登录，但未提供可与当前账号绑定的邮箱。无法安全完成验证。"
+        case .identityUnavailable: "Muse 已确认登录，但响应中没有可核验的已登录邮箱。输入框里的邮箱只能用于对照，暂无法验证。"
         case .verificationTimeout: "验证 Muse 登录状态时超时。请检查当前账号的网络或代理后重试。"
         case .writeVerification: "WebKit Cookie 写入回读与预期不一致。"
         case .wrongIdentity: "实际登录邮箱与预期不一致。"
