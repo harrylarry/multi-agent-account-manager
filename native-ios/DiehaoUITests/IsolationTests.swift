@@ -126,9 +126,39 @@ final class DashboardTests: XCTestCase {
     func testUnknownSendReconcilesWithoutSendingAgain() {
         continueAfterFailure = false
         let app = XCUIApplication()
-        app.launchArguments = ["-diehao-send-fixtures"]
+        app.launchArguments = ["-diehao-send-fixtures", UUID().uuidString]
         app.launch()
 
+        let send = composeSend(in: app)
+        send.tap()
+        let check = app.buttons["compose.checkSend"]
+        XCTAssertTrue(check.waitForExistence(timeout: 10))
+        // Another normal send with the same unresolved message must hit the ledger.
+        if !send.isHittable { app.swipeUp() }
+        send.tap()
+        XCTAssertTrue(check.waitForExistence(timeout: 10))
+        if !check.isHittable { app.swipeUp() }
+        check.tap()
+        XCTAssertTrue(app.buttons["account.openMuse"].waitForExistence(timeout: 15))
+    }
+
+    @MainActor
+    func testRestartReusesRecoveredSendInsteadOfSendingAgain() {
+        continueAfterFailure = false
+        let app = XCUIApplication()
+        app.launchArguments = ["-diehao-send-fixtures", UUID().uuidString]
+        app.launch()
+        let send = composeSend(in: app)
+        send.tap()
+        XCTAssertTrue(app.buttons["compose.checkSend"].waitForExistence(timeout: 10))
+        app.terminate()
+        app.launch()
+        composeSend(in: app).tap()
+        XCTAssertTrue(app.buttons["account.openMuse"].waitForExistence(timeout: 15))
+    }
+
+    @MainActor
+    private func composeSend(in app: XCUIApplication) -> XCUIElement {
         let compose = app.buttons["dashboard.compose"]
         XCTAssertTrue(compose.waitForExistence(timeout: 20))
         compose.tap()
@@ -140,12 +170,7 @@ final class DashboardTests: XCTestCase {
         app.typeText("Simulator send")
         let send = app.buttons["compose.send"]
         if !send.isHittable { app.swipeUp() }
-        send.tap()
-        let check = app.buttons["compose.checkSend"]
-        XCTAssertTrue(check.waitForExistence(timeout: 10))
-        if !check.isHittable { app.swipeUp() }
-        check.tap()
-        XCTAssertTrue(app.buttons["account.openMuse"].waitForExistence(timeout: 15))
+        return send
     }
 
     @MainActor

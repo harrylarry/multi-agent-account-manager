@@ -30,6 +30,7 @@ private struct SendReceipt: Codable {
     var phase: SendPhase
     var attemptedAgain = false
     var failedChecks = 0
+    var recoveredAwaitingReview: Bool?
 }
 
 @MainActor
@@ -168,17 +169,20 @@ final class MuseSendCoordinator {
     }
 
     #if DEBUG && targetEnvironment(simulator)
-    static func fixtures() -> MuseSendCoordinator {
-        let suffix = "send-fixture." + UUID().uuidString
+    static func fixtures(runID: UUID) -> MuseSendCoordinator {
+        let suffix = "send-fixture." + runID.uuidString
         let thread = "df60b78e-6b23-4fb5-bc42-e1bfad667a83"
-        var written: String?
         return MuseSendCoordinator(path: URL.temporaryDirectory.appending(path: suffix + ".sqlite"),
             keyName: suffix, create: { _ in thread }, send: { _, text, routed, _ in
-                guard routed == thread, written == nil else { throw MuseActivityError.rejected(400) }
-                written = text
+                guard routed == thread, UserDefaults.standard.string(forKey: suffix) == nil else {
+                    throw MuseActivityError.rejected(400)
+                }
+                UserDefaults.standard.set(text, forKey: suffix)
                 throw MuseActivityError.timeout
             }, history: { _, routed in
-                guard let written, routed == thread else { throw MuseActivityError.unavailable }
+                guard let written = UserDefaults.standard.string(forKey: suffix), routed == thread else {
+                    throw MuseActivityError.unavailable
+                }
                 return try JSONSerialization.data(withJSONObject: ["session_id": thread, "has_more": false,
                     "messages": [["role": "user", "session_id": thread, "text": written]]])
             })
@@ -196,10 +200,20 @@ final class MuseSendCoordinator {
             digest = try ledger.digest(message)
             receipts = try ledger.all()
         } catch { return .failed }
+        if let recovered = receipts.first(where: {
+            $0.account == account && $0.digest == digest && $0.recoveredAwaitingReview == true
+        }) {
+            return acknowledge(recovered)
+        }
         if let same = receipts.first(where: { $0.account == account && $0.phase.unresolved && $0.digest == digest }) {
             guard retry, same.phase == .retryAvailable, !same.attemptedAgain else {
+                if same.phase == .deadLetter { return .needsReview }
                 return same.phase == .retryAvailable ? .retryAvailable : .unknown
             }
+            do {
+                let snapshot = try await history(account, same.thread)
+                guard try verify(snapshot, receipt: same) == .empty else { return await check(same, force: true) }
+            } catch { return .unknown }
             var attempt = same
             attempt.attemptedAgain = true
             return await execute(attempt, message: message)
@@ -231,7 +245,7 @@ final class MuseSendCoordinator {
                 outcome = .confirmed(receipt.thread)
             } else if ack.thread != nil {
                 receipt.phase = .deadLetter
-                outcome = .unknown
+                outcome = .needsReview
             } else {
                 receipt.phase = .unknown
                 outcome = .unknown
@@ -256,10 +270,20 @@ final class MuseSendCoordinator {
         defer { locked.remove(account) }
         let digest = try? ledger.digest(message.trimmingCharacters(in: .whitespacesAndNewlines))
         guard let digest, let records = try? ledger.all(),
-              let receipt = records.first(where: { $0.account == account && $0.digest == digest && $0.phase.unresolved }) else {
+              let receipt = records.first(where: {
+                  $0.account == account && $0.digest == digest && ($0.phase.unresolved || $0.recoveredAwaitingReview == true)
+              }) else {
             return .unknown
         }
+        if receipt.recoveredAwaitingReview == true { return acknowledge(receipt) }
         return await check(receipt)
+    }
+
+    private func acknowledge(_ receipt: SendReceipt) -> ComposeResult {
+        var reviewed = receipt
+        reviewed.recoveredAwaitingReview = false
+        do { try ledger.save(reviewed) } catch { return .unknown }
+        return .confirmed(receipt.thread)
     }
 
     func resume(accounts: Set<UUID>) async {
@@ -267,29 +291,35 @@ final class MuseSendCoordinator {
         for receipt in records where accounts.contains(receipt.account) && [.unknown, .sending].contains(receipt.phase) {
             if Task.isCancelled { return }
             guard locked.insert(receipt.account).inserted else { continue }
-            _ = await check(receipt)
+            _ = await check(receipt, recovered: true)
             locked.remove(receipt.account)
         }
     }
 
-    private func check(_ receipt: SendReceipt) async -> ComposeResult {
-        if receipt.phase == .retryAvailable { return .retryAvailable }
-        if receipt.phase == .deadLetter { return .unknown }
+    private func check(_ receipt: SendReceipt, recovered: Bool = false, force: Bool = false) async -> ComposeResult {
+        if receipt.phase == .retryAvailable && !force { return .retryAvailable }
+        if receipt.phase == .deadLetter { return .needsReview }
         let (results, continuation) = AsyncStream<SendHistoryVerdict>.makeStream(bufferingPolicy: .bufferingNewest(1))
         let worker = Task {
             let deadline = Date().addingTimeInterval(26)
             var secondEmpty = false
-            do {
-                repeat {
+            var delay = 2
+            repeat {
+                do {
                     let snapshot = try await history(receipt.account, receipt.thread)
+                    if Task.isCancelled { break }
                     let verdict = try verify(snapshot, receipt: receipt)
                     if verdict == .matching { continuation.yield(.matching); break }
                     let settled = Date().timeIntervalSince(receipt.updated) >= 26
                     if verdict == .empty && secondEmpty && settled { continuation.yield(.empty); break }
                     secondEmpty = verdict == .empty
-                    try await Task.sleep(for: .seconds(2))
-                } while Date() < deadline
-            } catch {}
+                    delay = 2
+                } catch {
+                    secondEmpty = false
+                    delay = min(delay * 2, 8)
+                }
+                do { try await Task.sleep(for: .seconds(delay)) } catch { break }
+            } while Date() < deadline
             continuation.finish()
         }
         let timer = Task {
@@ -305,6 +335,7 @@ final class MuseSendCoordinator {
         switch verdict {
         case .matching:
             next.phase = .confirmed
+            next.recoveredAwaitingReview = recovered
             outcome = .confirmed(receipt.thread)
         case .empty where !receipt.attemptedAgain:
             next.phase = .retryAvailable
@@ -312,7 +343,7 @@ final class MuseSendCoordinator {
         default:
             next.failedChecks += 1
             next.phase = next.failedChecks >= 3 ? .deadLetter : .unknown
-            outcome = .unknown
+            outcome = next.phase == .deadLetter ? .needsReview : .unknown
         }
         do { try ledger.save(next) } catch { return .unknown }
         return outcome

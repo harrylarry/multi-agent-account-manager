@@ -74,7 +74,7 @@ final class NativeMuseActivityConnection: MuseActivityConnection {
 
     static func open(registry: AccountStoreRegistry, id: UUID) async throws -> NativeMuseActivityConnection {
         let (store, configuration) = try registry.accountResources(for: id)
-        let cookies = try await MuseQuotaHTTP.readCookies(store)
+        let cookies = try await MuseQuotaHTTP.readCookies(store, timeout: .seconds(15))
         let cookie = MuseQuotaHTTP.cookieHeader(cookies, path: "/")
         guard !cookie.isEmpty else { throw MuseActivityError.signIn }
         let control = URLSession(configuration: configuration, delegate: MuseRedirectPolicy(), delegateQueue: nil)

@@ -22,7 +22,7 @@ enum ForegroundPollInterval: Int, CaseIterable, Identifiable {
 
 enum ComposeResult {
     case notConnected
-    case failed, busy, unknown, retryAvailable
+    case failed, busy, unknown, retryAvailable, needsReview
     case confirmed(String)
 }
 
@@ -52,8 +52,8 @@ struct DashboardServices {
     }
 
     #if DEBUG && targetEnvironment(simulator)
-    static func fixtures(registry: AccountStoreRegistry) -> Self {
-        let a = AccountIdentity(id: UUID(), purpose: .account, alias: "测试账号 A")
+    static func fixtures(registry: AccountStoreRegistry, accountID: UUID = UUID()) -> Self {
+        let a = AccountIdentity(id: accountID, purpose: .account, alias: "测试账号 A")
         let b = AccountIdentity(id: UUID(), purpose: .account, alias: "测试账号 B")
         var services = Self(registry: registry)
         var reads = 0
@@ -99,21 +99,27 @@ struct Dashboard: View {
         self.registry = registry
         self.check = check
         let activityCoordinator: MuseActivityCoordinator
-        let sender = MuseSendCoordinator(registry: registry)
-        _sender = State(initialValue: sender)
+        let sender: MuseSendCoordinator
         #if DEBUG && targetEnvironment(simulator)
-        if ProcessInfo.processInfo.arguments.contains("-diehao-send-fixtures") {
-            var fixtures = DashboardServices.fixtures(registry: registry)
-            let simulatedSender = MuseSendCoordinator.fixtures()
-            fixtures.send = { await simulatedSender.submit(account: $0, message: $1) }
-            fixtures.checkSend = { await simulatedSender.check(account: $0, message: $1) }
-            fixtures.retrySend = { await simulatedSender.submit(account: $0, message: $1, retry: true) }
+        let arguments = ProcessInfo.processInfo.arguments
+        if let index = arguments.firstIndex(of: "-diehao-send-fixtures"),
+           arguments.indices.contains(index + 1), let runID = UUID(uuidString: arguments[index + 1]) {
+            sender = .fixtures(runID: runID)
+            var fixtures = DashboardServices.fixtures(registry: registry, accountID: runID)
+            fixtures.send = { await sender.submit(account: $0, message: $1) }
+            fixtures.checkSend = { await sender.check(account: $0, message: $1) }
+            fixtures.retrySend = { await sender.submit(account: $0, message: $1, retry: true) }
+            _sender = State(initialValue: sender)
             _services = State(initialValue: fixtures)
             _quota = State(initialValue: .fixtures(accounts: fixtures.accounts()))
             _activityCoordinator = State(initialValue: .fixtures(account: nil))
             _approvals = State(initialValue: .fixtures(account: nil))
             return
         }
+        #endif
+        sender = MuseSendCoordinator(registry: registry)
+        _sender = State(initialValue: sender)
+        #if DEBUG && targetEnvironment(simulator)
         if ProcessInfo.processInfo.arguments.contains("-diehao-approval-fixtures") {
             let fixtures = DashboardServices.fixtures(registry: registry)
             _services = State(initialValue: fixtures)
@@ -276,7 +282,7 @@ struct Dashboard: View {
         }
         .task(id: scenePhase == .active) {
             guard scenePhase == .active else { return }
-            let accounts = registry.accounts
+            let accounts = services.accounts()
             if !accounts.isEmpty { await sender.resume(accounts: Set(accounts.map(\.id))) }
         }
         .task(id: scenePhase == .active ? pollSeconds : 0) {
@@ -489,6 +495,8 @@ private struct DashboardCompose: View {
     private func send() {
         guard allowed, let selection else { return }
         sending = true
+        canCheck = false
+        canRetry = false
         let text = message
         Task {
             defer { sending = false }
@@ -523,6 +531,8 @@ private struct DashboardCompose: View {
             pendingAccount = id
             pendingText = text
             canRetry = true
+        case .needsReview:
+            status = "自动核对已停止。请在 Muse 会话中确认发送结果。"
         case .confirmed(let thread):
             onConfirmed(id, thread)
         }

@@ -263,7 +263,7 @@ enum MuseQuotaHTTP {
         return try await post(discovered, cookies: cookies, session: session, deadline: deadline)
     }
 
-    static func readCookies(_ store: WKHTTPCookieStore) async throws -> [HTTPCookie] {
+    static func readCookies(_ store: WKHTTPCookieStore, timeout interval: Duration = .seconds(5)) async throws -> [HTTPCookie] {
         let (stream, continuation) = AsyncStream<[HTTPCookie]>.makeStream(bufferingPolicy: .bufferingNewest(1))
         let read = Task {
             let cookies = await store.allCookies()
@@ -271,7 +271,7 @@ enum MuseQuotaHTTP {
             continuation.finish()
         }
         let timeout = Task {
-            do { try await Task.sleep(for: .seconds(5)) } catch { return }
+            do { try await Task.sleep(for: interval) } catch { return }
             continuation.finish()
         }
         defer { read.cancel(); timeout.cancel() }
