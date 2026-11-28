@@ -193,6 +193,19 @@ struct AccountDetail: View {
                     .font(.caption)
                 NavigationLink("模型指纹") { MuseFingerprintView(registry: registry, account: account) }
                     .accessibilityIdentifier("account.fingerprint")
+                Button("检查 Muse 原生连接") { perform {
+                    do {
+                        let connection = try await NativeMuseActivityConnection.open(registry: registry, id: account.id)
+                        defer { connection.close() }
+                        let listing = try await connection.call("/api/session/list")
+                        _ = try MuseReply.sessions(from: listing)
+                        status = "Muse 原生连接和会话列表读取成功。"
+                    } catch let error as MuseActivityError {
+                        status = error.localizedDescription
+                    } catch {
+                        status = "Muse 原生连接未完成，请检查当前资料的网络与代理。"
+                    }
+                } }
                 if !status.isEmpty { Text(status).accessibilityIdentifier("account.status") }
             }
             if let approvals {

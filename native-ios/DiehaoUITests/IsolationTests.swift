@@ -288,7 +288,9 @@ final class DashboardTests: XCTestCase {
         let hasValue = NSPredicate(format: "value CONTAINS %@", "额度剩余 100%")
         XCTAssertEqual(XCTWaiter.wait(for: [XCTNSPredicateExpectation(predicate: hasValue, object: available)],
                                       timeout: 10), .completed)
-        XCTAssertTrue((unknown.value as? String)?.contains("额度未观测") == true)
+        let signedOut = NSPredicate(format: "value CONTAINS %@", "Muse 会话已失效")
+        XCTAssertEqual(XCTWaiter.wait(for: [XCTNSPredicateExpectation(predicate: signedOut, object: unknown)],
+                                      timeout: 10), .completed)
         let refresh = app.buttons["dashboard.refreshQuota"]
         XCTAssertTrue(refresh.waitForExistence(timeout: 5))
         refresh.tap()

@@ -22,6 +22,7 @@ enum ForegroundPollInterval: Int, CaseIterable, Identifiable {
 
 enum ComposeResult {
     case notConnected
+    case connectionFailed(MuseActivityError)
     case failed, busy, unknown, retryAvailable, needsReview
     case confirmed(String)
 }
@@ -274,7 +275,6 @@ struct Dashboard: View {
                 approvals.configure([], active: false)
                 return
             }
-            await quota.refresh(services.accounts().map(\.id), trigger: .foreground)
             if !Task.isCancelled {
                 activityEnabled = true
                 activityCoordinator.configure(services.accounts(), active: true, interval: pollSeconds)
@@ -284,6 +284,10 @@ struct Dashboard: View {
                 await approvals.poll(running: activityCoordinator.runningAccounts)
                 do { try await Task.sleep(for: .seconds(1)) } catch { return }
             }
+        }
+        .task(id: scenePhase) {
+            guard scenePhase == .active else { return }
+            await quota.refresh(services.accounts().map(\.id), trigger: .foreground)
         }
         .task(id: scenePhase == .active) {
             guard scenePhase == .active else { return }
@@ -525,6 +529,7 @@ private struct DashboardCompose: View {
         switch result {
         case .notConnected: status = "发送接口已调用，当前版本未发送消息。"
         case .failed: status = "发送未完成。请检查账号状态。"
+        case .connectionFailed(let error): status = error.localizedDescription
         case .busy: status = "这个账号正在发送或核对。"
         case .unknown:
             status = "发送结果未知，可核对历史。"

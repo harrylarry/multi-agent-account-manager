@@ -2,6 +2,10 @@
 
 ## Swift T10 Noise
 
+构建号 12（7bb00d9）首轮统一真机回执部分通过：隔离自检、添加和检测代理、打开登录网页、内嵌视频及选择并预览 Cookie JSON。两次 Cookie 按域清点分别为 9/2 与 8/2。Cookie 池保存与恢复缺少服务端邮箱绑定证据。两种传输模式均报告原生功能失败。Rust 模式总览未同步，原生发送、额度刷新和指纹未通过。[回执和进度](https://github.com/harrylarry/multi-agent-account-manager/issues/36)
+
+构建号 13 优先定位共享的控制面与 RPC。账号资料里的「检查 Muse 原生连接」只建立连接并读会话列表。它报告握手、HTTP 或超时阶段，不展示会话内容。每次用原测试资料和原代理，先测 Rust，重启切到 Swift 再测。Cookie 池仍要求已登录邮箱的可信绑定。
+
 [Issue #36](https://github.com/harrylarry/multi-agent-account-manager/issues/36) 跟踪 CryptoKit Noise XX 发起端和 [统一真机验收](../acceptance/swift-unified-iphone.md)。现有 Rust Noise 是默认路径。Swift 模式仅在手动打开开关后对新连接生效，交换过程中不自动切模式或重发。
 
 - Swift 负责 Noise 握手、传输加密与认证。Rust 保留已有 Muse 帧格式和分片实现，Swift 模式下由 CryptoKit 在套接字收发边界保护每帧。现有 owner attestation 判定复用 Rust 解析。
