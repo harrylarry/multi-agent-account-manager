@@ -138,7 +138,8 @@ struct Dashboard: View {
             return
         }
         if ProcessInfo.processInfo.arguments.contains("-diehao-dashboard-fixtures") ||
-            ProcessInfo.processInfo.arguments.contains("-diehao-quota-fixtures") {
+            ProcessInfo.processInfo.arguments.contains("-diehao-quota-fixtures") ||
+            ProcessInfo.processInfo.arguments.contains("-diehao-fingerprint-fixtures") {
             let fixtures = DashboardServices.fixtures(registry: registry)
             _services = State(initialValue: fixtures)
             _quota = State(initialValue: .fixtures(accounts: fixtures.accounts()))

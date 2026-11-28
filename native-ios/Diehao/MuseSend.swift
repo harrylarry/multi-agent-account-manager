@@ -138,16 +138,7 @@ final class MuseSendCoordinator {
                   keyName: "swift-send-ledger", create: { account in
             let connection = try await NativeMuseActivityConnection.open(registry: registry, id: account)
             defer { connection.close() }
-            let result = try MuseApproval.object(await connection.call("/session/start"))
-            let data = result["data"] as? [String: Any] ?? result
-            let scope = (data["session"] ?? data["thread"]) as? [String: Any] ?? data
-            let raw = ["session_id", "sessionId", "thread_id", "threadId", "id"].compactMap { scope[$0] as? String }.first
-            guard let raw, let id = UUID(uuidString: raw) else {
-                throw MuseActivityError.invalidFrame
-            }
-            let listed = try MuseReply.sessions(from: await connection.call("/api/session/list"))
-            guard listed.contains(where: { UUID(uuidString: $0.id) == id }) else { throw MuseActivityError.invalidFrame }
-            return id.uuidString.lowercased()
+            return try await connection.createThread()
         }, send: { account, text, thread, key in
             let connection = try await NativeMuseActivityConnection.open(registry: registry, id: account)
             defer { connection.close() }
@@ -155,7 +146,7 @@ final class MuseSendCoordinator {
         }, history: { account, thread in
             let connection = try await NativeMuseActivityConnection.open(registry: registry, id: account)
             defer { connection.close() }
-            return try await connection.call("/chat/history?limit=50&transcript_mode=messages&session_id=" + thread)
+            return try await connection.threadHistory(thread)
         })
     }
 

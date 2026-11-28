@@ -191,6 +191,8 @@ struct AccountDetail: View {
                 .accessibilityIdentifier("account.openMuse")
                 Text("资料 ID · " + String(account.id.uuidString.prefix(8)))
                     .font(.caption)
+                NavigationLink("模型指纹") { MuseFingerprintView(registry: registry, account: account) }
+                    .accessibilityIdentifier("account.fingerprint")
                 if !status.isEmpty { Text(status).accessibilityIdentifier("account.status") }
             }
             if let approvals {

@@ -259,6 +259,22 @@ final class NativeMuseActivityConnection: MuseActivityConnection {
         return result
     }
 
+    func createThread() async throws -> String {
+        let result = try MuseApproval.object(await call("/session/start"))
+        let data = result["data"] as? [String: Any] ?? result
+        let scope = (data["session"] ?? data["thread"]) as? [String: Any] ?? data
+        let raw = ["session_id", "sessionId", "thread_id", "threadId", "id"].compactMap { scope[$0] as? String }.first
+        guard let raw, let id = UUID(uuidString: raw) else { throw MuseActivityError.invalidFrame }
+        let listed = try MuseReply.sessions(from: await call("/api/session/list"))
+        guard listed.contains(where: { UUID(uuidString: $0.id) == id }) else { throw MuseActivityError.invalidFrame }
+        return id.uuidString.lowercased()
+    }
+
+    func threadHistory(_ thread: String) async throws -> Data {
+        guard let id = UUID(uuidString: thread) else { throw MuseActivityError.invalidFrame }
+        return try await call("/chat/history?limit=50&transcript_mode=messages&session_id=" + id.uuidString.lowercased())
+    }
+
     func sendNew(_ text: String, thread: String, key: UUID) async throws -> MuseSendAck {
         let body = try JSONSerialization.data(withJSONObject: [
             "items": [["type": "text", "text": text]],

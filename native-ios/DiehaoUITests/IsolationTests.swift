@@ -123,6 +123,31 @@ final class IsolationTests: XCTestCase {
 
 final class DashboardTests: XCTestCase {
     @MainActor
+    func testFingerprintRunsOnlyOnExplicitConfirmation() {
+        continueAfterFailure = false
+        let app = XCUIApplication()
+        app.launchArguments = ["-diehao-fingerprint-fixtures"]
+        app.launch()
+        let account = app.buttons["测试账号 A"]
+        XCTAssertTrue(account.waitForExistence(timeout: 20))
+        account.tap()
+        let fingerprint = app.buttons["account.fingerprint"]
+        XCTAssertTrue(fingerprint.waitForExistence(timeout: 10))
+        fingerprint.tap()
+        XCTAssertTrue(app.staticTexts["fingerprint.empty"].waitForExistence(timeout: 10))
+        app.buttons["fingerprint.measure"].tap()
+        // SwiftUI exposes the confirmation action as two nested accessibility buttons.
+        let confirm = app.sheets.firstMatch.buttons.matching(identifier: "fingerprint.confirm").firstMatch
+        XCTAssertTrue(confirm.waitForExistence(timeout: 10))
+        XCTAssertFalse(app.buttons["fingerprint.result"].exists)
+        confirm.tap()
+        XCTAssertTrue(app.staticTexts["fingerprint.status"].waitForExistence(timeout: 10))
+        let result = app.buttons["fingerprint.result"].firstMatch
+        XCTAssertTrue(result.exists)
+        XCTAssertTrue(result.label.contains("模拟候选模型"))
+    }
+
+    @MainActor
     func testBackupModesRecoveryCodeAndTamperRejection() {
         continueAfterFailure = false
         let app = XCUIApplication()
