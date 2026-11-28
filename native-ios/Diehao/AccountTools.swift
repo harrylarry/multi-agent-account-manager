@@ -100,6 +100,7 @@ enum SavedCookies {
 struct AccountTools: View {
     let registry: AccountStoreRegistry
     var quota: QuotaCoordinator? = nil
+    var museActivity: MuseActivityCoordinator? = nil
     @State private var accounts: [AccountIdentity] = []
     @State private var alias = ""
     @State private var status = ""
@@ -134,7 +135,7 @@ struct AccountTools: View {
         .navigationTitle("账号资料")
         .onAppear(perform: refresh)
         .sheet(item: $selected, onDismiss: refresh) { account in
-            NavigationStack { AccountDetail(registry: registry, account: account, quota: quota) }
+            NavigationStack { AccountDetail(registry: registry, account: account, quota: quota, museActivity: museActivity) }
                 .interactiveDismissDisabled()
         }
     }
@@ -145,9 +146,11 @@ struct AccountTools: View {
 @MainActor
 struct AccountDetail: View {
     @Environment(\.dismiss) private var dismiss
+    @Environment(\.scenePhase) private var scenePhase
     let registry: AccountStoreRegistry
     let account: AccountIdentity
     var quota: QuotaCoordinator? = nil
+    var museActivity: MuseActivityCoordinator? = nil
     @State private var scheme: AccountProxySettings.Scheme = .http
     @State private var host = ""
     @State private var port = ""
@@ -213,6 +216,11 @@ struct AccountDetail: View {
                 } }
             }
             cookieSection
+            if let museActivity {
+                Section("订阅诊断") {
+                    Text(museActivity.diagnostic(account.id))
+                }
+            }
             Section {
                 Button("删除账号", role: .destructive) { deletePrompt = true }
             }
@@ -248,6 +256,15 @@ struct AccountDetail: View {
                             guard let quota else { return }
                             Task { await quota.refresh(account.id, trigger: .account, page: view) }
                         })
+                    .task(id: scenePhase) {
+                        guard scenePhase == .active, let museActivity else { return }
+                        museActivity.focus(account.id)
+                        defer { museActivity.focus(nil) }
+                        while !Task.isCancelled {
+                            await museActivity.checkVisibleReply(in: webView, account: account.id)
+                            do { try await Task.sleep(for: .seconds(2)) } catch { return }
+                        }
+                    }
                 }
                 .navigationTitle("Muse")
                 .navigationBarTitleDisplayMode(.inline)

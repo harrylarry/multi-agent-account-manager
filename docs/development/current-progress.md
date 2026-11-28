@@ -1,5 +1,9 @@
 # 当前开发进度
 
+## Swift T5 订阅、回填和未读
+
+[Issue #26](https://github.com/harrylarry/multi-agent-account-manager/issues/26) 从 T4 模拟器通过提交 d0e98ae 推进。iOS 用每账号 URLSession 建立 WebSocket，握手和帧解析沿用 Rust。Rust 静态库在 Swift 工作流按真机和模拟器架构分别编译。真机用非主力账号统一验收。
+
 ## Swift T4 三层额度同步
 
 [Issue #24](https://github.com/harrylarry/multi-agent-account-manager/issues/24) 基于 T3 的模拟器通过提交 113d87d。同步按账号 UUID 取 Cookie 和出口配置，额度与花费各自显示来源和观察时间。开发阶段使用模拟数据验证，真实账号的三层读数留到统一真机验收。

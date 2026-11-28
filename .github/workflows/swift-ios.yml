@@ -4,6 +4,7 @@ on:
   pull_request:
     paths:
       - 'native-ios/**'
+      - 'src-tauri/muse-native/**'
       - '.github/workflows/swift-ios.yml'
   workflow_dispatch:
 
@@ -25,13 +26,21 @@ jobs:
           persist-credentials: false
       - name: Select Xcode 26
         run: sudo xcode-select --switch /Applications/Xcode_26.3.app/Contents/Developer
+      - name: Build Rust Noise bridge
+        run: |
+          rustup target add aarch64-apple-ios aarch64-apple-ios-sim
+          for target in aarch64-apple-ios aarch64-apple-ios-sim; do
+            cargo rustc --release --lib --crate-type staticlib \
+              --manifest-path src-tauri/muse-native/Cargo.toml --target-dir "$RUNNER_TEMP/swift-rust" --target "$target"
+          done
       - name: Build unsigned Swift IPA
         run: |
           version=$(python3 -c 'import json; print(json.load(open("package.json"))["version"])')
           xcodebuild -project native-ios/Diehao.xcodeproj -scheme Diehao \
             -configuration Release -sdk iphoneos -destination 'generic/platform=iOS' \
             -derivedDataPath "$RUNNER_TEMP/swift-ios-device" \
-            CODE_SIGNING_ALLOWED=NO PRODUCT_BUNDLE_IDENTIFIER=com.ldjx.accountmanager.swift-t1 build
+            CODE_SIGNING_ALLOWED=NO PRODUCT_BUNDLE_IDENTIFIER=com.ldjx.accountmanager.swift-t1 \
+            DIEHAO_RUST_LIB="$RUNNER_TEMP/swift-rust/aarch64-apple-ios/release/libmuse_native.a" build
           plist="$RUNNER_TEMP/swift-ios-device/Build/Products/Release-iphoneos/Diehao.app/Info.plist"
           test "$(plutil -extract CFBundleShortVersionString raw "$plist")" = "$version"
           test "$(plutil -extract CFBundleIdentifier raw "$plist")" = "com.ldjx.accountmanager.swift-t1"
@@ -74,7 +83,8 @@ jobs:
             -destination "platform=iOS Simulator,id=$simulator" \
             -derivedDataPath "$RUNNER_TEMP/swift-ios-simulator" \
             -parallel-testing-enabled NO -resultBundlePath "$RUNNER_TEMP/IsolationABC.xcresult" \
-            ARCHS=arm64 ONLY_ACTIVE_ARCH=YES test
+            ARCHS=arm64 ONLY_ACTIVE_ARCH=YES \
+            DIEHAO_RUST_LIB="$RUNNER_TEMP/swift-rust/aarch64-apple-ios-sim/release/libmuse_native.a" test
       - uses: actions/upload-artifact@v7
         if: always()
         with:

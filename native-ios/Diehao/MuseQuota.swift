@@ -234,7 +234,7 @@ enum MuseQuotaPayload {
     }
 }
 
-private final class QuotaRedirectPolicy: NSObject, URLSessionTaskDelegate {
+final class MuseRedirectPolicy: NSObject, URLSessionTaskDelegate {
     func urlSession(_ session: URLSession, task: URLSessionTask,
                     willPerformHTTPRedirection response: HTTPURLResponse, newRequest request: URLRequest,
                     completionHandler: @escaping @Sendable (URLRequest?) -> Void) {
@@ -250,10 +250,10 @@ enum MuseQuotaHTTP {
 
     static func read(account: UUID, cachedAction: String?, registry: AccountStoreRegistry) async throws -> QuotaObservation {
         let deadline = Date().addingTimeInterval(deadlineSeconds)
-        let (store, configuration) = try registry.quotaResources(for: account)
+        let (store, configuration) = try registry.accountResources(for: account)
         let cookies = try await readCookies(store)
         guard !cookieHeader(cookies, path: "/").isEmpty else { throw QuotaFailure.signedOut }
-        let session = URLSession(configuration: configuration, delegate: QuotaRedirectPolicy(), delegateQueue: nil)
+        let session = URLSession(configuration: configuration, delegate: MuseRedirectPolicy(), delegateQueue: nil)
         defer { session.invalidateAndCancel() }
         if let cachedAction {
             do { return try await post(cachedAction, cookies: cookies, session: session, deadline: deadline) }
@@ -263,7 +263,7 @@ enum MuseQuotaHTTP {
         return try await post(discovered, cookies: cookies, session: session, deadline: deadline)
     }
 
-    private static func readCookies(_ store: WKHTTPCookieStore) async throws -> [HTTPCookie] {
+    static func readCookies(_ store: WKHTTPCookieStore) async throws -> [HTTPCookie] {
         let (stream, continuation) = AsyncStream<[HTTPCookie]>.makeStream(bufferingPolicy: .bufferingNewest(1))
         let read = Task {
             let cookies = await store.allCookies()
@@ -279,7 +279,7 @@ enum MuseQuotaHTTP {
         throw QuotaFailure.transport
     }
 
-    private static func cookieHeader(_ cookies: [HTTPCookie], path: String) -> String {
+    static func cookieHeader(_ cookies: [HTTPCookie], path: String) -> String {
         let scoped = cookies.filter { cookie in
             let domain = cookie.domain.lowercased()
             let cookiePath = cookie.path
