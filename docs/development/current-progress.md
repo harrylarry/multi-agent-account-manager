@@ -1,5 +1,9 @@
 # 当前开发进度
 
+## Swift T8 加密备份
+
+基于 T7 模拟器 8/8 通过提交 fff605b。备份采用 Argon2id 包装数据密钥，恢复码以独立槽解锁。覆盖仅更新备份内同 UUID 的资料，其他资料不删。已导出的旧备份仍可用旧密钥解开，吊销在本机生效。真实 Cookie、代理和导入验证留到统一真机验收。
+
 ## Swift T7 新对话发送 · 交接
 
 [Issue #30](https://github.com/harrylarry/multi-agent-account-manager/issues/30) 的工作树位于 D:/Codex/swift-t7，分支 feat/swift-t7-send，基于 T6 模拟器通过提交 5e3523e。当前是交接中的 WIP，仅检查了 Git diff，尚未核验 Xcode、Rust 链接或模拟器。

@@ -123,6 +123,21 @@ final class IsolationTests: XCTestCase {
 
 final class DashboardTests: XCTestCase {
     @MainActor
+    func testBackupModesRecoveryCodeAndTamperRejection() {
+        continueAfterFailure = false
+        let app = XCUIApplication()
+        app.launchArguments = ["-diehao-backup-fixtures"]
+        app.launch()
+        let backup = app.buttons["dashboard.backup"]
+        XCTAssertTrue(backup.waitForExistence(timeout: 20))
+        if !backup.isHittable { app.swipeUp() }
+        backup.tap()
+        let status = app.staticTexts["backup.status"]
+        XCTAssertTrue(status.waitForExistence(timeout: 25))
+        XCTAssertEqual(status.label, "三种模式、恢复码、坏包和 UUID 合并通过。")
+    }
+
+    @MainActor
     func testUnknownSendReconcilesWithoutSendingAgain() {
         continueAfterFailure = false
         let app = XCUIApplication()

@@ -68,6 +68,7 @@ final class AccountStoreRegistry {
         var pendingRemoval: Set<UUID> = []
         var legacyReferencesChecked = false
         var pendingCookieWrites: Set<UUID>? = nil
+        var pendingBackupWrites: Set<UUID>? = nil
     }
 
     private final class WeakView {
@@ -136,6 +137,47 @@ final class AccountStoreRegistry {
         return identity
     }
 
+    func createBackupAccount(id: UUID, alias: String, requiresProxy: Bool) async throws {
+        _ = WKWebsiteDataStore.default()
+        let existing = try await storeStep(for: nil) { await WKWebsiteDataStore.allDataStoreIdentifiers }
+        guard !existing.contains(id), !index.identities.contains(where: { $0.id == id }) else { throw BackupError.collision }
+        var next = index
+        next.identities.append(AccountIdentity(id: id, purpose: .account, requiresProxy: requiresProxy, alias: alias))
+        next.pendingBackupWrites = (next.pendingBackupWrites ?? []).union([id])
+        try save(next)
+    }
+
+    func setBackupAlias(_ alias: String?, for id: UUID) throws {
+        guard let position = index.identities.firstIndex(where: { $0.id == id && $0.purpose == .account }),
+              !index.pendingRemoval.contains(id) else { throw BackupError.collision }
+        var next = index
+        next.identities[position].alias = alias
+        try save(next)
+    }
+
+    func finishBackup(_ ids: Set<UUID>) throws {
+        var next = index
+        next.pendingBackupWrites?.subtract(ids)
+        try save(next)
+    }
+
+    func beginBackup(_ ids: Set<UUID>) throws {
+        _ = try backupAccounts(ids)
+        var next = index
+        next.pendingBackupWrites = (next.pendingBackupWrites ?? []).union(ids)
+        try save(next)
+        for id in ids { invalidateViews(for: id) }
+    }
+
+    func hasPendingBackupWrite(_ id: UUID) -> Bool { index.pendingBackupWrites?.contains(id) == true }
+
+    func backupAccounts(_ ids: Set<UUID>) throws -> [AccountIdentity] {
+        try ids.map { id in
+            guard index.pendingCookieWrites?.contains(id) != true, !hasPendingBackupWrite(id) else { throw CookieError.rollback }
+            return try activeIdentity(id)
+        }
+    }
+
     func createIsolationPair() async throws -> (a: UUID, b: UUID) {
         _ = WKWebsiteDataStore.default()
         let existing = try await storeStep(for: nil) { await WKWebsiteDataStore.allDataStoreIdentifiers }
@@ -165,7 +207,7 @@ final class AccountStoreRegistry {
     }
 
     func makeWebView(for id: UUID) throws -> AccountWebView {
-        guard index.pendingCookieWrites?.contains(id) != true else { throw CookieError.rollback }
+        guard index.pendingCookieWrites?.contains(id) != true, !hasPendingBackupWrite(id) else { throw CookieError.rollback }
         return try makeConfiguredWebView(for: id)
     }
 
@@ -174,7 +216,7 @@ final class AccountStoreRegistry {
     }
 
     func accountResources(for id: UUID) throws -> (WKHTTPCookieStore, URLSessionConfiguration) {
-        guard index.pendingCookieWrites?.contains(id) != true else { throw CookieError.rollback }
+        guard index.pendingCookieWrites?.contains(id) != true, !hasPendingBackupWrite(id) else { throw CookieError.rollback }
         let identity = try activeIdentity(id)
         let configuration = URLSessionConfiguration.ephemeral
         configuration.httpCookieStorage = nil
@@ -219,6 +261,7 @@ final class AccountStoreRegistry {
 
     func setCookieWritePending(_ pending: Bool, for id: UUID) throws {
         _ = try activeIdentity(id)
+        guard !hasPendingBackupWrite(id) else { throw CookieError.rollback }
         var next = index
         if pending {
             next.pendingCookieWrites = (next.pendingCookieWrites ?? []).union([id])
@@ -229,7 +272,8 @@ final class AccountStoreRegistry {
         if pending { invalidateViews(for: id) }
     }
 
-    func setProxy(_ settings: AccountProxySettings?, password: String, for id: UUID) throws {
+    func setProxy(_ settings: AccountProxySettings?, password: String, for id: UUID, restoringBackup: Bool = false) throws {
+        guard restoringBackup || !hasPendingBackupWrite(id) else { throw BackupError.rollback }
         let identity = try activeIdentity(id)
         guard !identity.usesLegacyDefault else { throw RegistryError.legacyStoreIsShared }
         // Store each credential under a fresh reference. A failed index write
@@ -276,7 +320,8 @@ final class AccountStoreRegistry {
         store.proxyConfigurations = list
     }
 
-    func remove(_ id: UUID) async throws {
+    func remove(_ id: UUID, recoveringBackup: Bool = false) async throws {
+        guard recoveringBackup || !hasPendingBackupWrite(id) else { throw BackupError.rollback }
         guard !Self.restartRequired.contains(id) else { throw RegistryError.storeAwaitingRestart }
         guard !removing.contains(id) else { throw RegistryError.removalInProgress }
         guard let identity = index.identities.first(where: { $0.id == id }) else { return }
@@ -322,6 +367,7 @@ final class AccountStoreRegistry {
         next.identities.removeAll { $0.id == id }
         next.pendingRemoval.remove(id)
         next.pendingCookieWrites?.remove(id)
+        next.pendingBackupWrites?.remove(id)
         try save(next)
     }
 

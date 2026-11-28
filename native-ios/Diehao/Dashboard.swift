@@ -229,6 +229,10 @@ struct Dashboard: View {
                     AccountTools(registry: registry, quota: quota, museActivity: activityCoordinator, approvals: approvals)
                         .onDisappear { rows = services.accounts() }
                 }
+                NavigationLink("加密备份") {
+                    BackupView(registry: registry).onDisappear { rows = services.accounts() }
+                }
+                .accessibilityIdentifier("dashboard.backup")
             }
             Section("同步") {
                 Menu {
