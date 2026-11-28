@@ -136,10 +136,12 @@ final class DashboardTests: XCTestCase {
         XCTAssertEqual(XCTWaiter.wait(for: [XCTNSPredicateExpectation(predicate: hasValue, object: available)],
                                       timeout: 10), .completed)
         XCTAssertTrue((unknown.value as? String)?.contains("额度未观测") == true)
-        app.swipeDown()
+        let refresh = app.buttons["dashboard.refreshQuota"]
+        XCTAssertTrue(refresh.waitForExistence(timeout: 5))
+        refresh.tap()
         let depleted = NSPredicate(format: "value CONTAINS %@", "额度已用尽")
         XCTAssertEqual(XCTWaiter.wait(for: [XCTNSPredicateExpectation(predicate: depleted, object: unknown)],
-                                      timeout: 10), .completed)
+                                      timeout: 10), .completed, String(describing: unknown.value))
         XCTAssertTrue((available.value as? String)?.contains("额度剩余 100%") == true)
     }
 

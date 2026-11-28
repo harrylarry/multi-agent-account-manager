@@ -171,15 +171,18 @@ struct Dashboard: View {
         }
         .navigationTitle("总览")
         .toolbar {
+            ToolbarItem(placement: .topBarLeading) {
+                Button("刷新额度", systemImage: "arrow.clockwise") {
+                    Task { await refreshManually() }
+                }
+                .accessibilityIdentifier("dashboard.refreshQuota")
+            }
             ToolbarItem(placement: .primaryAction) {
                 Button("新建对话", systemImage: "square.and.pencil") { showCompose = true }
                     .accessibilityIdentifier("dashboard.compose")
             }
         }
-        .refreshable {
-            await quota.refresh(services.accounts().map(\.id), trigger: .manual)
-            await refresh()
-        }
+        .refreshable { await refreshManually() }
         .task(id: scenePhase) {
             guard scenePhase == .active else { return }
             await quota.refresh(services.accounts().map(\.id), trigger: .foreground)
@@ -233,6 +236,11 @@ struct Dashboard: View {
         rows = services.accounts()
         let updated = await services.activity()
         if !Task.isCancelled { activity = updated }
+    }
+
+    private func refreshManually() async {
+        await quota.refresh(services.accounts().map(\.id), trigger: .manual)
+        await refresh()
     }
 }
 
