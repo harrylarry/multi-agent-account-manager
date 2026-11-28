@@ -136,7 +136,10 @@ final class DashboardTests: XCTestCase {
         fingerprint.tap()
         XCTAssertTrue(app.staticTexts["fingerprint.empty"].waitForExistence(timeout: 10))
         app.buttons["fingerprint.measure"].tap()
-        app.buttons["开始测量"].tap()
+        let confirm = app.buttons["fingerprint.confirm"]
+        XCTAssertTrue(confirm.waitForExistence(timeout: 10))
+        XCTAssertFalse(app.buttons["fingerprint.result"].exists)
+        confirm.tap()
         XCTAssertTrue(app.staticTexts["fingerprint.status"].waitForExistence(timeout: 10))
         let result = app.buttons["fingerprint.result"].firstMatch
         XCTAssertTrue(result.exists)
