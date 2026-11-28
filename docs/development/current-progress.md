@@ -1,5 +1,9 @@
 # 当前开发进度
 
+## Swift T2 隔离、代理与 Cookie
+
+T2 从 `main` 的 `1155ef3` 开始，目标版本 0.2.1。进度见 [Issue #20](https://github.com/harrylarry/multi-agent-account-manager/issues/20) 与 [PR #21](https://github.com/harrylarry/multi-agent-account-manager/pull/21)。新 Swift 验收版沿用独立 Bundle ID，与日常版并存。真机只用测试账号。按[真机验收说明](../acceptance/swift-t2-iphone.md)验证隔离 A–C、三协议代理出口及双域 Cookie。代理订阅缺真实测试地址。
+
 ## Swift T1 原生骨架
 
 从 `main` 的 `0bd4341` 建立 0.2.0 并行 Swift 验收包。T0 已在 [#17](https://github.com/harrylarry/multi-agent-account-manager/issues/17) 收口。T1 在 [Issue #18](https://github.com/harrylarry/multi-agent-account-manager/issues/18) 和 [PR #19](https://github.com/harrylarry/multi-agent-account-manager/pull/19) 推进。

@@ -9,6 +9,9 @@ struct DiehaoApp: App {
         WindowGroup {
             NavigationStack {
                 List {
+                    if let registry = check.registry {
+                        NavigationLink("账号资料、代理与 Cookie") { AccountTools(registry: registry) }
+                    }
                     Section("隔离自检 A 组") {
                         Text(check.status)
                             .accessibilityIdentifier("isolationA.status")
@@ -27,6 +30,15 @@ struct DiehaoApp: App {
                         }
                         .disabled(!check.canClean)
                         .accessibilityIdentifier("isolationA.clean")
+                    }
+                    Section("隔离自检 B / C 组") {
+                        if check.hasTestSlots {
+                            Text("验证 A 组重启结果并清理测试资料后，可以运行 B / C 组。")
+                                .font(.caption)
+                        }
+                        Button("验证删除与恢复") { Task { await check.runBC() } }
+                            .disabled(!check.canSeed)
+                            .accessibilityIdentifier("isolationBC.run")
                     }
                     if check.referencedAccountCount > 0 {
                         Section("旧资料") {

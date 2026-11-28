@@ -24,7 +24,8 @@ final class IsolationCheck {
     private let defaults = UserDefaults.standard
     private let phaseKey = "isolation-a.phase"
     private let seededProcessKey = "isolation-a.seededProcess"
-    private var registry: AccountStoreRegistry?
+    private let bcKey = "isolation-bc.checkpoint"
+    private(set) var registry: AccountStoreRegistry?
 
     private(set) var busy = false
     private(set) var ready = false
@@ -48,6 +49,7 @@ final class IsolationCheck {
             let registry = try AccountStoreRegistry(indexURL: path)
             try await registry.referenceLegacyProfiles(in: support, bundleID: Bundle.main.bundleIdentifier ?? "")
             self.registry = registry
+            await registry.retryPendingRemoval(includeIsolation: false)
             hasTestSlots = !registry.isolationIdentities.isEmpty
             referencedAccountCount = registry.referencedAccountCount
             phase = defaults.string(forKey: phaseKey) ?? ""
@@ -124,6 +126,83 @@ final class IsolationCheck {
             self.savePhase(wasVerified ? "cleaned" : "")
             self.status = wasVerified ? "A 组通过，测试资料已清理。" : "测试资料已清理。"
         }
+    }
+
+    func runBC() async {
+        guard ready, !busy, !hasTestSlots else { return }
+        await perform("正在验证删除、恢复和 UUID 冲突…") {
+            let folder = URL.applicationSupportDirectory.appending(path: "DiehaoNative/check-bc")
+            let tests = try AccountStoreRegistry(indexURL: folder.appending(path: "accounts.json"))
+            if let saved = self.defaults.data(forKey: self.bcKey) {
+                try await self.finishBC(JSONDecoder().decode(BCCheckpoint.self, from: saved), tests: tests)
+                return
+            }
+            for stale in tests.accounts { try await tests.remove(stale.id) }
+            guard await tests.retryPendingRemoval() else { throw RegistryError.storeAwaitingRestart }
+            let original = try await tests.createAccount(alias: "Synthetic original")
+            let restored = try await tests.createAccount(alias: "Synthetic restore", reserving: original.id)
+            let values = ["muse.ai", "meta.com"].map { domain in
+                MuseCookie(name: "diehao_t2", value: UUID().uuidString, domain: domain, path: "/",
+                           secure: true, httpOnly: true, hostOnly: true,
+                           expirationDate: Date().timeIntervalSince1970 + 3600)
+            }
+            let password = UUID().uuidString
+            let data = try await CookieArchive.seal(values, password: password)
+            let imported = try CookiePreview(await CookieArchive.open(data, password: password))
+            let rejected = (try? await CookieArchive.open(data, password: UUID().uuidString)) == nil
+            guard rejected, restored.id != original.id else {
+                throw IsolationError.mismatch("C 组口令或 UUID")
+            }
+            try await CookieTransfer.apply(imported, id: original.id, registry: tests) {}
+            try await CookieTransfer.apply(imported, id: restored.id, registry: tests) {}
+            let different = try CookiePreview(values.map {
+                MuseCookie(name: $0.name, value: "different", domain: $0.domain, path: $0.path,
+                           secure: $0.secure, httpOnly: $0.httpOnly, hostOnly: true, expirationDate: $0.expirationDate)
+            })
+            do {
+                try await CookieTransfer.apply(different, id: original.id, registry: tests) {
+                    throw CookieError.wrongIdentity
+                }
+                throw IsolationError.mismatch("C 组应拒绝错误邮箱")
+            } catch CookieError.wrongIdentity {}
+            let after = try await CookieTransfer.capture(store: tests.dataStore(for: original.id))
+            guard Set(tests.accounts.map(\.id)) == [original.id, restored.id],
+                  Set(after.cookies.map(\.value)) == Set(values.map(\.value)) else {
+                throw IsolationError.mismatch("C 组覆盖与回滚")
+            }
+            let checkpoint = BCCheckpoint(original: original.id, restored: restored.id, expected: Set(values.map(\.value)))
+            try self.saveBC(checkpoint)
+            let handle = try tests.makeWebView(for: restored.id)
+            try await self.finishBC(checkpoint, tests: tests, opened: handle)
+        }
+    }
+
+    private struct BCCheckpoint: Codable {
+        let original: UUID
+        let restored: UUID
+        let expected: Set<String>
+        var checkedTargetRemoval = false
+    }
+
+    private func saveBC(_ checkpoint: BCCheckpoint) throws {
+        defaults.set(try JSONEncoder().encode(checkpoint), forKey: bcKey)
+    }
+
+    private func finishBC(_ saved: BCCheckpoint, tests: AccountStoreRegistry, opened: AccountWebView? = nil) async throws {
+        var checkpoint = saved
+        if !checkpoint.checkedTargetRemoval {
+            try await tests.remove(checkpoint.restored)
+            let remaining = try await CookieTransfer.capture(store: tests.dataStore(for: checkpoint.original))
+            guard opened?.view == nil, tests.accounts.map(\.id) == [checkpoint.original],
+                  Set(remaining.cookies.map(\.value)) == checkpoint.expected else {
+                throw IsolationError.mismatch("B 组仅删除目标资料")
+            }
+            checkpoint.checkedTargetRemoval = true
+            try saveBC(checkpoint)
+        }
+        try await tests.remove(checkpoint.original)
+        defaults.removeObject(forKey: bcKey)
+        status = "B / C 组通过，测试资料已清理。"
     }
 
     private func verifyProxyWiring(_ registry: AccountStoreRegistry, a: UUID, b: UUID) throws {
