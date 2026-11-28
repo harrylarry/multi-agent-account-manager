@@ -7,7 +7,7 @@ Swift 各阶段在这里与 0.1.26 日常版逐项对照。基线是 main `0bd43
 | 阶段 | 模块 | 真机关闭条件 | 当前证据 |
 |---|---|---|---|
 | T1 | Swift 骨架、注册表 | iPhone 启动原生 @main，经注册表建取删测试 DataStore。A 组双向隔离，重启后各自保留 Cookie 和 localStorage。代理注册配置归属与 WebView 重建在自检中验证。 | [T1 Issue](https://github.com/harrylarry/multi-agent-account-manager/issues/18) · [验收步骤](swift-t1-iphone.md) · 真机待验 |
-| T2 | 隔离、代理、Cookie | 隔离 A–C。双代理真实出口不串；同邮箱双槽登录态隔离。HTTP/HTTPS/SOCKS5 端到端、失败阻断、移除只影响目标。Muse 与 Meta 双域导出 20/20、导入验证、覆盖和恢复按 UUID 管理。记录 CHIPS/DBSC，WebAuthn 等有开关的真机包再对照。 | 待实现与验收 |
+| T2 | 隔离、代理、Cookie | 隔离 A–C。双代理真实出口不串；同邮箱双槽登录态隔离。HTTP/HTTPS/SOCKS5 端到端、失败阻断、移除只影响目标。Muse 与 Meta 双域导出 20/20、导入验证、覆盖和恢复按 UUID 管理。记录 CHIPS/DBSC，WebAuthn 等有开关的真机包再对照。 | [Issue #20](https://github.com/harrylarry/multi-agent-account-manager/issues/20) · [真机说明](swift-t2-iphone.md) |
 | T3 | 总览、账号列表、Compose | 正确聚合未读、待审批、进行中并显示空态。前台轮询 10/20/30 秒可换，默认 20 秒。Compose 可手动选择账号、输入 1–16,000 字并调用发送接口。 | 待实现与验收 |
 | T4 | 额度 | 进 App N 个账号额度 N/N，带更新时间、来源和 stale。L1 失败仅经相应条件转 L2 一次，进入账号触发 L3。30 分钟内重进不重复刷新，0% 与未观测分开。 | T0 S1、S2 已明确原生额度路径及取消被动层 |
 | T5 | 订阅、未读、红点（B1） | 两项出入账号的未读场景、断线重连与回填无丢重、看到最新消息后清除，诊断能区分订阅、轮询与回填。 | 待实现与验收 |
