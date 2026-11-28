@@ -82,6 +82,7 @@ final class AccountStoreRegistry {
     private var proxyConfigurations: [UUID: [ProxyConfiguration]] = [:]
     private var webViews: [UUID: [WeakView]] = [:]
     private var removing: Set<UUID> = []
+    private static var restartRequired: Set<UUID> = []
 
     init(indexURL: URL) throws {
         self.indexURL = indexURL
@@ -111,8 +112,9 @@ final class AccountStoreRegistry {
     }
 
     @discardableResult
-    func retryPendingRemoval() async -> Bool {
+    func retryPendingRemoval(includeIsolation: Bool = true) async -> Bool {
         for id in index.pendingRemoval {
+            if !includeIsolation && isolationIdentities.contains(where: { $0.id == id }) { continue }
             // A failed WebKit/Keychain removal remains queued in the index.
             try? await remove(id)
         }
@@ -250,6 +252,7 @@ final class AccountStoreRegistry {
     }
 
     func remove(_ id: UUID) async throws {
+        guard !Self.restartRequired.contains(id) else { throw RegistryError.storeAwaitingRestart }
         guard !removing.contains(id) else { throw RegistryError.removalInProgress }
         guard let identity = index.identities.first(where: { $0.id == id }) else { return }
         guard !identity.usesLegacyDefault else { throw RegistryError.legacyStoreIsShared }
@@ -264,26 +267,29 @@ final class AccountStoreRegistry {
 
         // Initialize the default store before enumeration/removal on a cold launch.
         _ = WKWebsiteDataStore.default()
-        let existing = await WKWebsiteDataStore.allDataStoreIdentifiers
+        let existing = try await removalStep(for: id) { await WKWebsiteDataStore.allDataStoreIdentifiers }
         if existing.contains(id) {
             do {
-                try await WKWebsiteDataStore.remove(forIdentifier: id)
+                try await removalStep(for: id) { try await WKWebsiteDataStore.remove(forIdentifier: id) }
             } catch where Self.isStoreInUse(error) {
                 // Clear the target's WebKit caches and storage. WebKit also
                 // releases cached processes for this session during this call.
-                await Self.purgeWebsiteData(for: id)
+                try await removalStep(for: id) { await Self.purgeWebsiteData(for: id) }
                 for delay in [200, 500, 1_000] {
                     try await Task.sleep(for: .milliseconds(delay))
                     do {
-                        try await WKWebsiteDataStore.remove(forIdentifier: id)
+                        try await removalStep(for: id) { try await WKWebsiteDataStore.remove(forIdentifier: id) }
                         break
                     } catch where Self.isStoreInUse(error) {
-                        if delay == 1_000 { throw RegistryError.storeAwaitingRestart }
+                        if delay == 1_000 {
+                            Self.restartRequired.insert(id)
+                            throw RegistryError.storeAwaitingRestart
+                        }
                     }
                 }
             }
         }
-        let remaining = await WKWebsiteDataStore.allDataStoreIdentifiers
+        let remaining = try await removalStep(for: id) { await WKWebsiteDataStore.allDataStoreIdentifiers }
         guard !remaining.contains(id) else { throw RegistryError.storeStillExists }
         if let key = identity.proxy?.credentialID { try T2Keychain.delete(key) }
         try T2Keychain.delete("cookie-rollback." + id.uuidString)
@@ -303,6 +309,41 @@ final class AccountStoreRegistry {
     private static func purgeWebsiteData(for id: UUID) async {
         let store = WKWebsiteDataStore(forIdentifier: id)
         await store.removeData(ofTypes: WKWebsiteDataStore.allWebsiteDataTypes(), modifiedSince: .distantPast)
+    }
+
+    private func removalStep<Value: Sendable>(for id: UUID,
+                                               _ operation: @escaping @MainActor () async throws -> Value) async throws -> Value {
+        try await withCheckedThrowingContinuation { continuation in
+            let step = RemovalStep(continuation)
+            let watchdog = Task {
+                do { try await Task.sleep(for: .seconds(8)) } catch { return }
+                // A public WebKit callback cannot be cancelled. Keep this UUID
+                // blocked in this process instead of starting a second removal.
+                if step.resolve(.failure(RegistryError.storeAwaitingRestart)) {
+                    Self.restartRequired.insert(id)
+                }
+            }
+            Task {
+                do { step.resolve(.success(try await operation())) }
+                catch { step.resolve(.failure(error)) }
+                watchdog.cancel()
+            }
+        }
+    }
+
+    @MainActor
+    private final class RemovalStep<Value: Sendable> {
+        private var continuation: CheckedContinuation<Value, Error>?
+
+        init(_ continuation: CheckedContinuation<Value, Error>) { self.continuation = continuation }
+
+        @discardableResult
+        func resolve(_ result: Result<Value, Error>) -> Bool {
+            guard let continuation else { return false }
+            self.continuation = nil
+            continuation.resume(with: result)
+            return true
+        }
     }
 
     func referenceLegacyProfiles(in applicationSupport: URL, bundleID: String) async throws {

@@ -49,7 +49,7 @@ final class IsolationCheck {
             let registry = try AccountStoreRegistry(indexURL: path)
             try await registry.referenceLegacyProfiles(in: support, bundleID: Bundle.main.bundleIdentifier ?? "")
             self.registry = registry
-            await registry.retryPendingRemoval()
+            await registry.retryPendingRemoval(includeIsolation: false)
             hasTestSlots = !registry.isolationIdentities.isEmpty
             referencedAccountCount = registry.referencedAccountCount
             phase = defaults.string(forKey: phaseKey) ?? ""

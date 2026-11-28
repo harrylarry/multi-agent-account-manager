@@ -18,8 +18,7 @@ final class IsolationTests: XCTestCase {
             .completed
         )
         if cleanup.isEnabled {
-            cleanup.tap()
-            wait(for: status, toContain: "测试资料已清理")
+            clean(app: app, button: cleanup, status: status)
         }
         XCTAssertTrue(seed.isEnabled, status.label)
         seed.tap()
@@ -37,8 +36,7 @@ final class IsolationTests: XCTestCase {
         )
         verify.tap()
         wait(for: status, toContain: "A 组通过")
-        cleanup.tap()
-        wait(for: status, toContain: "测试资料已清理")
+        clean(app: app, button: cleanup, status: status)
         let bc = app.buttons["isolationBC.run"]
         bc.tap()
         let bcProgress = NSPredicate(format: "label CONTAINS %@ OR label CONTAINS %@", "B / C 组通过", "请彻底退出并重开叠号")
@@ -56,6 +54,27 @@ final class IsolationTests: XCTestCase {
             bc.tap()
         }
         wait(for: status, toContain: "B / C 组通过")
+    }
+
+    @MainActor
+    private func clean(app: XCUIApplication, button: XCUIElement, status: XCUIElement) {
+        button.tap()
+        let progress = NSPredicate(format: "label CONTAINS %@ OR label CONTAINS %@", "测试资料已清理", "请彻底退出并重开叠号")
+        XCTAssertEqual(
+            XCTWaiter.wait(for: [XCTNSPredicateExpectation(predicate: progress, object: status)], timeout: 90),
+            .completed, status.label
+        )
+        if status.label.contains("请彻底退出并重开叠号") {
+            app.terminate()
+            app.launch()
+            let enabled = NSPredicate(format: "enabled == true")
+            XCTAssertEqual(
+                XCTWaiter.wait(for: [XCTNSPredicateExpectation(predicate: enabled, object: button)], timeout: 10),
+                .completed
+            )
+            button.tap()
+        }
+        wait(for: status, toContain: "测试资料已清理")
     }
 
     @MainActor
